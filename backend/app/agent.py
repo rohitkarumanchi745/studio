@@ -1,0 +1,659 @@
+"""The Studio agent — LangChain + LangGraph, model-agnostic.
+
+STUDIO_LLM selects the model as a LangChain init_chat_model string:
+    anthropic:claude-opus-4-8   (default)
+    openai:gpt-4o
+Any provider LangChain supports works — the graph, tools, and prompts are
+provider-neutral.
+
+ReAct loop with four tools:
+  run_sql(sql)                    — validated (SELECT-only, RBAC) execution
+  render_chart(type, title, x, y) — records an ECharts-ready chart spec
+  remember(note)                  — saves a durable note about this user
+  email_report(subject)           — emails the current result to the user
+
+Scale model (TB-range warehouses): computation is pushed down into the
+warehouse — the agent is instructed to aggregate in SQL, every query gets a
+LIMIT, and results are hard-capped at MAX_ROWS before leaving the backend.
+The browser only ever sees aggregated/preview rows, never raw terabytes.
+
+Without an API key for the selected provider, run_agent degrades to a
+deterministic fallback (SELECT * ... LIMIT + auto chart).
+"""
+import json
+import os
+import re
+from typing import List
+
+from . import db, email_service, queryguard
+from .queryguard import QueryRejected
+
+# Full Power BI / Tableau-style catalog (rendered with ECharts client-side)
+CHART_TYPES = [
+    "bar", "hbar", "stacked_bar", "line", "area", "stacked_area", "combo",
+    "pie", "donut", "scatter", "bubble", "heatmap", "treemap", "funnel",
+    "radar", "gauge", "kpi", "histogram", "boxplot", "waterfall", "sankey",
+    "table",
+]
+
+# Phrase → type map for prompt edits without an LLM key ("stacked bar chart")
+_CHART_PHRASES = [
+    ("stacked bar", "stacked_bar"), ("stacked column", "stacked_bar"),
+    ("stacked area", "stacked_area"), ("horizontal bar", "hbar"),
+    ("box plot", "boxplot"), ("donut", "donut"), ("treemap", "treemap"),
+    ("tree map", "treemap"), ("heatmap", "heatmap"), ("heat map", "heatmap"),
+    ("funnel", "funnel"), ("radar", "radar"), ("spider", "radar"),
+    ("gauge", "gauge"), ("kpi", "kpi"), ("card", "kpi"),
+    ("histogram", "histogram"), ("boxplot", "boxplot"),
+    ("waterfall", "waterfall"), ("sankey", "sankey"), ("bubble", "bubble"),
+    ("combo", "combo"), ("scatter", "scatter"), ("pie", "pie"),
+    ("area", "area"), ("line", "line"), ("bar", "bar"), ("column", "bar"),
+    ("table", "table"),
+]
+MAX_ROWS = int(os.getenv("STUDIO_MAX_ROWS", "50000"))  # server ceiling (configurable)
+PREVIEW_ROWS = 40      # rows shown to the model per query
+
+_KEY_FOR_PROVIDER = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+}
+
+
+def mcp_servers():
+    """MCP servers the agent may use, from STUDIO_MCP_SERVERS (JSON).
+
+    Example:
+      {"snowflake": {"transport": "streamable_http", "url": "http://mcp.internal/sf"},
+       "tools":     {"transport": "stdio", "command": "npx",
+                     "args": ["-y", "@modelcontextprotocol/server-everything"]}}
+    """
+    raw = os.getenv("STUDIO_MCP_SERVERS", "").strip()
+    if not raw:
+        return {}
+    try:
+        cfg = json.loads(raw)
+        return cfg if isinstance(cfg, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+async def _load_mcp_tools(cfg):
+    """Fetch tools from all configured MCP servers (version-tolerant)."""
+    from langchain_mcp_adapters.client import MultiServerMCPClient
+    client = MultiServerMCPClient(cfg)
+    try:
+        return await client.get_tools()          # sessionless API (new)
+    except (TypeError, AttributeError):
+        async with client:                        # context-manager API (old)
+            return client.get_tools()
+
+
+def llm_spec():
+    return os.getenv("STUDIO_LLM", "anthropic:claude-opus-4-8")
+
+
+# The model menu the company offers its users. Override with STUDIO_MODELS
+# (comma-separated init_chat_model strings) to add/remove providers.
+_DEFAULT_MODELS = (
+    "anthropic:claude-opus-4-8,anthropic:claude-sonnet-5,anthropic:claude-haiku-4-5,"
+    "openai:gpt-4o,openai:gpt-4o-mini"
+)
+
+
+def available_models():
+    specs = [s.strip() for s in os.getenv("STUDIO_MODELS", _DEFAULT_MODELS).split(",") if s.strip()]
+    if llm_spec() not in specs:
+        specs.insert(0, llm_spec())
+    return [
+        {
+            "spec": s,
+            "provider": s.split(":", 1)[0],
+            "name": s.split(":", 1)[-1],
+            "available": llm_available(s),
+            "default": s == llm_spec(),
+        }
+        for s in specs
+    ]
+
+
+def llm_available(spec=None):
+    provider = (spec or llm_spec()).split(":", 1)[0]
+    key_var = _KEY_FOR_PROVIDER.get(provider)
+    if key_var is None:
+        return True  # unknown provider — let LangChain resolve credentials
+    return bool(os.getenv(key_var))
+
+
+def _build_graph(llm, tools, system):
+    """Version-tolerant agent construction across langchain/langgraph releases."""
+    try:
+        from langchain.agents import create_agent  # langchain >= 1.0
+        try:
+            return create_agent(llm, tools, system_prompt=system)
+        except TypeError:
+            return create_agent(llm, tools, prompt=system)
+    except ImportError:
+        from langgraph.prebuilt import create_react_agent
+        try:
+            return create_react_agent(llm, tools, prompt=system)
+        except TypeError:
+            return create_react_agent(llm, tools, state_modifier=system)
+
+
+def _final_text(result):
+    for message in reversed(result.get("messages", [])):
+        if getattr(message, "type", "") == "ai":
+            content = message.content
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+            if isinstance(content, list):
+                parts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+                text = "\n".join(p for p in parts if p).strip()
+                if text:
+                    return text
+    return ""
+
+
+def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, model=None):
+    """One analytics turn.
+
+    schemas: {table_name: [{"name","type"}, ...]} — one entry for single-table
+    mode, several for whole-source ("All tables") mode.
+    model: optional per-request model spec chosen by the user (validated by
+    the caller against available_models()); defaults to STUDIO_LLM.
+    Returns {text, sql, columns, rows, chart, mode, model, email}.
+    """
+    spec = model or llm_spec()
+    if not llm_available(spec):
+        return _fallback(prompt, connector, table, allowed_tables)
+
+    ctx = {"sql": None, "columns": [], "rows": [], "chart": None, "email": None, "panels": [],
+           "errors": []}
+
+    from langchain_core.tools import tool
+
+    @tool
+    def run_sql(sql: str) -> str:
+        """Execute a read-only SQL SELECT against the connected data source.
+
+        Args:
+            sql: A single SELECT (or WITH...SELECT) statement. No DML/DDL.
+        """
+        try:
+            cleaned = queryguard.validate(sql, allowed_tables)
+            cleaned = queryguard.enforce_limit(cleaned, MAX_ROWS)
+            columns, rows = connector.run_query(cleaned)
+            rows = rows[:MAX_ROWS]
+        except QueryRejected as e:
+            ctx["errors"].append(f"rejected: {e}")
+            return f"QUERY REJECTED: {e}"
+        except Exception as e:
+            ctx["errors"].append(f"sql error: {e}")
+            return f"QUERY ERROR: {e}"
+        ctx["sql"], ctx["columns"], ctx["rows"] = cleaned, columns, rows
+        preview = {"columns": columns, "rows": rows[:PREVIEW_ROWS], "total_rows": len(rows)}
+        return json.dumps(preview, default=str)
+
+    @tool
+    def render_chart(chart_type: str, title: str, x: str, y: List[str]) -> str:
+        """Propose a visualization of the most recent run_sql result.
+
+        Args:
+            chart_type: One of: bar, hbar (horizontal), stacked_bar, line,
+                area, stacked_area, combo (y[0] bars + rest lines, one axis),
+                pie, donut, scatter, bubble (y=[value, size]), heatmap
+                (x category, y=[row_category, value]), treemap, funnel, radar,
+                gauge (single-row value), kpi (single-row big number),
+                histogram (bins y[0]), boxplot (groups x, distribution of y[0]),
+                waterfall (x stages, y[0] deltas), sankey (x source,
+                y=[target, value]), table.
+            title: Short human-readable chart title.
+            x: Column for the x axis / category / label / source dimension.
+            y: Numeric column(s) to plot; special shapes noted per type above.
+        """
+        if chart_type not in CHART_TYPES:
+            return f"Unsupported chart_type. Use one of: {', '.join(CHART_TYPES)}"
+        if ctx["sql"] is None:
+            return "No query result yet — call run_sql first."
+        missing = [c for c in [x] + list(y) if c not in ctx["columns"]]
+        if missing:
+            return f"Columns not in result: {missing}. Result columns: {ctx['columns']}"
+        spec = {"type": chart_type, "title": title, "x": x, "y": list(y)}
+        ctx["chart"] = spec
+        # Each render_chart snapshots the current query result as one panel,
+        # so repeating run_sql → render_chart builds a multi-chart dashboard
+        # (e.g. the same metric at day/month/year granularity side by side).
+        ctx["panels"].append({
+            "sql": ctx["sql"],
+            "columns": ctx["columns"],
+            "rows": ctx["rows"],
+            "chart": spec,
+        })
+        return f"Chart panel {len(ctx['panels'])} recorded."
+
+    @tool
+    def remember(note: str) -> str:
+        """Save a durable note about this user's preferences or context
+        (e.g. "prefers revenue in bar charts", "cares about the West region").
+        Use when the user states a lasting preference or important fact.
+
+        Args:
+            note: One short sentence to remember for future conversations.
+        """
+        db.add_memory(user["id"], note)
+        return "Noted."
+
+    @tool
+    def email_report(subject: str) -> str:
+        """Email the current query result and your insight to the user's
+        email address. Only call when the user asks for a report by email.
+
+        Args:
+            subject: Short subject line for the report email.
+        """
+        if ctx["sql"] is None:
+            return "No query result yet — call run_sql first."
+        html = email_service.report_html(
+            subject, "Report generated by the Studio agent on request.",
+            ctx["sql"], ctx["columns"], ctx["rows"],
+            footer=f"Requested by {user['email']} · source: {connector.name}",
+        )
+        try:
+            delivery = email_service.send(user["email"], f"Studio report: {subject}", html)
+        except Exception as e:
+            return f"EMAIL FAILED: {e}"
+        ctx["email"] = delivery
+        return f"Report emailed to {user['email']} (mode: {delivery['mode']})."
+
+    memory_notes = db.list_memory(user["id"])
+    system = _system_prompt(connector, table, allowed_tables, schemas, memory_notes)
+
+    from langchain.chat_models import init_chat_model
+
+    try:
+        llm = init_chat_model(spec)
+        base_tools = [run_sql, render_chart, remember, email_report]
+        messages = [("user" if h["role"] == "user" else "assistant", h["text"]) for h in history]
+        messages.append(("user", prompt))
+        mcp_cfg = mcp_servers()
+        if mcp_cfg:
+            # MCP tools are async — load them and run the graph on an event loop.
+            import asyncio
+
+            async def _arun():
+                tools = base_tools + list(await _load_mcp_tools(mcp_cfg))
+                graph = _build_graph(llm, tools, system)
+                return await graph.ainvoke({"messages": messages}, config={"recursion_limit": 16})
+
+            result = asyncio.run(_arun())
+        else:
+            graph = _build_graph(llm, base_tools, system)
+            result = graph.invoke({"messages": messages}, config={"recursion_limit": 16})
+        text = _final_text(result) or "Done."
+    except Exception as e:
+        # Provider/graph failure — fall back so the product keeps working,
+        # surface the reason, and alert the user by email (best-effort).
+        try:
+            email_service.send(
+                user["email"],
+                "Studio agent issue",
+                f"<p>Your question <b>{prompt[:200]}</b> hit an agent error:</p>"
+                f"<pre>{str(e)[:500]}</pre><p>A basic preview was shown instead.</p>",
+            )
+        except Exception:
+            pass
+        out = _fallback(prompt, connector, table, allowed_tables)
+        out["text"] = f"(Agent error: {e}) — showing a basic preview instead.\n\n" + out["text"]
+        return out
+
+    panels = ctx["panels"]
+    if not panels and ctx["sql"]:
+        panels = [{"sql": ctx["sql"], "columns": ctx["columns"],
+                   "rows": ctx["rows"], "chart": ctx["chart"]}]
+    return {
+        "text": text,
+        "sql": ctx["sql"],
+        "columns": ctx["columns"],
+        "rows": ctx["rows"],
+        "chart": ctx["chart"],
+        "panels": panels,
+        "email": ctx["email"],
+        "errors": ctx["errors"],
+        "mode": "agent",
+        "model": spec,
+    }
+
+
+def _system_prompt(connector, table, allowed_tables, schemas, memory_notes):
+    schema_blocks = []
+    for t, cols in list(schemas.items())[:10]:
+        lines = "\n".join(f"    - {c['name']} ({c['type']})" for c in cols)
+        schema_blocks.append(f"  {t}:\n{lines}")
+    schema_text = "\n".join(schema_blocks)
+    scope = f"Selected table: {table}" if table != "*" else "Scope: the whole source (all tables listed below)"
+    memory = "\n".join(f"  - {n}" for n in memory_notes) or "  (none)"
+    return f"""You are Studio, a senior data analyst agent. Answer the user's question about their data by writing SQL, running it, and (when a visualization helps) proposing a chart.
+
+Data source: {connector.name} (SQL dialect: {connector.dialect})
+{scope}
+Accessible tables and schemas:
+{schema_text}
+All tables you may reference: {', '.join(allowed_tables)}
+
+What you remember about this user (from earlier sessions):
+{memory}
+
+Learned guidance (distilled from past runs and mistakes — follow it):
+{_learned_lessons(connector.name)}
+
+Rules:
+- Always call run_sql to get real data before answering. Never invent numbers.
+- The warehouse may hold terabytes: ALWAYS aggregate in SQL (GROUP BY, filters,
+  date_trunc) and let the warehouse do the work. Never select raw rows when an
+  aggregate answers the question; always LIMIT raw listings.
+- Only SELECT statements; only the tables listed above.
+- After a successful query, call render_chart when a visualization would help.
+  Pick the form for the job: trends → line/area/stacked_area, comparisons →
+  bar/hbar/stacked_bar/combo, shares → pie/donut/treemap/funnel, correlations →
+  scatter/bubble, matrices → heatmap, distributions → histogram/boxplot,
+  bridges → waterfall, flows → sankey, single headline number → kpi/gauge.
+- Multiple views: when the user asks for several breakdowns at once (e.g. day
+  level AND month level AND year level), produce one chart per view — repeat
+  run_sql then render_chart for each granularity. Each render_chart captures
+  the most recent query result as its own panel; all panels display together.
+- Call remember when the user states a lasting preference; call email_report
+  only when they ask for the report by email.
+- Additional company tools (MCP) may be available beyond SQL — use them when
+  they fit the question better than querying the warehouse.
+- If a query fails, read the error and fix your SQL — do not give up on the first error.
+- Final answer: a short, direct insight (2-4 sentences) with concrete numbers.
+  Do not paste raw result tables into the text — the UI renders them."""
+
+
+def _learned_lessons(source):
+    """The agent's accumulated lessons: the distilled prompt from training runs
+    (prompts/system_learned.txt, written by scripts/train_apo.py) plus recent
+    failure messages for this source, so known bugs aren't repeated."""
+    parts = []
+    path = os.path.join(os.path.dirname(__file__), "..", "prompts", "system_learned.txt")
+    try:
+        with open(path) as f:
+            learned = f.read().strip()
+        if learned:
+            parts.append(learned)
+    except OSError:
+        pass
+    try:
+        from . import db
+        for err in db.recent_failures(source, limit=5):
+            parts.append(f"- A previous query here failed with: {err[:180]} — avoid this mistake.")
+    except Exception:
+        pass
+    return "\n".join(parts) or "  (none yet)"
+
+
+# ── Deterministic fallback (no LLM key) ─────────────────────────────────
+
+def _fallback(prompt, connector, table, allowed_tables):
+    target = table if table != "*" else (allowed_tables[0] if allowed_tables else None)
+    if not target:
+        return {"text": "No accessible tables.", "sql": None, "columns": [], "rows": [],
+                "chart": None, "panels": [], "email": None, "mode": "fallback", "model": None}
+
+    # Multi-granularity ask ("day level and month level and year level") →
+    # one aggregated panel per granularity (sqlite demo dialect).
+    grans = [g for g in ("hour", "day", "week", "month", "year") if g in prompt.lower()]
+    if len(grans) >= 2 and connector.dialect == "sqlite":
+        multi = _fallback_granularity_panels(connector, target, allowed_tables, grans)
+        if multi:
+            return multi
+
+    # Multi-table selection → one preview panel per selected table.
+    if table == "*" and 1 < len(allowed_tables) <= 6:
+        panels = []
+        for t in allowed_tables:
+            sql_t = f"SELECT * FROM {t} LIMIT 2000"
+            try:
+                cleaned = queryguard.validate(sql_t, allowed_tables)
+                columns, rows = connector.run_query(cleaned)
+            except Exception:
+                continue
+            chart = _auto_chart(columns, rows, t) or {"type": "table", "title": t, "x": columns[0], "y": columns[1:2]}
+            chart = {**chart, "title": t}
+            panels.append({"sql": cleaned, "columns": columns, "rows": rows, "chart": chart})
+        if panels:
+            last = panels[-1]
+            key_var = _KEY_FOR_PROVIDER.get(llm_spec().split(":", 1)[0], "the provider API key")
+            return {
+                "text": f"Previews of {len(panels)} selected tables: "
+                        + ", ".join(p["chart"]["title"] for p in panels)
+                        + f". Set {key_var} to ask cross-table questions in plain English.",
+                "sql": last["sql"], "columns": last["columns"], "rows": last["rows"],
+                "chart": last["chart"], "panels": panels, "email": None,
+                "mode": "fallback", "model": None,
+            }
+
+    sql = f"SELECT * FROM {target} LIMIT {MAX_ROWS}"
+    try:
+        cleaned = queryguard.validate(sql, allowed_tables)
+        columns, rows = connector.run_query(cleaned)
+    except Exception as e:
+        return {"text": f"Could not query {target}: {e}", "sql": sql, "columns": [],
+                "rows": [], "chart": None, "email": None, "mode": "fallback", "model": None}
+
+    chart = _auto_chart(columns, rows, target)
+    key_var = _KEY_FOR_PROVIDER.get(llm_spec().split(":", 1)[0], "the provider API key")
+    text = (
+        f"Preview of {target} ({len(rows)} rows). "
+        f"The AI agent is offline — set {key_var} (see .env.example) to enable "
+        f"natural-language analysis with {llm_spec()}."
+    )
+    panels = [{"sql": cleaned, "columns": columns, "rows": rows, "chart": chart}]
+    return {"text": text, "sql": cleaned, "columns": columns, "rows": rows,
+            "chart": chart, "panels": panels, "email": None, "mode": "fallback", "model": None}
+
+
+_GRAN_FMT = {  # sqlite strftime formats per granularity
+    "hour": "%Y-%m-%d %H:00",
+    "day": "%Y-%m-%d",
+    "week": "%Y-%W",
+    "month": "%Y-%m",
+    "year": "%Y",
+}
+
+
+def _fallback_granularity_panels(connector, target, allowed_tables, grans):
+    """Demo-mode small multiples: one aggregate per requested time granularity."""
+    try:
+        schema = connector.get_schema(target)
+    except Exception:
+        return None
+    names = [c["name"] for c in schema]
+    date_col = next((n for n in names if re.search(r"date|day|time", n, re.IGNORECASE)), None)
+    # Probe a row to find a numeric measure column.
+    try:
+        cols, probe = connector.run_query(f"SELECT * FROM {target} LIMIT 1")
+    except Exception:
+        return None
+    if not probe:
+        return None
+    num_col = next((c for c, v in zip(cols, probe[0]) if isinstance(v, (int, float)) and not re.search(r"id$", c, re.IGNORECASE)), None)
+    if not date_col or not num_col:
+        return None
+
+    panels = []
+    for g in grans:
+        fmt = _GRAN_FMT[g]
+        sql = (
+            f"SELECT strftime('{fmt}', {date_col}) AS {g}, SUM({num_col}) AS total_{num_col} "
+            f"FROM {target} GROUP BY 1 ORDER BY 1"
+        )
+        try:
+            cleaned = queryguard.validate(sql, allowed_tables)
+            cleaned = queryguard.enforce_limit(cleaned, MAX_ROWS)
+            columns, rows = connector.run_query(cleaned)
+        except Exception:
+            continue
+        chart_type = "bar" if g == "year" else "line"
+        panels.append({
+            "sql": cleaned, "columns": columns, "rows": rows,
+            "chart": {"type": chart_type, "title": f"{num_col} — {g} level",
+                      "x": g, "y": [f"total_{num_col}"]},
+        })
+    if not panels:
+        return None
+    last = panels[-1]
+    return {
+        "text": f"{len(panels)} views of {num_col} in {target}: " + ", ".join(g for g in grans) +
+                " level. (Fallback mode — with an LLM key the agent handles any breakdown on any source.)",
+        "sql": last["sql"], "columns": last["columns"], "rows": last["rows"],
+        "chart": last["chart"], "panels": panels, "email": None,
+        "mode": "fallback", "model": None,
+    }
+
+
+def _auto_chart(columns, rows, table):
+    if not rows:
+        return None
+    first = rows[0]
+    numeric = [c for c, v in zip(columns, first) if isinstance(v, (int, float))]
+    texty = [c for c, v in zip(columns, first) if isinstance(v, str)]
+    datish = [c for c in texty if re.search(r"date|day|month|time", c, re.IGNORECASE)]
+    if datish and numeric:
+        return {"type": "line", "title": f"{numeric[0]} over {datish[0]}", "x": datish[0], "y": [numeric[0]]}
+    if texty and numeric:
+        return {"type": "bar", "title": f"{numeric[0]} by {texty[0]}", "x": texty[0], "y": [numeric[0]]}
+    return {"type": "table", "title": table, "x": columns[0], "y": columns[1:2]}
+
+
+# ── Canvas: prompt-driven chart/data edits (local only — never writes back) ──
+
+_CANVAS_SYS = """You edit a chart/data view in an analytics canvas. Given columns, sample rows, the current chart spec, and the user's instruction, respond with ONLY a JSON object (no prose, no code fences):
+{"chart": {"type": "bar|line|area|pie|scatter|table", "title": str, "x": column, "y": [columns]} or null to keep the current chart,
+ "transform": {"filter": {"column": str, "op": "eq|ne|gt|lt|contains", "value": any} or null,
+               "replace": {"column": str, "find": str, "replace": str} or null,
+               "sort": {"column": str, "dir": "asc|desc"} or null,
+               "top_n": int or null} or null,
+ "note": one short sentence confirming what changed}
+Edits are LOCAL to the canvas — they never modify source tables. Only reference columns that exist."""
+
+
+def edit_canvas(instruction, columns, rows, chart):
+    """Apply a natural-language edit to a canvas (chart spec + local data)."""
+    result = None
+    if llm_available():
+        try:
+            from langchain.chat_models import init_chat_model
+            llm = init_chat_model(llm_spec())
+            payload = json.dumps({
+                "columns": columns,
+                "sample_rows": rows[:20],
+                "row_count": len(rows),
+                "current_chart": chart,
+                "instruction": instruction,
+            }, default=str)
+            reply = llm.invoke([("system", _CANVAS_SYS), ("user", payload)])
+            text = reply.content if isinstance(reply.content, str) else "".join(
+                b.get("text", "") for b in reply.content if isinstance(b, dict)
+            )
+            text = re.sub(r"^```(json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
+            result = json.loads(text)
+        except Exception as e:
+            result = _canvas_fallback(instruction, columns, chart)
+            result["note"] = f"(LLM edit failed: {e}) {result['note']}"
+    else:
+        result = _canvas_fallback(instruction, columns, chart)
+
+    new_chart = result.get("chart") or chart
+    new_columns, new_rows = _apply_transform(columns, rows, result.get("transform"))
+    return {
+        "columns": new_columns,
+        "rows": new_rows,
+        "chart": new_chart,
+        "note": result.get("note") or "Updated.",
+    }
+
+
+def _canvas_fallback(instruction, columns, chart):
+    """Keyword parser so canvas edits work without an LLM key."""
+    low = instruction.lower()
+    new_chart = dict(chart) if chart else None
+    note_parts = []
+    for phrase, t in _CHART_PHRASES:
+        if phrase in low:
+            if new_chart:
+                new_chart["type"] = t
+                note_parts.append(f"chart type → {t}")
+            break
+    transform = {}
+    m = re.search(r"top\s+(\d+)", low)
+    if m:
+        transform["top_n"] = int(m.group(1))
+        note_parts.append(f"top {m.group(1)}")
+    m = re.search(r"sort(?:ed)?\s+by\s+(\w+)(\s+desc)?", low)
+    if m and m.group(1) in [c.lower() for c in columns]:
+        col = next(c for c in columns if c.lower() == m.group(1))
+        transform["sort"] = {"column": col, "dir": "desc" if m.group(2) else "asc"}
+        note_parts.append(f"sorted by {col}")
+    m = re.search(r"title\s*[:\"]?\s*(.+)$", instruction, re.IGNORECASE)
+    if m and new_chart and "title" in low:
+        new_chart["title"] = m.group(1).strip(' "')
+        note_parts.append("title updated")
+    return {
+        "chart": new_chart,
+        "transform": transform or None,
+        "note": ("Applied: " + ", ".join(note_parts)) if note_parts else
+                "No change recognized (without an LLM key I only understand chart types, 'top N', 'sort by X', 'title ...').",
+    }
+
+
+def _apply_transform(columns, rows, t):
+    if not t:
+        return columns, rows
+    out = [list(r) for r in rows]
+
+    f = t.get("filter")
+    if f and f.get("column") in columns:
+        i = columns.index(f["column"])
+        op, val = f.get("op", "eq"), f.get("value")
+
+        def keep(r):
+            v = r[i]
+            try:
+                if op == "eq":
+                    return str(v).lower() == str(val).lower()
+                if op == "ne":
+                    return str(v).lower() != str(val).lower()
+                if op == "gt":
+                    return float(v) > float(val)
+                if op == "lt":
+                    return float(v) < float(val)
+                if op == "contains":
+                    return str(val).lower() in str(v).lower()
+            except (TypeError, ValueError):
+                return True
+            return True
+        out = [r for r in out if keep(r)]
+
+    rep = t.get("replace")
+    if rep and rep.get("column") in columns:
+        i = columns.index(rep["column"])
+        out = [[(str(v).replace(rep["find"], rep["replace"]) if j == i else v)
+                for j, v in enumerate(r)] for r in out]
+
+    s = t.get("sort")
+    if s and s.get("column") in columns:
+        i = columns.index(s["column"])
+
+        def key(r):
+            try:
+                return (0, float(r[i]))
+            except (TypeError, ValueError):
+                return (1, str(r[i]))
+        out.sort(key=key, reverse=s.get("dir") == "desc")
+
+    n = t.get("top_n")
+    if isinstance(n, int) and n > 0:
+        out = out[:n]
+
+    return columns, out

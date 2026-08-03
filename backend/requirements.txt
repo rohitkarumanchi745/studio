@@ -1,0 +1,20 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.5
+bcrypt>=4.0
+PyJWT>=2.8
+
+# Agent framework — model-agnostic (Claude, OpenAI, ... via STUDIO_LLM)
+langchain>=0.3
+langgraph>=0.2
+langchain-anthropic>=0.3
+langchain-openai>=0.2
+
+# Optional warehouse connectors — uncomment the ones you use.
+# The app runs without them; the source just shows as "not configured".
+# snowflake-connector-python>=3.7
+# databricks-sql-connector>=3.0
+python-dotenv>=1.0
+langchain-mcp-adapters>=0.1
+cryptography>=42.0
+# agentlightning  # optional — Agent Lightning (trace/RL/APO) integration; loop works without it

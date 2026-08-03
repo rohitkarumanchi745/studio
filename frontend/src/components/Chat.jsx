@@ -1,0 +1,428 @@
+import { useEffect, useRef, useState } from "react";
+import { api } from "../api";
+import Canvas from "./Canvas";
+import ChartView from "./ChartView";
+
+function buildCanvas(m) {
+  const panels =
+    m.panels?.length > 0
+      ? m.panels
+      : [{ sql: m.sql, columns: m.columns, rows: m.rows, chart: m.chart }];
+  return {
+    panels,
+    selected: 0,
+    source: m.source,
+    note: "",
+    original: panels.map((p) => ({ ...p, rows: p.rows.map((r) => [...r]) })),
+  };
+}
+
+export default function Chat({ conversationId, onConversationCreated }) {
+  const [canvas, setCanvas] = useState(null);
+  const [chatOpen, setChatOpen] = useState(true);
+  const [models, setModels] = useState([]);
+  const [model, setModel] = useState(localStorage.getItem("studio_model") || "");
+
+  useEffect(() => {
+    api("/models")
+      .then((ms) => {
+        setModels(ms);
+        if (!ms.find((m) => m.spec === localStorage.getItem("studio_model"))) {
+          const def = ms.find((m) => m.default) || ms[0];
+          if (def) setModel(def.spec);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (model) localStorage.setItem("studio_model", model);
+  }, [model]);
+  const [sources, setSources] = useState([]);
+  const [source, setSource] = useState("demo");
+  const [tables, setTables] = useState([]);
+  const [sel, setSel] = useState([]); // selected tables; empty = all
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const tableLabel =
+    sel.length === 0 ? "✳ All tables" : sel.length === 1 ? sel[0] : `${sel.length} tables`;
+  const [messages, setMessages] = useState([]);
+  const [prompt, setPrompt] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const endRef = useRef(null);
+
+  useEffect(() => {
+    api("/catalog/sources").then(setSources).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    setTables([]);
+    setSel([]);
+    if (!source) return;
+    api(`/catalog/sources/${source}/tables`)
+      .then((t) => {
+        setTables(t);
+        // default: chat across the whole source (empty selection)
+      })
+      .catch((e) => setError(e.message));
+  }, [source]);
+
+  useEffect(() => {
+    setError("");
+    if (!conversationId) {
+      setMessages([]);
+      return;
+    }
+    api(`/conversations/${conversationId}/messages`)
+      .then((ms) => setMessages(ms.map((m) => ({ role: m.role, ...m.content }))))
+      .catch(() => setMessages([]));
+  }, [conversationId]);
+
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, busy]);
+
+  async function send(e) {
+    e?.preventDefault();
+    const q = prompt.trim();
+    if (!q || busy || tables.length === 0) return;
+    setPrompt("");
+    setError("");
+    setMessages((m) => [...m, { role: "user", text: q, source, table: tableLabel }]);
+    setBusy(true);
+    try {
+      const data = await api("/chat", {
+        method: "POST",
+        body: JSON.stringify({
+          prompt: q,
+          source,
+          table: sel.length === 1 ? sel[0] : "*",
+          tables: sel.length > 1 ? sel : undefined,
+          conversation_id: conversationId,
+          model: model || undefined,
+        }),
+      });
+      setMessages((m) => [...m, { role: "assistant", ...data.message }]);
+      // Chart(s) produced → canvas takes the main screen, chat docks aside.
+      if (data.message.panels?.length || (data.message.chart && data.message.rows?.length)) {
+        setCanvas(buildCanvas(data.message));
+      }
+      if (!conversationId) onConversationCreated(data.conversation_id);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const suggestions = [
+    "What were monthly revenue trends over the last year?",
+    "Top 5 products by revenue — show a bar chart",
+    "Which region grew the most in the last quarter?",
+  ];
+
+  return (
+    <div className={"workspace" + (canvas ? " with-canvas" : "") + (canvas && !chatOpen ? " chat-hidden" : "")}>
+      {canvas && (
+        <Canvas
+          state={canvas}
+          setState={setCanvas}
+          onClose={() => { setCanvas(null); setChatOpen(true); }}
+          chatOpen={chatOpen}
+          onToggleChat={() => setChatOpen(!chatOpen)}
+          conversationId={conversationId}
+          tableLabel={tableLabel}
+          onNewVersion={(msg) => setMessages((m) => [...m, { role: "assistant", ...msg }])}
+        />
+      )}
+      {canvas && !chatOpen && (
+        <button className="chat-reopen" onClick={() => setChatOpen(true)} title="Open chat">
+          💬
+        </button>
+      )}
+      <main className="chatpane">
+      <div className="toolbar">
+        <label>Source</label>
+        <select value={source} onChange={(e) => setSource(e.target.value)}>
+          {sources.map((s) => (
+            <option key={s.name} value={s.name} disabled={!s.allowed || !s.configured}>
+              {s.name}
+              {!s.configured ? " (not configured)" : !s.allowed ? " (no access)" : ""}
+            </option>
+          ))}
+        </select>
+        <label>Table</label>
+        <div className="tpicker">
+          <button type="button" className="tpicker-btn" onClick={() => setPickerOpen(!pickerOpen)}>
+            {tableLabel} ▾
+          </button>
+          {pickerOpen && (
+            <div className="tpicker-panel">
+              <label className="tpicker-item">
+                <input type="checkbox" checked={sel.length === 0} onChange={() => setSel([])} />
+                ✳ All tables
+              </label>
+              {tables.map((t) => (
+                <label key={t} className="tpicker-item">
+                  <input
+                    type="checkbox"
+                    checked={sel.includes(t)}
+                    onChange={() =>
+                      setSel(sel.includes(t) ? sel.filter((x) => x !== t) : [...sel, t])
+                    }
+                  />
+                  {t}
+                </label>
+              ))}
+              <button type="button" className="chip" onClick={() => setPickerOpen(false)}>
+                done
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="messages">
+        {messages.length === 0 && !busy && (
+          <div className="empty">
+            <div className="empty-title">
+              <span className="brand-mark">◆</span> What do you want to know?
+            </div>
+            <div className="empty-sub">
+              Pick a source and table above, then ask in plain English. The agent writes the SQL,
+              runs it, and charts the answer.
+            </div>
+            <div className="suggestions">
+              {suggestions.map((s) => (
+                <button key={s} className="suggestion" onClick={() => setPrompt(s)}>
+                  {s}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {messages.map((m, i) =>
+          m.role === "user" ? (
+            <div key={i} className="msg msg-user">
+              <div className="bubble-user">{m.text}</div>
+            </div>
+          ) : (
+            <AssistantMessage key={i} m={m} compact={!!canvas} onOpenCanvas={() => setCanvas(buildCanvas(m))} />
+          )
+        )}
+
+        {busy && (
+          <div className="msg">
+            <div className="thinking">
+              <span className="dot" />
+              <span className="dot" />
+              <span className="dot" />
+              agent is querying…
+            </div>
+          </div>
+        )}
+        {error && <div className="error">{error}</div>}
+        <div ref={endRef} />
+      </div>
+
+      <form className="composer" onSubmit={send}>
+        <div className="composer-pill">
+          <input
+            className="pill-input"
+            value={prompt}
+            onChange={(e) => setPrompt(e.target.value)}
+            placeholder={tables.length ? `Ask about ${sel.length ? sel.join(", ") : "your data"}…` : "Pick a source first…"}
+            disabled={busy}
+          />
+          <select
+            className="model-mini"
+            value={model}
+            onChange={(e) => setModel(e.target.value)}
+            title="Which AI model answers"
+          >
+            {models.map((m) => (
+              <option key={m.spec} value={m.spec} disabled={!m.available}>
+                {m.name}{!m.available ? " — no key" : ""}
+              </option>
+            ))}
+          </select>
+          <button className="primary send-btn" disabled={busy || !prompt.trim() || tables.length === 0}>
+            ➤
+          </button>
+        </div>
+      </form>
+      </main>
+    </div>
+  );
+}
+
+function AssistantMessage({ m, compact, onOpenCanvas }) {
+  const [showSql, setShowSql] = useState(false);
+  const [columns, setColumns] = useState(m.columns);
+  const [rows, setRows] = useState(m.rows);
+  const [status, setStatus] = useState("");
+  const [voted, setVoted] = useState(0);
+  const [sample, setSample] = useState(null);
+  const [sampleBusy, setSampleBusy] = useState("");
+
+  async function loadSample(t) {
+    // Every click re-queries the source — the sample is always latest data.
+    setSampleBusy(t);
+    try {
+      const d = await api(`/catalog/sources/${m.source}/tables/${t}/sample`);
+      setSample({ table: t, panels: d.panels, at: new Date().toLocaleTimeString() });
+    } catch (e) {
+      setStatus(`sample failed: ${e.message}`);
+    } finally {
+      setSampleBusy("");
+    }
+  }
+
+  async function vote(score) {
+    if (!m.trace_id || voted) return;
+    setVoted(score);
+    try {
+      await api("/feedback", {
+        method: "POST",
+        body: JSON.stringify({ trace_id: m.trace_id, score }),
+      });
+      setStatus(score > 0 ? "thanks — the agent learns from this" : "flagged for agent learning");
+    } catch (e) {
+      setVoted(0);
+      setStatus(`feedback failed: ${e.message}`);
+    }
+  }
+
+  async function refresh() {
+    if (!m.sql) return;
+    setStatus("refreshing…");
+    try {
+      const data = await api("/chat/rerun", {
+        method: "POST",
+        body: JSON.stringify({ source: m.source, sql: m.sql }),
+      });
+      setColumns(data.columns);
+      setRows(data.rows);
+      setStatus(`refreshed ${new Date().toLocaleTimeString()}`);
+    } catch (e) {
+      setStatus(`refresh failed: ${e.message}`);
+    }
+  }
+
+  async function emailReport() {
+    setStatus("emailing…");
+    try {
+      const d = await api("/reports/email", {
+        method: "POST",
+        body: JSON.stringify({
+          subject: m.chart?.title || `Query on ${m.table}`,
+          text: m.text || "",
+          sql: m.sql,
+          columns,
+          rows: rows.slice(0, 200),
+        }),
+      });
+      setStatus(d.mode === "smtp" ? `emailed to ${d.to}` : `saved to outbox (no SMTP configured)`);
+    } catch (e) {
+      setStatus(`email failed: ${e.message}`);
+    }
+  }
+
+  return (
+    <div className="msg">
+      <div className="assistant">
+        <div className="assistant-head">
+          <span className="brand-mark">◆</span>
+          <span className="meta">
+            {m.mode === "fallback" ? "fallback" : m.model} · {m.source}/{m.table === "*" ? "all tables" : m.table}
+          </span>
+        </div>
+        {m.text && <p className="answer">{m.text}</p>}
+        {m.matched_tables?.length > 0 && (
+          <div className="match-row">
+            <span className="meta">matched tables:</span>
+            {m.matched_tables.map((mt) => (
+              <button
+                key={mt.table}
+                className={"chip" + (sample?.table === mt.table ? " chip-on" : "")}
+                onClick={() => loadSample(mt.table)}
+                disabled={sampleBusy === mt.table}
+                title={`matched on: ${mt.why.join(", ")}\ncolumns: ${mt.columns.join(", ")}\nclick for the latest sample — click again to refresh`}
+              >
+                ▦ {mt.table}{sampleBusy === mt.table ? " …" : ""}
+              </button>
+            ))}
+            {sample && (
+              <button className="chip" onClick={() => setSample(null)} title="Close sample">
+                ✕
+              </button>
+            )}
+          </div>
+        )}
+        {sample && (
+          <div className="sample-view">
+            <div className="meta">▦ {sample.table} — latest data, fetched {sample.at}</div>
+            <div className="msg-panels">
+              {sample.panels.map((p, i) => (
+                <ChartView key={i} columns={p.columns} rows={p.rows} chart={p.chart} />
+              ))}
+            </div>
+          </div>
+        )}
+        {m.sql && (
+          <div className="sqlbox">
+            <button className="chip" onClick={() => setShowSql(!showSql)}>
+              {showSql ? "hide SQL" : "show SQL"}
+            </button>{" "}
+            <button className="chip" onClick={refresh} title="Re-run this query for the newest records">
+              ⟳ refresh data
+            </button>{" "}
+            <button className="chip" onClick={emailReport} title="Email this report to yourself">
+              ✉ email report
+            </button>{" "}
+            {m.chart && (
+              <button className="chip" onClick={onOpenCanvas} title="Open on the main screen">
+                ⤢ canvas
+              </button>
+            )}
+            {status && <span className="meta"> {status}</span>}
+            {showSql && <pre>{m.sql}</pre>}
+          </div>
+        )}
+        {m.trace_id && (
+          <div className="feedback-row">
+            <button
+              className={"chip" + (voted === 1 ? " chip-on" : "")}
+              onClick={() => vote(1)}
+              disabled={!!voted}
+              title="Good answer — reinforces this behavior"
+            >
+              👍
+            </button>{" "}
+            <button
+              className={"chip" + (voted === -1 ? " chip-on" : "")}
+              onClick={() => vote(-1)}
+              disabled={!!voted}
+              title="Wrong or unhelpful — the agent learns from flagged runs"
+            >
+              👎
+            </button>
+            {!m.sql && status && <span className="meta"> {status}</span>}
+          </div>
+        )}
+        {/* When the canvas is open, keep chat compact — the charts live there. */}
+        {!compact &&
+          (m.panels?.length > 1 ? (
+            <div className="msg-panels">
+              {m.panels.map((p, i) => (
+                <ChartView key={i} columns={p.columns} rows={p.rows} chart={p.chart} />
+              ))}
+            </div>
+          ) : (
+            <ChartView columns={columns} rows={rows} chart={m.chart} />
+          ))}
+      </div>
+    </div>
+  );
+}
