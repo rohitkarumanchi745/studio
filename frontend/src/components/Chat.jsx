@@ -225,7 +225,7 @@ export default function Chat({ conversationId, onConversationCreated }) {
               <div className="bubble-user">{m.text}</div>
             </div>
           ) : (
-            <AssistantMessage key={i} m={m} compact={!!canvas} onOpenCanvas={() => setCanvas(buildCanvas(m))} />
+            <AssistantMessage key={i} m={m} onOpenCanvas={() => setCanvas(buildCanvas(m))} />
           )
         )}
 
@@ -278,7 +278,7 @@ export default function Chat({ conversationId, onConversationCreated }) {
   );
 }
 
-function AssistantMessage({ m, compact, onOpenCanvas }) {
+function AssistantMessage({ m, onOpenCanvas }) {
   const [showSql, setShowSql] = useState(false);
   const [columns, setColumns] = useState(m.columns);
   const [rows, setRows] = useState(m.rows);
@@ -433,17 +433,13 @@ function AssistantMessage({ m, compact, onOpenCanvas }) {
             {!m.sql && status && <span className="meta"> {status}</span>}
           </div>
         )}
-        {/* When the canvas is open, keep chat compact — the charts live there. */}
-        {!compact &&
-          (m.panels?.length > 1 ? (
-            <div className="msg-panels">
-              {m.panels.map((p, i) => (
-                <ChartView key={i} columns={p.columns} rows={p.rows} chart={p.chart} />
-              ))}
-            </div>
-          ) : (
-            <ChartView columns={columns} rows={rows} chart={m.chart} />
-          ))}
+        {/* Charts always live in the canvas (center stage), never inline in the
+            chat column — chat keeps a button to bring this message's view back. */}
+        {(m.panels?.length > 0 || (m.chart && rows?.length > 0)) && (
+          <button className="chip chart-open" onClick={onOpenCanvas}>
+            ⤢ {m.panels?.length > 1 ? `${m.panels.length} charts` : "chart"} in canvas
+          </button>
+        )}
       </div>
     </div>
   );

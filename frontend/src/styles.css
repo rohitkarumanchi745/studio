@@ -176,6 +176,27 @@ td { color: var(--ink-2); }
 }
 /* Visualization is the centerpiece: every canvas row shares one centered column. */
 .canvas > * { width: 100%; max-width: 1180px; margin-left: auto; margin-right: auto; }
+.chart-open { margin-top: 6px; }
+
+/* Narrow screens: the chat pane cannot hold a fixed 380px or it starves the
+   canvas of width — stack instead, visualization on top. */
+@media (max-width: 900px) {
+  .workspace { flex-direction: column; }
+  .with-canvas .chatpane {
+    flex: 1 1 auto; width: auto; min-height: 220px;
+    border-left: none; border-top: 1px solid var(--line);
+  }
+  .canvas { flex: 2 1 auto; padding: 12px 12px 8px; }
+  .echart-tall { height: 320px; }
+  .sidebar { width: 200px; }
+}
+@media (max-width: 620px) {
+  /* Narrowed, not hidden — the ☰ rail only exists when the sidebar is
+     collapsed in React state, so hiding it here would strand navigation. */
+  .sidebar { width: 132px; padding: 10px 8px; }
+  .canvas { padding: 10px 8px 6px; }
+  .echart-tall { height: 260px; }
+}
 .canvas-head { display: flex; justify-content: space-between; align-items: start; margin-bottom: 8px; }
 .canvas-title { font-size: 18px; font-weight: 700; }
 .canvas-actions { display: flex; gap: 6px; }
