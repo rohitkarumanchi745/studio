@@ -154,13 +154,16 @@ def _final_text(result):
     return ""
 
 
-def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, model=None):
+def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, model=None,
+              skill_md=None):
     """One analytics turn.
 
     schemas: {table_name: [{"name","type"}, ...]} — one entry for single-table
     mode, several for whole-source ("All tables") mode.
     model: optional per-request model spec chosen by the user (validated by
     the caller against available_models()); defaults to STUDIO_LLM.
+    skill_md: this source's skill file (skills.get_skill) — the RBAC-scoped
+    briefing on the database and its tables; replaces the inline schema block.
     Returns {text, sql, columns, rows, chart, mode, model, email}.
     """
     spec = model or llm_spec()
@@ -266,7 +269,7 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         return f"Report emailed to {user['email']} (mode: {delivery['mode']})."
 
     memory_notes = db.list_memory(user["id"])
-    system = _system_prompt(connector, table, allowed_tables, schemas, memory_notes)
+    system = _system_prompt(connector, table, allowed_tables, schemas, memory_notes, skill_md)
 
     from langchain.chat_models import init_chat_model
 
@@ -324,21 +327,27 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
     }
 
 
-def _system_prompt(connector, table, allowed_tables, schemas, memory_notes):
-    schema_blocks = []
-    for t, cols in list(schemas.items())[:10]:
-        lines = "\n".join(f"    - {c['name']} ({c['type']})" for c in cols)
-        schema_blocks.append(f"  {t}:\n{lines}")
-    schema_text = "\n".join(schema_blocks)
+def _system_prompt(connector, table, allowed_tables, schemas, memory_notes, skill_md=None):
     scope = f"Selected table: {table}" if table != "*" else "Scope: the whole source (all tables listed below)"
     memory = "\n".join(f"  - {n}" for n in memory_notes) or "  (none)"
-    return f"""You are Studio, a senior data analyst agent. Answer the user's question about their data by writing SQL, running it, and (when a visualization helps) proposing a chart.
-
-Data source: {connector.name} (SQL dialect: {connector.dialect})
-{scope}
+    if skill_md:
+        # The skill file IS the database briefing: source, dialect, and the
+        # RBAC-scoped tables/schemas for this user, kept fresh by skills.py.
+        source_block = f"Your skill file for this database:\n\n{skill_md}"
+    else:
+        schema_blocks = []
+        for t, cols in list(schemas.items())[:10]:
+            lines = "\n".join(f"    - {c['name']} ({c['type']})" for c in cols)
+            schema_blocks.append(f"  {t}:\n{lines}")
+        schema_text = "\n".join(schema_blocks)
+        source_block = f"""Data source: {connector.name} (SQL dialect: {connector.dialect})
 Accessible tables and schemas:
 {schema_text}
-All tables you may reference: {', '.join(allowed_tables)}
+All tables you may reference: {', '.join(allowed_tables)}"""
+    return f"""You are Studio, a senior data analyst agent. Answer the user's question about their data by writing SQL, running it, and (when a visualization helps) proposing a chart.
+
+{scope}
+{source_block}
 
 What you remember about this user (from earlier sessions):
 {memory}

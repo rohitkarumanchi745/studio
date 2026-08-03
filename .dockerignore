@@ -1,0 +1,12 @@
+.git
+.gitignore
+README.md
+backend/.env
+backend/.venv
+backend/outbox
+backend/skills
+backend/*.db
+backend/**/__pycache__
+frontend/node_modules
+frontend/dist
+.DS_Store

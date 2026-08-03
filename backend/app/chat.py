@@ -6,7 +6,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from . import agent, db, email_service, lightning, queryguard, rbac
+from . import agent, db, email_service, lightning, orchestrator, queryguard, rbac, skills
 from .auth import current_user
 from .catalog import _connector_or_400, match_tables
 
@@ -52,6 +52,38 @@ def ask(body: Ask, user=Depends(current_user)):
     prompt = body.prompt.strip()
     if not prompt:
         raise HTTPException(400, "Empty prompt")
+
+    model = None
+    if body.model:
+        if body.model not in {m["spec"] for m in agent.available_models()}:
+            raise HTTPException(400, f"Model '{body.model}' is not offered")
+        model = body.model
+
+    # source "*": the orchestrator fans the question out across per-database
+    # agents (one per source this role may access, each with its skill file).
+    if body.source == "*":
+        cid, history = _conversation(body.conversation_id, user, prompt)
+        db.add_message(cid, "user", {"text": prompt, "source": "*", "table": "all sources"})
+        t0 = time.time()
+        result = orchestrator.run_orchestrated(prompt, user, history, model)
+        result.setdefault("source", "*")
+        result["table"] = "all sources"
+        result["matched_tables"] = []
+        tid = lightning.record_chat_trace(
+            user, cid, prompt, result, int((time.time() - t0) * 1000))
+        if tid:
+            result["trace_id"] = tid
+        db.add_message(cid, "assistant", result)
+        db.log_activity(
+            user, "chat", prompt=prompt, source="*",
+            table=",".join(result.get("agents_used") or []) or "all sources",
+            sql=result.get("sql"), mode=result.get("mode"),
+            row_count=len(result.get("rows") or []),
+            ok=not (result.get("text") or "").startswith(("(Agent error", "(Orchestrator error")),
+            duration_ms=int((time.time() - t0) * 1000),
+        )
+        return {"conversation_id": cid, "message": result}
+
     if not rbac.can_access(user["role"], body.source, body.table):
         raise HTTPException(403, "Your role has no access to this table")
 
@@ -88,25 +120,8 @@ def ask(body: Ask, user=Depends(current_user)):
     except Exception as e:
         raise HTTPException(502, f"Source error: {e}")
 
-    cid = body.conversation_id
-    if cid:
-        _own_or_404(cid, user)
-        history = [
-            {"role": m["role"], "text": m["content"].get("text", "")}
-            for m in db.list_messages(cid)
-            if m["content"].get("text")
-        ][-8:]
-    else:
-        cid = db.create_conversation(user["id"], prompt)
-        history = []
-
+    cid, history = _conversation(body.conversation_id, user, prompt)
     db.add_message(cid, "user", {"text": prompt, "source": body.source, "table": table_label})
-
-    model = None
-    if body.model:
-        if body.model not in {m["spec"] for m in agent.available_models()}:
-            raise HTTPException(400, f"Model '{body.model}' is not offered")
-        model = body.model
 
     t0 = time.time()
     result = agent.run_agent(
@@ -118,6 +133,9 @@ def ask(body: Ask, user=Depends(current_user)):
         history=history,
         user=user,
         model=model,
+        # This source's agent skill file: the RBAC-scoped database briefing,
+        # auto-rebuilt whenever the schema or this role's access changes.
+        skill_md=skills.get_skill(connector, user["role"], allowed, schemas),
     )
     result["source"] = body.source
     result["table"] = table_label
@@ -302,6 +320,19 @@ def learning(user=Depends(current_user)):
         for t in db.list_traces(limit=10, max_reward=0.4)
     ]
     return stats
+
+
+def _conversation(cid, user, prompt):
+    """Resolve/create the conversation and return (cid, recent history)."""
+    if cid:
+        _own_or_404(cid, user)
+        history = [
+            {"role": m["role"], "text": m["content"].get("text", "")}
+            for m in db.list_messages(cid)
+            if m["content"].get("text")
+        ][-8:]
+        return cid, history
+    return db.create_conversation(user["id"], prompt), []
 
 
 def _own_or_404(cid, user):

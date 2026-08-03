@@ -4,7 +4,7 @@ import time
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from . import rbac
+from . import rbac, skills
 from .auth import current_user
 from .connectors import all_sources, get_connector
 
@@ -65,6 +65,28 @@ def tables(source: str, user=Depends(current_user)):
     except Exception as e:
         raise HTTPException(502, f"Could not list tables on {source}: {e}")
     return rbac.allowed_tables(user["role"], source, names)
+
+
+@router.get("/sources/{source}/skill")
+def source_skill(source: str, user=Depends(current_user)):
+    """The skill file briefing this source's agent for the current user's
+    role — regenerated automatically when schema or access changes."""
+    if source not in rbac.allowed_sources(user["role"]):
+        raise HTTPException(403, "Your role has no access to this source")
+    conn = _connector_or_400(source)
+    try:
+        names = conn.list_tables()
+    except Exception as e:
+        raise HTTPException(502, f"Could not list tables on {source}: {e}")
+    allowed = rbac.allowed_tables(user["role"], source, names)
+    schemas = {}
+    for t in allowed[:10]:
+        try:
+            schemas[t] = conn.get_schema(t)
+        except Exception:
+            schemas[t] = []
+    return {"source": source, "role": user["role"],
+            "skill": skills.get_skill(conn, user["role"], allowed, schemas)}
 
 
 @router.get("/sources/{source}/tables/{table}/schema")

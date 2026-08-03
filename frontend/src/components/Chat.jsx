@@ -43,8 +43,11 @@ export default function Chat({ conversationId, onConversationCreated }) {
   const [tables, setTables] = useState([]);
   const [sel, setSel] = useState([]); // selected tables; empty = all
   const [pickerOpen, setPickerOpen] = useState(false);
-  const tableLabel =
-    sel.length === 0 ? "✳ All tables" : sel.length === 1 ? sel[0] : `${sel.length} tables`;
+  // "*" = multi-agent mode: one agent per database, orchestrated server-side.
+  const orchestrated = source === "*";
+  const tableLabel = orchestrated
+    ? "all sources"
+    : sel.length === 0 ? "✳ All tables" : sel.length === 1 ? sel[0] : `${sel.length} tables`;
   const [messages, setMessages] = useState([]);
   const [prompt, setPrompt] = useState("");
   const [busy, setBusy] = useState(false);
@@ -58,7 +61,7 @@ export default function Chat({ conversationId, onConversationCreated }) {
   useEffect(() => {
     setTables([]);
     setSel([]);
-    if (!source) return;
+    if (!source || source === "*") return;
     api(`/catalog/sources/${source}/tables`)
       .then((t) => {
         setTables(t);
@@ -85,7 +88,7 @@ export default function Chat({ conversationId, onConversationCreated }) {
   async function send(e) {
     e?.preventDefault();
     const q = prompt.trim();
-    if (!q || busy || tables.length === 0) return;
+    if (!q || busy || (!orchestrated && tables.length === 0)) return;
     setPrompt("");
     setError("");
     setMessages((m) => [...m, { role: "user", text: q, source, table: tableLabel }]);
@@ -96,8 +99,8 @@ export default function Chat({ conversationId, onConversationCreated }) {
         body: JSON.stringify({
           prompt: q,
           source,
-          table: sel.length === 1 ? sel[0] : "*",
-          tables: sel.length > 1 ? sel : undefined,
+          table: orchestrated || sel.length !== 1 ? "*" : sel[0],
+          tables: !orchestrated && sel.length > 1 ? sel : undefined,
           conversation_id: conversationId,
           model: model || undefined,
         }),
@@ -144,6 +147,7 @@ export default function Chat({ conversationId, onConversationCreated }) {
       <div className="toolbar">
         <label>Source</label>
         <select value={source} onChange={(e) => setSource(e.target.value)}>
+          <option value="*">✳ all sources — multi-agent</option>
           {sources.map((s) => (
             <option key={s.name} value={s.name} disabled={!s.allowed || !s.configured}>
               {s.name}
@@ -153,8 +157,8 @@ export default function Chat({ conversationId, onConversationCreated }) {
         </select>
         <label>Table</label>
         <div className="tpicker">
-          <button type="button" className="tpicker-btn" onClick={() => setPickerOpen(!pickerOpen)}>
-            {tableLabel} ▾
+          <button type="button" className="tpicker-btn" disabled={orchestrated} onClick={() => setPickerOpen(!pickerOpen)}>
+            {orchestrated ? "agent-routed" : tableLabel} ▾
           </button>
           {pickerOpen && (
             <div className="tpicker-panel">
@@ -232,7 +236,11 @@ export default function Chat({ conversationId, onConversationCreated }) {
             className="pill-input"
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
-            placeholder={tables.length ? `Ask about ${sel.length ? sel.join(", ") : "your data"}…` : "Pick a source first…"}
+            placeholder={
+              orchestrated
+                ? "Ask across all your databases — agents route the question…"
+                : tables.length ? `Ask about ${sel.length ? sel.join(", ") : "your data"}…` : "Pick a source first…"
+            }
             disabled={busy}
           />
           <select
@@ -247,7 +255,7 @@ export default function Chat({ conversationId, onConversationCreated }) {
               </option>
             ))}
           </select>
-          <button className="primary send-btn" disabled={busy || !prompt.trim() || tables.length === 0}>
+          <button className="primary send-btn" disabled={busy || !prompt.trim() || (!orchestrated && tables.length === 0)}>
             ➤
           </button>
         </div>
@@ -336,6 +344,7 @@ function AssistantMessage({ m, compact, onOpenCanvas }) {
           <span className="brand-mark">◆</span>
           <span className="meta">
             {m.mode === "fallback" ? "fallback" : m.model} · {m.source}/{m.table === "*" ? "all tables" : m.table}
+            {m.mode === "orchestrated" && m.agents_used?.length > 0 && ` · agents: ${m.agents_used.join(", ")}`}
           </span>
         </div>
         {m.text && <p className="answer">{m.text}</p>}
