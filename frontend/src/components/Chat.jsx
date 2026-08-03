@@ -74,11 +74,24 @@ export default function Chat({ conversationId, onConversationCreated }) {
     setError("");
     if (!conversationId) {
       setMessages([]);
+      setCanvas(null);
       return;
     }
     api(`/conversations/${conversationId}/messages`)
-      .then((ms) => setMessages(ms.map((m) => ({ role: m.role, ...m.content }))))
-      .catch(() => setMessages([]));
+      .then((ms) => {
+        const loaded = ms.map((m) => ({ role: m.role, ...m.content }));
+        setMessages(loaded);
+        // Reopening a conversation restores its charts to the canvas — the
+        // visualization is part of the saved conversation, not a transient view.
+        const last = [...loaded]
+          .reverse()
+          .find((m) => m.role === "assistant" && (m.panels?.length || (m.chart && m.rows?.length)));
+        setCanvas(last ? buildCanvas(last) : null);
+      })
+      .catch(() => {
+        setMessages([]);
+        setCanvas(null);
+      });
   }, [conversationId]);
 
   useEffect(() => {
