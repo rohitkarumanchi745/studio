@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api, setSession } from "../api";
 
 export default function Login({ onLogin }) {
@@ -8,6 +8,11 @@ export default function Login({ onLogin }) {
   const [name, setName] = useState("");
   const [error, setError] = useState(new URLSearchParams(window.location.search).get("sso_error") || "");
   const [busy, setBusy] = useState(false);
+  const [azureReady, setAzureReady] = useState(true);
+
+  useEffect(() => {
+    api("/auth/sso").then((s) => setAzureReady(!!s.azure)).catch(() => {});
+  }, []);
 
   async function submit(e) {
     e.preventDefault();
@@ -26,8 +31,14 @@ export default function Login({ onLogin }) {
   }
 
   function azure() {
+    if (!azureReady) {
+      setError(
+        "Microsoft sign-in needs an Entra app registration on this deployment — use a demo login below."
+      );
+      return;
+    }
     // Full-page redirect: backend sends us to Microsoft, then back with a
-    // Studio token (or ?sso_error when Entra isn't configured yet).
+    // Studio token (or ?sso_error if the flow fails).
     window.location.href = "/api/auth/azure/login";
   }
 
@@ -61,7 +72,12 @@ export default function Login({ onLogin }) {
           </button>
         </form>
 
-        <button className="sso" onClick={azure} title="Configured via AZURE_* env vars">
+        <button
+          className="sso"
+          onClick={azure}
+          style={azureReady ? undefined : { opacity: 0.6 }}
+          title={azureReady ? "Sign in with your Microsoft account" : "Entra SSO — configured via AZURE_* env vars"}
+        >
           <svg width="14" height="14" viewBox="0 0 21 21">
             <rect x="0" y="0" width="10" height="10" fill="#f25022" />
             <rect x="11" y="0" width="10" height="10" fill="#7fba00" />

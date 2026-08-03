@@ -178,6 +178,12 @@ def _group_role_map():
         return {}
 
 
+@router.get("/sso")
+def sso_status():
+    """Which SSO providers are configured — drives the login button state."""
+    return {"azure": _azure_cfg() is not None}
+
+
 @router.get("/azure/login")
 def azure_login():
     cfg = _azure_cfg()
