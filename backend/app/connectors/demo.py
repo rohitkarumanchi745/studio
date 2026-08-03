@@ -3,6 +3,7 @@ zero external credentials. Mirrors the Connector interface used by the
 Snowflake and Databricks connectors.
 """
 import datetime as dt
+import math
 import os
 import random
 import sqlite3
@@ -61,14 +62,20 @@ def seed():
         );
         """
     )
-    start = dt.date.today() - dt.timedelta(days=365)
+    # 3 years so year-over-year, running totals, and moving averages have real
+    # prior-period values to compare against. Growth + Q4 seasonality make the
+    # trend readable instead of noise.
+    SALES_DAYS = 365 * 3
+    start = dt.date.today() - dt.timedelta(days=SALES_DAYS)
     order_id = 1000
-    for d in range(365):
+    for d in range(SALES_DAYS):
         day = start + dt.timedelta(days=d)
+        growth = 1.0 + 0.18 * (d / 365.0)
+        season = 1.0 + 0.35 * math.sin((day.timetuple().tm_yday / 365.0) * 2 * math.pi - 1.2)
         for _ in range(rng.randint(1, 4)):
             product, category, base_price = rng.choice(PRODUCTS)
-            units = rng.randint(1, 8)
-            price = round(base_price * rng.uniform(0.9, 1.1), 2)
+            units = max(1, round(rng.randint(1, 8) * season))
+            price = round(base_price * rng.uniform(0.9, 1.1) * growth, 2)
             c.execute(
                 "INSERT INTO sales VALUES (?,?,?,?,?,?,?,?)",
                 (order_id, day.isoformat(), rng.choice(REGIONS), product, category,
@@ -77,7 +84,7 @@ def seed():
             order_id += 1
     cities = ["Austin", "Berlin", "Hyderabad", "London", "Sydney", "Toronto"]
     for i in range(120):
-        signup = start + dt.timedelta(days=rng.randint(0, 364))
+        signup = start + dt.timedelta(days=rng.randint(0, SALES_DAYS - 1))
         c.execute(
             "INSERT INTO customers VALUES (?,?,?,?,?,?)",
             (i + 1, f"Customer {i + 1}", rng.choice(cities), rng.choice(SEGMENTS),
