@@ -548,7 +548,15 @@ Edits are LOCAL to the canvas — they never modify source tables. Only referenc
 
 
 def edit_canvas(instruction, columns, rows, chart):
-    """Apply a natural-language edit to a canvas (chart spec + local data)."""
+    """Apply a natural-language edit to a canvas (chart spec + local data).
+
+    The model emits a chart-spec v2 MERGE PATCH (viz.SPEC_PROMPT), so one
+    sentence can add measures, table calcs, filters and formatting at once
+    without discarding the parts of the spec it did not mention. Transforms
+    run server-side over the ORIGINAL rows, so edits stay re-appliable.
+    """
+    from . import viz
+
     result = None
     if llm_available():
         try:
@@ -558,10 +566,10 @@ def edit_canvas(instruction, columns, rows, chart):
                 "columns": columns,
                 "sample_rows": rows[:20],
                 "row_count": len(rows),
-                "current_chart": chart,
+                "current_spec": viz.normalize_spec(chart),
                 "instruction": instruction,
             }, default=str)
-            reply = llm.invoke([("system", _CANVAS_SYS), ("user", payload)])
+            reply = llm.invoke([("system", viz.SPEC_PROMPT), ("user", payload)])
             text = reply.content if isinstance(reply.content, str) else "".join(
                 b.get("text", "") for b in reply.content if isinstance(b, dict)
             )
@@ -573,14 +581,51 @@ def edit_canvas(instruction, columns, rows, chart):
     else:
         result = _canvas_fallback(instruction, columns, chart)
 
-    new_chart = result.get("chart") or chart
-    new_columns, new_rows = _apply_transform(columns, rows, result.get("transform"))
+    patch = result.get("spec") or result.get("chart") or {}
+    # A v1 fallback patch carries its transform beside the spec, not inside it.
+    if result.get("transform") and not patch.get("transform"):
+        patch = {**patch, "transform": _v1_transform_to_v2(result["transform"])}
+
+    warnings = []
+    try:
+        new_spec = viz.merge_spec(chart, patch)
+        new_spec, spec_warn = viz.sanitize_spec(new_spec, columns, rows)
+        new_columns, new_rows, t_warn = _unpack_transform(
+            viz.apply_transform(columns, rows, new_spec.get("transform")))
+        warnings = list(spec_warn or []) + list(t_warn or [])
+    except Exception as e:
+        # Never lose the user's chart to a bad patch — keep the current view.
+        new_spec, new_columns, new_rows = viz.normalize_spec(chart), columns, rows
+        warnings = [f"edit not applied: {e}"]
+
     return {
         "columns": new_columns,
         "rows": new_rows,
-        "chart": new_chart,
+        "chart": new_spec,
         "note": result.get("note") or "Updated.",
+        "warnings": warnings,
     }
+
+
+def _unpack_transform(res):
+    """apply_transform returns (columns, rows) or (columns, rows, warnings)."""
+    if isinstance(res, tuple) and len(res) >= 3:
+        return res[0], res[1], res[2]
+    return res[0], res[1], []
+
+
+def _v1_transform_to_v2(t):
+    """Lift the keyword-fallback's v1 transform into a v2 transform block."""
+    out = {}
+    f = t.get("filter")
+    if f and f.get("column"):
+        out["filters"] = [{"col": f["column"], "op": f.get("op", "eq"), "value": f.get("value")}]
+    s = t.get("sort")
+    if s and s.get("column"):
+        out["sort"] = [{"col": s["column"], "dir": s.get("dir", "asc")}]
+    if isinstance(t.get("top_n"), int) and t["top_n"] > 0:
+        out["top_n"] = {"n": t["top_n"]}
+    return out
 
 
 def _canvas_fallback(instruction, columns, chart):

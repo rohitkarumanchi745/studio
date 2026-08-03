@@ -6,7 +6,7 @@ import { useMemo, useState } from "react";
 import { api } from "../api";
 import ChartView, { LABELS, computeFit } from "./ChartView";
 
-export default function Canvas({ state, setState, onClose, chatOpen, onToggleChat, conversationId, tableLabel, onNewVersion }) {
+export default function Canvas({ state, setState, onClose, chatOpen, onToggleChat, conversationId, tableLabel, onNewVersion, onOpenDashboard }) {
   const { panels, selected, note, original } = state;
   const [instruction, setInstruction] = useState("");
   const [busy, setBusy] = useState(false);
@@ -77,6 +77,36 @@ export default function Canvas({ state, setState, onClose, chatOpen, onToggleCha
     setState((s) => ({ ...s, note: "Cell edited (local only)." }));
   }
 
+  async function pin() {
+    if (!cur || busy) return;
+    setBusy(true);
+    try {
+      // No dashboard_id: the server pins into a new dashboard and returns it.
+      const d = await api("/dashboards/pin", {
+        method: "POST",
+        body: JSON.stringify({
+          source: state.source,
+          table_label: tableLabel,
+          sql: cur.sql,
+          spec: spec,
+          title: spec?.title || "Chart",
+          columns: cur.columns,
+          rows: cur.rows.slice(0, 500),
+        }),
+      });
+      setState({
+        ...state,
+        note: `Pinned to "${d.dashboard_title}"${d.created_dashboard ? " (new dashboard)" : ""}.`,
+        pinnedDashboardId: d.dashboard_id,
+      });
+      if (onOpenDashboard) onOpenDashboard(d.dashboard_id);
+    } catch (err) {
+      setState({ ...state, note: `Pin failed: ${err.message}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
   function reset() {
     setState({
       ...state,
@@ -106,7 +136,10 @@ export default function Canvas({ state, setState, onClose, chatOpen, onToggleCha
             onClick={() => setGallery(!gallery)}
             title="Render every chart type that fits this data"
           >
-            \u229e all views ({fitTypes.length})
+            ⊞ all views ({fitTypes.length})
+          </button>
+          <button className="chip" onClick={pin} disabled={busy} title="Pin this chart to a dashboard">
+            📌 pin
           </button>
           <button className="chip" onClick={reset}>reset edits</button>
           {onToggleChat && (
@@ -136,7 +169,7 @@ export default function Canvas({ state, setState, onClose, chatOpen, onToggleCha
               </div>
             ))}
             {fitTypes.length === 0 && (
-              <div className="meta">No chart type fits this data \u2014 see the table below.</div>
+              <div className="meta">No chart type fits this data — see the table below.</div>
             )}
           </div>
         ) : (

@@ -1,6 +1,6 @@
 import { clearSession, getUser } from "../api";
 
-export default function Sidebar({ conversations, activeId, onSelect, onNew, onDelete, onActivity, onCollapse }) {
+export default function Sidebar({ conversations, activeId, onSelect, onNew, onDelete, onActivity, onCollapse, onDashboards }) {
   const user = getUser();
   return (
     <aside className="sidebar">
@@ -35,6 +35,9 @@ export default function Sidebar({ conversations, activeId, onSelect, onNew, onDe
         {conversations.length === 0 && <div className="conv-empty">No conversations yet</div>}
       </div>
       <div className="sidebar-footer">
+        <button className="logout" onClick={onDashboards} style={{ marginBottom: 8 }}>
+          ▦ Dashboards
+        </button>
         <button className="logout" onClick={onActivity} style={{ marginBottom: 8 }}>
           ⏱ Activity{user?.role === "admin" ? " (all users)" : ""}
         </button>

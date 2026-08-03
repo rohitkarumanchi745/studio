@@ -17,7 +17,7 @@ function buildCanvas(m) {
   };
 }
 
-export default function Chat({ conversationId, onConversationCreated }) {
+export default function Chat({ conversationId, onConversationCreated, onOpenDashboard }) {
   const [canvas, setCanvas] = useState(null);
   const [chatOpen, setChatOpen] = useState(true);
   const [models, setModels] = useState([]);
@@ -149,6 +149,7 @@ export default function Chat({ conversationId, onConversationCreated }) {
           conversationId={conversationId}
           tableLabel={tableLabel}
           onNewVersion={(msg) => setMessages((m) => [...m, { role: "assistant", ...msg }])}
+          onOpenDashboard={onOpenDashboard}
         />
       )}
       {canvas && !chatOpen && (

@@ -8,6 +8,7 @@ import * as echarts from "echarts";
 import {
   AXIS_LINE, BAD, GOOD, GRID_LINE, INK, SEQ, SERIES, SURFACE, TOTAL,
 } from "./renderers/common";
+import { applyFormat } from "./renderers/format";
 import PlotlyView, { PLOTLY_TYPES } from "./renderers/PlotlyView";
 import VegaView, { VEGA_TYPES } from "./renderers/VegaView";
 
@@ -113,7 +114,12 @@ export function computeFit(columns, rows, spec) {
   return fit;
 }
 
-export default function ChartView({ columns, rows, chart, tall, plain }) {
+export default function ChartView({
+  columns, rows, chart, tall, plain,
+  // Dashboard tile props: identify the tile, apply a cross-filter highlight,
+  // report clicks upward, and surface format warnings. All optional.
+  tileId, highlight, onSelect, onWarnings,
+}) {
   const [type, setType] = useState(chart?.type || "table");
   useEffect(() => setType(chart?.type || "table"), [chart]);
 
@@ -132,7 +138,18 @@ export default function ChartView({ columns, rows, chart, tall, plain }) {
     : engine === "vega" && VEGA_TYPES.has(type) ? "vega"
     : "echarts";
   const plottable = typeOk && spec && type !== "table" && type !== "kpi";
-  const option = plottable && drawEngine === "echarts" ? buildOption(columns, rows, spec) : null;
+  let option = plottable && drawEngine === "echarts" ? buildOption(columns, rows, spec) : null;
+  if (option) {
+    // spec.format is declarative (number formats, labels, axis titles,
+    // reference lines, palette). A bad format spec must never blank a chart.
+    try {
+      const res = applyFormat(option, spec, { columns, rows, highlight });
+      option = res?.option || res || option;
+      if (onWarnings) onWarnings(res?.warnings || []);
+    } catch (e) {
+      if (onWarnings) onWarnings([{ msg: String(e?.message || e) }]);
+    }
+  }
 
   function pickEngine(e) {
     setEngine(e);
@@ -188,7 +205,7 @@ export default function ChartView({ columns, rows, chart, tall, plain }) {
       ) : plottable && drawEngine === "vega" ? (
         <VegaView columns={columns} rows={rows} spec={spec} tall={tall} />
       ) : option ? (
-        <Echart option={option} tall={tall} />
+        <Echart option={option} tall={tall} spec={spec} onSelect={onSelect} tileId={tileId} />
       ) : (
         <DataTable columns={columns} rows={rows} />
       )}
@@ -228,12 +245,25 @@ function DataTable({ columns, rows }) {
   );
 }
 
-function Echart({ option, tall }) {
+function Echart({ option, tall, spec, onSelect, tileId }) {
   const ref = useRef(null);
+  // Kept in a ref so the click handler always sees the current callback
+  // without re-initializing the chart on every parent render.
+  const selectRef = useRef(null);
+  selectRef.current = onSelect;
+  const xCol = spec?.x;
   useEffect(() => {
     const el = ref.current;
     if (!el || !option) return;
     const inst = echarts.init(el, null, { renderer: "canvas" });
+    if (onSelect) {
+      inst.on("click", (p) => {
+        const value = p?.name ?? (Array.isArray(p?.value) ? p.value[0] : p?.value);
+        if (value == null || !xCol) return;
+        selectRef.current?.({ col: xCol, op: "eq", value: String(value), source_tile: tileId });
+      });
+      inst.getZr().setCursorStyle("pointer");
+    }
     try {
       inst.setOption(option);
     } catch (e) {
@@ -250,7 +280,7 @@ function Echart({ option, tall }) {
       window.removeEventListener("resize", onResize);
       inst.dispose();
     };
-  }, [option]);
+  }, [option, xCol]);
   return <div ref={ref} className={"echart" + (tall ? " echart-tall" : "")} />;
 }
 

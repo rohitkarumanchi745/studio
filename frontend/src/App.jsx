@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { api, getToken, getUser, setSession } from "./api";
 import Activity from "./components/Activity";
 import Chat from "./components/Chat";
+import Dashboard from "./components/Dashboard";
 import Login from "./components/Login";
 import Sidebar from "./components/Sidebar";
 
@@ -25,6 +26,7 @@ export default function App() {
   const [activeId, setActiveId] = useState(null);
   const [showActivity, setShowActivity] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [dashboardId, setDashboardId] = useState(null);
 
   const refresh = useCallback(() => {
     if (!getToken()) return;
@@ -56,16 +58,26 @@ export default function App() {
           refresh();
         }}
         onActivity={() => setShowActivity(true)}
+        onDashboards={() => setDashboardId("*")}
       />
       )}
       {showActivity && <Activity onClose={() => setShowActivity(false)} />}
-      <Chat
-        conversationId={activeId}
-        onConversationCreated={(id) => {
-          setActiveId(id);
-          refresh();
-        }}
-      />
+      {dashboardId ? (
+        <Dashboard
+          dashboardId={dashboardId === "*" ? null : dashboardId}
+          user={user}
+          onClose={() => setDashboardId(null)}
+        />
+      ) : (
+        <Chat
+          conversationId={activeId}
+          onConversationCreated={(id) => {
+            setActiveId(id);
+            refresh();
+          }}
+          onOpenDashboard={(id) => setDashboardId(id || "*")}
+        />
+      )}
     </div>
   );
 }
