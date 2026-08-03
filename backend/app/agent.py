@@ -607,6 +607,116 @@ def edit_canvas(instruction, columns, rows, chart):
     }
 
 
+_COMPOSE_SYS = """You compose the charts on ONE analytics sheet. A sheet holds SEVERAL charts side by side — when the user asks for more than one view (e.g. "monthly and weekly trends, plus day level for this week"), return one panel PER view.
+
+Respond with ONLY a JSON object (no prose, no code fences):
+{"panels": [{"title": str, "sql": str or null, "spec": <chart spec>}, ...],
+ "note": one short sentence describing the sheet}
+
+Rules:
+- One panel per requested view. Up to 6 panels.
+- "sql": write a NEW read-only SELECT when the view needs data the current
+  result cannot provide — a different grain (day/week/month/year), a
+  different filter window, or different columns. The current result is
+  already aggregated, so a finer grain ALWAYS needs new SQL against the
+  source table. Use the schemas below; single SELECT only.
+- "sql": null reuses the current result as-is (only when the view is
+  derivable from the columns already present).
+- "spec" is a chart spec: at minimum {"type","title","x","y":[...]}. Its x/y
+  MUST name columns produced by that panel's own sql (or the current columns
+  when sql is null).
+- Prefer explicit date bucketing in SQL so each grain is its own column.
+- Never invent tables or columns that are not listed."""
+
+
+def compose_canvas(instruction, columns, rows, chart, connector=None,
+                   allowed_tables=None, schemas=None):
+    """Prompt-driven sheet composition — may return SEVERAL charts.
+
+    Unlike edit_canvas (one chart, local rows only), a panel here may carry
+    its own SELECT, so views the current result threw away (finer time
+    grain, a different window) can be re-queried. Every SELECT goes through
+    the same query guard and RBAC table allowlist as the agent's own SQL.
+    """
+    from . import viz
+
+    schema_text = ""
+    for t, cols in list((schemas or {}).items())[:10]:
+        cl = ", ".join(f"{c['name']} {c['type']}" for c in cols)
+        schema_text += f"\n  {t}({cl})"
+    sys_prompt = _COMPOSE_SYS
+    if schema_text:
+        sys_prompt += (f"\n\nSource: {connector.name} (SQL dialect: {connector.dialect})"
+                       f"\nTables you may query:{schema_text}"
+                       "\nStay on the table the current chart came from unless the "
+                       "requested view genuinely needs another one."
+                       "\nDate ranges: the data may end well before today. Anchor "
+                       "relative windows ('this week') on the data's own MAX(date), "
+                       "not on the current date, or the panel will come back empty.")
+
+    from langchain.chat_models import init_chat_model
+    llm = init_chat_model(llm_spec())
+    payload = json.dumps({
+        "columns": columns,
+        "sample_rows": rows[:15],
+        "row_count": len(rows),
+        "current_spec": viz.normalize_spec(chart),
+        "instruction": instruction,
+    }, default=str)
+    reply = llm.invoke([("system", sys_prompt), ("user", payload)])
+    text = reply.content if isinstance(reply.content, str) else "".join(
+        b.get("text", "") for b in reply.content if isinstance(b, dict))
+    text = re.sub(r"^```(json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
+    parsed = json.loads(text)
+
+    panels, warnings = [], []
+    for p in (parsed.get("panels") or [])[:6]:
+        sql = (p.get("sql") or "").strip() or None
+        p_cols, p_rows, p_sql = columns, rows, None
+        if sql:
+            if connector is None:
+                warnings.append(f"{p.get('title') or 'panel'}: no source bound — skipped")
+                continue
+            try:
+                cleaned = queryguard.validate(sql, allowed_tables or [])
+                cleaned = queryguard.enforce_limit(cleaned, MAX_ROWS)
+                p_cols, p_rows = connector.run_query(cleaned)
+                p_rows = p_rows[:MAX_ROWS]
+                p_sql = cleaned
+            except QueryRejected as e:
+                warnings.append(f"{p.get('title') or 'panel'}: rejected — {e}")
+                continue
+            except Exception as e:
+                warnings.append(f"{p.get('title') or 'panel'}: query failed — {e}")
+                continue
+        spec = p.get("spec") or {}
+        if p.get("title") and not spec.get("title"):
+            spec["title"] = p["title"]
+        # A reused result keeps the current spec as its base; fresh SQL does not.
+        spec = viz.merge_spec(chart if not sql else None, spec)
+        spec, sw = viz.sanitize_spec(spec, p_cols, p_rows)
+        warnings.extend(sw or [])
+        try:
+            p_cols, p_rows, tw = _unpack_transform(
+                viz.apply_transform(p_cols, p_rows, spec.get("transform")))
+            warnings.extend(tw or [])
+        except Exception as e:
+            warnings.append(f"{spec.get('title')}: transform skipped — {e}")
+        if p_rows:
+            panels.append({"sql": p_sql, "columns": p_cols, "rows": p_rows, "chart": spec})
+        else:
+            warnings.append(f"{spec.get('title') or 'panel'}: no rows — dropped")
+
+    if not panels:
+        raise ValueError("no panels produced" + (f" ({'; '.join(warnings[:3])})" if warnings else ""))
+    note = parsed.get("note") or f"{len(panels)} views."
+    dropped = len(parsed.get("panels") or []) - len(panels)
+    if dropped > 0:
+        # The note must describe what actually rendered, not what was asked for.
+        note = f"{len(panels)} view{'s' if len(panels) != 1 else ''} shown; {dropped} skipped — {warnings[-1]}"
+    return {"panels": panels, "note": note, "warnings": warnings}
+
+
 def _unpack_transform(res):
     """apply_transform returns (columns, rows) or (columns, rows, warnings)."""
     if isinstance(res, tuple) and len(res) >= 3:

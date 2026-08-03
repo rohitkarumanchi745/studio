@@ -223,23 +223,44 @@ def canvas_edit(body: CanvasEdit, user=Depends(current_user)):
     instruction = body.instruction.strip()
     if not instruction:
         raise HTTPException(400, "Empty instruction")
-    result = agent.edit_canvas(
-        instruction, body.columns, body.rows[:agent.MAX_ROWS], body.chart
-    )
+
+    # A sheet may hold several charts. When the source is known, composition
+    # can also issue fresh RBAC-guarded SQL, so views the current result
+    # aggregated away (a finer time grain, another window) are reachable.
+    result = None
+    if agent.llm_available():
+        connector, allowed, schemas = _canvas_source(body, user)
+        try:
+            result = agent.compose_canvas(
+                instruction, body.columns, body.rows[:agent.MAX_ROWS], body.chart,
+                connector=connector, allowed_tables=allowed, schemas=schemas)
+            first = result["panels"][0]
+            result = {**result, "columns": first["columns"], "rows": first["rows"],
+                      "chart": first["chart"]}
+        except Exception as e:
+            result = None  # fall back to the single-chart editor below
+            _compose_err = str(e)[:200]
+
+    if result is None:
+        result = agent.edit_canvas(
+            instruction, body.columns, body.rows[:agent.MAX_ROWS], body.chart)
+        result.setdefault("panels", [{"sql": body.sql, "columns": result["columns"],
+                                      "rows": result["rows"], "chart": result["chart"]}])
     db.log_activity(user, "canvas_edit", prompt=instruction,
                     row_count=len(result.get("rows") or []))
 
     message = None
     if body.conversation_id:
         _own_or_404(body.conversation_id, user)
+        panels = result.get("panels") or [{"sql": body.sql, "columns": result["columns"],
+                                           "rows": result["rows"], "chart": result["chart"]}]
         message = {
             "text": f"✏️ {instruction} — {result.get('note', 'updated')}",
-            "sql": body.sql,
+            "sql": panels[0].get("sql") or body.sql,
             "columns": result["columns"],
             "rows": result["rows"],
             "chart": result["chart"],
-            "panels": [{"sql": body.sql, "columns": result["columns"],
-                        "rows": result["rows"], "chart": result["chart"]}],
+            "panels": panels,
             "mode": "canvas_edit",
             "model": None,
             "source": body.source,
@@ -320,6 +341,29 @@ def learning(user=Depends(current_user)):
         for t in db.list_traces(limit=10, max_reward=0.4)
     ]
     return stats
+
+
+def _canvas_source(body, user):
+    """Bind the canvas to its source so composed SQL stays inside this
+    user's RBAC allowlist. Returns (connector, allowed_tables, schemas);
+    all None/empty when the source is unknown — then no SQL is composed."""
+    if not body.source or body.source == "*":
+        return None, [], {}
+    try:
+        connector = _connector_or_400(body.source)
+        all_tables = connector.list_tables()
+    except Exception:
+        return None, [], {}
+    allowed = rbac.allowed_tables(user["role"], body.source, all_tables)
+    if not allowed:
+        return None, [], {}
+    schemas = {}
+    for t in allowed[:10]:
+        try:
+            schemas[t] = connector.get_schema(t)
+        except Exception:
+            pass
+    return connector, allowed, schemas
 
 
 def _conversation(cid, user, prompt):

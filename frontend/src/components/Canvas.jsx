@@ -55,10 +55,21 @@ export default function Canvas({ state, setState, onClose, chatOpen, onToggleCha
           sql: cur.sql,
         }),
       });
-      const next = panels.map((p, i) =>
-        i === selected ? { ...p, columns: d.columns, rows: d.rows, chart: d.chart } : p
-      );
-      setState({ ...state, panels: next, note: d.note });
+      // A composed sheet returns every chart it wants shown, so it replaces
+      // the sheet. A single-chart edit still patches just the selected panel.
+      const composed = d.panels?.length > 1 || (d.panels?.length === 1 && panels.length === 1 && d.panels[0].sql);
+      const next = composed
+        ? d.panels
+        : panels.map((p, i) =>
+            i === selected ? { ...p, columns: d.columns, rows: d.rows, chart: d.chart } : p
+          );
+      setState({
+        ...state,
+        panels: next,
+        selected: composed ? 0 : selected,
+        original: composed ? next.map((p) => ({ ...p, rows: p.rows.map((r) => [...r]) })) : original,
+        note: d.note + (d.warnings?.length ? ` (${d.warnings.length} warning${d.warnings.length > 1 ? "s" : ""})` : ""),
+      });
       // Each edit is a NEW version: it appears as its own chat message, so
       // the previous chart stays intact in the history.
       if (d.message && onNewVersion) onNewVersion(d.message);
