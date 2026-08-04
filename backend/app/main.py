@@ -61,8 +61,11 @@ def shutdown():
 @app.get("/health")
 @app.get("/api/health", include_in_schema=False)
 def health():
+    from . import dashboards as _dash
     return {
         "status": "ok",
+        "store": "postgres" if db.IS_PG else f"sqlite ({db.DB_PATH})",
+        "tile_cache": "redis" if _dash._redis() is not None else "in-process",
         "llm": llm_spec(),
         "agent": "ready" if llm_available() else "fallback (no API key)",
         "mcp_servers": list(__import__("app.agent", fromlist=["mcp_servers"]).mcp_servers().keys()),
