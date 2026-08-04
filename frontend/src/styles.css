@@ -213,6 +213,13 @@ td { color: var(--ink-2); }
 }
 .dash-tile { position: relative; }
 .tile-warn { display: flex; flex-wrap: wrap; gap: 4px; padding: 4px 8px 6px; }
+.dash-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; }
+.dash-card {
+  background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
+  padding: 12px 14px; text-align: left; display: flex; flex-direction: column; gap: 4px;
+}
+.dash-card:hover { border-color: var(--accent); }
+.dash-card-title { font-size: 14px; font-weight: 600; color: var(--ink); }
 .dash-picker { position: relative; }
 .dash-picker-list {
   position: absolute; z-index: 30; top: 100%; right: 0; margin-top: 4px; min-width: 220px;

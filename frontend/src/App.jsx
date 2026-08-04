@@ -3,6 +3,7 @@ import { api, getToken, getUser, setSession } from "./api";
 import Activity from "./components/Activity";
 import Chat from "./components/Chat";
 import Dashboard from "./components/Dashboard";
+import DashboardList from "./components/DashboardList";
 import Login from "./components/Login";
 import Sidebar from "./components/Sidebar";
 
@@ -62,11 +63,13 @@ export default function App() {
       />
       )}
       {showActivity && <Activity onClose={() => setShowActivity(false)} />}
-      {dashboardId ? (
+      {dashboardId === "*" ? (
+        <DashboardList onOpen={setDashboardId} onClose={() => setDashboardId(null)} />
+      ) : dashboardId ? (
         <Dashboard
-          dashboardId={dashboardId === "*" ? null : dashboardId}
+          dashboardId={dashboardId}
           user={user}
-          onClose={() => setDashboardId(null)}
+          onClose={() => setDashboardId("*")}
         />
       ) : (
         <Chat
