@@ -712,24 +712,74 @@ def _capture_key_order(spec, columns, rows):
 # ── Data ────────────────────────────────────────────────────────────────
 
 _CACHE = OrderedDict()  # (role, source, sha1(sql)) -> (ts, columns, rows)
+_REDIS = None
+_REDIS_TRIED = False
+
+
+def _redis():
+    """Shared tile cache when REDIS_URL is set. A dead Redis must never take
+    the app down — every failure falls back to the in-process cache."""
+    global _REDIS, _REDIS_TRIED
+    if _REDIS_TRIED:
+        return _REDIS
+    _REDIS_TRIED = True
+    url = os.getenv("REDIS_URL", "")
+    if url:
+        try:
+            import redis
+            client = redis.from_url(url, socket_timeout=1.5, socket_connect_timeout=1.5)
+            client.ping()
+            _REDIS = client
+        except Exception:
+            _REDIS = None
+    return _REDIS
 
 
 def _cached_query(source, sql, role, connector, *, refresh=False):
     """TTL cache of BASE rows. The role is in the key, so two roles can never
     share rows; queryguard still runs on every request, so the cache can
     never be an RBAC bypass — only the warehouse round trip is skipped."""
-    key = (role, source, hashlib.sha1(sql.encode("utf-8", "replace")).hexdigest())
+    digest = hashlib.sha1(sql.encode("utf-8", "replace")).hexdigest()
+    key = (role, source, digest)
     now = time.time()
     hit = _CACHE.get(key)
     if hit and not refresh and now - hit[0] < CACHE_TTL:
         return hit[1], hit[2], True
+
+    rkey = f"studio:tile:{role}:{source}:{digest}"
+    client = _redis()
+    if client is not None and not refresh:
+        try:
+            blob = client.get(rkey)
+            if blob:
+                payload = json.loads(blob)
+                columns, rows = payload["columns"], payload["rows"]
+                _remember(key, now, columns, rows)
+                return columns, rows, True
+        except Exception:
+            pass
+
     columns, rows = connector.run_query(sql)
     columns, rows = list(columns or []), list(rows or [])
+    if client is not None:
+        # Round-trip through JSON even on a miss, so a cached read and a fresh
+        # read hand downstream transforms identically-typed values.
+        try:
+            blob = json.dumps({"columns": columns, "rows": rows}, default=str)
+            payload = json.loads(blob)
+            columns, rows = payload["columns"], payload["rows"]
+            client.setex(rkey, int(max(CACHE_TTL, 1)), blob)
+        except Exception:
+            pass
+    _remember(key, now, columns, rows)
+    return columns, rows, False
+
+
+def _remember(key, now, columns, rows):
     _CACHE[key] = (now, columns, rows)
     _CACHE.move_to_end(key)
     while len(_CACHE) > CACHE_MAX_ENTRIES:
         _CACHE.popitem(last=False)
-    return columns, rows, False
 
 
 def _affected_by(interaction, col):

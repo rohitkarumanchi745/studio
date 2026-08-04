@@ -7,13 +7,51 @@ import uuid
 
 import bcrypt
 
-# Container filesystems are ephemeral: without STUDIO_DB_PATH pointing at a
-# mounted volume, every deploy discards accounts, chats and dashboards.
+# Postgres when DATABASE_URL is set, else SQLite. Container filesystems are
+# ephemeral, so file-backed SQLite needs STUDIO_DB_PATH on a mounted volume
+# or every deploy discards accounts, chats and dashboards.
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+IS_PG = DATABASE_URL.startswith(("postgres://", "postgresql://"))
 DB_PATH = os.getenv("STUDIO_DB_PATH") or os.path.join(
     os.path.dirname(__file__), "..", "studio.db")
 
 
+def _pg_sql(sql):
+    """SQLite dialect -> Postgres. Placeholders are ?; psycopg wants %s.
+
+    REAL must become DOUBLE PRECISION: Postgres REAL is float4, which holds
+    ~7 significant digits and would round a time.time() epoch to whole
+    seconds, breaking every ORDER BY created_at.
+    """
+    return sql.replace("?", "%s").replace(" REAL", " DOUBLE PRECISION")
+
+
+class _PgConn:
+    """SQLite-shaped facade over psycopg, so callers stay dialect-agnostic."""
+
+    def __init__(self, dsn):
+        import psycopg
+        from psycopg.rows import dict_row
+        self._c = psycopg.connect(dsn, row_factory=dict_row)
+
+    def execute(self, sql, params=()):
+        return self._c.execute(_pg_sql(sql), tuple(params))
+
+    def executescript(self, script):
+        with self._c.cursor() as cur:
+            cur.execute(_pg_sql(script))
+        self._c.commit()
+
+    def commit(self):
+        self._c.commit()
+
+    def close(self):
+        self._c.close()
+
+
 def _conn():
+    if IS_PG:
+        return _PgConn(DATABASE_URL)
     parent = os.path.dirname(os.path.abspath(DB_PATH))
     if parent and not os.path.isdir(parent):
         os.makedirs(parent, exist_ok=True)
