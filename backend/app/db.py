@@ -140,11 +140,17 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_traces_time ON agent_traces(created_at DESC);
         """
     )
-    # Email-verification flag (guarded ALTER for existing databases).
-    try:
-        c.execute("ALTER TABLE users ADD COLUMN verified INTEGER NOT NULL DEFAULT 1")
-    except sqlite3.OperationalError:
-        pass
+    # Email-verification flag (guarded ALTER for existing databases). Postgres
+    # gets IF NOT EXISTS rather than a caught error: a failed statement there
+    # aborts the whole transaction, so swallowing it would poison the seeds
+    # that follow — and every restart after the first would fail to boot.
+    if IS_PG:
+        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS verified INTEGER NOT NULL DEFAULT 1")
+    else:
+        try:
+            c.execute("ALTER TABLE users ADD COLUMN verified INTEGER NOT NULL DEFAULT 1")
+        except sqlite3.OperationalError:
+            pass
     c.commit()
     # Seed demo users (one per role) so RBAC is demonstrable out of the box.
     seeds = [
