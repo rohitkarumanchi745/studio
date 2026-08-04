@@ -115,7 +115,8 @@ def ask(body: Ask, user=Depends(current_user)):
     # agents (one per source this role may access, each with its skill file).
     if body.source == "*":
         cid, history = _conversation(body.conversation_id, user, prompt)
-        db.add_message(cid, "user", {"text": prompt, "source": "*", "table": "all sources"})
+        db.add_message(cid, "user", {"text": prompt, "source": "*", "table": "all sources",
+                                     "author_role": user["role"]})
         t0 = time.time()
         result = orchestrator.run_orchestrated(prompt, user, history, model)
         result.setdefault("source", "*")
@@ -125,6 +126,7 @@ def ask(body: Ask, user=Depends(current_user)):
             user, cid, prompt, result, int((time.time() - t0) * 1000))
         if tid:
             result["trace_id"] = tid
+        result["author_role"] = user["role"]
         db.add_message(cid, "assistant", result)
         db.log_activity(
             user, "chat", prompt=prompt, source="*",
@@ -173,7 +175,8 @@ def ask(body: Ask, user=Depends(current_user)):
         raise HTTPException(502, f"Source error: {e}")
 
     cid, history = _conversation(body.conversation_id, user, prompt)
-    db.add_message(cid, "user", {"text": prompt, "source": body.source, "table": table_label})
+    db.add_message(cid, "user", {"text": prompt, "source": body.source, "table": table_label,
+                                 "author_role": user["role"]})
 
     t0 = time.time()
     result = agent.run_agent(
@@ -208,6 +211,7 @@ def ask(body: Ask, user=Depends(current_user)):
         user, cid, prompt, result, int((time.time() - t0) * 1000))
     if tid:
         result["trace_id"] = tid
+    result["author_role"] = user["role"]
     db.add_message(cid, "assistant", result)
 
     db.log_activity(
@@ -317,6 +321,7 @@ def canvas_edit(body: CanvasEdit, user=Depends(current_user)):
             "model": None,
             "source": body.source,
             "table": body.table,
+            "author_role": user["role"],
         }
         db.add_message(body.conversation_id, "assistant", message)
 
@@ -431,6 +436,9 @@ def _conversation(cid, user, prompt):
     return db.create_conversation(user["id"], prompt), []
 
 
+_ROLE_RANK = {"admin": 3, "analyst": 2, "viewer": 1}
+
+
 def _unrestricted(role, source):
     """True when the role may read EVERY table in a source ("*" policy)."""
     return rbac.POLICIES.get(role, {}).get(source) == "*"
@@ -444,9 +452,17 @@ def _msg_allowed(role, content):
     unrestricted access, since the author may have reached any table.
     """
     content = content or {}
+    # The source/table labels on a stored message are client-supplied (canvas
+    # edits post their own), so they cannot be trusted on their own. The
+    # author's role is stamped server-side: never release a message to a role
+    # less privileged than the one that produced it.
+    author = content.get("author_role")
+    if author and _ROLE_RANK.get(role, 0) < _ROLE_RANK.get(author, 0):
+        return False
     source = content.get("source")
     if not source:
-        return True
+        # No provenance and no source: only safe for a message carrying no data.
+        return not (content.get("rows") or content.get("panels")) if not author else True
     label = str(content.get("table") or "*")
     if source == "*":
         sources = rbac.allowed_sources(role)
@@ -466,11 +482,11 @@ def _visible_messages(cid, user, access):
     Checking only at share time is not enough: the owner can add a PII query
     to an already-shared conversation, and the recipient would inherit it.
     """
-    msgs = db.list_messages(cid)
-    if access == "owner":
-        return msgs
+    # Redaction keys off the READER's role, never ownership: a viewer who
+    # owns a chat and invites an analyst would otherwise inherit whatever
+    # the analyst queried into it.
     out = []
-    for m in msgs:
+    for m in db.list_messages(cid):
         content = m.get("content") or {}
         if not _msg_allowed(user["role"], content):
             m = {**m, "content": {

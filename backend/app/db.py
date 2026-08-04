@@ -189,8 +189,11 @@ def verify_password(pw, pw_hash):
 # ── Users ───────────────────────────────────────────────────────────────
 
 def get_user_by_email(email):
+    # Emails are stored lowercased; normalise here too so a share invite or
+    # login can never miss a user on casing alone.
     c = _conn()
-    row = c.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+    row = c.execute("SELECT * FROM users WHERE email=?",
+                    ((email or "").strip().lower(),)).fetchone()
     c.close()
     return dict(row) if row else None
 
@@ -203,6 +206,7 @@ def get_user(user_id):
 
 
 def create_user(email, password, name, role="viewer"):
+    email = (email or "").strip().lower()
     c = _conn()
     uid = str(uuid.uuid4())
     c.execute(
