@@ -78,6 +78,13 @@ def init_db():
             title TEXT NOT NULL,
             created_at REAL NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS conversation_shares (
+            conversation_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            permission TEXT NOT NULL DEFAULT 'edit',
+            created_at REAL NOT NULL,
+            PRIMARY KEY (conversation_id, user_id)
+        );
         CREATE TABLE IF NOT EXISTS messages (
             id TEXT PRIMARY KEY,
             conversation_id TEXT NOT NULL,
@@ -409,13 +416,40 @@ def create_conversation(user_id, title):
 
 
 def list_conversations(user_id):
+    """Own conversations plus any shared with this user, newest first."""
     c = _conn()
     rows = c.execute(
-        "SELECT id, title, created_at FROM conversations WHERE user_id=? ORDER BY created_at DESC",
-        (user_id,),
+        "SELECT c.id, c.title, c.created_at, c.user_id AS owner_id, u.email AS owner_email, "
+        "       s.permission AS shared_permission "
+        "FROM conversations c "
+        "LEFT JOIN users u ON u.id = c.user_id "
+        "LEFT JOIN conversation_shares s ON s.conversation_id = c.id AND s.user_id = ? "
+        "WHERE c.user_id = ? OR s.user_id IS NOT NULL "
+        "ORDER BY c.created_at DESC",
+        (user_id, user_id),
     ).fetchall()
     c.close()
-    return [dict(r) for r in rows]
+    out = []
+    for r in rows:
+        d = dict(r)
+        owned = d.pop("owner_id") == user_id
+        perm = "owner" if owned else (d.pop("shared_permission", None) or "view")
+        d.pop("shared_permission", None)
+        out.append({
+            "id": d["id"], "title": d["title"], "created_at": d["created_at"],
+            "permission": perm, "shared": not owned,
+            "owner_email": d.get("owner_email"),
+            "can_edit": perm in ("owner", "edit"),
+        })
+    return out
+
+
+def rename_conversation(conversation_id, title):
+    c = _conn()
+    c.execute("UPDATE conversations SET title=? WHERE id=?",
+              (title[:80], conversation_id))
+    c.commit()
+    c.close()
 
 
 def conversation_owner(conversation_id):
@@ -425,9 +459,63 @@ def conversation_owner(conversation_id):
     return row["user_id"] if row else None
 
 
+def conversation_access(conversation_id, user_id):
+    """'owner' | 'edit' | 'view' | None — the single source of truth for who
+    may touch a conversation. None means it does not exist for this user."""
+    c = _conn()
+    row = c.execute("SELECT user_id FROM conversations WHERE id=?",
+                    (conversation_id,)).fetchone()
+    if row is None:
+        c.close()
+        return None
+    if row["user_id"] == user_id:
+        c.close()
+        return "owner"
+    share = c.execute(
+        "SELECT permission FROM conversation_shares WHERE conversation_id=? AND user_id=?",
+        (conversation_id, user_id)).fetchone()
+    c.close()
+    if share is None:
+        return None
+    return "edit" if share["permission"] == "edit" else "view"
+
+
+def share_conversation(conversation_id, user_id, permission="edit"):
+    permission = "edit" if permission == "edit" else "view"
+    c = _conn()
+    c.execute("DELETE FROM conversation_shares WHERE conversation_id=? AND user_id=?",
+              (conversation_id, user_id))
+    c.execute(
+        "INSERT INTO conversation_shares (conversation_id, user_id, permission, created_at) "
+        "VALUES (?,?,?,?)",
+        (conversation_id, user_id, permission, time.time()))
+    c.commit()
+    c.close()
+
+
+def list_conversation_shares(conversation_id):
+    c = _conn()
+    rows = c.execute(
+        "SELECT s.user_id, s.permission, u.email, u.name "
+        "FROM conversation_shares s LEFT JOIN users u ON u.id = s.user_id "
+        "WHERE s.conversation_id=? ORDER BY u.email",
+        (conversation_id,)).fetchall()
+    c.close()
+    return [dict(r) for r in rows]
+
+
+def unshare_conversation(conversation_id, user_id):
+    c = _conn()
+    c.execute("DELETE FROM conversation_shares WHERE conversation_id=? AND user_id=?",
+              (conversation_id, user_id))
+    c.commit()
+    c.close()
+
+
 def delete_conversation(conversation_id):
     c = _conn()
     c.execute("DELETE FROM messages WHERE conversation_id=?", (conversation_id,))
+    c.execute("DELETE FROM conversation_shares WHERE conversation_id=?", (conversation_id,))
     c.execute("DELETE FROM conversations WHERE id=?", (conversation_id,))
     c.commit()
     c.close()

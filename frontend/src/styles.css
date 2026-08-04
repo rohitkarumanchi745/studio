@@ -213,6 +213,35 @@ td { color: var(--ink-2); }
 }
 .dash-tile { position: relative; }
 .tile-warn { display: flex; flex-wrap: wrap; gap: 4px; padding: 4px 8px 6px; }
+/* ── Conversation rename / share ── */
+.ctx-menu {
+  position: fixed; z-index: 60; min-width: 160px; padding: 4px;
+  background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+.ctx-item {
+  display: block; width: 100%; text-align: left; padding: 7px 10px;
+  font-size: 13px; color: var(--ink-2); border-radius: 5px;
+}
+.ctx-item:hover:not(:disabled) { background: var(--surface); color: var(--ink); }
+.ctx-item:disabled { opacity: 0.4; cursor: default; }
+.ctx-danger:hover:not(:disabled) { color: #e5679a; }
+.conv-rename {
+  width: 100%; font-size: 13px; padding: 3px 6px;
+  background: var(--surface-2); border: 1px solid var(--accent); border-radius: 5px;
+  color: var(--ink);
+}
+.conv-shared { color: var(--accent); }
+.conv-del:disabled { opacity: 0.25; cursor: default; }
+.share-form { display: flex; gap: 6px; margin: 10px 0; }
+.share-form input { flex: 1; font-size: 13px; padding: 7px 9px; }
+.share-list { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.share-row {
+  display: flex; justify-content: space-between; align-items: center; gap: 8px;
+  padding: 7px 9px; background: var(--surface); border: 1px solid var(--line);
+  border-radius: 7px; font-size: 13px;
+}
+
 .dash-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; }
 .dash-card {
   background: var(--surface); border: 1px solid var(--line); border-radius: 10px;

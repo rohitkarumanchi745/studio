@@ -36,15 +36,67 @@ def conversations(user=Depends(current_user)):
 
 @router.get("/conversations/{cid}/messages")
 def messages(cid: str, user=Depends(current_user)):
-    _own_or_404(cid, user)
-    return db.list_messages(cid)
+    access = _own_or_404(cid, user)
+    return _visible_messages(cid, user, access)
 
 
 @router.delete("/conversations/{cid}")
 def remove(cid: str, user=Depends(current_user)):
-    _own_or_404(cid, user)
+    # Deleting destroys it for everyone it is shared with — owner only.
+    _own_or_404(cid, user, need="owner")
     db.delete_conversation(cid)
     return {"deleted": True}
+
+
+class Rename(BaseModel):
+    title: str
+
+
+@router.patch("/conversations/{cid}")
+def rename(cid: str, body: Rename, user=Depends(current_user)):
+    """Rename a conversation. Collaborators with edit rights may rename too."""
+    _own_or_404(cid, user, need="edit")
+    title = body.title.strip()
+    if not title:
+        raise HTTPException(400, "Title cannot be empty")
+    db.rename_conversation(cid, title)
+    return {"id": cid, "title": title[:80]}
+
+
+class ShareIn(BaseModel):
+    email: str
+    permission: str = "edit"
+
+
+@router.get("/conversations/{cid}/shares")
+def shares(cid: str, user=Depends(current_user)):
+    access = _own_or_404(cid, user)
+    return {"shares": db.list_conversation_shares(cid), "can_share": access == "owner"}
+
+
+@router.post("/conversations/{cid}/shares", status_code=201)
+def add_share(cid: str, body: ShareIn, user=Depends(current_user)):
+    """Share with another Studio user by email. Owner only — a collaborator
+    must not be able to widen access they were merely granted."""
+    _own_or_404(cid, user, need="owner")
+    if body.permission not in ("view", "edit"):
+        raise HTTPException(400, "permission must be 'view' or 'edit'")
+    target = db.get_user_by_email(body.email.strip().lower())
+    if not target:
+        raise HTTPException(404, "No Studio user with that email")
+    if target["id"] == user["id"]:
+        raise HTTPException(400, "That conversation is already yours")
+    db.share_conversation(cid, target["id"], body.permission)
+    db.log_activity(user, "conversation_share", prompt=f"{body.email} ({body.permission})")
+    return {"shares": db.list_conversation_shares(cid), "can_share": True,
+            "hidden_for_recipient": _hidden_count(cid, target["role"])}
+
+
+@router.delete("/conversations/{cid}/shares/{share_user_id}")
+def remove_share(cid: str, share_user_id: str, user=Depends(current_user)):
+    _own_or_404(cid, user, need="owner")
+    db.unshare_conversation(cid, share_user_id)
+    return {"shares": db.list_conversation_shares(cid), "can_share": True}
 
 
 @router.post("/chat")
@@ -251,7 +303,7 @@ def canvas_edit(body: CanvasEdit, user=Depends(current_user)):
 
     message = None
     if body.conversation_id:
-        _own_or_404(body.conversation_id, user)
+        _own_or_404(body.conversation_id, user, need="edit")
         panels = result.get("panels") or [{"sql": body.sql, "columns": result["columns"],
                                            "rows": result["rows"], "chart": result["chart"]}]
         message = {
@@ -369,19 +421,84 @@ def _canvas_source(body, user):
 def _conversation(cid, user, prompt):
     """Resolve/create the conversation and return (cid, recent history)."""
     if cid:
-        _own_or_404(cid, user)
+        access = _own_or_404(cid, user, need="edit")
         history = [
             {"role": m["role"], "text": m["content"].get("text", "")}
-            for m in db.list_messages(cid)
+            for m in _visible_messages(cid, user, access)
             if m["content"].get("text")
         ][-8:]
         return cid, history
     return db.create_conversation(user["id"], prompt), []
 
 
-def _own_or_404(cid, user):
-    owner = db.conversation_owner(cid)
-    if owner is None:
+def _unrestricted(role, source):
+    """True when the role may read EVERY table in a source ("*" policy)."""
+    return rbac.POLICIES.get(role, {}).get(source) == "*"
+
+
+def _msg_allowed(role, content):
+    """May this role see a stored message's results? Messages carry result
+    ROWS, so this is the RBAC boundary for anyone who is not the owner.
+
+    Whole-source and orchestrated answers are only released to a role with
+    unrestricted access, since the author may have reached any table.
+    """
+    content = content or {}
+    source = content.get("source")
+    if not source:
+        return True
+    label = str(content.get("table") or "*")
+    if source == "*":
+        sources = rbac.allowed_sources(role)
+        return bool(sources) and all(_unrestricted(role, s) for s in sources)
+    if label in ("*", "all tables", "all sources"):
+        return _unrestricted(role, source)
+    tables = [t.strip() for t in label.split(",") if t.strip()] or ["*"]
+    return all(rbac.can_access(role, source, t) for t in tables)
+
+
+_REDACTED = "🔒 Hidden — this message used data your role cannot access."
+
+
+def _visible_messages(cid, user, access):
+    """Redact, at READ time, anything the viewer's role may not query.
+
+    Checking only at share time is not enough: the owner can add a PII query
+    to an already-shared conversation, and the recipient would inherit it.
+    """
+    msgs = db.list_messages(cid)
+    if access == "owner":
+        return msgs
+    out = []
+    for m in msgs:
+        content = m.get("content") or {}
+        if not _msg_allowed(user["role"], content):
+            m = {**m, "content": {
+                "text": _REDACTED, "redacted": True,
+                "source": content.get("source"), "table": content.get("table"),
+                "columns": [], "rows": [], "panels": [], "chart": None, "sql": None,
+            }}
+        out.append(m)
+    return out
+
+
+def _hidden_count(cid, role):
+    return sum(1 for m in db.list_messages(cid)
+               if not _msg_allowed(role, m.get("content") or {}))
+
+
+def _own_or_404(cid, user, need="view"):
+    """The one gate for conversation access. need: view | edit | owner.
+
+    404 when the conversation is invisible to this user — an unshared
+    conversation must not be distinguishable from a nonexistent one, or the
+    id space becomes an existence oracle.
+    """
+    access = db.conversation_access(cid, user["id"])
+    if access is None:
         raise HTTPException(404, "Conversation not found")
-    if owner != user["id"]:
-        raise HTTPException(403, "Not your conversation")
+    if need == "owner" and access != "owner":
+        raise HTTPException(403, "Only the owner can do that")
+    if need == "edit" and access not in ("owner", "edit"):
+        raise HTTPException(403, "You have view-only access to this conversation")
+    return access

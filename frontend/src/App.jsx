@@ -60,6 +60,13 @@ export default function App() {
         }}
         onActivity={() => setShowActivity(true)}
         onDashboards={() => setDashboardId("*")}
+        onRename={async (id, title) => {
+          await api(`/conversations/${id}`, {
+            method: "PATCH",
+            body: JSON.stringify({ title }),
+          });
+          refresh();
+        }}
       />
       )}
       {showActivity && <Activity onClose={() => setShowActivity(false)} />}
