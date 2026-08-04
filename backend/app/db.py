@@ -7,10 +7,16 @@ import uuid
 
 import bcrypt
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "..", "studio.db")
+# Container filesystems are ephemeral: without STUDIO_DB_PATH pointing at a
+# mounted volume, every deploy discards accounts, chats and dashboards.
+DB_PATH = os.getenv("STUDIO_DB_PATH") or os.path.join(
+    os.path.dirname(__file__), "..", "studio.db")
 
 
 def _conn():
+    parent = os.path.dirname(os.path.abspath(DB_PATH))
+    if parent and not os.path.isdir(parent):
+        os.makedirs(parent, exist_ok=True)
     c = sqlite3.connect(DB_PATH)
     c.row_factory = sqlite3.Row
     return c
