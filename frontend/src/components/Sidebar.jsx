@@ -1,16 +1,18 @@
 import { useEffect, useRef, useState } from "react";
 import { clearSession, getUser } from "../api";
+import KeySettings from "./KeySettings";
 import ShareDialog from "./ShareDialog";
 
 export default function Sidebar({
   conversations, activeId, onSelect, onNew, onDelete, onActivity, onCollapse,
-  onDashboards, onRename,
+  onDashboards, onRename, onKeysChanged,
 }) {
   const user = getUser();
   const [menu, setMenu] = useState(null);     // {id, title, x, y, canEdit, owned}
   const [renaming, setRenaming] = useState(null); // conversation id
   const [draft, setDraft] = useState("");
   const [sharing, setSharing] = useState(null);   // {id, title}
+  const [keysOpen, setKeysOpen] = useState(false);
   const inputRef = useRef(null);
 
   // The menu is positioned in viewport coordinates, so any scroll, resize or
@@ -156,6 +158,8 @@ export default function Sidebar({
         </div>
       )}
 
+      {keysOpen && <KeySettings onClose={() => setKeysOpen(false)} onChanged={onKeysChanged} />}
+
       {sharing && (
         <ShareDialog
           conversationId={sharing.id}
@@ -167,6 +171,9 @@ export default function Sidebar({
       <div className="sidebar-footer">
         <button className="logout" onClick={onDashboards} style={{ marginBottom: 8 }}>
           ▦ Dashboards
+        </button>
+        <button className="logout" onClick={() => setKeysOpen(true)} style={{ marginBottom: 8 }}>
+          ⚿ API keys
         </button>
         <button className="logout" onClick={onActivity} style={{ marginBottom: 8 }}>
           ⏱ Activity{user?.role === "admin" ? " (all users)" : ""}

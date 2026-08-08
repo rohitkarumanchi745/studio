@@ -28,6 +28,8 @@ export default function App() {
   const [showActivity, setShowActivity] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [dashboardId, setDashboardId] = useState(null);
+  // Bumped when a user connects/removes a key so the model menu refetches.
+  const [modelsEpoch, setModelsEpoch] = useState(0);
 
   const refresh = useCallback(() => {
     if (!getToken()) return;
@@ -60,6 +62,7 @@ export default function App() {
         }}
         onActivity={() => setShowActivity(true)}
         onDashboards={() => setDashboardId("*")}
+        onKeysChanged={() => setModelsEpoch((n) => n + 1)}
         onRename={async (id, title) => {
           await api(`/conversations/${id}`, {
             method: "PATCH",
@@ -86,6 +89,7 @@ export default function App() {
             refresh();
           }}
           onOpenDashboard={(id) => setDashboardId(id || "*")}
+          modelsEpoch={modelsEpoch}
         />
       )}
     </div>

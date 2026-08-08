@@ -17,7 +17,7 @@ function buildCanvas(m) {
   };
 }
 
-export default function Chat({ conversationId, onConversationCreated, onOpenDashboard }) {
+export default function Chat({ conversationId, onConversationCreated, onOpenDashboard, modelsEpoch }) {
   const [canvas, setCanvas] = useState(null);
   const [chatOpen, setChatOpen] = useState(true);
   const [models, setModels] = useState([]);
@@ -33,7 +33,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
         }
       })
       .catch(() => {});
-  }, []);
+  }, [modelsEpoch]);
 
   useEffect(() => {
     if (model) localStorage.setItem("studio_model", model);
@@ -118,6 +118,17 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
           model: model || undefined,
         }),
       });
+      // A model can be "available" (its key is set) yet still fail — no
+      // credit, revoked key. Drop back to the server default so a stale
+      // per-device choice can't leave this browser stuck in fallback.
+      const me = data.message?.model_error;
+      if (me?.retryable_with_default) {
+        const def = models.find((x) => x.default) || models[0];
+        if (def && def.spec !== me.spec) {
+          setModel(def.spec);
+          setError(`${me.spec} failed (${me.detail.slice(0, 90)}…) — switched to ${def.name}. Ask again.`);
+        }
+      }
       setMessages((m) => [...m, { role: "assistant", ...data.message }]);
       // Chart(s) produced → canvas takes the main screen, chat docks aside.
       if (data.message.panels?.length || (data.message.chart && data.message.rows?.length)) {
@@ -131,11 +142,25 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
     }
   }
 
-  const suggestions = [
-    "What were monthly revenue trends over the last year?",
-    "Top 5 products by revenue — show a bar chart",
-    "Which region grew the most in the last quarter?",
-  ];
+  // Starter questions come from the selected table's own schema, so they can
+  // actually be answered by the data in front of you.
+  const [suggestions, setSuggestions] = useState([]);
+  const [sugBusy, setSugBusy] = useState(false);
+  const selKey = orchestrated ? "*" : sel.length ? sel.join(",") : "*";
+
+  useEffect(() => {
+    if (!source) return;
+    let cancelled = false;
+    setSugBusy(true);
+    setSuggestions([]);
+    api(`/catalog/sources/${orchestrated ? "demo" : source}/suggestions?table=${encodeURIComponent(selKey)}`)
+      .then((d) => !cancelled && setSuggestions(d.suggestions || []))
+      .catch(() => !cancelled && setSuggestions([]))
+      .finally(() => !cancelled && setSugBusy(false));
+    return () => {
+      cancelled = true;
+    };
+  }, [source, selKey, orchestrated]);
 
   return (
     <div className={"workspace" + (canvas ? " with-canvas" : "") + (canvas && !chatOpen ? " chat-hidden" : "")}>
@@ -207,13 +232,21 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
               <span className="brand-mark">◆</span> What do you want to know?
             </div>
             <div className="empty-sub">
-              Pick a source and table above, then ask in plain English. The agent writes the SQL,
-              runs it, and charts the answer.
+              {orchestrated
+                ? "Ask across every database you can see — agents route the question."
+                : `Ask about ${sel.length ? sel.join(", ") : "your data"} in plain English. The agent writes the SQL, runs it, and charts the answer.`}
             </div>
             <div className="suggestions">
+              {sugBusy && <div className="meta">reading the schema…</div>}
               {suggestions.map((s) => (
-                <button key={s} className="suggestion" onClick={() => setPrompt(s)}>
-                  {s}
+                <button
+                  key={s.question + s.table}
+                  className="suggestion"
+                  onClick={() => setPrompt(s.question)}
+                  title={`answerable from ${s.table}`}
+                >
+                  {s.question}
+                  {sel.length !== 1 && <span className="sug-table">▦ {s.table}</span>}
                 </button>
               ))}
             </div>
@@ -362,6 +395,25 @@ function AssistantMessage({ m, onOpenCanvas }) {
           </span>
         </div>
         {m.text && <p className="answer">{m.text}</p>}
+        {/* What the answer was computed from — read off the executed SQL, so it
+            reflects the tables actually queried, not the ones picked up top. */}
+        {m.inputs?.tables?.length > 0 && (
+          <div className="inputs-row">
+            <span className="meta">answered from</span>
+            {m.inputs.tables.map((t) => (
+              <span key={t} className="chip chip-input" title="table referenced by the executed SQL">
+                ▦ {t}
+              </span>
+            ))}
+            {m.inputs.columns?.length > 0 && (
+              <span className="meta" title={m.inputs.columns.join(", ")}>
+                · {m.inputs.columns.slice(0, 4).join(", ")}
+                {m.inputs.columns.length > 4 ? ` +${m.inputs.columns.length - 4}` : ""}
+              </span>
+            )}
+            {m.inputs.row_count > 0 && <span className="meta">· {m.inputs.row_count} rows</span>}
+          </div>
+        )}
         {m.matched_tables?.length > 0 && (
           <div className="match-row">
             <span className="meta">matched tables:</span>

@@ -4,7 +4,7 @@ import time
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from . import rbac, skills
+from . import rbac, skills, suggest
 from .auth import current_user
 from .connectors import all_sources, get_connector
 
@@ -87,6 +87,54 @@ def source_skill(source: str, user=Depends(current_user)):
             schemas[t] = []
     return {"source": source, "role": user["role"],
             "skill": skills.get_skill(conn, user["role"], allowed, schemas)}
+
+
+@router.get("/sources/{source}/suggestions")
+def source_suggestions(source: str, table: str = "*", user=Depends(current_user)):
+    """Starter questions for the current selection, grounded in its schema.
+
+    table="*" spreads the suggestions across the tables this role can see, so
+    whole-source mode still offers something concrete to click.
+    """
+    if not rbac.can_access(user["role"], source, table):
+        raise HTTPException(403, "Your role has no access to this table")
+    conn = _connector_or_400(source)
+    try:
+        names = conn.list_tables()
+    except Exception as e:
+        raise HTTPException(502, f"Could not list tables on {source}: {e}")
+    allowed = rbac.allowed_tables(user["role"], source, names)
+    if not allowed:
+        raise HTTPException(403, "Your role has no access to this source")
+
+    targets = [t for t in _selected_tables(table) if t in allowed] or allowed[:3]
+    out = []
+    for t in targets[:3]:
+        try:
+            cols = conn.get_schema(t)
+            rows = conn.run_query(f"SELECT * FROM {t} LIMIT 3")[1]
+        except Exception:
+            continue
+        for q in suggest.suggestions_for(conn, t, cols, rows):
+            out.append({"question": q, "table": t})
+    # Round-robin across tables so one wide table cannot crowd the list out.
+    by_table = {}
+    for item in out:
+        by_table.setdefault(item["table"], []).append(item)
+    mixed, i = [], 0
+    while len(mixed) < suggest.MAX_SUGGESTIONS and any(v[i:] for v in by_table.values()):
+        for v in by_table.values():
+            if i < len(v) and len(mixed) < suggest.MAX_SUGGESTIONS:
+                mixed.append(v[i])
+        i += 1
+    return {"source": source, "table": table, "suggestions": mixed}
+
+
+def _selected_tables(label):
+    """'sales' -> [sales]; 'sales, web_traffic' -> both; '*' -> []."""
+    if not label or label in ("*", "all tables", "all sources"):
+        return []
+    return [t.strip() for t in str(label).split(",") if t.strip()]
 
 
 @router.get("/sources/{source}/tables/{table}/schema")

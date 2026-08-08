@@ -213,6 +213,14 @@ td { color: var(--ink-2); }
 }
 .dash-tile { position: relative; }
 .tile-warn { display: flex; flex-wrap: wrap; gap: 4px; padding: 4px 8px 6px; }
+/* ── Suggested questions + answer provenance ── */
+.suggestion { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.sug-table { color: var(--ink-3); font-size: 11px; flex: none; }
+.inputs-row {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 6px 0 2px;
+}
+.chip-input { border-color: var(--accent); color: var(--ink-2); }
+
 /* ── Conversation rename / share ── */
 .ctx-menu {
   position: fixed; z-index: 60; min-width: 160px; padding: 4px;

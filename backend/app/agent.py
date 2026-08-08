@@ -100,7 +100,7 @@ _DEFAULT_MODELS = (
 )
 
 
-def available_models():
+def available_models(user=None):
     specs = [s.strip() for s in os.getenv("STUDIO_MODELS", _DEFAULT_MODELS).split(",") if s.strip()]
     if llm_spec() not in specs:
         specs.insert(0, llm_spec())
@@ -109,19 +109,42 @@ def available_models():
             "spec": s,
             "provider": s.split(":", 1)[0],
             "name": s.split(":", 1)[-1],
-            "available": llm_available(s),
+            "available": llm_available(s, user),
+            "byok": bool(user_key(user, s)),
             "default": s == llm_spec(),
         }
         for s in specs
     ]
 
 
-def llm_available(spec=None):
+def user_key(user, spec=None):
+    """This user's own key for the spec's provider, if they connected one."""
+    if not user or not user.get("id"):
+        return None
+    provider = (spec or llm_spec()).split(":", 1)[0]
+    try:
+        from . import keys
+        return keys.get_key(user["id"], provider)
+    except Exception:
+        return None
+
+
+def llm_available(spec=None, user=None):
+    """A provider is usable when the server has a key, or this user brought one."""
     provider = (spec or llm_spec()).split(":", 1)[0]
     key_var = _KEY_FOR_PROVIDER.get(provider)
     if key_var is None:
         return True  # unknown provider — let LangChain resolve credentials
-    return bool(os.getenv(key_var))
+    return bool(os.getenv(key_var)) or bool(user_key(user, spec))
+
+
+def make_llm(spec, user=None, **kwargs):
+    """init_chat_model, preferring this user's key over the server's."""
+    from langchain.chat_models import init_chat_model
+    key = user_key(user, spec)
+    if key:
+        kwargs["api_key"] = key
+    return init_chat_model(spec, **kwargs)
 
 
 def _build_graph(llm, tools, system):
@@ -167,7 +190,7 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
     Returns {text, sql, columns, rows, chart, mode, model, email}.
     """
     spec = model or llm_spec()
-    if not llm_available(spec):
+    if not llm_available(spec, user):
         return _fallback(prompt, connector, table, allowed_tables)
 
     ctx = {"sql": None, "columns": [], "rows": [], "chart": None, "email": None, "panels": [],
@@ -271,10 +294,8 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
     memory_notes = db.list_memory(user["id"])
     system = _system_prompt(connector, table, allowed_tables, schemas, memory_notes, skill_md)
 
-    from langchain.chat_models import init_chat_model
-
     try:
-        llm = init_chat_model(spec)
+        llm = make_llm(spec, user)
         base_tools = [run_sql, render_chart, remember, email_report]
         messages = [("user" if h["role"] == "user" else "assistant", h["text"]) for h in history]
         messages.append(("user", prompt))
@@ -307,6 +328,11 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
             pass
         out = _fallback(prompt, connector, table, allowed_tables)
         out["text"] = f"(Agent error: {e}) — showing a basic preview instead.\n\n" + out["text"]
+        # Name the model that failed so the client can stop using it. A key
+        # being set only means the provider is configured, not that the
+        # account can actually bill — quota and auth errors surface here.
+        out["model_error"] = {"spec": spec, "detail": str(e)[:300],
+                              "retryable_with_default": spec != llm_spec()}
         return out
 
     panels = ctx["panels"]
@@ -560,8 +586,7 @@ def edit_canvas(instruction, columns, rows, chart):
     result = None
     if llm_available():
         try:
-            from langchain.chat_models import init_chat_model
-            llm = init_chat_model(llm_spec())
+            llm = make_llm(llm_spec(), user)
             payload = json.dumps({
                 "columns": columns,
                 "sample_rows": rows[:20],
@@ -654,8 +679,7 @@ def compose_canvas(instruction, columns, rows, chart, connector=None,
                        "relative windows ('this week') on the data's own MAX(date), "
                        "not on the current date, or the panel will come back empty.")
 
-    from langchain.chat_models import init_chat_model
-    llm = init_chat_model(llm_spec())
+    llm = make_llm(llm_spec(), user)
     payload = json.dumps({
         "columns": columns,
         "sample_rows": rows[:15],

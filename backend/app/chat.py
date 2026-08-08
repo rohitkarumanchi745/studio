@@ -1,12 +1,14 @@
 """Chat: conversations, the ask endpoint driving the agent, fresh-data rerun,
 email reports, and the per-user activity audit log."""
+import os
 import time
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from . import agent, db, email_service, lightning, orchestrator, queryguard, rbac, skills
+from . import (agent, db, email_service, keys, lightning, orchestrator, queryguard,
+               rbac, skills)
 from .auth import current_user
 from .catalog import _connector_or_400, match_tables
 
@@ -26,7 +28,44 @@ class Ask(BaseModel):
 def models(user=Depends(current_user)):
     """The model menu (Claude, GPT, …) the company offers. Configure with
     STUDIO_MODELS; availability reflects which provider keys are set."""
-    return agent.available_models()
+    return agent.available_models(user)
+
+
+class KeyIn(BaseModel):
+    provider: str
+    api_key: str
+
+
+@router.get("/settings/keys")
+def get_keys(user=Depends(current_user)):
+    """Which providers this user has connected. Never returns a key."""
+    return {"keys": keys.list_keys(user["id"]), "providers": list(keys.PROVIDERS),
+            "server_keys": [p for p in keys.PROVIDERS
+                            if os.getenv(agent._KEY_FOR_PROVIDER[p])]}
+
+
+@router.post("/settings/keys", status_code=201)
+def put_key(body: KeyIn, user=Depends(current_user)):
+    provider = body.provider.strip().lower()
+    api_key = body.api_key.strip()
+    if provider not in keys.PROVIDERS:
+        raise HTTPException(400, f"provider must be one of {', '.join(keys.PROVIDERS)}")
+    if not api_key:
+        raise HTTPException(400, "API key cannot be empty")
+    ok, detail = keys.verify(provider, api_key)
+    if not ok:
+        raise HTTPException(400, detail)
+    keys.set_key(user["id"], provider, api_key)
+    # Log the event, never the secret.
+    db.log_activity(user, "api_key_connected", prompt=provider)
+    return {"keys": keys.list_keys(user["id"])}
+
+
+@router.delete("/settings/keys/{provider}")
+def drop_key(provider: str, user=Depends(current_user)):
+    keys.delete_key(user["id"], provider.strip().lower())
+    db.log_activity(user, "api_key_removed", prompt=provider)
+    return {"keys": keys.list_keys(user["id"])}
 
 
 @router.get("/conversations")
@@ -107,7 +146,7 @@ def ask(body: Ask, user=Depends(current_user)):
 
     model = None
     if body.model:
-        if body.model not in {m["spec"] for m in agent.available_models()}:
+        if body.model not in {m["spec"] for m in agent.available_models(user)}:
             raise HTTPException(400, f"Model '{body.model}' is not offered")
         model = body.model
 
@@ -122,6 +161,7 @@ def ask(body: Ask, user=Depends(current_user)):
         result.setdefault("source", "*")
         result["table"] = "all sources"
         result["matched_tables"] = []
+        result["inputs"] = _query_inputs(result)
         tid = lightning.record_chat_trace(
             user, cid, prompt, result, int((time.time() - t0) * 1000))
         if tid:
@@ -205,6 +245,7 @@ def ask(body: Ask, user=Depends(current_user)):
         result["matched_tables"] = match_tables(prompt, match_schemas)
     except Exception:
         result["matched_tables"] = []
+    result["inputs"] = _query_inputs(result)
     # Agent Lightning-style rollout: record the run with a heuristic reward;
     # the trace id rides inside the message so 👍/👎 can re-score it later.
     tid = lightning.record_chat_trace(
@@ -434,6 +475,28 @@ def _conversation(cid, user, prompt):
         ][-8:]
         return cid, history
     return db.create_conversation(user["id"], prompt), []
+
+
+def _query_inputs(result):
+    """What the answer was actually computed from.
+
+    The requested table label is what the user picked; the executed SQL is what
+    the agent really read. Those differ whenever the agent follows a question
+    into a neighbouring table, so report the SQL's own references.
+    """
+    sqls = [result.get("sql")] + [p.get("sql") for p in (result.get("panels") or [])]
+    tables, seen = [], set()
+    for sql in [s for s in sqls if s]:
+        for ref in queryguard.TABLE_REF.findall(sql):
+            name = ref.strip('"').split(".")[-1].lower()
+            if name and name not in seen:
+                seen.add(name)
+                tables.append(name)
+    return {
+        "tables": tables,
+        "columns": [c for c in (result.get("columns") or []) if c][:12],
+        "row_count": len(result.get("rows") or []),
+    }
 
 
 _ROLE_RANK = {"admin": 3, "analyst": 2, "viewer": 1}

@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from . import auth, catalog, chat, dashboards, db
+from . import auth, catalog, chat, dashboards, db, keys
 from .agent import llm_available, llm_spec
 from .connectors.demo import seed
 
@@ -43,6 +43,7 @@ for _router in (auth.router, catalog.router, chat.router, dashboards.router):
 def startup():
     db.init_db()
     dashboards.init_tables()
+    keys.init_tables()
     seed()
 
 

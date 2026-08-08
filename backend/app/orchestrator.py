@@ -71,17 +71,15 @@ def run_orchestrated(prompt, user, history, model=None):
         return result
 
     spec = model or agent.llm_spec()
-    if not agent.llm_available(spec):
+    if not agent.llm_available(spec, user):
         return _route_fallback(prompt, sources, history, user, model)
 
     ctx = {"panels": [], "sub": [], "errors": []}
     tools = [_source_tool(s, ctx, user, model) for s in sources]
     system = _orchestrator_prompt(sources)
 
-    from langchain.chat_models import init_chat_model
-
     try:
-        llm = init_chat_model(spec)
+        llm = agent.make_llm(spec, user)
         graph = agent._build_graph(llm, tools, system)
         messages = [("user" if h["role"] == "user" else "assistant", h["text"]) for h in history]
         messages.append(("user", prompt))
