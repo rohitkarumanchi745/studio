@@ -6,6 +6,13 @@ import { api } from "../api";
 
 const LABEL = { anthropic: "Anthropic (Claude)", openai: "OpenAI (GPT)" };
 const PLACEHOLDER = { anthropic: "sk-ant-…", openai: "sk-…" };
+// Anthropic has no OAuth flow a web app can use — API keys, Workload Identity
+// Federation and App Attest are the only options — so the best we can do is
+// deep-link the page that mints one.
+const KEY_PAGE = {
+  anthropic: "https://platform.claude.com/settings/keys",
+  openai: "https://platform.openai.com/api-keys",
+};
 
 export default function KeySettings({ onClose, onChanged }) {
   const [state, setState] = useState(null);
@@ -76,6 +83,16 @@ export default function KeySettings({ onClose, onChanged }) {
             </div>
           </div>
           <button className="chip" onClick={onClose}>✕ close</button>
+        </div>
+
+        <div className="key-steps">
+          <a className="chip" href={KEY_PAGE[provider]} target="_blank" rel="noopener noreferrer">
+            ↗ Create a key on {provider === "anthropic" ? "Anthropic" : "OpenAI"}
+          </a>
+          <span className="meta">
+            Opens {new URL(KEY_PAGE[provider]).host} — create the key there, then paste it below.
+            We verify it against the provider before saving.
+          </span>
         </div>
 
         <form className="share-form" onSubmit={connect}>

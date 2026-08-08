@@ -241,6 +241,8 @@ td { color: var(--ink-2); }
 }
 .conv-shared { color: var(--accent); }
 .conv-del:disabled { opacity: 0.25; cursor: default; }
+.key-steps { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
+.key-steps .chip { align-self: flex-start; text-decoration: none; }
 .share-form { display: flex; gap: 6px; margin: 10px 0; }
 .share-form input { flex: 1; font-size: 13px; padding: 7px 9px; }
 .share-list { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
