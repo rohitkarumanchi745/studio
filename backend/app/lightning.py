@@ -79,7 +79,11 @@ def record_chat_trace(user, conversation_id, prompt, result, duration_ms):
             duration_ms=duration_ms,
             reward=heuristic_reward(result),
             reward_source="heuristic",
-            meta={"errors": errors[:5]},
+            # Attribute the rollout to the named agents behind it, so the
+            # learning store shows which agents were called (single worker, or
+            # the fan-out crew + Aggregator).
+            meta={"errors": errors[:5],
+                  "agents": [a.get("name") for a in (result.get("agents") or [])]},
         )
     except Exception:
         return None  # learning must never break answering

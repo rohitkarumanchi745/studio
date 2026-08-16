@@ -258,9 +258,14 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
     briefing on the database and its tables; replaces the inline schema block.
     Returns {text, sql, columns, rows, chart, mode, model, email}.
     """
+    from . import roster
+    me = roster.worker(connector.name)  # this run's named worker agent
+
     spec = model or llm_spec()
     if not llm_available(spec, user):
-        return _fallback(prompt, connector, table, allowed_tables)
+        out = _fallback(prompt, connector, table, allowed_tables)
+        out["agents"] = [me]
+        return out
 
     ctx = {"sql": None, "columns": [], "rows": [], "chart": None, "email": None, "panels": [],
            "errors": []}
@@ -403,6 +408,7 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         # account can actually bill — quota and auth errors surface here.
         out["model_error"] = {"spec": spec, "detail": str(e)[:300],
                               "retryable_with_default": spec != llm_spec()}
+        out["agents"] = [me]
         return out
 
     panels = ctx["panels"]
@@ -419,6 +425,7 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         "email": ctx["email"],
         "errors": ctx["errors"],
         "usage": usage,
+        "agents": [me],
         "mode": "agent",
         "model": spec,
     }

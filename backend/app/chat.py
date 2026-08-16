@@ -1,5 +1,6 @@
 """Chat: conversations, the ask endpoint driving the agent, fresh-data rerun,
 email reports, and the per-user activity audit log."""
+import json
 import os
 import time
 from typing import List, Optional
@@ -8,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from . import (agent, db, email_service, keys, lightning, orchestrator, queryguard,
-               rbac, sessions, skills)
+               rbac, roster, sessions, skills)
 from .auth import current_user
 from .catalog import _connector_or_400, match_tables
 
@@ -22,6 +23,13 @@ class Ask(BaseModel):
     tables: Optional[List[str]] = None  # multi-select: restrict to these tables
     conversation_id: Optional[str] = None
     model: Optional[str] = None  # user-selected model spec from GET /models
+
+
+@router.get("/agents")
+def agents(user=Depends(current_user)):
+    """The named agent crew for this user: a worker per accessible source, plus
+    the Aggregator/Orchestrator, and whether a question fans out."""
+    return roster.summary(user)
 
 
 @router.get("/models")
@@ -442,7 +450,38 @@ def learning(user=Depends(current_user)):
         {k: t[k] for k in ("prompt", "model", "error", "reward", "reward_source")}
         for t in db.list_traces(limit=10, max_reward=0.4)
     ]
+    stats["by_agent"] = _agent_tally(db.list_traces(limit=1000))
+    # Where the learning is stored — surfaced so it's discoverable in the UI.
+    stats["storage"] = {
+        "rollouts_table": "agent_traces",
+        "store": "postgres" if db.IS_PG else f"sqlite ({db.DB_PATH})",
+        "learned_prompt": "prompts/system_learned.txt",
+    }
     return stats
+
+
+def _agent_tally(traces):
+    """Rollup of rollouts per named agent (from each trace's meta.agents), so
+    the learning dashboard shows which agents are called and how they score."""
+    tally = {}
+    for t in traces:
+        meta = t.get("meta")
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except ValueError:
+                meta = {}
+        for name in (meta or {}).get("agents") or []:
+            d = tally.setdefault(name, {"agent": name, "n": 0, "rsum": 0.0, "rn": 0})
+            d["n"] += 1
+            if t.get("reward") is not None:
+                d["rsum"] += t["reward"]
+                d["rn"] += 1
+    out = [{"agent": d["agent"], "n": d["n"],
+            "avg_reward": round(d["rsum"] / d["rn"], 3) if d["rn"] else None}
+           for d in tally.values()]
+    out.sort(key=lambda x: -x["n"])
+    return out
 
 
 def _canvas_source(body, user):

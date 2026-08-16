@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, getToken, getUser, setSession } from "./api";
 import Activity from "./components/Activity";
+import Agents from "./components/Agents";
 import Chat from "./components/Chat";
 import Dashboard from "./components/Dashboard";
 import DashboardList from "./components/DashboardList";
@@ -40,6 +41,7 @@ export default function App() {
   const [showJobs, setShowJobs] = useState(false);
   const [showPy, setShowPy] = useState(false);
   const [showSessions, setShowSessions] = useState(false);
+  const [showAgents, setShowAgents] = useState(false);
   // Bumped when a user connects/removes a key so the model menu refetches.
   const [modelsEpoch, setModelsEpoch] = useState(0);
 
@@ -80,6 +82,7 @@ export default function App() {
         onJobs={() => setShowJobs(true)}
         onPyBuild={() => setShowPy(true)}
         onSessions={() => setShowSessions(true)}
+        onAgents={() => setShowAgents(true)}
         onKeysChanged={() => setModelsEpoch((n) => n + 1)}
         onRename={async (id, title) => {
           await api(`/conversations/${id}`, {
@@ -91,7 +94,9 @@ export default function App() {
       />
       )}
       {showActivity && <Activity onClose={() => setShowActivity(false)} />}
-      {showSessions ? (
+      {showAgents ? (
+        <Agents onClose={() => setShowAgents(false)} />
+      ) : showSessions ? (
         <Sessions
           onClose={() => setShowSessions(false)}
           onResume={(state) => {

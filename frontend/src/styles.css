@@ -302,6 +302,10 @@ td { color: var(--ink-2); }
 .sess-meters { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; }
 .sess-meters .meta { font-size: 12px; }
 
+/* ── Agents roster ── */
+.offline-agents { display: flex; flex-wrap: wrap; gap: 8px; }
+.offline-agents .chip { opacity: 0.55; }
+
 /* ── Suggested questions + answer provenance ── */
 .suggestion { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
 .sug-table { color: var(--ink-3); font-size: 11px; flex: none; }

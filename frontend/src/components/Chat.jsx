@@ -4,6 +4,15 @@ import Canvas from "./Canvas";
 import ChartView from "./ChartView";
 import SqlLab from "./SqlLab";
 
+// "Demo agent" for a single worker; "Snowflake agent + Databricks agent →
+// Aggregator" when a question fanned out across sources.
+function agentLabel(agents) {
+  if (!agents?.length) return "";
+  const workers = agents.filter((a) => a.role !== "aggregator");
+  const names = workers.map((a) => a.name).join(" + ");
+  return agents.some((a) => a.role === "aggregator") ? `${names} → Aggregator` : names;
+}
+
 function buildCanvas(m) {
   const panels =
     m.panels?.length > 0
@@ -397,7 +406,11 @@ function AssistantMessage({ m, requirement, onOpenCanvas }) {
           <span className="brand-mark">◆</span>
           <span className="meta">
             {m.mode === "fallback" ? "fallback" : m.model} · {m.source}/{m.table === "*" ? "all tables" : m.table}
-            {m.mode === "orchestrated" && m.agents_used?.length > 0 && ` · agents: ${m.agents_used.join(", ")}`}
+            {m.agents?.length > 0
+              ? ` · ${agentLabel(m.agents)}`
+              : m.mode === "orchestrated" && m.agents_used?.length > 0
+                ? ` · agents: ${m.agents_used.join(", ")}`
+                : ""}
           </span>
         </div>
         {m.text && <p className="answer">{m.text}</p>}

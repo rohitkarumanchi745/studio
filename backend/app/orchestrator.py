@@ -19,7 +19,7 @@ deterministic fallback, and the aggregator falls back to a per-source summary.
 import concurrent.futures
 import json
 
-from . import agent, rbac, skills
+from . import agent, rbac, roster, skills
 from .connectors import all_sources, get_connector
 
 MAX_PARALLEL = 6
@@ -68,11 +68,13 @@ def run_orchestrated(prompt, user, history, model=None):
                 "source": "*", "agents_used": []}
 
     if len(sources) == 1:
+        # One accessible source → its worker answers directly, no aggregator.
         s = sources[0]
         result = agent.run_agent(prompt, s["connector"], "*", s["allowed"], s["schemas"],
                                  history, user, model, skill_md=s["skill"])
         result["source"] = s["connector"].name
         result["agents_used"] = [s["connector"].name]
+        result.setdefault("agents", [roster.worker(s["connector"].name)])
         return result
 
     spec = model or agent.llm_spec()
@@ -81,7 +83,9 @@ def run_orchestrated(prompt, user, history, model=None):
     panels, errors = [], []
     for sub in subs:
         for p in sub.get("panels") or []:
-            panels.append({**p, "source": sub["_source"]})
+            # Stamp every panel with the named agent that produced it.
+            panels.append({**p, "source": sub["_source"],
+                           "agent": roster.name_for(sub["_source"])})
         errors.extend(sub.get("errors") or [])
 
     text = _aggregate(prompt, subs, user, spec)
@@ -99,6 +103,9 @@ def run_orchestrated(prompt, user, history, model=None):
         "model": spec,
         "source": last["_source"] if last else subs[0]["_source"],
         "agents_used": [r["_source"] for r in subs],
+        # The full named crew for this turn: every worker that ran + the
+        # Aggregator that synthesized them.
+        "agents": [roster.worker(r["_source"]) for r in subs] + [roster.AGGREGATOR],
     }
 
 
