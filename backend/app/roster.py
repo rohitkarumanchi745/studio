@@ -41,6 +41,11 @@ STAGE_AGENTS = [
 ]
 
 
+# Utility agents that aren't source workers or a flow stage but are still named,
+# traced agents in their own right.
+SQL_VERIFIER = {"name": "SQL verifier", "role": "verifier", "produces": "verified SQL"}
+
+
 def stage(name):
     """The named stage agent for a flow stage (plan/codegen/validate/…)."""
     return next((a for a in STAGE_AGENTS if a["stage"] == name),
@@ -85,6 +90,7 @@ def summary(user):
         "orchestrator": ORCHESTRATOR,
         "aggregator": AGGREGATOR,
         "pipeline_crew": STAGE_AGENTS,
+        "utility_agents": [SQL_VERIFIER],
         "multi_source": len(accessible) > 1,
         "accessible_count": len(accessible),
     }

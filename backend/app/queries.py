@@ -106,6 +106,45 @@ def verify_sql(user, source, table_label, sql):
     }
 
 
+# ── The SQL verifier as a named, traced agent ───────────────────────────
+
+def _verify_reward(result):
+    """Reward for a verification rollout. A guard rejection scores low but not
+    zero — the guard did its job catching bad SQL; a hard execution failure is
+    the worst outcome; a query that runs and returns rows is best."""
+    if result.get("ok"):
+        return 1.0 if result.get("row_count") else 0.7
+    err = (result.get("error") or "").lower()
+    return 0.2 if ("guard" in err or "rejected" in err) else 0.0
+
+
+def verify_agent(user, source, table_label, sql):
+    """Run verify_sql AND record it as an Agent Lightning rollout attributed to
+    the named "SQL verifier" agent. This is the user-facing verify action; the
+    reward feeds the learning loop (failed verifications become recent_failures
+    that get injected into the analyst agent's prompt). Internal callers
+    (pipelines, the flow Validator) call verify_sql directly to avoid flooding
+    the trace store with one rollout per step."""
+    from . import roster
+    result = verify_sql(user, source, table_label, sql)
+    try:
+        tid = db.add_trace(
+            user, prompt=(sql or "")[:1000], mode="sql_verify", source=source,
+            table=table_label, sql=result.get("sql") or sql, ok=result["ok"],
+            error=None if result["ok"] else (result.get("error") or "")[:500],
+            row_count=result.get("row_count"), duration_ms=result.get("took_ms"),
+            reward=_verify_reward(result), reward_source="verifier",
+            meta={"agent": roster.SQL_VERIFIER["name"],
+                  "agents": [roster.SQL_VERIFIER["name"]]},
+        )
+    except Exception:
+        tid = None
+    result["agent"] = roster.SQL_VERIFIER["name"]
+    if tid:
+        result["trace_id"] = tid
+    return result
+
+
 # ── Persistence ─────────────────────────────────────────────────────────
 
 def _row(r):
@@ -146,8 +185,10 @@ class VerifyIn(BaseModel):
 @router.post("/verify")
 def verify(body: VerifyIn, user=Depends(current_user)):
     """Verify SQL without saving. This is the gate the UI checks before it
-    lets the user save."""
-    return verify_sql(user, body.source, body.table, body.sql)
+    lets the user save. The named SQL verifier agent records the attempt as an
+    Agent Lightning rollout, so verifications (and failures) feed the learning
+    loop."""
+    return verify_agent(user, body.source, body.table, body.sql)
 
 
 class SaveIn(BaseModel):

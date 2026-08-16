@@ -118,6 +118,10 @@ export default function SqlLab({ sql, source, table, requirement }) {
           ) : (
             <>✗ {result.error}</>
           )}
+          {result.agent && (
+            <span className="meta"> · by {result.agent}
+              {result.trace_id ? ` · trace ${String(result.trace_id).slice(0, 8)}` : ""}</span>
+          )}
         </div>
       )}
       {saved && (

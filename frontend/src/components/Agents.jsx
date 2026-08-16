@@ -87,6 +87,26 @@ export default function Agents({ onClose }) {
         )}
       </div>
 
+      {(data?.pipeline_crew?.length > 0 || data?.utility_agents?.length > 0) && (
+        <>
+          <div className="meta" style={{ margin: "14px 0 6px" }}>
+            Pipeline &amp; utility agents — named stages every run passes through
+          </div>
+          <div className="offline-agents">
+            {(data.pipeline_crew || []).map((a) => (
+              <span key={a.name} className="chip chip-on" title={`emits ${a.produces}`}>
+                {a.name}{a.produces ? ` → ${a.produces}` : ""}
+              </span>
+            ))}
+            {(data.utility_agents || []).map((a) => (
+              <span key={a.name} className="chip chip-on" title={`emits ${a.produces}`}>
+                {a.name}
+              </span>
+            ))}
+          </div>
+        </>
+      )}
+
       {offline.length > 0 && (
         <>
           <div className="meta" style={{ margin: "14px 0 6px" }}>Not connected</div>
