@@ -761,6 +761,8 @@ def _cached_query(source, sql, role, connector, *, refresh=False):
 
     columns, rows = connector.run_query(sql)
     columns, rows = list(columns or []), list(rows or [])
+    from . import governance
+    columns, rows = governance.filter_result(source, sql, columns, rows)
     if client is not None:
         # Round-trip through JSON even on a miss, so a cached read and a fresh
         # read hand downstream transforms identically-typed values.

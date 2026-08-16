@@ -92,6 +92,10 @@ def verify_sql(user, source, table_label, sql):
     except Exception as e:
         return {"ok": False, "error": f"Query failed: {str(e)[:300]}", "sql": cleaned}
     rows = rows[:agent.MAX_ROWS]
+    # Compliance: strip denied columns, mask masked ones, cap rows — before
+    # anything leaves the backend, so even SELECT * can't leak a denied column.
+    from . import governance
+    columns, rows = governance.filter_result(source, cleaned, columns, rows)
     return {
         "ok": True,
         "sql": cleaned,

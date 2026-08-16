@@ -25,13 +25,38 @@ POLICIES = {
 }
 
 
+def _policies():
+    """The governance document's roles when one is loaded, else the built-in
+    POLICIES. This is the single switch that makes RBAC governance-driven."""
+    from . import governance
+    gov = governance.policies()
+    return gov if gov is not None else POLICIES
+
+
+def _role_policy(role, source):
+    """Resolve a role's policy for a source under the active document. A role
+    whose whole `sources` is '*' can see every source and table."""
+    role_pol = _policies().get(role, {})
+    if role_pol == "*":
+        return "*"
+    return role_pol.get(source)
+
+
 def allowed_sources(role):
-    return set(POLICIES.get(role, {}).keys())
+    pol = _policies().get(role, {})
+    if pol == "*":
+        return {s["name"] for s in _all_source_names()}
+    return set(pol.keys())
+
+
+def _all_source_names():
+    from .connectors import all_sources
+    return all_sources()
 
 
 def allowed_tables(role, source, all_tables):
     """Filter a source's table list down to what this role may access."""
-    policy = POLICIES.get(role, {}).get(source)
+    policy = _role_policy(role, source)
     if policy is None:
         return []
     if policy == "*":
@@ -40,7 +65,7 @@ def allowed_tables(role, source, all_tables):
 
 
 def can_access(role, source, table):
-    policy = POLICIES.get(role, {}).get(source)
+    policy = _role_policy(role, source)
     if policy is None:
         return False
     if table == "*":  # whole-source chat: allowed if the role can see anything here

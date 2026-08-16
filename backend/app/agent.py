@@ -163,6 +163,15 @@ def _build_graph(llm, tools, system):
             return create_react_agent(llm, tools, state_modifier=system)
 
 
+def _run(connector, sql):
+    """Execute + apply governance compliance in one place, so every path that
+    returns data to a user (agent tool, fallback preview, canvas compose) is
+    covered — deny/mask columns and row caps from the active governance doc."""
+    columns, rows = connector.run_query(sql)
+    from . import governance
+    return governance.filter_result(connector.name, sql, columns, rows)
+
+
 def _final_text(result):
     for message in reversed(result.get("messages", [])):
         if getattr(message, "type", "") == "ai":
@@ -208,7 +217,7 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         try:
             cleaned = queryguard.validate(sql, allowed_tables)
             cleaned = queryguard.enforce_limit(cleaned, MAX_ROWS)
-            columns, rows = connector.run_query(cleaned)
+            columns, rows = _run(connector, cleaned)
             rows = rows[:MAX_ROWS]
         except QueryRejected as e:
             ctx["errors"].append(f"rejected: {e}")
@@ -450,7 +459,7 @@ def _fallback(prompt, connector, table, allowed_tables):
             sql_t = f"SELECT * FROM {t} LIMIT 2000"
             try:
                 cleaned = queryguard.validate(sql_t, allowed_tables)
-                columns, rows = connector.run_query(cleaned)
+                columns, rows = _run(connector, cleaned)
             except Exception:
                 continue
             chart = _auto_chart(columns, rows, t) or {"type": "table", "title": t, "x": columns[0], "y": columns[1:2]}
@@ -471,7 +480,7 @@ def _fallback(prompt, connector, table, allowed_tables):
     sql = f"SELECT * FROM {target} LIMIT {MAX_ROWS}"
     try:
         cleaned = queryguard.validate(sql, allowed_tables)
-        columns, rows = connector.run_query(cleaned)
+        columns, rows = _run(connector, cleaned)
     except Exception as e:
         return {"text": f"Could not query {target}: {e}", "sql": sql, "columns": [],
                 "rows": [], "chart": None, "email": None, "mode": "fallback", "model": None}
@@ -526,7 +535,7 @@ def _fallback_granularity_panels(connector, target, allowed_tables, grans):
         try:
             cleaned = queryguard.validate(sql, allowed_tables)
             cleaned = queryguard.enforce_limit(cleaned, MAX_ROWS)
-            columns, rows = connector.run_query(cleaned)
+            columns, rows = _run(connector, cleaned)
         except Exception:
             continue
         chart_type = "bar" if g == "year" else "line"
@@ -704,7 +713,7 @@ def compose_canvas(instruction, columns, rows, chart, connector=None,
             try:
                 cleaned = queryguard.validate(sql, allowed_tables or [])
                 cleaned = queryguard.enforce_limit(cleaned, MAX_ROWS)
-                p_cols, p_rows = connector.run_query(cleaned)
+                p_cols, p_rows = _run(connector, cleaned)
                 p_rows = p_rows[:MAX_ROWS]
                 p_sql = cleaned
             except QueryRejected as e:

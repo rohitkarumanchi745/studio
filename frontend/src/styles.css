@@ -248,6 +248,17 @@ td { color: var(--ink-2); }
 .query-actions { display: flex; gap: 6px; margin: 8px 0; }
 .query-result { margin-top: 8px; }
 
+/* ── Governance ── */
+.gov-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+.gov-summary { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin: 8px 0; font-size: 13px; }
+.gov-role { margin: 3px 0; }
+.gov-yaml {
+  width: 100%; min-height: 340px; margin-top: 10px;
+  background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px;
+  color: var(--ink); padding: 12px 14px; resize: vertical;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12.5px; line-height: 1.55;
+}
+
 /* ── Pipelines ── */
 .pl-build { margin-bottom: 14px; }
 .pl-draft { margin-top: 10px; border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px; background: var(--surface); }

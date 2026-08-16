@@ -285,6 +285,8 @@ def rerun(body: Rerun, user=Depends(current_user)):
         cleaned = queryguard.validate(body.sql, allowed)
         cleaned = queryguard.enforce_limit(cleaned, agent.MAX_ROWS)
         columns, rows = connector.run_query(cleaned)
+        from . import governance
+        columns, rows = governance.filter_result(body.source, cleaned, columns, rows)
     except queryguard.QueryRejected as e:
         db.log_activity(user, "rerun", source=body.source, sql=body.sql, ok=False, error=str(e))
         raise HTTPException(403, str(e))
