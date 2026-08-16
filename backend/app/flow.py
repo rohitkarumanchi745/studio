@@ -553,6 +553,19 @@ def get(fid: str, user=Depends(current_user)):
     return d
 
 
+@router.delete("/{fid}")
+def remove(fid: str, user=Depends(current_user)):
+    c = db._conn()
+    r = c.execute("SELECT user_id FROM flow_runs WHERE id=?", (fid,)).fetchone()
+    if r is None or dict(r)["user_id"] != user["id"]:
+        c.close()
+        raise HTTPException(404, "Flow not found")  # 404, not 403 — no oracle
+    c.execute("DELETE FROM flow_runs WHERE id=?", (fid,))
+    c.commit()
+    c.close()
+    return {"deleted": True}
+
+
 def _stage_view_from_dict(d):
     spec, art = d.get("spec") or {}, d.get("artifact") or {}
     val, dep = d.get("validation"), d.get("deployment")

@@ -119,6 +119,17 @@ export default function Flow({ onClose, onOpenJobs }) {
     }
   }
 
+  async function remove(id, e) {
+    e.stopPropagation();
+    try {
+      await api(`/flow/${id}`, { method: "DELETE" });
+      setHistory((h) => h.filter((f) => f.id !== id));
+      if (flow?.id === id) setFlow(null);
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
   const tone = flow ? STATUS_TONE[flow.status] || (flow.status === "succeeded" ? "ok" : "warn") : "";
 
   return (
@@ -203,9 +214,12 @@ export default function Flow({ onClose, onOpenJobs }) {
                     {f.request}
                     <span className="query-tag">{f.target}/{f.kind}</span>
                   </div>
-                  <span className={"query-tag flow-badge-" + (STATUS_TONE[f.status] || "warn")}>
-                    {f.status.replace(/_/g, " ")}
-                  </span>
+                  <div className="query-actions">
+                    <span className={"query-tag flow-badge-" + (STATUS_TONE[f.status] || "warn")}>
+                      {f.status.replace(/_/g, " ")}
+                    </span>
+                    <button className="chip ctx-danger" onClick={(e) => remove(f.id, e)}>✕</button>
+                  </div>
                 </div>
               </div>
             ))}
