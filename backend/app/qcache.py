@@ -202,18 +202,22 @@ def store(user, source, table_scope, prompt, result, reward=None):
     c.close()
 
 
-def learned(user, source, table_scope, prompt):
-    """A repeated + successful pattern BitNet is expected to handle: a signature
-    match against an entry seen >= MIN_SEEN times with avg reward >= MIN_REWARD.
-    Returns the pattern (for logging) or None. The router uses this to decide
-    BitNet vs the frontier LLM."""
+def learned(source, table_scope, prompt):
+    """A repeated + successful pattern that ANY user has established for this
+    source + scope — CENTRALIZED across roles. Aggregates seen count and reward
+    over every role that has asked it (SUM(seen) >= MIN_SEEN, AVG(reward) >=
+    MIN_REWARD), so one user's learning benefits everyone. Returns the pattern,
+    or None. It is deliberately role-agnostic; the router still checks the
+    *requester's* access before actually routing to BitNet ("same access")."""
     sig = _sig(prompt)
     if not sig:
         return None
     c = db._conn()
-    rows = c.execute("SELECT prompt, signature, sql, seen, avg_reward FROM query_cache "
-                     "WHERE role=? AND source=? AND table_scope=? AND seen>=? AND avg_reward>=?",
-                     (user["role"], source, table_scope, MIN_SEEN, MIN_REWARD)).fetchall()
+    rows = c.execute(
+        "SELECT signature, SUM(seen) seen, AVG(avg_reward) avg_reward, MAX(sql) sql, "
+        "MAX(prompt) prompt FROM query_cache WHERE source=? AND table_scope=? "
+        "GROUP BY signature HAVING SUM(seen) >= ? AND AVG(avg_reward) >= ?",
+        (source, table_scope, MIN_SEEN, MIN_REWARD)).fetchall()
     c.close()
     best, score = None, 0.0
     for r in rows:

@@ -37,13 +37,30 @@ def bitnet_ready(user):
         return False
 
 
+def _has_access(user, source, sql):
+    """The requester's role can reach EVERY table the learned pattern touches —
+    'same access'. The pattern is centralized (some other user may have
+    established it), so only a requester who can actually access its data is
+    routed to BitNet. Execution is guarded regardless; this gates the routing."""
+    from . import queryguard, rbac
+    from .catalog import _connector_or_400
+    try:
+        conn = _connector_or_400(source)
+        allowed = {t.lower() for t in rbac.allowed_tables(user["role"], source, conn.list_tables())}
+    except Exception:
+        return False
+    refs = {r.strip('"').split(".")[-1].lower() for r in queryguard.TABLE_REF.findall(sql or "")}
+    return bool(refs) and refs.issubset(allowed)
+
+
 def choose(user, source, table_scope, prompt):
-    """First-choice model for this prompt: ('bitnet', pattern) when BitNet has
-    learned it, else ('frontier', None). The caller still escalates to frontier
-    if the BitNet attempt fails."""
+    """First-choice model for this prompt: ('bitnet', pattern) when a
+    CENTRALIZED learned pattern matches AND the requester has access to what it
+    needs, else ('frontier', None). The caller still escalates to frontier if
+    the BitNet attempt fails."""
     if not bitnet_ready(user):
         return "frontier", None
-    pattern = qcache.learned(user, source, table_scope, prompt)
-    if pattern:
+    pattern = qcache.learned(source, table_scope, prompt)   # centralized, role-agnostic
+    if pattern and _has_access(user, source, pattern["sql"]):
         return "bitnet", pattern
     return "frontier", None
