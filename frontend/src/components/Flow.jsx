@@ -18,12 +18,16 @@ const ARTIFACT_OF = {
 const STATUS_TONE = {
   succeeded: "ok",
   awaiting_approval: "warn",
+  human_review: "warn",
   escalated: "warn",
-  execute_skipped: "warn",
   rejected: "bad",
   plan_failed: "bad",
+  deploy_failed: "bad",
+  rolled_back: "bad",
   execute_failed: "bad",
 };
+
+const RUN_MARK = { true: "✓", false: "✗", null: "⏸" };
 
 function StageCard({ stage, flow, expanded, onToggle }) {
   const artifact = flow[ARTIFACT_OF[stage.stage]];
@@ -36,6 +40,7 @@ function StageCard({ stage, flow, expanded, onToggle }) {
           <div className="flow-node-head">
             <b>{stage.agent}</b>
             <span className="query-tag">{stage.produces}</span>
+            {stage.repairs > 0 && <span className="query-tag flow-badge-warn">repaired ×{stage.repairs}</span>}
             {stage.trace_id && <span className="meta flow-trace">trace {String(stage.trace_id).slice(0, 8)}</span>}
           </div>
           {artifact && <StageSummary stage={stage.stage} a={artifact} />}
@@ -59,7 +64,15 @@ function StageSummary({ stage, a }) {
   if (stage === "approve")
     return <div className="meta">decision <b>{a.decision}</b> · risk {a.risk} · {a.target}/{a.kind}</div>;
   if (stage === "execute")
-    return <div className="meta">status <b>{a.status}</b> · {a.executor}{a.job_id ? ` · job ${a.job_id.slice(0, 8)}` : ""}</div>;
+    return (
+      <div className="meta">
+        status <b>{a.status}</b> · {a.executor}
+        {a.deploy && ` · deploy ${a.deploy.ok ? "✓" : "✗"}`}
+        {a.run && ` · run ${RUN_MARK[String(a.run.ok)]}${a.run.attempts ? ` (${a.run.attempts} tr${a.run.attempts === 1 ? "y" : "ies"})` : ""}`}
+        {a.rollback && ` · rollback ${a.rollback.done ? "✓" : "⚠ manual"}`}
+        {a.job_id && ` · job ${a.job_id.slice(0, 8)}`}
+      </div>
+    );
   return null;
 }
 
@@ -159,6 +172,17 @@ export default function Flow({ onClose, onOpenJobs }) {
               </button>
             )}
           </div>
+          {flow.status === "human_review" && (
+            <div className="meta flow-note">
+              Automated repair was exhausted — the pipeline needs human review before it can proceed. You were alerted by email.
+            </div>
+          )}
+          {flow.status === "deploy_failed" && (
+            <div className="meta flow-note">Deployment failed — the error was reported and policy was not bypassed; nothing ran.</div>
+          )}
+          {flow.status === "rolled_back" && (
+            <div className="meta flow-note">The run kept failing after retries — it was stopped, you were alerted, and it was rolled back.</div>
+          )}
           <div className="flow-chain">
             {flow.stages.map((s) => (
               <StageCard key={s.stage} stage={s} flow={flow} expanded={!!expanded[s.stage]}

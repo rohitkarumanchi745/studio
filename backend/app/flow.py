@@ -26,10 +26,14 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from . import db, pipelines, pybuild, queries, queryguard, roster, supervisor
+from . import (db, email_service, pipelines, pybuild, queries, queryguard, roster,
+               supervisor)
 from .auth import current_user
+from .catalog import _connector_or_400
 
 router = APIRouter(prefix="/flow", tags=["flow"])
+
+MAX_REPAIRS = 2   # validate→repair attempts before a pipeline goes to human review
 
 
 # ── Typed contracts between stages ───────────────────────────────────────
@@ -83,8 +87,12 @@ class DeploymentRequest(BaseModel):
 
 
 class ExecutionResult(BaseModel):
-    status: str                     # succeeded | awaiting_approval | escalated | rejected | failed | skipped
+    # succeeded | awaiting_approval | deploy_failed | rejected | rolled_back | failed | skipped
+    status: str
     target: str
+    deploy: dict | None = None      # {ok, detail} — submission to the platform
+    run: dict | None = None         # {ok, attempts, detail} — execution + retries
+    rollback: dict | None = None    # {done, detail} — undo on terminal run failure
     result: object | None = None
     error: str | None = None
     job_id: str | None = None
@@ -167,6 +175,35 @@ def generate(user, spec):
     return art, tid
 
 
+def repair(user, spec, artifact, validation, attempt):
+    """Repair → a new GeneratedArtifact. Feeds the validation errors back to the
+    code generator so it can fix the artifact. Recorded as its own rollout, so
+    Agent Lightning sees the failure and the repair attempt. Without an LLM key
+    the generator can't actually fix anything — the loop then exhausts and the
+    pipeline correctly goes to human review rather than shipping a bad artifact."""
+    t0 = time.time()
+    errs = "\n".join(f"- {e}" for e in validation.errors)
+    prompt = (f"The generated pipeline for '{spec.request}' failed validation. "
+              f"Fix it so every check passes. Validation errors:\n{errs}")
+    context = f"{artifact.code}\n\n# Validation errors to fix:\n# " + "\n# ".join(validation.errors)
+    try:
+        out = pybuild.build(pybuild.BuildIn(prompt=prompt, context=context), user)
+        fixed = GeneratedArtifact(
+            language="python", code=out.get("python", ""),
+            mode="agent" if out.get("mode") == "agent" else "scaffold",
+            mcp_servers=out.get("mcp_servers", []),
+            note=f"repair attempt {attempt}: {out.get('note') or 'regenerated'}")
+    except Exception as e:
+        fixed = GeneratedArtifact(code=artifact.code, mode="scaffold",
+                                  note=f"repair attempt {attempt} error: {e}")
+    tid = _trace(user, "repair", "Code generator", spec.request, spec.source,
+                 {**fixed.model_dump(), "attempt": attempt, "fixing": validation.errors[:5]},
+                 ok=bool(fixed.code.strip()), reward=0.4,
+                 error="; ".join(validation.errors[:2]),
+                 duration_ms=int((time.time() - t0) * 1000))
+    return fixed, tid
+
+
 def validate(user, spec, artifact):
     """Validator → ValidationResult. Re-verifies every planned step (RBAC +
     guard + real execution) and static-checks the generated code."""
@@ -239,43 +276,104 @@ def request_approval(user, spec, validation, target, kind):
 
 
 def deploy_execute(user, spec, deployment):
-    """Airflow / Databricks executor → ExecutionResult. Routes through
-    supervisor.submit: read-only deployments run now; writes/Spark jobs create
-    an awaiting-approval job (the human gate) and defer."""
+    """Airflow / Databricks executor → ExecutionResult, in two phases:
+
+      Deploy — submit to the platform via supervisor.submit (policy enforced).
+               A deploy failure reports the error and does NOT bypass policy.
+      Run   — execution, with the platform's automatic retries. If it keeps
+              failing the run is STOPPED, the requester is ALERTED, and the
+              deployment is ROLLED BACK (best-effort, per connector).
+    """
     t0 = time.time()
     executor = roster.executor_name(deployment.target)
-    if deployment.decision == "reject":
-        res = ExecutionResult(status="rejected", target=deployment.target,
-                              error="; ".join(deployment.reasons[:2]), executor=executor)
+
+    def done(res, reward, error=None):
         tid = _trace(user, "execute", executor, spec.request, deployment.target,
-                     res.model_dump(), ok=False, reward=0.0, error=res.error,
-                     duration_ms=int((time.time() - t0) * 1000))
+                     res.model_dump(), ok=res.status in ("succeeded", "awaiting_approval"),
+                     reward=reward, error=error, duration_ms=int((time.time() - t0) * 1000))
         return res, tid
 
+    # ── Deploy: submit. supervisor is the ONLY executor, so policy (RBAC +
+    # human approval for writes/jobs) can never be bypassed here. ──
     try:
         job = supervisor.submit(deployment.kind, deployment.target, deployment.script, user)
     except HTTPException as e:
-        # Target not connected (e.g. Airflow/Databricks without credentials).
-        res = ExecutionResult(status="skipped", target=deployment.target,
-                              error=e.detail, executor=executor)
-        tid = _trace(user, "execute", executor, spec.request, deployment.target,
-                     res.model_dump(), ok=False, reward=0.5, error=e.detail,
-                     duration_ms=int((time.time() - t0) * 1000))
-        return res, tid
+        _alert(user, spec.request, "deploy", [e.detail])
+        return done(ExecutionResult(status="deploy_failed", target=deployment.target,
+                                    deploy={"ok": False, "detail": e.detail},
+                                    error=e.detail, executor=executor),
+                    reward=0.3, error=e.detail)
 
-    status_map = {"succeeded": "succeeded", "awaiting_approval": "awaiting_approval",
-                  "escalated": "escalated", "rejected": "rejected", "running": "succeeded",
-                  "retrying": "failed", "failed": "failed"}
-    status = status_map.get(job["status"], job["status"])
-    res = ExecutionResult(status=status, target=deployment.target,
-                          result=job.get("result"), error=job.get("last_error"),
-                          job_id=job["id"], executor=executor)
-    reward = {"succeeded": 1.0, "awaiting_approval": 0.7, "skipped": 0.5,
-              "escalated": 0.2, "failed": 0.0, "rejected": 0.0}.get(status, 0.0)
-    tid = _trace(user, "execute", executor, spec.request, deployment.target,
-                 res.model_dump(), ok=status in ("succeeded", "awaiting_approval"),
-                 reward=reward, error=res.error, duration_ms=int((time.time() - t0) * 1000))
-    return res, tid
+    js = job["status"]
+    if js == "rejected":   # blocked by policy — reported, never bypassed
+        return done(ExecutionResult(status="rejected", target=deployment.target,
+                                    deploy={"ok": False, "detail": "blocked by policy"},
+                                    error="; ".join(deployment.reasons[:2]), executor=executor),
+                    reward=0.0, error="policy reject")
+    if js == "awaiting_approval":   # deployed; run deferred to a human
+        return done(ExecutionResult(status="awaiting_approval", target=deployment.target,
+                                    deploy={"ok": True, "detail": "submitted"},
+                                    run={"ok": None, "detail": "pending human approval"},
+                                    job_id=job["id"], executor=executor), reward=0.7)
+
+    # ── Run outcomes (supervisor already retried up to its max) ──
+    if js in ("succeeded", "running"):
+        return done(ExecutionResult(status="succeeded", target=deployment.target,
+                                    deploy={"ok": True, "detail": "submitted"},
+                                    run={"ok": True, "attempts": (job.get("attempts") or 0) + 1},
+                                    result=job.get("result"), job_id=job["id"], executor=executor),
+                    reward=1.0)
+    if js == "escalated":   # kept failing → stop, alert, rollback
+        rb = _rollback(user, deployment, job)
+        _alert(user, spec.request, "run",
+               [job.get("last_error"), "run stopped after retries; rolled back"])
+        return done(ExecutionResult(status="rolled_back", target=deployment.target,
+                                    deploy={"ok": True, "detail": "submitted"},
+                                    run={"ok": False, "attempts": job.get("attempts"),
+                                         "detail": job.get("last_error")},
+                                    rollback=rb, error=job.get("last_error"),
+                                    job_id=job["id"], executor=executor),
+                    reward=0.0, error=job.get("last_error"))
+    return done(ExecutionResult(status="failed", target=deployment.target,
+                                deploy={"ok": True, "detail": "submitted"},
+                                run={"ok": False, "detail": job.get("last_error")},
+                                error=job.get("last_error"), job_id=job["id"], executor=executor),
+                reward=0.0, error=job.get("last_error"))
+
+
+def _rollback(user, deployment, job):
+    """Best-effort undo after a terminal run failure. Read-only deployments have
+    nothing to roll back; for writes/jobs, call the connector's rollback hook —
+    if it has none, flag that manual intervention is required (never silent)."""
+    if deployment.risk == "read":
+        return {"done": True, "detail": "read-only — nothing to roll back"}
+    try:
+        conn = _connector_or_400(deployment.target)
+        conn.rollback(job.get("result"))
+        return {"done": True, "detail": f"rolled back on {deployment.target}"}
+    except NotImplementedError:
+        return {"done": False,
+                "detail": f"{deployment.target} has no rollback hook — manual intervention required"}
+    except Exception as e:
+        return {"done": False, "detail": f"rollback failed: {str(e)[:200]}"}
+
+
+def _alert(user, request, phase, details):
+    """Alert the requester when a stage fails terminally (human review needed,
+    deploy error, or a run stopped + rolled back)."""
+    note = {"validation": "Automated repair was exhausted — human review is required.",
+            "deploy": "Deployment error — policy was not bypassed; nothing was run.",
+            "run": "The run was stopped after retries, you were alerted, and it was rolled back."
+            }.get(phase, "")
+    body = "; ".join(str(d) for d in details if d)
+    try:
+        email_service.send(
+            user["email"], f"Studio pipeline alert: {phase} failed",
+            f"<p>The <b>{phase}</b> stage failed for your request:</p><p>{request}</p>"
+            f"<pre style='background:#f6f6f6;padding:8px;border-radius:6px'>{body}</pre>"
+            f"<p>{note}</p>")
+    except Exception:
+        pass
 
 
 # ── Persistence + driver ─────────────────────────────────────────────────
@@ -305,8 +403,13 @@ def init_tables():
 
 
 def run_flow(user, request, target=None, kind="sql_script"):
-    """Drive one business request through every stage. Fails fast: a stage that
-    fails stops the chain, and the run's status reflects where it stopped."""
+    """Drive one business request through the safe-production flow:
+
+        generate → validate ─(fail)→ repair ×N ─(still failing)→ human review
+                 → approval → deploy ─(fail)→ report, no policy bypass
+                 → run ─(fail)→ retries ─(still failing)→ stop, alert, rollback
+                 → record result + reward (every stage) in Agent Lightning.
+    """
     request = (request or "").strip()
     if not request:
         raise HTTPException(400, "Describe the pipeline to build")
@@ -319,19 +422,32 @@ def run_flow(user, request, target=None, kind="sql_script"):
 
     target = target or spec.source
     artifact, traces["codegen"] = generate(user, spec)
+
+    # Validate, and on failure repair up to N times before re-validating. If it
+    # still won't pass, STOP before approval and send it to human review.
     validation, traces["validate"] = validate(user, spec, artifact)
+    repairs = []
+    while not validation.ok and len(repairs) < MAX_REPAIRS:
+        artifact, rtid = repair(user, spec, artifact, validation, len(repairs) + 1)
+        repairs.append(rtid)
+        validation, traces["validate"] = validate(user, spec, artifact)
+    if repairs:
+        traces["repair"] = repairs
+    if not validation.ok:
+        _alert(user, request, "validation", validation.errors)
+        return _finish(user, request, target, kind, "human_review", spec, artifact,
+                       validation, None, None, traces)
+
     deployment, traces["approve"] = request_approval(user, spec, validation, target, kind)
-
-    execution = None
     if deployment.decision == "reject":
-        status = "rejected"
-    else:
-        execution, traces["execute"] = deploy_execute(user, spec, deployment)
-        status = {"succeeded": "succeeded", "awaiting_approval": "awaiting_approval",
-                  "escalated": "escalated", "failed": "execute_failed",
-                  "skipped": "execute_skipped", "rejected": "rejected"}.get(
-                      execution.status, execution.status)
+        return _finish(user, request, target, kind, "rejected", spec, artifact,
+                       validation, deployment, None, traces)
 
+    execution, traces["execute"] = deploy_execute(user, spec, deployment)
+    status = {"succeeded": "succeeded", "awaiting_approval": "awaiting_approval",
+              "deploy_failed": "deploy_failed", "rolled_back": "rolled_back",
+              "failed": "execute_failed", "rejected": "rejected"}.get(
+                  execution.status, execution.status)
     return _finish(user, request, target, kind, status, spec, artifact,
                    validation, deployment, execution, traces)
 
@@ -364,24 +480,11 @@ def _finish(user, request, target, kind, status, spec, artifact, validation,
 
 
 def _stage_view(spec, artifact, validation, deployment, execution, traces):
-    """Compact, ordered summary of the chain: one row per stage — the agent,
-    the artifact type it produced, ok/failed, and its trace id."""
-    rows = [
-        ("plan", "Pipeline planner", "PipelineSpec", bool(spec and spec.steps)),
-        ("codegen", "Code generator", "GeneratedArtifact", bool(artifact and artifact.code)),
-        ("validate", "Validator", "ValidationResult", bool(validation and validation.ok)),
-        ("approve", "Approval agent", "DeploymentRequest",
-         bool(deployment and deployment.decision != "reject")),
-        ("execute", roster.executor_name(deployment.target if deployment else None),
-         "ExecutionResult", bool(execution and execution.status in ("succeeded", "awaiting_approval"))),
-    ]
-    out = []
-    for stage, agent_name, produces, ok in rows:
-        if stage == "execute" and execution is None:
-            continue
-        out.append({"stage": stage, "agent": agent_name, "produces": produces,
-                    "ok": ok, "trace_id": traces.get(stage)})
-    return out
+    """Compact, ordered summary of the chain — reuses the dict builder so the
+    live response and a re-fetched run render identically."""
+    return _stage_view_from_dict({
+        "spec": _obj(spec), "artifact": _obj(artifact), "validation": _obj(validation),
+        "deployment": _obj(deployment), "execution": _obj(execution), "trace_ids": traces})
 
 
 def _dump(model):
@@ -452,18 +555,27 @@ def get(fid: str, user=Depends(current_user)):
 
 def _stage_view_from_dict(d):
     spec, art = d.get("spec") or {}, d.get("artifact") or {}
-    val, dep = d.get("validation") or {}, d.get("deployment") or {}
+    val, dep = d.get("validation"), d.get("deployment")
     ex, traces = d.get("execution"), d.get("trace_ids") or {}
-    rows = [
-        ("plan", "Pipeline planner", "PipelineSpec", bool(spec.get("steps"))),
-        ("codegen", "Code generator", "GeneratedArtifact", bool(art.get("code"))),
-        ("validate", "Validator", "ValidationResult", bool(val.get("ok"))),
-        ("approve", "Approval agent", "DeploymentRequest", dep.get("decision") not in (None, "reject")),
+    repairs = traces.get("repair") or []
+    out = [
+        {"stage": "plan", "agent": "Pipeline planner", "produces": "PipelineSpec",
+         "ok": bool(spec.get("steps")), "trace_id": traces.get("plan")},
+        {"stage": "codegen", "agent": "Code generator", "produces": "GeneratedArtifact",
+         "ok": bool(art.get("code")), "trace_id": traces.get("codegen")},
     ]
-    out = [{"stage": s, "agent": a, "produces": p, "ok": ok, "trace_id": traces.get(s)}
-           for s, a, p, ok in rows]
-    if ex:
-        out.append({"stage": "execute", "agent": roster.executor_name(dep.get("target")),
+    if val is not None:
+        row = {"stage": "validate", "agent": "Validator", "produces": "ValidationResult",
+               "ok": bool(val.get("ok")), "trace_id": traces.get("validate")}
+        if repairs:
+            row["repairs"] = len(repairs)   # validate→repair loop ran this many times
+        out.append(row)
+    # Approval and execution only appear if the flow actually reached them.
+    if dep is not None:
+        out.append({"stage": "approve", "agent": "Approval agent", "produces": "DeploymentRequest",
+                    "ok": dep.get("decision") not in (None, "reject"), "trace_id": traces.get("approve")})
+    if ex is not None:
+        out.append({"stage": "execute", "agent": roster.executor_name((dep or {}).get("target")),
                     "produces": "ExecutionResult",
                     "ok": ex.get("status") in ("succeeded", "awaiting_approval"),
                     "trace_id": traces.get("execute")})

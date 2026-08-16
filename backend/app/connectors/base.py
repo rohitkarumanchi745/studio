@@ -34,3 +34,9 @@ class Connector:
         """Submit a Spark / compute job. Return a run handle. Default:
         unsupported."""
         raise NotImplementedError(f"{self.name} does not support Spark jobs")
+
+    def rollback(self, handle):
+        """Undo a deployed run after a terminal failure (cancel the run, revert
+        the target). Called only by the safe-production flow on a run that keeps
+        failing. Default: unsupported — the flow then flags manual intervention."""
+        raise NotImplementedError(f"{self.name} does not support rollback")

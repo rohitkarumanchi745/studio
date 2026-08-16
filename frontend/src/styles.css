@@ -333,6 +333,7 @@ td { color: var(--ink-2); }
 .flow-json { background: #141413; border: 1px solid var(--line); border-radius: 8px;
   padding: 10px; margin: 0 0 10px 36px; font-size: 12px; white-space: pre; overflow-x: auto;
   max-height: 320px; }
+.flow-note { margin: -4px 0 8px; padding-left: 2px; }
 .flow-hist { cursor: pointer; }
 .flow-hist:hover { border-color: #c9a86a; }
 .flow-badge-ok { color: #b7e4a0; }
