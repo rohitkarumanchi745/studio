@@ -264,7 +264,8 @@ def _run_turn(ctx, user):
     t0 = time.time()
 
     if ctx["mode"] == "*":
-        result = orchestrator.run_orchestrated(prompt, user, ctx["history"], model)
+        result = orchestrator.run_orchestrated(prompt, user, ctx["history"], model,
+                                               conversation_id=cid)
         result.setdefault("source", "*")
         result["table"] = "all sources"
         result["matched_tables"] = []
@@ -602,8 +603,11 @@ def learning(user=Depends(current_user)):
 
 
 def _agent_tally(traces):
-    """Rollup of rollouts per named agent (from each trace's meta.agents), so
-    the learning dashboard shows which agents are called and how they score."""
+    """Per-agent reward rollup. Only single-agent rollouts count — a trace naming
+    one agent is that agent's OWN scored decision (a flow stage, a worker, the
+    aggregator, the SQL verifier, a single-source answer). A blended multi-agent
+    trace (the whole orchestrated answer) is excluded, so no agent's average is
+    smeared by another agent's work."""
     tally = {}
     for t in traces:
         meta = t.get("meta")
@@ -612,12 +616,15 @@ def _agent_tally(traces):
                 meta = json.loads(meta)
             except ValueError:
                 meta = {}
-        for name in (meta or {}).get("agents") or []:
-            d = tally.setdefault(name, {"agent": name, "n": 0, "rsum": 0.0, "rn": 0})
-            d["n"] += 1
-            if t.get("reward") is not None:
-                d["rsum"] += t["reward"]
-                d["rn"] += 1
+        agents = (meta or {}).get("agents") or []
+        if len(agents) != 1:          # per-agent reward only, never blended
+            continue
+        name = agents[0]
+        d = tally.setdefault(name, {"agent": name, "n": 0, "rsum": 0.0, "rn": 0})
+        d["n"] += 1
+        if t.get("reward") is not None:
+            d["rsum"] += t["reward"]
+            d["rn"] += 1
     out = [{"agent": d["agent"], "n": d["n"],
             "avg_reward": round(d["rsum"] / d["rn"], 3) if d["rn"] else None}
            for d in tally.values()]

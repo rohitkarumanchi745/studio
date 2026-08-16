@@ -19,7 +19,7 @@ deterministic fallback, and the aggregator falls back to a per-source summary.
 import concurrent.futures
 import json
 
-from . import agent, rbac, roster, skills, util
+from . import agent, lightning, rbac, roster, skills, util
 from .connectors import all_sources, get_connector
 
 MAX_PARALLEL = 6
@@ -53,9 +53,11 @@ def accessible_sources(user, max_schema_tables=10):
     return [e for e in util.pmap(build, all_sources(), workers=MAX_PARALLEL) if e]
 
 
-def run_orchestrated(prompt, user, history, model=None):
+def run_orchestrated(prompt, user, history, model=None, conversation_id=None):
     """One multi-database turn. Same result shape as agent.run_agent, plus
-    agents_used; mode is "orchestrated"."""
+    agents_used; mode is "orchestrated". Each worker and the aggregator is
+    scored as its own rollout (per-agent reward shaping), so their policies
+    improve independently."""
     sources = accessible_sources(user)
     if not sources:
         return {"text": "No accessible data sources.", "sql": None, "columns": [],
@@ -86,6 +88,16 @@ def run_orchestrated(prompt, user, history, model=None):
 
     text = _aggregate(prompt, subs, user, spec)
     last = next((r for r in subs if r.get("sql")), None)
+
+    # Per-agent reward shaping: each worker scored on ITS own answer, the
+    # aggregator on ITS synthesis — separate rollouts, separate policies.
+    for sub in subs:
+        lightning.record_agent_rollout(
+            user, conversation_id, prompt, roster.name_for(sub["_source"]), "worker", sub)
+    lightning.record_agent_rollout(
+        user, conversation_id, prompt, roster.AGGREGATOR["name"], "aggregator",
+        {"text": text, "panels": panels, "model": spec})
+
     return {
         "text": text,
         "sql": last["sql"] if last else None,

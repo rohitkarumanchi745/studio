@@ -56,6 +56,63 @@ def heuristic_reward(result):
     return round(max(0.0, min(1.0, r)), 2)
 
 
+def agent_reward(role, sub):
+    """Score ONE agent's own decision, by what that agent's role is responsible
+    for — so each named agent's policy is rewarded independently instead of
+    sharing one blended score for the whole answer.
+
+    - worker (a per-source data agent): grounded in real SQL, the query ran,
+      it returned rows, and it visualized — minus stumbles.
+    - aggregator: it actually synthesized something substantive across the
+      workers' answers (its job is the reduce, not the SQL).
+    """
+    text = (sub.get("text") or "")
+    if text.startswith(("(agent error", "(Agent error", "(Orchestrator error")):
+        return 0.0
+
+    if role == "aggregator":
+        if not text.strip():
+            return 0.0
+        r = 0.4
+        r += 0.3 if len(text.split()) >= 15 else 0.0     # a real synthesis, not a stub
+        r += 0.3 if len(sub.get("panels") or []) > 1 else 0.0  # combined multiple sources' views
+        return round(min(1.0, r), 2)
+
+    # worker (default)
+    r = 0.3
+    if sub.get("sql"):
+        r += 0.3
+    if sub.get("rows"):
+        r += 0.2
+    chart = sub.get("chart") or {}
+    if chart.get("type") and chart.get("type") != "table":
+        r += 0.2
+    r -= 0.10 * min(len(sub.get("errors") or []), 2)
+    return round(max(0.0, min(1.0, r)), 2)
+
+
+def record_agent_rollout(user, conversation_id, prompt, agent_name, role, sub,
+                         duration_ms=None):
+    """Persist one agent's decision as its own rollout, scored by its role. Uses
+    the raw user prompt (not an agent-prefixed one) so per-agent rollouts don't
+    inflate the distinct-prompt count that gates training readiness."""
+    try:
+        return db.add_trace(
+            user, conversation_id=conversation_id, prompt=(prompt or "")[:1000],
+            model=sub.get("model"), mode=f"agent:{role}",
+            source=sub.get("_source") or sub.get("source"), sql=sub.get("sql"),
+            ok=not (sub.get("text") or "").startswith(("(agent error", "(Agent error")),
+            error=(sub.get("errors") or [None])[0],
+            row_count=len(sub.get("rows") or []),
+            chart_type=(sub.get("chart") or {}).get("type"),
+            panel_count=len(sub.get("panels") or []), duration_ms=duration_ms,
+            reward=agent_reward(role, sub), reward_source="per_agent",
+            meta={"agent": agent_name, "agents": [agent_name], "role": role},
+        )
+    except Exception:
+        return None
+
+
 def record_chat_trace(user, conversation_id, prompt, result, duration_ms):
     """Persist one rollout. Returns the trace id (also stored in the message,
     so the UI's 👍/👎 can target it later)."""

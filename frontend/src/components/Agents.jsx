@@ -5,17 +5,38 @@
 import { useEffect, useState } from "react";
 import { api, getUser } from "../api";
 
+// Each named agent is scored on its OWN decision (per-agent reward shaping):
+// a worker on its answer, the aggregator on its synthesis, each pipeline stage
+// on its own artifact. This chip shows that agent's average reward + rollouts.
+function RewardChip({ r }) {
+  if (!r || r.n === 0) return null;
+  const v = r.avg_reward;
+  const tone = v == null ? "" : v >= 0.7 ? "flow-badge-ok" : v >= 0.4 ? "flow-badge-warn" : "flow-badge-bad";
+  return (
+    <span className={"query-tag " + tone} title={`${r.n} rollout${r.n === 1 ? "" : "s"}`}>
+      reward {v == null ? "—" : v.toFixed(2)} · {r.n}
+    </span>
+  );
+}
+
 export default function Agents({ onClose }) {
   const [data, setData] = useState(null);
   const [training, setTraining] = useState(null);
+  const [rewards, setRewards] = useState({}); // agent name -> {n, avg_reward}
   const [error, setError] = useState("");
   const isAdmin = getUser()?.role === "admin";
 
   useEffect(() => {
     api("/agents").then(setData).catch((e) => setError(e.message));
-    if (isAdmin) api("/training").then(setTraining).catch(() => {});
+    if (isAdmin) {
+      api("/training").then(setTraining).catch(() => {});
+      api("/learning")
+        .then((d) => setRewards(Object.fromEntries((d.by_agent || []).map((a) => [a.agent, a]))))
+        .catch(() => {});
+    }
   }, [isAdmin]);
 
+  const rw = (name) => rewards[name];
   const agents = data?.agents || [];
   const live = agents.filter((a) => a.accessible);
   const offline = agents.filter((a) => !a.accessible);
@@ -29,7 +50,9 @@ export default function Agents({ onClose }) {
             Each connected source has its own worker agent. A single-source question
             is answered by that one agent; a cross-source question (source “all”) fans
             out to every accessible worker and the <b>Aggregator</b> synthesizes them.
-            The answer header always names the agent(s) that were called.
+            The answer header names the agent(s) called, and each agent is scored on
+            its <i>own</i> decision — a worker on its answer, the aggregator on its
+            synthesis — so their policies improve independently.
           </div>
         </div>
         <div className="canvas-actions">
@@ -55,6 +78,7 @@ export default function Agents({ onClose }) {
                 {a.name}
                 <span className="query-tag">{a.source}</span>
                 <span className="query-tag">{a.table_count} tables</span>
+                <RewardChip r={rw(a.name)} />
               </div>
               <span className="query-badge">● live</span>
             </div>
@@ -79,6 +103,7 @@ export default function Agents({ onClose }) {
               <div className="query-title">
                 {data.aggregator.name}
                 <span className="query-tag">reduce</span>
+                <RewardChip r={rw(data.aggregator.name)} />
               </div>
               <span className="query-badge">● live</span>
             </div>
@@ -116,19 +141,18 @@ export default function Agents({ onClose }) {
       {(data?.pipeline_crew?.length > 0 || data?.utility_agents?.length > 0) && (
         <>
           <div className="meta" style={{ margin: "14px 0 6px" }}>
-            Pipeline &amp; utility agents — named stages every run passes through
+            Pipeline &amp; utility agents — each scored on its own artifact (per-agent reward)
           </div>
           <div className="offline-agents">
-            {(data.pipeline_crew || []).map((a) => (
-              <span key={a.name} className="chip chip-on" title={`emits ${a.produces}`}>
-                {a.name}{a.produces ? ` → ${a.produces}` : ""}
-              </span>
-            ))}
-            {(data.utility_agents || []).map((a) => (
-              <span key={a.name} className="chip chip-on" title={`emits ${a.produces}`}>
-                {a.name}
-              </span>
-            ))}
+            {[...(data.pipeline_crew || []), ...(data.utility_agents || [])].map((a) => {
+              const r = rw(a.name);
+              return (
+                <span key={a.name} className="chip chip-on" title={a.produces ? `emits ${a.produces}` : ""}>
+                  {a.name}{a.produces ? ` → ${a.produces}` : ""}
+                  {r && r.avg_reward != null ? ` · ${r.avg_reward.toFixed(2)}` : ""}
+                </span>
+              );
+            })}
           </div>
         </>
       )}
