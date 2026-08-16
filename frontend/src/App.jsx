@@ -5,6 +5,7 @@ import Agents from "./components/Agents";
 import Chat from "./components/Chat";
 import Dashboard from "./components/Dashboard";
 import DashboardList from "./components/DashboardList";
+import Flow from "./components/Flow";
 import Login from "./components/Login";
 import Governance from "./components/Governance";
 import Jobs from "./components/Jobs";
@@ -42,6 +43,7 @@ export default function App() {
   const [showPy, setShowPy] = useState(false);
   const [showSessions, setShowSessions] = useState(false);
   const [showAgents, setShowAgents] = useState(false);
+  const [showFlow, setShowFlow] = useState(false);
   // Bumped when a user connects/removes a key so the model menu refetches.
   const [modelsEpoch, setModelsEpoch] = useState(0);
 
@@ -83,6 +85,7 @@ export default function App() {
         onPyBuild={() => setShowPy(true)}
         onSessions={() => setShowSessions(true)}
         onAgents={() => setShowAgents(true)}
+        onFlow={() => setShowFlow(true)}
         onKeysChanged={() => setModelsEpoch((n) => n + 1)}
         onRename={async (id, title) => {
           await api(`/conversations/${id}`, {
@@ -94,7 +97,9 @@ export default function App() {
       />
       )}
       {showActivity && <Activity onClose={() => setShowActivity(false)} />}
-      {showAgents ? (
+      {showFlow ? (
+        <Flow onClose={() => setShowFlow(false)} onOpenJobs={() => { setShowFlow(false); setShowJobs(true); }} />
+      ) : showAgents ? (
         <Agents onClose={() => setShowAgents(false)} />
       ) : showSessions ? (
         <Sessions

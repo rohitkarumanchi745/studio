@@ -25,6 +25,34 @@ def worker(source):
 AGGREGATOR = {"name": "Aggregator", "source": "*", "role": "aggregator"}
 ORCHESTRATOR = {"name": "Orchestrator", "source": "*", "role": "orchestrator"}
 
+# The staged pipeline crew (flow.py): each turns one typed JSON artifact into
+# the next, and each run is recorded as its own Agent Lightning trace.
+STAGE_AGENTS = [
+    {"name": "Pipeline planner", "stage": "plan", "role": "stage",
+     "produces": "PipelineSpec"},
+    {"name": "Code generator", "stage": "codegen", "role": "stage",
+     "produces": "GeneratedArtifact"},
+    {"name": "Validator", "stage": "validate", "role": "stage",
+     "produces": "ValidationResult"},
+    {"name": "Approval agent", "stage": "approve", "role": "stage",
+     "produces": "DeploymentRequest"},
+    {"name": "Deployment executor", "stage": "execute", "role": "stage",
+     "produces": "ExecutionResult"},
+]
+
+
+def stage(name):
+    """The named stage agent for a flow stage (plan/codegen/validate/…)."""
+    return next((a for a in STAGE_AGENTS if a["stage"] == name),
+                {"name": name, "stage": name, "role": "stage"})
+
+
+def executor_name(target):
+    """The executor agent is named for where it deploys ("Databricks executor")."""
+    if not target or target == "*":
+        return "Deployment executor"
+    return f"{target[:1].upper()}{target[1:]} executor"
+
 
 def roster(user):
     """The named worker agents this user's role can call, each with the tables
@@ -56,6 +84,7 @@ def summary(user):
         "agents": agents,
         "orchestrator": ORCHESTRATOR,
         "aggregator": AGGREGATOR,
+        "pipeline_crew": STAGE_AGENTS,
         "multi_source": len(accessible) > 1,
         "accessible_count": len(accessible),
     }

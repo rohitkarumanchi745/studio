@@ -306,6 +306,39 @@ td { color: var(--ink-2); }
 .offline-agents { display: flex; flex-wrap: wrap; gap: 8px; }
 .offline-agents .chip { opacity: 0.55; }
 
+/* ── Pipeline flow (staged, typed contracts) ── */
+.flow-opts { display: flex; align-items: center; gap: 8px; margin: 8px 0 4px; }
+.flow-status { display: inline-flex; align-items: center; margin: 12px 0; padding: 4px 12px;
+  border-radius: 999px; font-size: 12px; font-weight: 700; text-transform: capitalize;
+  border: 1px solid var(--line); }
+.flow-status-ok { color: #b7e4a0; border-color: #3d5a2e; }
+.flow-status-warn { color: #e0b64a; border-color: #6b5a1e; }
+.flow-status-bad { color: #e5679a; border-color: #6b2540; }
+.flow-chain { display: flex; flex-direction: column; }
+.flow-stage { position: relative; }
+.flow-stage:not(:last-child)::after { content: ""; position: absolute; left: 13px; top: 34px;
+  bottom: -6px; width: 2px; background: #c9a86a; opacity: 0.35; }
+.flow-node { display: flex; align-items: flex-start; gap: 10px; padding: 8px 10px;
+  border: 1px solid var(--line); border-radius: 9px; background: var(--surface);
+  margin-bottom: 8px; cursor: pointer; }
+.flow-node:hover { border-color: #c9a86a; }
+.flow-dot { flex: none; width: 26px; height: 26px; border-radius: 50%; display: grid;
+  place-items: center; font-size: 13px; font-weight: 700; z-index: 1; }
+.flow-ok { background: rgba(107,142,61,0.18); color: #b7e4a0; border: 1px solid #6b8e3d; }
+.flow-bad { background: rgba(192,90,68,0.18); color: #e5679a; border: 1px solid #c05a44; }
+.flow-node-body { flex: 1; min-width: 0; }
+.flow-node-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.flow-trace { font-size: 11px; }
+.flow-caret { color: var(--ink-3); flex: none; }
+.flow-json { background: #141413; border: 1px solid var(--line); border-radius: 8px;
+  padding: 10px; margin: 0 0 10px 36px; font-size: 12px; white-space: pre; overflow-x: auto;
+  max-height: 320px; }
+.flow-hist { cursor: pointer; }
+.flow-hist:hover { border-color: #c9a86a; }
+.flow-badge-ok { color: #b7e4a0; }
+.flow-badge-warn { color: #e0b64a; }
+.flow-badge-bad { color: #e5679a; }
+
 /* ── Suggested questions + answer provenance ── */
 .suggestion { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
 .sug-table { color: var(--ink-3); font-size: 11px; flex: none; }
