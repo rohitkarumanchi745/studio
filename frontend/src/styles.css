@@ -248,6 +248,20 @@ td { color: var(--ink-2); }
 .query-actions { display: flex; gap: 6px; margin: 8px 0; }
 .query-result { margin-top: 8px; }
 
+/* ── Pipelines ── */
+.pl-build { margin-bottom: 14px; }
+.pl-draft { margin-top: 10px; border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px; background: var(--surface); }
+.pl-step { margin: 8px 0; }
+.pl-step-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 13px; }
+.pl-draft-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+.pl-draft-actions .sqllab-prompt { flex: 1; min-width: 160px; }
+.pl-run { padding: 7px 0; border-top: 1px solid var(--line); font-size: 12.5px; }
+.pl-run:first-child { border-top: none; }
+.pl-status { font-weight: 700; margin-right: 8px; }
+.pl-status.pl-success { color: #b7e4a0; }
+.pl-status.pl-failed { color: #e5679a; }
+.pl-run-err { color: #e5679a; margin-top: 3px; }
+
 /* ── Suggested questions + answer provenance ── */
 .suggestion { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
 .sug-table { color: var(--ink-3); font-size: 11px; flex: none; }

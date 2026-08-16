@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from . import auth, catalog, chat, dashboards, db, keys, queries
+from . import auth, catalog, chat, dashboards, db, keys, pipelines, queries
 from .agent import llm_available, llm_spec
 from .connectors.demo import seed
 
@@ -33,10 +33,12 @@ app.include_router(catalog.router)
 app.include_router(chat.router)
 app.include_router(dashboards.router)
 app.include_router(queries.router)
+app.include_router(pipelines.router)
 
 # In production the built frontend calls the API at /api/* (the Vite dev
 # server proxies and strips that prefix, so dev keeps the unprefixed routes).
-for _router in (auth.router, catalog.router, chat.router, dashboards.router, queries.router):
+for _router in (auth.router, catalog.router, chat.router, dashboards.router,
+                queries.router, pipelines.router):
     app.include_router(_router, prefix="/api", include_in_schema=False)
 
 
@@ -46,6 +48,7 @@ def startup():
     dashboards.init_tables()
     keys.init_tables()
     queries.init_tables()
+    pipelines.init_tables()
     seed()
 
 
