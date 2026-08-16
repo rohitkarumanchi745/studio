@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { api } from "../api";
 import Canvas from "./Canvas";
 import ChartView from "./ChartView";
+import SqlLab from "./SqlLab";
 
 function buildCanvas(m) {
   const panels =
@@ -259,7 +260,12 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
               <div className="bubble-user">{m.text}</div>
             </div>
           ) : (
-            <AssistantMessage key={i} m={m} onOpenCanvas={() => setCanvas(buildCanvas(m))} />
+            <AssistantMessage
+              key={i}
+              m={m}
+              requirement={messages[i - 1]?.role === "user" ? messages[i - 1].text : ""}
+              onOpenCanvas={() => setCanvas(buildCanvas(m))}
+            />
           )
         )}
 
@@ -312,7 +318,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
   );
 }
 
-function AssistantMessage({ m, onOpenCanvas }) {
+function AssistantMessage({ m, requirement, onOpenCanvas }) {
   const [showSql, setShowSql] = useState(false);
   const [columns, setColumns] = useState(m.columns);
   const [rows, setRows] = useState(m.rows);
@@ -448,7 +454,7 @@ function AssistantMessage({ m, onOpenCanvas }) {
         {m.sql && (
           <div className="sqlbox">
             <button className="chip" onClick={() => setShowSql(!showSql)}>
-              {showSql ? "hide SQL" : "show SQL"}
+              {showSql ? "hide SQL" : "◦ edit / verify / save SQL"}
             </button>{" "}
             <button className="chip" onClick={refresh} title="Re-run this query for the newest records">
               ⟳ refresh data
@@ -462,7 +468,9 @@ function AssistantMessage({ m, onOpenCanvas }) {
               </button>
             )}
             {status && <span className="meta"> {status}</span>}
-            {showSql && <pre>{m.sql}</pre>}
+            {showSql && (
+              <SqlLab sql={m.sql} source={m.source} table={m.table} requirement={requirement} />
+            )}
           </div>
         )}
         {m.trace_id && (

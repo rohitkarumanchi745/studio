@@ -5,7 +5,7 @@ import ShareDialog from "./ShareDialog";
 
 export default function Sidebar({
   conversations, activeId, onSelect, onNew, onDelete, onActivity, onCollapse,
-  onDashboards, onRename, onKeysChanged,
+  onDashboards, onRename, onKeysChanged, onQueries,
 }) {
   const user = getUser();
   const [menu, setMenu] = useState(null);     // {id, title, x, y, canEdit, owned}
@@ -171,6 +171,9 @@ export default function Sidebar({
       <div className="sidebar-footer">
         <button className="logout" onClick={onDashboards} style={{ marginBottom: 8 }}>
           ▦ Dashboards
+        </button>
+        <button className="logout" onClick={onQueries} style={{ marginBottom: 8 }}>
+          ⌗ Saved SQL
         </button>
         <button className="logout" onClick={() => setKeysOpen(true)} style={{ marginBottom: 8 }}>
           ⚿ API keys

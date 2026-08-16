@@ -213,6 +213,41 @@ td { color: var(--ink-2); }
 }
 .dash-tile { position: relative; }
 .tile-warn { display: flex; flex-wrap: wrap; gap: 4px; padding: 4px 8px 6px; }
+/* ── SQL lab (edit / verify / save) + saved-query library ── */
+.sqllab { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; }
+.sqllab-label { margin-top: 4px; }
+.sqllab-edited { color: var(--accent); }
+.sqllab-prompt, .sqllab-sql {
+  width: 100%; background: var(--surface-2); border: 1px solid var(--line);
+  border-radius: 6px; color: var(--ink); padding: 7px 9px; font-size: 12.5px;
+}
+.sqllab-sql { font-family: ui-monospace, "SF Mono", Menlo, monospace; line-height: 1.5; resize: vertical; }
+.sqllab-actions { display: flex; align-items: center; gap: 8px; margin: 4px 0; flex-wrap: wrap; }
+.sqllab-org { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+.sqllab-result { font-size: 12.5px; padding: 6px 9px; border-radius: 6px; }
+.sqllab-result.ok { color: #b7e4a0; background: rgba(106, 153, 78, 0.16); }
+.sqllab-result.bad { color: #e5679a; background: rgba(229, 103, 154, 0.12); }
+.sqllab-saved { color: var(--accent); }
+
+.query-list { display: flex; flex-direction: column; gap: 8px; }
+.query-card { background: var(--surface); border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
+.query-head { padding: 10px 14px; cursor: pointer; }
+.query-head:hover { background: var(--surface-2); }
+.query-title { font-size: 14px; font-weight: 600; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.query-badge { font-size: 11px; font-weight: 600; color: #b7e4a0; }
+.query-tag {
+  font-size: 10.5px; color: var(--ink-3); background: var(--surface-2);
+  border: 1px solid var(--line); border-radius: 999px; padding: 1px 7px;
+}
+.query-body { padding: 0 14px 12px; }
+.query-prompt { font-style: italic; margin: 4px 0 8px; }
+.query-sql {
+  background: var(--surface-2); border: 1px solid var(--line); border-radius: 6px;
+  padding: 9px 11px; font-size: 12px; overflow-x: auto; white-space: pre;
+}
+.query-actions { display: flex; gap: 6px; margin: 8px 0; }
+.query-result { margin-top: 8px; }
+
 /* ── Suggested questions + answer provenance ── */
 .suggestion { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
 .sug-table { color: var(--ink-3); font-size: 11px; flex: none; }
