@@ -5,6 +5,97 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
 
+function McpServers() {
+  const [servers, setServers] = useState([]);
+  const [envServers, setEnvServers] = useState([]);
+  const [form, setForm] = useState({ name: "", transport: "streamable_http", url: "", command: "", args: "" });
+  const [err, setErr] = useState("");
+
+  const load = () =>
+    api("/settings/mcp")
+      .then((d) => {
+        setServers(d.servers || []);
+        setEnvServers(d.env_servers || []);
+      })
+      .catch((e) => setErr(e.message));
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  async function add() {
+    setErr("");
+    try {
+      const body = {
+        name: form.name.trim(),
+        transport: form.transport,
+        url: form.url.trim() || undefined,
+        command: form.command.trim() || undefined,
+        args: form.args.trim() ? form.args.split(/\s+/) : undefined,
+      };
+      await api("/settings/mcp", { method: "POST", body: JSON.stringify(body) });
+      setForm({ name: "", transport: form.transport, url: "", command: "", args: "" });
+      load();
+    } catch (e) {
+      setErr(e.message);
+    }
+  }
+
+  async function remove(name) {
+    await api(`/settings/mcp/${name}`, { method: "DELETE" });
+    load();
+  }
+
+  const stdio = form.transport === "stdio";
+  return (
+    <div className="mcp-block">
+      <div className="canvas-title" style={{ fontSize: 15 }}>MCP servers</div>
+      <div className="meta">
+        Register servers that expose your existing scripts (a filesystem or git
+        server) or internal tools; agents pick up their tools automatically.
+      </div>
+      {err && <div className="error">{err}</div>}
+      <div className="job-form-row" style={{ marginTop: 8 }}>
+        <input className="sqllab-prompt" style={{ maxWidth: 150 }} placeholder="name"
+          value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
+        <select value={form.transport} onChange={(e) => setForm({ ...form, transport: e.target.value })}>
+          <option value="streamable_http">streamable_http</option>
+          <option value="sse">sse</option>
+          <option value="stdio">stdio</option>
+        </select>
+        {stdio ? (
+          <>
+            <input className="sqllab-prompt" style={{ maxWidth: 120 }} placeholder="command (npx)"
+              value={form.command} onChange={(e) => setForm({ ...form, command: e.target.value })} />
+            <input className="sqllab-prompt" style={{ flex: 1 }} placeholder="args (space-separated)"
+              value={form.args} onChange={(e) => setForm({ ...form, args: e.target.value })} />
+          </>
+        ) : (
+          <input className="sqllab-prompt" style={{ flex: 1 }} placeholder="https://mcp.internal/… "
+            value={form.url} onChange={(e) => setForm({ ...form, url: e.target.value })} />
+        )}
+        <button className="chip chip-on" onClick={add} disabled={!form.name.trim()}>＋ register</button>
+      </div>
+      <div className="share-list">
+        {servers.map((s) => (
+          <div key={s.name} className="share-row">
+            <div>
+              <div>{s.name} <span className="query-tag">{s.transport}</span></div>
+              <div className="meta">{s.url || `${s.command} ${(s.args || []).join(" ")}`}</div>
+            </div>
+            <button className="chip" onClick={() => remove(s.name)}>remove</button>
+          </div>
+        ))}
+        {servers.length === 0 && (
+          <div className="meta">
+            No servers registered{envServers.length ? ` (env: ${envServers.join(", ")})` : ""}.
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function Governance({ onClose }) {
   const [text, setText] = useState("");
   const [meta, setMeta] = useState({ loaded: false, source: null });
@@ -163,6 +254,8 @@ export default function Governance({ onClose }) {
         spellCheck={false}
         placeholder="Load the template to start from your current setup, or paste a governance document…"
       />
+
+      <McpServers />
     </section>
   );
 }

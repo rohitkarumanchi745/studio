@@ -67,14 +67,23 @@ def mcp_servers():
        "tools":     {"transport": "stdio", "command": "npx",
                      "args": ["-y", "@modelcontextprotocol/server-everything"]}}
     """
+    cfg = {}
     raw = os.getenv("STUDIO_MCP_SERVERS", "").strip()
-    if not raw:
-        return {}
+    if raw:
+        try:
+            env_cfg = json.loads(raw)
+            if isinstance(env_cfg, dict):
+                cfg.update(env_cfg)
+        except json.JSONDecodeError:
+            pass
+    # Merge in servers registered in-app (e.g. a filesystem/git server exposing
+    # existing scripts), so agents pick them up without a redeploy.
     try:
-        cfg = json.loads(raw)
-        return cfg if isinstance(cfg, dict) else {}
-    except json.JSONDecodeError:
-        return {}
+        from . import mcp
+        cfg.update(mcp.registered())
+    except Exception:
+        pass
+    return cfg
 
 
 async def _load_mcp_tools(cfg):

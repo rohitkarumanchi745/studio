@@ -1,6 +1,7 @@
 """Connector registry."""
 from .databricks_conn import DatabricksConnector
 from .demo import DemoConnector
+from .graph_conn import GraphConnector
 from .marketing import MARKETING_CONNECTORS
 from .snowflake_conn import SnowflakeConnector
 
@@ -8,6 +9,7 @@ _REGISTRY = {
     "demo": DemoConnector(),
     "snowflake": SnowflakeConnector(),
     "databricks": DatabricksConnector(),
+    "neo4j": GraphConnector(),
 }
 for _mc in MARKETING_CONNECTORS:
     _REGISTRY[_mc.name] = _mc

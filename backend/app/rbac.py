@@ -11,11 +11,11 @@ _MARKETING = ["ga4", "braze", "powerbi_sap", "dynamic_yield", "qualtrics",
 
 POLICIES = {
     "admin": {
-        "demo": "*", "snowflake": "*", "databricks": "*",
+        "demo": "*", "snowflake": "*", "databricks": "*", "neo4j": "*",
         **{m: "*" for m in _MARKETING},
     },
     "analyst": {
-        "demo": "*", "snowflake": "*", "databricks": "*",
+        "demo": "*", "snowflake": "*", "databricks": "*", "neo4j": "*",
         **{m: "*" for m in _MARKETING},
     },
     "viewer": {

@@ -248,6 +248,8 @@ td { color: var(--ink-2); }
 .query-actions { display: flex; gap: 6px; margin: 8px 0; }
 .query-result { margin-top: 8px; }
 
+.mcp-block { margin-top: 18px; border-top: 1px solid var(--line); padding-top: 12px; }
+
 /* ── Supervised jobs ── */
 .job-form-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
 .job-form-row select { font-size: 13px; padding: 6px 8px; }
