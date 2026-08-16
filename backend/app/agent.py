@@ -148,11 +148,30 @@ def llm_available(spec=None, user=None):
 
 
 def make_llm(spec, user=None, **kwargs):
-    """init_chat_model, preferring this user's key over the server's."""
+    """init_chat_model, preferring this user's key over the server's.
+
+    When STUDIO_LLM_BASE_URL points at a self-hosted, OpenAI-compatible endpoint
+    (a BitNet served by vLLM / llama.cpp), the request is routed there and the
+    user's active LoRA adapters — a global tool-calling adapter plus this user's
+    style adapter — ride along, so simultaneous training's newest weights serve
+    the next call. A no-op for hosted Claude/GPT."""
     from langchain.chat_models import init_chat_model
     key = user_key(user, spec)
     if key:
         kwargs["api_key"] = key
+    base_url = os.getenv("STUDIO_LLM_BASE_URL", "").strip()
+    if base_url:
+        kwargs["base_url"] = base_url
+        try:
+            from . import trainer
+            adapters = trainer.active_adapters(user.get("id") if user else None)
+            if adapters:
+                # Passed through to the self-hosted server, which loads the LoRAs
+                # (vLLM multi-LoRA). Harmless extra field for other servers.
+                mk = kwargs.setdefault("model_kwargs", {})
+                mk.setdefault("extra_body", {})["studio_adapters"] = adapters
+        except Exception:
+            pass
     return init_chat_model(spec, **kwargs)
 
 

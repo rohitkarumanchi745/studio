@@ -22,6 +22,7 @@ function RewardChip({ r }) {
 export default function Agents({ onClose }) {
   const [data, setData] = useState(null);
   const [training, setTraining] = useState(null);
+  const [online, setOnline] = useState(null); // simultaneous-training loop status
   const [rewards, setRewards] = useState({}); // agent name -> {n, avg_reward}
   const [error, setError] = useState("");
   const isAdmin = getUser()?.role === "admin";
@@ -30,6 +31,7 @@ export default function Agents({ onClose }) {
     api("/agents").then(setData).catch((e) => setError(e.message));
     if (isAdmin) {
       api("/training").then(setTraining).catch(() => {});
+      api("/training/online").then(setOnline).catch(() => {});
       api("/learning")
         .then((d) => setRewards(Object.fromEntries((d.by_agent || []).map((a) => [a.agent, a]))))
         .catch(() => {});
@@ -135,6 +137,28 @@ export default function Agents({ onClose }) {
             </span>
           </div>
           <div className="meta" style={{ marginTop: 4 }}>method: {training.method} · store: {training.store}</div>
+
+          {/* Simultaneous loop: agent serves + streams rollouts while a trainer
+              consumes them and publishes LoRA adapters Studio hot-swaps in. */}
+          <div className="train-loop">
+            {online?.tool_call_adapter ? (
+              <>
+                <span className={"query-tag " + (online.loop === "live" ? "flow-badge-ok" : "flow-badge-warn")}>
+                  ● loop {online.loop}
+                </span>
+                <span className="meta">tool-calling adapter v{online.tool_call_adapter.version}</span>
+                <span className="meta">{online.user_adapters} per-user adapter{online.user_adapters === 1 ? "" : "s"}</span>
+                <span className="meta">{online.rollouts_since_last_train} rollouts since last train</span>
+              </>
+            ) : (
+              <span className="meta">
+                Simultaneous loop idle — no adapter published yet. Point a BitNet trainer at
+                <code> GET /training/rollouts</code> and <code> POST /training/adapters</code>; set
+                <code> STUDIO_LLM_BASE_URL</code> to serve it. Global tool-calling + per-user style
+                adapters compose per request.
+              </span>
+            )}
+          </div>
         </div>
       )}
 

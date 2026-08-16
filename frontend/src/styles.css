@@ -310,6 +310,9 @@ td { color: var(--ink-2); }
 .train-bar { height: 8px; background: var(--surface-2); border: 1px solid var(--line);
   border-radius: 6px; overflow: hidden; margin-top: 10px; }
 .train-fill { height: 100%; background: linear-gradient(90deg, #6b8e3d, #c9a86a); }
+.train-loop { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center;
+  margin-top: 10px; padding-top: 8px; border-top: 1px dashed var(--line); }
+.train-loop code { background: var(--surface-2); padding: 0 4px; border-radius: 4px; font-size: 11px; }
 
 /* ── Session meters (token / cache accounting) ── */
 .sess-meters { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; }
