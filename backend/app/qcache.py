@@ -16,13 +16,23 @@ Correctness guardrails:
   and fall through to the agent.
 """
 import json
+import os
 import re
 import time
 import uuid
 
 from . import db
 
-THRESHOLD = float(__import__("os").getenv("STUDIO_QCACHE_THRESHOLD", "0.82"))
+# Two distinct bands so the tiers don't overlap:
+#   >= CACHE_THRESHOLD           → near-identical, reuse the exact plan (cache)
+#   [LEARN_THRESHOLD, CACHE)     → a learned *variation*, route to BitNet
+#   <  LEARN_THRESHOLD           → novel, the frontier LLM
+CACHE_THRESHOLD = float(os.getenv("STUDIO_QCACHE_THRESHOLD", "0.9"))
+LEARN_THRESHOLD = float(os.getenv("STUDIO_BITNET_MATCH", "0.6"))
+# A pattern is "learned" (routable to BitNet) once it has been asked at least
+# this many times with at least this average reward — repeated AND successful.
+MIN_SEEN = int(os.getenv("STUDIO_BITNET_MIN_SEEN", "2"))
+MIN_REWARD = float(os.getenv("STUDIO_BITNET_MIN_REWARD", "0.6"))
 
 # Stopwords include query filler AND ranking words (top / most / highest / best):
 # those map to the same stored SQL plan (whose ORDER BY already encodes the
@@ -52,6 +62,8 @@ def init_tables():
             chart TEXT,
             text TEXT,
             hits INTEGER NOT NULL DEFAULT 0,
+            seen INTEGER NOT NULL DEFAULT 0,
+            avg_reward REAL,
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL
         );
@@ -59,6 +71,17 @@ def init_tables():
             ON query_cache(role, source, table_scope);
         """
     )
+    # Learned-pattern columns for any table created before routing existed.
+    if db.IS_PG:
+        c.execute("ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS seen INTEGER NOT NULL DEFAULT 0")
+        c.execute("ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS avg_reward REAL")
+    else:
+        for ddl in ("ALTER TABLE query_cache ADD COLUMN seen INTEGER NOT NULL DEFAULT 0",
+                    "ALTER TABLE query_cache ADD COLUMN avg_reward REAL"):
+            try:
+                c.execute(ddl)
+            except Exception:
+                pass
     c.commit()
     c.close()
 
@@ -116,7 +139,7 @@ def lookup(user, source, table_scope, prompt):
         score = _jaccard(sig, json.loads(r["signature"]))
         if score > best_score:
             best, best_score = r, score
-    if not best or best_score < THRESHOLD:
+    if not best or best_score < CACHE_THRESHOLD:
         return None
 
     executed = _exec_full(user, source, best["sql"])
@@ -134,16 +157,18 @@ def lookup(user, source, table_scope, prompt):
         "text": best["text"] or "Reused a cached query plan.",
         "sql": best["sql"], "columns": cols, "rows": data, "chart": chart,
         "panels": [panel] if (chart or data) else [],
-        "email": None, "errors": [], "mode": "cached", "model": None,
+        "email": None, "errors": [], "mode": "cached", "model": None, "served_by": "cache",
         "agents": [{"name": "Query cache", "source": source, "role": "cache"}],
         "cached": {"similarity": round(best_score, 3), "from_prompt": best["prompt"],
                    "hits": best["hits"] + 1},
     }
 
 
-def store(user, source, table_scope, prompt, result):
-    """Cache a successful single-SQL run's plan. Skips multi-panel/orchestrated
-    and error results — those don't have one reusable plan."""
+def store(user, source, table_scope, prompt, result, reward=None):
+    """Cache a successful single-SQL run's plan, and track how often this pattern
+    recurs and how well it scores — so `learned()` can tell a repeated, reliable
+    pattern (routable to BitNet) from a one-off. Skips multi-panel/orchestrated
+    and error results."""
     sql = result.get("sql")
     text = result.get("text") or ""
     if not sql or text.startswith("(Agent error") or len(result.get("panels") or []) > 1:
@@ -151,17 +176,53 @@ def store(user, source, table_scope, prompt, result):
     sig = _sig(prompt)
     if not sig:
         return
+    if reward is None:
+        reward = 1.0 if result.get("rows") else 0.5
+    chart = json.dumps(result.get("chart")) if result.get("chart") else None
     now = time.time()
     c = db._conn()
-    # One entry per identical signature in scope — refresh it rather than pile up.
-    c.execute("DELETE FROM query_cache WHERE role=? AND source=? AND table_scope=? AND signature=?",
-              (user["role"], source, table_scope, json.dumps(sig)))
-    c.execute(
-        "INSERT INTO query_cache (id, role, source, table_scope, prompt, signature, sql, "
-        "chart, text, hits, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        (str(uuid.uuid4()), user["role"], source, table_scope, prompt[:500],
-         json.dumps(sig), sql, json.dumps(result.get("chart")) if result.get("chart") else None,
-         text[:2000], 0, now, now),
-    )
+    row = c.execute("SELECT id, seen, avg_reward FROM query_cache WHERE role=? AND source=? "
+                    "AND table_scope=? AND signature=?",
+                    (user["role"], source, table_scope, json.dumps(sig))).fetchone()
+    if row:
+        seen = (row["seen"] or 0) + 1
+        prev = row["avg_reward"] if row["avg_reward"] is not None else reward
+        avg = (prev * (seen - 1) + reward) / seen        # running average
+        c.execute("UPDATE query_cache SET sql=?, chart=?, text=?, seen=?, avg_reward=?, "
+                  "updated_at=? WHERE id=?",
+                  (sql, chart, text[:2000], seen, avg, now, row["id"]))
+    else:
+        c.execute(
+            "INSERT INTO query_cache (id, role, source, table_scope, prompt, signature, sql, "
+            "chart, text, hits, seen, avg_reward, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (str(uuid.uuid4()), user["role"], source, table_scope, prompt[:500],
+             json.dumps(sig), sql, chart, text[:2000], 0, 1, reward, now, now))
     c.commit()
     c.close()
+
+
+def learned(user, source, table_scope, prompt):
+    """A repeated + successful pattern BitNet is expected to handle: a signature
+    match against an entry seen >= MIN_SEEN times with avg reward >= MIN_REWARD.
+    Returns the pattern (for logging) or None. The router uses this to decide
+    BitNet vs the frontier LLM."""
+    sig = _sig(prompt)
+    if not sig:
+        return None
+    c = db._conn()
+    rows = c.execute("SELECT prompt, signature, sql, seen, avg_reward FROM query_cache "
+                     "WHERE role=? AND source=? AND table_scope=? AND seen>=? AND avg_reward>=?",
+                     (user["role"], source, table_scope, MIN_SEEN, MIN_REWARD)).fetchall()
+    c.close()
+    best, score = None, 0.0
+    for r in rows:
+        s = _jaccard(sig, json.loads(r["signature"]))
+        if s > score:
+            best, score = r, s
+    # The learned band sits below the cache threshold — a variation the exact
+    # cached plan may not fit, but within a family BitNet has been trained on.
+    if best and LEARN_THRESHOLD <= score < CACHE_THRESHOLD:
+        return {"prompt": best["prompt"], "sql": best["sql"], "seen": best["seen"],
+                "avg_reward": round(best["avg_reward"], 3), "similarity": round(score, 3)}
+    return None

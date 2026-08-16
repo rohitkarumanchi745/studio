@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from . import (agent, db, email_service, keys, lightning, orchestrator, qcache,
-               queryguard, rbac, roster, sessions, skills)
+               queryguard, rbac, roster, router as model_router, sessions, skills)
 from .auth import current_user
 from .catalog import _connector_or_400, match_tables
 
@@ -286,18 +286,39 @@ def _run_turn(ctx, user):
         return result
 
     connector = ctx["connector"]
-    # Semantic cache: a prompt that means the same as an earlier one reuses its
-    # plan (SQL + chart), re-executed fresh — skipping the agent entirely.
+    skill_md = skills.get_skill(connector, user["role"], ctx["allowed"], ctx["schemas"])
+
+    def _run(spec):
+        return agent.run_agent(
+            prompt=prompt, connector=connector, table=ctx["table_param"],
+            allowed_tables=ctx["allowed"], schemas=ctx["schemas"], history=ctx["history"],
+            user=user, model=spec, skill_md=skill_md)
+
+    # Tier 0 — semantic cache: an equivalent prompt reuses its plan (SQL+chart),
+    # re-executed fresh, with no model at all.
     cached = qcache.lookup(user, ctx["source"], ctx["table_label"], prompt)
     if cached is not None:
         result = cached
     else:
-        result = agent.run_agent(
-            prompt=prompt, connector=connector, table=ctx["table_param"],
-            allowed_tables=ctx["allowed"], schemas=ctx["schemas"], history=ctx["history"],
-            user=user, model=model,
-            skill_md=skills.get_skill(connector, user["role"], ctx["allowed"], ctx["schemas"]))
-        qcache.store(user, ctx["source"], ctx["table_label"], prompt, result)
+        # Tier 1/2 — route learned, repeated work to the self-hosted BitNet;
+        # only novel prompts reach the frontier LLM. BitNet's SQL still passes
+        # the guard, and a failed BitNet attempt escalates to the frontier.
+        route, pattern = model_router.choose(user, ctx["source"], ctx["table_label"], prompt)
+        result = None
+        if route == "bitnet":
+            try:
+                r = _run(model_router.bitnet_spec())
+                if r.get("sql") and not r.get("errors"):
+                    r["served_by"] = "bitnet"
+                    r["routed"] = {"model": "bitnet", **{k: pattern[k] for k in ("seen", "avg_reward", "similarity")}}
+                    result = r
+            except Exception:
+                result = None   # escalate below
+        if result is None:
+            result = _run(model)   # frontier LLM (default, or BitNet escalation)
+            result.setdefault("served_by", "frontier")
+        qcache.store(user, ctx["source"], ctx["table_label"], prompt, result,
+                     reward=lightning.heuristic_reward(result))
     result["source"] = ctx["source"]
     result["table"] = ctx["table_label"]
     try:

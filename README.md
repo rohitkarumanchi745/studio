@@ -273,6 +273,15 @@ flowchart TB
   normalized token signature; a semantically-similar prompt reuses it but
   **always re-executes the SQL** through RBAC + guard + governance — fresh rows,
   access re-checked, never stale and never a bypass.
+- **Model cascade** (`router.py`) — learned, repeated work stops paying for the
+  frontier LLM. A turn is routed in three tiers: an **identical** prompt
+  (≥ cache threshold) reuses the cached plan with no model; a **learned
+  variation** (a pattern seen ≥ N times with good reward, matched below the cache
+  band) routes to the **self-hosted BitNet**; a **novel** prompt goes to the
+  frontier LLM. BitNet's SQL still passes the guard, and a failed BitNet attempt
+  escalates to the frontier — so it's cheaper, never wrong. Dormant until a
+  BitNet endpoint is configured (`STUDIO_LLM_BASE_URL`), so it changes nothing
+  on its own.
 
 `usage` on each answer (input/output + cache-read/write tokens) makes the reuse
 measurable.
