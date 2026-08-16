@@ -365,3 +365,10 @@ class DemoConnector(Connector):
         rows = [list(r) for r in cur.fetchmany(int(os.getenv("STUDIO_MAX_ROWS", "50000")))]
         c.close()
         return columns, rows
+
+    def run_script(self, sql):
+        # The demo warehouse is a read-only sandbox — writes are refused even
+        # after approval, which is what a locked-down environment should do.
+        raise PermissionError(
+            "demo is a read-only sandbox — writes are blocked. Point the job at "
+            "a configured Snowflake or Databricks environment.")

@@ -6,6 +6,7 @@ import Dashboard from "./components/Dashboard";
 import DashboardList from "./components/DashboardList";
 import Login from "./components/Login";
 import Governance from "./components/Governance";
+import Jobs from "./components/Jobs";
 import Pipelines from "./components/Pipelines";
 import QueryLibrary from "./components/QueryLibrary";
 import Sidebar from "./components/Sidebar";
@@ -34,6 +35,7 @@ export default function App() {
   const [showQueries, setShowQueries] = useState(false);
   const [showPipelines, setShowPipelines] = useState(false);
   const [showGovernance, setShowGovernance] = useState(false);
+  const [showJobs, setShowJobs] = useState(false);
   // Bumped when a user connects/removes a key so the model menu refetches.
   const [modelsEpoch, setModelsEpoch] = useState(0);
 
@@ -71,6 +73,7 @@ export default function App() {
         onQueries={() => setShowQueries(true)}
         onPipelines={() => setShowPipelines(true)}
         onGovernance={() => setShowGovernance(true)}
+        onJobs={() => setShowJobs(true)}
         onKeysChanged={() => setModelsEpoch((n) => n + 1)}
         onRename={async (id, title) => {
           await api(`/conversations/${id}`, {
@@ -82,7 +85,9 @@ export default function App() {
       />
       )}
       {showActivity && <Activity onClose={() => setShowActivity(false)} />}
-      {showGovernance ? (
+      {showJobs ? (
+        <Jobs onClose={() => setShowJobs(false)} />
+      ) : showGovernance ? (
         <Governance onClose={() => setShowGovernance(false)} />
       ) : showPipelines ? (
         <Pipelines onClose={() => setShowPipelines(false)} />

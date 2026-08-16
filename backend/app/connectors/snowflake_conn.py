@@ -104,3 +104,12 @@ class SnowflakeConnector(Connector):
             rows = [list(r) for r in cur.fetchmany(int(os.getenv("STUDIO_MAX_ROWS", "50000")))]
             return columns, rows
         return self._execute(go)
+
+    def run_script(self, sql):
+        """Execute a write/DDL statement. Reached only after supervisor +
+        human approval (supervisor.py). Returns rowcount when available."""
+        def go(con):
+            cur = con.cursor()
+            cur.execute(sql)
+            return {"rowcount": cur.rowcount}
+        return self._execute(go)

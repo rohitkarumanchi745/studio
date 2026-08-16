@@ -248,6 +248,20 @@ td { color: var(--ink-2); }
 .query-actions { display: flex; gap: 6px; margin: 8px 0; }
 .query-result { margin-top: 8px; }
 
+/* ── Supervised jobs ── */
+.job-form-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
+.job-form-row select { font-size: 13px; padding: 6px 8px; }
+.job-status { font-weight: 700; }
+.job-succeeded { color: #b7e4a0; }
+.job-running, .job-retrying { color: var(--ink-2); }
+.job-awaiting_approval { color: #e9c46a; }
+.job-escalated { color: #e5679a; }
+.job-rejected { color: var(--ink-3); }
+.job-risk { font-size: 10.5px; border-radius: 999px; padding: 1px 7px; border: 1px solid var(--line); }
+.job-risk-read { color: #b7e4a0; }
+.job-risk-write { color: #e9c46a; }
+.job-risk-job { color: #e5679a; }
+
 /* ── Governance ── */
 .gov-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
 .gov-summary { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin: 8px 0; font-size: 13px; }

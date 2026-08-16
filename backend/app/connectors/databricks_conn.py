@@ -108,3 +108,28 @@ class DatabricksConnector(Connector):
             rows = [list(r) for r in cur.fetchmany(int(os.getenv("STUDIO_MAX_ROWS", "50000")))]
             return columns, rows
         return self._execute(go)
+
+    def run_script(self, sql_text):
+        """Execute a write/DDL statement (supervisor + human-approved only)."""
+        def go(con):
+            cur = con.cursor()
+            cur.execute(sql_text)
+            return {"rowcount": getattr(cur, "rowcount", None)}
+        return self._execute(go)
+
+    def submit_spark_job(self, config):
+        """Submit a Databricks Jobs run (Spark). `config` is a Jobs 2.1
+        run-submit body; returns {run_id}. Requires DATABRICKS_TOKEN + host."""
+        import json
+        import urllib.request
+
+        cfg = self._cfg()
+        host = cfg["server_hostname"]
+        url = f"https://{host}/api/2.1/jobs/runs/submit"
+        body = json.dumps(config).encode()
+        req = urllib.request.Request(
+            url, data=body, method="POST",
+            headers={"Authorization": f"Bearer {cfg['access_token']}",
+                     "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode())

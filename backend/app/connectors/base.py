@@ -20,3 +20,17 @@ class Connector:
     def run_query(self, sql):
         """Execute a (pre-validated) SELECT. Return (columns, rows)."""
         raise NotImplementedError
+
+    # ── High-risk capabilities (gated by the supervisor + human-in-the-loop) ──
+    # These break the read-only invariant, so they must never be reached
+    # except through supervisor.py, which requires human approval first.
+
+    def run_script(self, sql):
+        """Execute a write/DDL statement against this environment. Default:
+        unsupported — a connector must opt in."""
+        raise NotImplementedError(f"{self.name} does not support writes")
+
+    def submit_spark_job(self, config):
+        """Submit a Spark / compute job. Return a run handle. Default:
+        unsupported."""
+        raise NotImplementedError(f"{self.name} does not support Spark jobs")
