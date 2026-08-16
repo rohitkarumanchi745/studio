@@ -6,6 +6,7 @@ import ShareDialog from "./ShareDialog";
 export default function Sidebar({
   conversations, activeId, onSelect, onNew, onDelete, onActivity, onCollapse,
   onDashboards, onRename, onKeysChanged, onQueries, onPipelines, onGovernance, onJobs, onPyBuild,
+  onSessions,
 }) {
   const user = getUser();
   const [menu, setMenu] = useState(null);     // {id, title, x, y, canEdit, owned}
@@ -183,6 +184,9 @@ export default function Sidebar({
         </button>
         <button className="logout" onClick={onPyBuild} style={{ marginBottom: 8 }}>
           ⟨⟩ Build Python
+        </button>
+        <button className="logout" onClick={onSessions} style={{ marginBottom: 8 }}>
+          ⟳ Sessions
         </button>
         {user?.role === "admin" && (
           <button className="logout" onClick={onGovernance} style={{ marginBottom: 8 }}>

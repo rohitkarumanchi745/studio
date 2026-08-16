@@ -298,6 +298,10 @@ td { color: var(--ink-2); }
 .lineage-scroll { overflow-x: auto; }
 .lineage svg { display: block; }
 
+/* ── Session meters (token / cache accounting) ── */
+.sess-meters { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; }
+.sess-meters .meta { font-size: 12px; }
+
 /* ── Suggested questions + answer provenance ── */
 .suggestion { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
 .sug-table { color: var(--ink-3); font-size: 11px; flex: none; }

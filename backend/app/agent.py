@@ -172,6 +172,57 @@ def _build_graph(llm, tools, system):
             return create_react_agent(llm, tools, state_modifier=system)
 
 
+def _apply_prompt_cache(system, spec):
+    """Mark the large, stable system/skill prefix for Anthropic prompt caching.
+
+    This is the real hosted-API analog of a KV-cache snapshot: with a
+    cache_control breakpoint the provider keeps the prefix's KV cache warm
+    server-side, so the next turn (or a resumed session replaying the same
+    prefix) is billed at ~10% and skips re-processing it. Returns a
+    SystemMessage carrying the breakpoint for Anthropic; the plain string for
+    other providers or when STUDIO_PROMPT_CACHE is disabled. Never raises."""
+    if os.getenv("STUDIO_PROMPT_CACHE", "1").lower() not in ("1", "true", "yes"):
+        return system
+    if (spec or "").split(":", 1)[0] != "anthropic":
+        return system
+    try:
+        from langchain_core.messages import SystemMessage
+        return SystemMessage(content=[{"type": "text", "text": system,
+                                       "cache_control": {"type": "ephemeral"}}])
+    except Exception:
+        return system
+
+
+def _graph(llm, tools, system, spec):
+    """Build the agent graph, preferring a cache-marked system prompt. Falls
+    back to the plain string if this LangChain build won't take a SystemMessage,
+    so caching is strictly best-effort and never blocks the agent."""
+    cached = _apply_prompt_cache(system, spec)
+    if cached is not system:
+        try:
+            return _build_graph(llm, tools, cached)
+        except Exception:
+            pass
+    return _build_graph(llm, tools, system)
+
+
+def _extract_usage(result):
+    """Sum token usage across the turn's messages, separating cache reads/writes
+    (Anthropic input_token_details) so prompt-cache reuse is measurable."""
+    tot = {"input_tokens": 0, "output_tokens": 0,
+           "cache_read_tokens": 0, "cache_write_tokens": 0}
+    for m in result.get("messages", []):
+        um = getattr(m, "usage_metadata", None)
+        if not isinstance(um, dict):
+            continue
+        tot["input_tokens"] += int(um.get("input_tokens") or 0)
+        tot["output_tokens"] += int(um.get("output_tokens") or 0)
+        det = um.get("input_token_details") or {}
+        tot["cache_read_tokens"] += int(det.get("cache_read") or 0)
+        tot["cache_write_tokens"] += int(det.get("cache_creation") or 0)
+    return tot
+
+
 def _run(connector, sql):
     """Execute + apply governance compliance in one place, so every path that
     returns data to a user (agent tool, fallback preview, canvas compose) is
@@ -324,14 +375,15 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
 
             async def _arun():
                 tools = base_tools + list(await _load_mcp_tools(mcp_cfg))
-                graph = _build_graph(llm, tools, system)
+                graph = _graph(llm, tools, system, spec)
                 return await graph.ainvoke({"messages": messages}, config={"recursion_limit": 16})
 
             result = asyncio.run(_arun())
         else:
-            graph = _build_graph(llm, base_tools, system)
+            graph = _graph(llm, base_tools, system, spec)
             result = graph.invoke({"messages": messages}, config={"recursion_limit": 16})
         text = _final_text(result) or "Done."
+        usage = _extract_usage(result)
     except Exception as e:
         # Provider/graph failure — fall back so the product keeps working,
         # surface the reason, and alert the user by email (best-effort).
@@ -366,6 +418,7 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         "panels": panels,
         "email": ctx["email"],
         "errors": ctx["errors"],
+        "usage": usage,
         "mode": "agent",
         "model": spec,
     }

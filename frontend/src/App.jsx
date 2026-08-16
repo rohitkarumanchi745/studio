@@ -10,6 +10,7 @@ import Jobs from "./components/Jobs";
 import PyBuild from "./components/PyBuild";
 import Pipelines from "./components/Pipelines";
 import QueryLibrary from "./components/QueryLibrary";
+import Sessions from "./components/Sessions";
 import Sidebar from "./components/Sidebar";
 
 // Complete an Entra SSO redirect: /?sso_token=…&sso_user=… → store session.
@@ -38,6 +39,7 @@ export default function App() {
   const [showGovernance, setShowGovernance] = useState(false);
   const [showJobs, setShowJobs] = useState(false);
   const [showPy, setShowPy] = useState(false);
+  const [showSessions, setShowSessions] = useState(false);
   // Bumped when a user connects/removes a key so the model menu refetches.
   const [modelsEpoch, setModelsEpoch] = useState(0);
 
@@ -77,6 +79,7 @@ export default function App() {
         onGovernance={() => setShowGovernance(true)}
         onJobs={() => setShowJobs(true)}
         onPyBuild={() => setShowPy(true)}
+        onSessions={() => setShowSessions(true)}
         onKeysChanged={() => setModelsEpoch((n) => n + 1)}
         onRename={async (id, title) => {
           await api(`/conversations/${id}`, {
@@ -88,7 +91,17 @@ export default function App() {
       />
       )}
       {showActivity && <Activity onClose={() => setShowActivity(false)} />}
-      {showPy ? (
+      {showSessions ? (
+        <Sessions
+          onClose={() => setShowSessions(false)}
+          onResume={(state) => {
+            // Resuming drops back into the exact conversation; its next turn
+            // replays the same stable prefix, reusing the provider cache.
+            setShowSessions(false);
+            if (state?.conversation_id) setActiveId(state.conversation_id);
+          }}
+        />
+      ) : showPy ? (
         <PyBuild onClose={() => setShowPy(false)} />
       ) : showJobs ? (
         <Jobs onClose={() => setShowJobs(false)} />

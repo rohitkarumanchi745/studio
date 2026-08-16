@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from . import (agent, db, email_service, keys, lightning, orchestrator, queryguard,
-               rbac, skills)
+               rbac, sessions, skills)
 from .auth import current_user
 from .catalog import _connector_or_400, match_tables
 
@@ -176,6 +176,7 @@ def ask(body: Ask, user=Depends(current_user)):
             ok=not (result.get("text") or "").startswith(("(Agent error", "(Orchestrator error")),
             duration_ms=int((time.time() - t0) * 1000),
         )
+        _checkpoint(user, cid, result, model, "*", "all sources")
         return {"conversation_id": cid, "message": result}
 
     if not rbac.can_access(user["role"], body.source, body.table):
@@ -263,6 +264,7 @@ def ask(body: Ask, user=Depends(current_user)):
         duration_ms=int((time.time() - t0) * 1000),
     )
 
+    _checkpoint(user, cid, result, model, body.source, table_label)
     return {"conversation_id": cid, "message": result}
 
 
@@ -477,6 +479,24 @@ def _conversation(cid, user, prompt):
         ][-8:]
         return cid, history
     return db.create_conversation(user["id"], prompt), []
+
+
+def _checkpoint(user, cid, result, model, source, table_scope):
+    """Serialize the conversation as a resumable agent session after each turn,
+    folding in this turn's token/cache usage. Best-effort — a snapshot failure
+    must never fail the chat response."""
+    try:
+        transcript = [{"role": m["role"], "text": (m.get("content") or {}).get("text", "")}
+                      for m in db.list_messages(cid)]
+        title = (db.get_conversation_title(cid) if hasattr(db, "get_conversation_title")
+                 else None) or (transcript[0]["text"][:80] if transcript else "Session")
+        sessions.snapshot(
+            user, conversation_id=cid, title=title,
+            model_spec=result.get("model") or model, source=source,
+            table_scope=table_scope, messages=transcript, usage=result.get("usage"),
+            count_turn=True)
+    except Exception:
+        pass
 
 
 def _query_inputs(result):
