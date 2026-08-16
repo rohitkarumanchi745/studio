@@ -129,6 +129,10 @@ def remove(cid: str, user=Depends(current_user)):
     # Deleting destroys it for everyone it is shared with — owner only.
     _own_or_404(cid, user, need="owner")
     db.delete_conversation(cid)
+    c = db._conn()   # drop this chat's background-task rows too (no orphans)
+    c.execute("DELETE FROM chat_tasks WHERE conversation_id=?", (cid,))
+    c.commit()
+    c.close()
     return {"deleted": True}
 
 
