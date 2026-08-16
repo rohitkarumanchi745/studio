@@ -47,8 +47,8 @@ def init_tables():
     c = db._conn()
     c.executescript(
         """
-        CREATE TABLE IF NOT EXISTS governance_config (
-            id INTEGER PRIMARY KEY,
+        CREATE TABLE IF NOT EXISTS governance_docs (
+            id TEXT PRIMARY KEY,
             yaml TEXT NOT NULL,
             applied_by TEXT,
             applied_at REAL NOT NULL
@@ -65,7 +65,7 @@ def load():
     import os
 
     c = db._conn()
-    row = c.execute("SELECT yaml FROM governance_config ORDER BY applied_at DESC LIMIT 1").fetchone()
+    row = c.execute("SELECT yaml FROM governance_docs ORDER BY applied_at DESC LIMIT 1").fetchone()
     c.close()
     if row and row["yaml"].strip():
         _set(row["yaml"], "database")
@@ -232,8 +232,8 @@ def apply_yaml(text, user):
     if not ok:
         return False, errors
     c = db._conn()
-    c.execute("INSERT INTO governance_config (yaml, applied_by, applied_at) VALUES (?,?,?)",
-              (text, (user or {}).get("email"), time.time()))
+    c.execute("INSERT INTO governance_docs (id, yaml, applied_by, applied_at) VALUES (?,?,?,?)",
+              (__import__("uuid").uuid4().hex, text, (user or {}).get("email"), time.time()))
     c.commit()
     c.close()
     reload()
@@ -335,7 +335,7 @@ def clear_config(user=Depends(current_user)):
     """Revert to built-in RBAC (removes the applied document)."""
     _admin(user)
     c = db._conn()
-    c.execute("DELETE FROM governance_config")
+    c.execute("DELETE FROM governance_docs")
     c.commit()
     c.close()
     reload()
