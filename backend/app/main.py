@@ -56,6 +56,7 @@ for _router in (auth.router, catalog.router, chat.router, dashboards.router,
 @app.on_event("startup")
 def startup():
     db.init_db()
+    chat.init_tables()
     dashboards.init_tables()
     keys.init_tables()
     queries.init_tables()

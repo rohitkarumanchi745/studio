@@ -62,6 +62,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
   const [prompt, setPrompt] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [pollTask, setPollTask] = useState(null); // {id, cid} of a running background task
   const endRef = useRef(null);
 
   useEffect(() => {
@@ -82,6 +83,10 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
 
   useEffect(() => {
     setError("");
+    // Switching chats abandons any poll tied to the previous conversation; its
+    // task keeps running server-side and its blue dot appears when it finishes.
+    setPollTask(null);
+    setBusy(false);
     if (!conversationId) {
       setMessages([]);
       setCanvas(null);
@@ -97,12 +102,53 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
           .reverse()
           .find((m) => m.role === "assistant" && (m.panels?.length || (m.chart && m.rows?.length)));
         setCanvas(last ? buildCanvas(last) : null);
+        // If a background task is still running here, resume the live state.
+        api(`/conversations/${conversationId}/task`)
+          .then((t) => {
+            if (t.status === "running") {
+              setBusy(true);
+              setPollTask({ id: t.id, cid: conversationId });
+            }
+          })
+          .catch(() => {});
       })
       .catch(() => {
         setMessages([]);
         setCanvas(null);
       });
   }, [conversationId]);
+
+  // Poll a running background task; when it finishes, reload the conversation.
+  useEffect(() => {
+    if (!pollTask) return;
+    let stop = false;
+    let handle;
+    const tick = async () => {
+      if (stop) return;
+      try {
+        const st = await api(`/tasks/${pollTask.id}`);
+        if (st.status !== "running") {
+          // Only apply to the view if this is still the open conversation.
+          if (pollTask.cid === conversationId) {
+            const ms = await api(`/conversations/${pollTask.cid}/messages`);
+            const loaded = ms.map((m) => ({ role: m.role, ...m.content }));
+            setMessages(loaded);
+            const last = [...loaded].reverse().find(
+              (m) => m.role === "assistant" && (m.panels?.length || (m.chart && m.rows?.length)));
+            setCanvas(last ? buildCanvas(last) : null);
+            handleModelError(loaded);
+            if (st.status === "failed") setError(st.error || "The task failed.");
+            setBusy(false);
+          }
+          setPollTask(null);
+          return;
+        }
+      } catch { /* keep polling */ }
+      if (!stop) handle = setTimeout(tick, 2500);
+    };
+    handle = setTimeout(tick, 2000);
+    return () => { stop = true; clearTimeout(handle); };
+  }, [pollTask, conversationId]);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -114,10 +160,13 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
     if (!q || busy || (!orchestrated && tables.length === 0)) return;
     setPrompt("");
     setError("");
+    // Optimistically show the question + a working placeholder; the answer is
+    // produced in the background, so the user can switch to another chat and
+    // start a different task without waiting.
     setMessages((m) => [...m, { role: "user", text: q, source, table: tableLabel }]);
     setBusy(true);
     try {
-      const data = await api("/chat", {
+      const data = await api("/chat/background", {
         method: "POST",
         body: JSON.stringify({
           prompt: q,
@@ -128,27 +177,25 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
           model: model || undefined,
         }),
       });
-      // A model can be "available" (its key is set) yet still fail — no
-      // credit, revoked key. Drop back to the server default so a stale
-      // per-device choice can't leave this browser stuck in fallback.
-      const me = data.message?.model_error;
-      if (me?.retryable_with_default) {
-        const def = models.find((x) => x.default) || models[0];
-        if (def && def.spec !== me.spec) {
-          setModel(def.spec);
-          setError(`${me.spec} failed (${me.detail.slice(0, 90)}…) — switched to ${def.name}. Ask again.`);
-        }
-      }
-      setMessages((m) => [...m, { role: "assistant", ...data.message }]);
-      // Chart(s) produced → canvas takes the main screen, chat docks aside.
-      if (data.message.panels?.length || (data.message.chart && data.message.rows?.length)) {
-        setCanvas(buildCanvas(data.message));
-      }
       if (!conversationId) onConversationCreated(data.conversation_id);
+      setPollTask({ id: data.task_id, cid: data.conversation_id });
     } catch (err) {
       setError(err.message);
-    } finally {
       setBusy(false);
+    }
+  }
+
+  // A model can be "available" yet fail (no credit, revoked key). After a run
+  // completes, drop back to the server default so a stale per-device choice
+  // can't leave this browser stuck.
+  function handleModelError(loaded) {
+    const me = [...loaded].reverse().find((m) => m.role === "assistant")?.model_error;
+    if (me?.retryable_with_default) {
+      const def = models.find((x) => x.default) || models[0];
+      if (def && def.spec !== me.spec) {
+        setModel(def.spec);
+        setError(`${me.spec} failed (${me.detail.slice(0, 90)}…) — switched to ${def.name}. Ask again.`);
+      }
     }
   }
 

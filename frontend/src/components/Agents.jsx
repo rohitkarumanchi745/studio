@@ -3,15 +3,18 @@
 // which agents are callable for your role and the tables each is briefed on —
 // so you can see exactly which agent answers which question.
 import { useEffect, useState } from "react";
-import { api } from "../api";
+import { api, getUser } from "../api";
 
 export default function Agents({ onClose }) {
   const [data, setData] = useState(null);
+  const [training, setTraining] = useState(null);
   const [error, setError] = useState("");
+  const isAdmin = getUser()?.role === "admin";
 
   useEffect(() => {
     api("/agents").then(setData).catch((e) => setError(e.message));
-  }, []);
+    if (isAdmin) api("/training").then(setTraining).catch(() => {});
+  }, [isAdmin]);
 
   const agents = data?.agents || [];
   const live = agents.filter((a) => a.accessible);
@@ -86,6 +89,29 @@ export default function Agents({ onClose }) {
           </div>
         )}
       </div>
+
+      {isAdmin && training && (
+        <div className="mcp-block">
+          <div className="canvas-title" style={{ fontSize: 15 }}>Train our own model</div>
+          <div className="meta">
+            Every prompt users ask is collected as a rollout. Once enough accumulate,
+            they train our own policy — prompt optimization now, weight RL when a
+            self-hosted model is available.
+          </div>
+          <div className="train-bar">
+            <div className="train-fill" style={{ width: `${Math.round(training.progress * 100)}%` }} />
+          </div>
+          <div className="sess-meters" style={{ marginTop: 6 }}>
+            <span className="meta"><b>{training.collected}</b> / {training.threshold} prompts collected</span>
+            <span className="meta">{training.usable} reward-labeled</span>
+            <span className="meta">{training.human_labeled} human-rated</span>
+            <span className={"query-tag " + (training.ready ? "flow-badge-ok" : "")}>
+              {training.ready ? "ready to train" : "collecting"}
+            </span>
+          </div>
+          <div className="meta" style={{ marginTop: 4 }}>method: {training.method} · store: {training.store}</div>
+        </div>
+      )}
 
       {(data?.pipeline_crew?.length > 0 || data?.utility_agents?.length > 0) && (
         <>

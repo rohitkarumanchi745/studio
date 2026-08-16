@@ -1,8 +1,10 @@
 """Chat: conversations, the ask endpoint driving the agent, fresh-data rerun,
 email reports, and the per-user activity audit log."""
+import concurrent.futures
 import json
 import os
 import time
+import uuid
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -14,6 +16,34 @@ from .auth import current_user
 from .catalog import _connector_or_400, match_tables
 
 router = APIRouter(tags=["chat"])
+
+# Background tasks let a user start a question in one chat, move to another, and
+# be notified (a blue dot on the conversation) when it finishes. Bounded pool —
+# a run holds a worker for its duration.
+_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+
+def init_tables():
+    c = db._conn()
+    c.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS chat_tasks (
+            id TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            prompt TEXT,
+            status TEXT NOT NULL DEFAULT 'running',
+            error TEXT,
+            seen INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            finished_at REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_chat_tasks_user
+            ON chat_tasks(user_id, conversation_id);
+        """
+    )
+    c.commit()
+    c.close()
 
 
 class Ask(BaseModel):
@@ -78,12 +108,19 @@ def drop_key(provider: str, user=Depends(current_user)):
 
 @router.get("/conversations")
 def conversations(user=Depends(current_user)):
-    return db.list_conversations(user["id"])
+    convs = db.list_conversations(user["id"])
+    states = _task_states(user["id"])
+    for c in convs:
+        s = states.get(c["id"], {})
+        c["running"] = s.get("running", 0)   # a task is still working here
+        c["unseen"] = s.get("unseen", 0)     # finished, not yet opened → blue dot
+    return convs
 
 
 @router.get("/conversations/{cid}/messages")
 def messages(cid: str, user=Depends(current_user)):
     access = _own_or_404(cid, user)
+    _mark_seen(cid, user["id"])   # opening the chat clears its blue dot
     return _visible_messages(cid, user, access)
 
 
@@ -146,8 +183,11 @@ def remove_share(cid: str, share_user_id: str, user=Depends(current_user)):
     return {"shares": db.list_conversation_shares(cid), "can_share": True}
 
 
-@router.post("/chat")
-def ask(body: Ask, user=Depends(current_user)):
+def _prepare(body, user):
+    """Synchronous half of a turn: validate, resolve/create the conversation,
+    append the user message. Returns a context for _run_turn, or raises
+    HTTPException on validation/RBAC errors — so both the sync path and the
+    background submit fail fast, before any agent work starts."""
     prompt = body.prompt.strip()
     if not prompt:
         raise HTTPException(400, "Empty prompt")
@@ -158,38 +198,15 @@ def ask(body: Ask, user=Depends(current_user)):
             raise HTTPException(400, f"Model '{body.model}' is not offered")
         model = body.model
 
-    # source "*": the orchestrator fans the question out across per-database
-    # agents (one per source this role may access, each with its skill file).
+    # source "*": the orchestrator fans out across per-database agents.
     if body.source == "*":
         cid, history = _conversation(body.conversation_id, user, prompt)
         db.add_message(cid, "user", {"text": prompt, "source": "*", "table": "all sources",
                                      "author_role": user["role"]})
-        t0 = time.time()
-        result = orchestrator.run_orchestrated(prompt, user, history, model)
-        result.setdefault("source", "*")
-        result["table"] = "all sources"
-        result["matched_tables"] = []
-        result["inputs"] = _query_inputs(result)
-        tid = lightning.record_chat_trace(
-            user, cid, prompt, result, int((time.time() - t0) * 1000))
-        if tid:
-            result["trace_id"] = tid
-        result["author_role"] = user["role"]
-        db.add_message(cid, "assistant", result)
-        db.log_activity(
-            user, "chat", prompt=prompt, source="*",
-            table=",".join(result.get("agents_used") or []) or "all sources",
-            sql=result.get("sql"), mode=result.get("mode"),
-            row_count=len(result.get("rows") or []),
-            ok=not (result.get("text") or "").startswith(("(Agent error", "(Orchestrator error")),
-            duration_ms=int((time.time() - t0) * 1000),
-        )
-        _checkpoint(user, cid, result, model, "*", "all sources")
-        return {"conversation_id": cid, "message": result}
+        return {"mode": "*", "cid": cid, "history": history, "model": model, "prompt": prompt}
 
     if not rbac.can_access(user["role"], body.source, body.table):
         raise HTTPException(403, "Your role has no access to this table")
-
     connector = _connector_or_400(body.source)
     try:
         all_tables = connector.list_tables()
@@ -206,7 +223,7 @@ def ask(body: Ask, user=Depends(current_user)):
         if denied:
             raise HTTPException(403, f"Your role has no access to: {', '.join(denied)}")
         allowed = [t for t in allowed if t in selection]
-        table_param = "*"  # agent scopes to `allowed`, which is the selection
+        table_param = "*"
         table_label = ", ".join(allowed)
     else:
         if body.table != "*" and body.table not in allowed:
@@ -214,7 +231,6 @@ def ask(body: Ask, user=Depends(current_user)):
         table_param = body.table
         table_label = body.table
 
-    # Schema context for every table in scope (capped).
     try:
         if table_param == "*":
             schemas = {t: connector.get_schema(t) for t in allowed[:10]}
@@ -226,54 +242,163 @@ def ask(body: Ask, user=Depends(current_user)):
     cid, history = _conversation(body.conversation_id, user, prompt)
     db.add_message(cid, "user", {"text": prompt, "source": body.source, "table": table_label,
                                  "author_role": user["role"]})
+    return {"mode": "normal", "cid": cid, "history": history, "model": model, "prompt": prompt,
+            "source": body.source, "connector": connector, "all_tables": all_tables,
+            "allowed": allowed, "schemas": schemas, "table_param": table_param,
+            "table_label": table_label}
 
+
+def _run_turn(ctx, user):
+    """Heavy half of a turn: run the agent, append the assistant message, trace,
+    and checkpoint. Pure work off the prepared context — safe in a thread."""
+    cid, model, prompt = ctx["cid"], ctx["model"], ctx["prompt"]
     t0 = time.time()
-    result = agent.run_agent(
-        prompt=prompt,
-        connector=connector,
-        table=table_param,
-        allowed_tables=allowed,
-        schemas=schemas,
-        history=history,
-        user=user,
-        model=model,
-        # This source's agent skill file: the RBAC-scoped database briefing,
-        # auto-rebuilt whenever the schema or this role's access changes.
-        skill_md=skills.get_skill(connector, user["role"], allowed, schemas),
-    )
-    result["source"] = body.source
-    result["table"] = table_label
 
-    # Which tables does this business request touch? Match across everything
-    # the user may see (not just the current selection) so discovery works.
+    if ctx["mode"] == "*":
+        result = orchestrator.run_orchestrated(prompt, user, ctx["history"], model)
+        result.setdefault("source", "*")
+        result["table"] = "all sources"
+        result["matched_tables"] = []
+        result["inputs"] = _query_inputs(result)
+        tid = lightning.record_chat_trace(user, cid, prompt, result, int((time.time() - t0) * 1000))
+        if tid:
+            result["trace_id"] = tid
+        result["author_role"] = user["role"]
+        db.add_message(cid, "assistant", result)
+        db.log_activity(
+            user, "chat", prompt=prompt, source="*",
+            table=",".join(result.get("agents_used") or []) or "all sources",
+            sql=result.get("sql"), mode=result.get("mode"),
+            row_count=len(result.get("rows") or []),
+            ok=not (result.get("text") or "").startswith(("(Agent error", "(Orchestrator error")),
+            duration_ms=int((time.time() - t0) * 1000))
+        _checkpoint(user, cid, result, model, "*", "all sources")
+        return result
+
+    connector = ctx["connector"]
+    result = agent.run_agent(
+        prompt=prompt, connector=connector, table=ctx["table_param"],
+        allowed_tables=ctx["allowed"], schemas=ctx["schemas"], history=ctx["history"],
+        user=user, model=model,
+        skill_md=skills.get_skill(connector, user["role"], ctx["allowed"], ctx["schemas"]))
+    result["source"] = ctx["source"]
+    result["table"] = ctx["table_label"]
     try:
-        match_schemas = dict(schemas)
-        for t in rbac.allowed_tables(user["role"], body.source, all_tables)[:20]:
+        match_schemas = dict(ctx["schemas"])
+        for t in rbac.allowed_tables(user["role"], ctx["source"], ctx["all_tables"])[:20]:
             if t not in match_schemas:
                 match_schemas[t] = connector.get_schema(t)
         result["matched_tables"] = match_tables(prompt, match_schemas)
     except Exception:
         result["matched_tables"] = []
     result["inputs"] = _query_inputs(result)
-    # Agent Lightning-style rollout: record the run with a heuristic reward;
-    # the trace id rides inside the message so 👍/👎 can re-score it later.
-    tid = lightning.record_chat_trace(
-        user, cid, prompt, result, int((time.time() - t0) * 1000))
+    tid = lightning.record_chat_trace(user, cid, prompt, result, int((time.time() - t0) * 1000))
     if tid:
         result["trace_id"] = tid
     result["author_role"] = user["role"]
     db.add_message(cid, "assistant", result)
-
     db.log_activity(
-        user, "chat", prompt=prompt, source=body.source, table=table_label,
+        user, "chat", prompt=prompt, source=ctx["source"], table=ctx["table_label"],
         sql=result.get("sql"), mode=result.get("mode"),
         row_count=len(result.get("rows") or []),
         ok=not (result.get("text") or "").startswith("(Agent error"),
-        duration_ms=int((time.time() - t0) * 1000),
-    )
+        duration_ms=int((time.time() - t0) * 1000))
+    _checkpoint(user, cid, result, model, ctx["source"], ctx["table_label"])
+    return result
 
-    _checkpoint(user, cid, result, model, body.source, table_label)
-    return {"conversation_id": cid, "message": result}
+
+@router.post("/chat")
+def ask(body: Ask, user=Depends(current_user)):
+    """Synchronous turn — waits for the answer."""
+    ctx = _prepare(body, user)
+    result = _run_turn(ctx, user)
+    return {"conversation_id": ctx["cid"], "message": result}
+
+
+@router.post("/chat/background", status_code=202)
+def ask_background(body: Ask, user=Depends(current_user)):
+    """Start a turn without waiting. Returns immediately with a task id; the
+    answer is appended to the conversation when it finishes, and the
+    conversation gets an unseen marker (the blue dot) until it's opened. Lets a
+    user run tasks in several chats at once."""
+    ctx = _prepare(body, user)   # validates + writes the user message now
+    tid = str(uuid.uuid4())
+    now = time.time()
+    c = db._conn()
+    c.execute("INSERT INTO chat_tasks (id, conversation_id, user_id, prompt, status, "
+              "seen, created_at) VALUES (?,?,?,?,?,?,?)",
+              (tid, ctx["cid"], user["id"], ctx["prompt"][:500], "running", 0, now))
+    c.commit()
+    c.close()
+    _EXECUTOR.submit(_bg_run, ctx, dict(user), tid)
+    return {"conversation_id": ctx["cid"], "task_id": tid, "status": "running"}
+
+
+def _bg_run(ctx, user, tid):
+    """Runs in a worker thread: execute the turn, then record task outcome."""
+    status, error = "done", None
+    try:
+        _run_turn(ctx, user)
+    except Exception as e:
+        status, error = "failed", str(e)[:500]
+    try:
+        c = db._conn()
+        c.execute("UPDATE chat_tasks SET status=?, error=?, finished_at=? WHERE id=?",
+                  (status, error, time.time(), tid))
+        c.commit()
+        c.close()
+    except Exception:
+        pass
+
+
+@router.get("/tasks/{tid}")
+def task_status(tid: str, user=Depends(current_user)):
+    c = db._conn()
+    r = c.execute("SELECT id, conversation_id, user_id, status, error FROM chat_tasks WHERE id=?",
+                  (tid,)).fetchone()
+    c.close()
+    if r is None or dict(r)["user_id"] != user["id"]:
+        raise HTTPException(404, "Task not found")
+    d = dict(r)
+    d.pop("user_id", None)
+    return d
+
+
+@router.get("/conversations/{cid}/task")
+def latest_task(cid: str, user=Depends(current_user)):
+    """The most recent background task for a conversation — so reopening a chat
+    whose task is still running resumes the live 'working…' state."""
+    _own_or_404(cid, user)
+    c = db._conn()
+    r = c.execute("SELECT id, status, error FROM chat_tasks WHERE conversation_id=? AND user_id=? "
+                  "ORDER BY created_at DESC LIMIT 1", (cid, user["id"])).fetchone()
+    c.close()
+    return dict(r) if r else {"status": "none"}
+
+
+def _task_states(user_id):
+    """Per-conversation task counts for the sidebar: how many are still running,
+    and how many finished but haven't been seen (the blue dot)."""
+    c = db._conn()
+    rows = c.execute("SELECT conversation_id, status, seen FROM chat_tasks WHERE user_id=?",
+                     (user_id,)).fetchall()
+    c.close()
+    out = {}
+    for r in rows:
+        d = out.setdefault(r["conversation_id"], {"running": 0, "unseen": 0})
+        if r["status"] == "running":
+            d["running"] += 1
+        elif not r["seen"]:
+            d["unseen"] += 1
+    return out
+
+
+def _mark_seen(cid, user_id):
+    c = db._conn()
+    c.execute("UPDATE chat_tasks SET seen=1 WHERE conversation_id=? AND user_id=? AND status!='running'",
+              (cid, user_id))
+    c.commit()
+    c.close()
 
 
 class Rerun(BaseModel):
@@ -482,6 +607,78 @@ def _agent_tally(traces):
            for d in tally.values()]
     out.sort(key=lambda x: -x["n"])
     return out
+
+
+@router.get("/skills")
+def skills_catalog(user=Depends(current_user)):
+    """Every skill file this user's role can see — the RBAC-scoped briefing each
+    per-source agent runs on (source, dialect, tables, schemas). This is exactly
+    what the agents read, surfaced so a user can read it too."""
+    out = []
+    for s in orchestrator.accessible_sources(user):
+        conn = s["connector"]
+        out.append({
+            "source": conn.name,
+            "agent": roster.name_for(conn.name),
+            "dialect": conn.dialect,
+            "tables": s["allowed"],
+            "skill": s["skill"],
+        })
+    return {"skills": out, "role": user["role"]}
+
+
+def _training_stats():
+    c = db._conn()
+    n = lambda q: c.execute(q).fetchone()["n"]
+    stats = {
+        "total_rollouts": n("SELECT COUNT(*) n FROM agent_traces"),
+        "usable": n("SELECT COUNT(*) n FROM agent_traces WHERE reward IS NOT NULL"),
+        "distinct_prompts": n("SELECT COUNT(DISTINCT prompt) n FROM agent_traces WHERE prompt IS NOT NULL"),
+        "human_labeled": n("SELECT COUNT(*) n FROM agent_traces WHERE reward_source='user'"),
+    }
+    c.close()
+    return stats
+
+
+@router.get("/training")
+def training(user=Depends(current_user)):
+    """Readiness to train our own model from collected prompts. On hosted models
+    the lever is prompt optimization (APO); the same rollouts graduate to weight
+    RL once a self-hosted open-weight model is available. Admin-only."""
+    if user["role"] != "admin":
+        raise HTTPException(403, "Only admins can view training readiness")
+    threshold = int(os.getenv("STUDIO_TRAIN_THRESHOLD", "500"))
+    stats = _training_stats()
+    collected = stats["distinct_prompts"]      # prompts from users — the gate
+    stats["threshold"] = threshold
+    stats["collected"] = collected
+    stats["ready"] = collected >= threshold
+    stats["progress"] = round(min(1.0, collected / threshold), 3) if threshold else 1.0
+    stats["store"] = "postgres" if db.IS_PG else f"sqlite ({db.DB_PATH})"
+    # usable = reward-labeled rollouts (the trainable subset); the rest are
+    # unlabeled prompts still useful for prompt optimization.
+    stats["method"] = "APO (prompt optimization) now · weight RL when self-hosted"
+    return stats
+
+
+class ExportIn(BaseModel):
+    path: Optional[str] = None
+
+
+@router.post("/training/export")
+def training_export(body: ExportIn, user=Depends(current_user)):
+    """Export the reward-labeled rollouts as JSONL (the shape an RL/APO trainer
+    consumes). Admin-only."""
+    if user["role"] != "admin":
+        raise HTTPException(403, "Only admins can export training data")
+    path = (body.path or os.path.join(os.getenv("STUDIO_EXPORT_DIR", "/tmp"),
+                                      "studio_rollouts.jsonl"))
+    try:
+        n = lightning.export_rollouts(path)
+    except Exception as e:
+        raise HTTPException(500, f"Export failed: {e}")
+    db.log_activity(user, "training_export", prompt=f"{n} rollouts")
+    return {"exported": n, "path": path}
 
 
 def _canvas_source(body, user):

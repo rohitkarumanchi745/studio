@@ -298,6 +298,19 @@ td { color: var(--ink-2); }
 .lineage-scroll { overflow-x: auto; }
 .lineage svg { display: block; }
 
+/* ── Chat task indicators (blue dot / running) ── */
+.conv-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  background: #3987e5; margin-right: 7px; vertical-align: middle;
+  box-shadow: 0 0 6px rgba(57,135,229,0.7); }
+.conv-run { color: #c9a86a; margin-right: 3px; animation: convspin 1.4s linear infinite;
+  display: inline-block; }
+@keyframes convspin { to { transform: rotate(360deg); } }
+
+/* ── Training readiness bar ── */
+.train-bar { height: 8px; background: var(--surface-2); border: 1px solid var(--line);
+  border-radius: 6px; overflow: hidden; margin-top: 10px; }
+.train-fill { height: 100%; background: linear-gradient(90deg, #6b8e3d, #c9a86a); }
+
 /* ── Session meters (token / cache accounting) ── */
 .sess-meters { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; }
 .sess-meters .meta { font-size: 12px; }

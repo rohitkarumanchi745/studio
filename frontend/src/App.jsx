@@ -13,6 +13,7 @@ import PyBuild from "./components/PyBuild";
 import Pipelines from "./components/Pipelines";
 import QueryLibrary from "./components/QueryLibrary";
 import Sessions from "./components/Sessions";
+import Skills from "./components/Skills";
 import Sidebar from "./components/Sidebar";
 
 // Complete an Entra SSO redirect: /?sso_token=…&sso_user=… → store session.
@@ -44,6 +45,7 @@ export default function App() {
   const [showSessions, setShowSessions] = useState(false);
   const [showAgents, setShowAgents] = useState(false);
   const [showFlow, setShowFlow] = useState(false);
+  const [showSkills, setShowSkills] = useState(false);
   // Bumped when a user connects/removes a key so the model menu refetches.
   const [modelsEpoch, setModelsEpoch] = useState(0);
 
@@ -53,6 +55,14 @@ export default function App() {
   }, []);
 
   useEffect(refresh, [refresh, user]);
+
+  // Poll conversations so a background task finishing in another chat lights up
+  // its blue dot without a manual refresh.
+  useEffect(() => {
+    if (!user) return;
+    const h = setInterval(refresh, 6000);
+    return () => clearInterval(h);
+  }, [user, refresh]);
 
   if (!user) return <Login onLogin={setUser} />;
 
@@ -86,6 +96,7 @@ export default function App() {
         onSessions={() => setShowSessions(true)}
         onAgents={() => setShowAgents(true)}
         onFlow={() => setShowFlow(true)}
+        onSkills={() => setShowSkills(true)}
         onKeysChanged={() => setModelsEpoch((n) => n + 1)}
         onRename={async (id, title) => {
           await api(`/conversations/${id}`, {
@@ -97,7 +108,9 @@ export default function App() {
       />
       )}
       {showActivity && <Activity onClose={() => setShowActivity(false)} />}
-      {showFlow ? (
+      {showSkills ? (
+        <Skills onClose={() => setShowSkills(false)} />
+      ) : showFlow ? (
         <Flow onClose={() => setShowFlow(false)} onOpenJobs={() => { setShowFlow(false); setShowJobs(true); }} />
       ) : showAgents ? (
         <Agents onClose={() => setShowAgents(false)} />

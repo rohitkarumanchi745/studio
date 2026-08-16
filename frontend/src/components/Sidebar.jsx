@@ -6,7 +6,7 @@ import ShareDialog from "./ShareDialog";
 export default function Sidebar({
   conversations, activeId, onSelect, onNew, onDelete, onActivity, onCollapse,
   onDashboards, onRename, onKeysChanged, onQueries, onPipelines, onGovernance, onJobs, onPyBuild,
-  onSessions, onAgents, onFlow,
+  onSessions, onAgents, onFlow, onSkills,
 }) {
   const user = getUser();
   const [menu, setMenu] = useState(null);     // {id, title, x, y, canEdit, owned}
@@ -101,6 +101,11 @@ export default function Sidebar({
             ) : (
               <>
                 <span className="conv-title">
+                  {c.running > 0 ? (
+                    <span className="conv-run" title="A task is running here">◌ </span>
+                  ) : c.unseen > 0 ? (
+                    <span className="conv-dot" title="A task finished — open to view" />
+                  ) : null}
                   {c.shared && <span className="conv-shared" title="Shared with you">◈ </span>}
                   {c.title}
                 </span>
@@ -193,6 +198,9 @@ export default function Sidebar({
         </button>
         <button className="logout" onClick={onAgents} style={{ marginBottom: 8 }}>
           ⚇ Agents
+        </button>
+        <button className="logout" onClick={onSkills} style={{ marginBottom: 8 }}>
+          ▤ Skill files
         </button>
         {user?.role === "admin" && (
           <button className="logout" onClick={onGovernance} style={{ marginBottom: 8 }}>
