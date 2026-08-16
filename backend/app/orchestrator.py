@@ -1,23 +1,28 @@
-"""Cross-database orchestration.
+"""Cross-database orchestration — parallel fan-out + aggregator.
 
-Every configured data source the user's role can access gets its own agent,
-briefed by that source's skill file (skills.py — RBAC-scoped tables/schemas,
-auto-refreshed on schema or access changes). The orchestrator is an agent
-whose tools are those per-database agents: it routes each question to the
-right database(s), lets each source agent write and run its own SQL, and
-synthesizes the answers. Sub-agent charts accumulate as panels so a
-cross-database question renders one dashboard.
+                    ┌→ Snowflake agent ─┐
+   User question ──┼→ Databricks agent ┼→ Aggregator → one synthesized answer
+                    └→ SAP agent ───────┘
 
-Without an LLM key the orchestrator degrades to deterministic routing: the
-source whose tables best match the prompt (catalog.match_tables) handles it
-in fallback mode.
+Every configured source the user's role can access gets its own agent,
+briefed by that source's skill file (skills.py — RBAC-scoped tables/schemas).
+The agents are INDEPENDENT: the question is fanned out to all of them
+concurrently — each writes and runs its own SQL against its own source, with
+no knowledge of the others — and an aggregator then synthesizes their answers
+into one. Every agent's charts accumulate as panels, so a cross-database
+question renders one dashboard.
+
+Fan-out is thread-safe: one thread per source, each with its own connector.
+It works with or without an LLM key — a keyless agent answers in its
+deterministic fallback, and the aggregator falls back to a per-source summary.
 """
+import concurrent.futures
 import json
-import re
 
 from . import agent, rbac, skills
-from .catalog import match_tables
 from .connectors import all_sources, get_connector
+
+MAX_PARALLEL = 6
 
 
 def accessible_sources(user, max_schema_tables=10):
@@ -71,119 +76,89 @@ def run_orchestrated(prompt, user, history, model=None):
         return result
 
     spec = model or agent.llm_spec()
-    if not agent.llm_available(spec, user):
-        return _route_fallback(prompt, sources, history, user, model)
+    subs = _fanout(prompt, sources, user, model)
 
-    ctx = {"panels": [], "sub": [], "errors": []}
-    tools = [_source_tool(s, ctx, user, model) for s in sources]
-    system = _orchestrator_prompt(sources)
+    panels, errors = [], []
+    for sub in subs:
+        for p in sub.get("panels") or []:
+            panels.append({**p, "source": sub["_source"]})
+        errors.extend(sub.get("errors") or [])
 
-    try:
-        llm = agent.make_llm(spec, user)
-        graph = agent._build_graph(llm, tools, system)
-        messages = [("user" if h["role"] == "user" else "assistant", h["text"]) for h in history]
-        messages.append(("user", prompt))
-        result = graph.invoke({"messages": messages}, config={"recursion_limit": 20})
-        text = agent._final_text(result) or "Done."
-    except Exception as e:
-        out = _route_fallback(prompt, sources, history, user, model)
-        out["text"] = f"(Orchestrator error: {e}) — routed to one database instead.\n\n" + out["text"]
-        return out
-
-    last = next((r for r in reversed(ctx["sub"]) if r.get("sql")), None)
+    text = _aggregate(prompt, subs, user, spec)
+    last = next((r for r in subs if r.get("sql")), None)
     return {
         "text": text,
         "sql": last["sql"] if last else None,
         "columns": last["columns"] if last else [],
         "rows": last["rows"] if last else [],
         "chart": last["chart"] if last else None,
-        "panels": ctx["panels"],
-        "email": next((r["email"] for r in ctx["sub"] if r.get("email")), None),
-        "errors": ctx["errors"],
+        "panels": panels,
+        "email": next((r["email"] for r in subs if r.get("email")), None),
+        "errors": errors,
         "mode": "orchestrated",
         "model": spec,
-        "source": last["_source"] if last else sources[0]["connector"].name,
-        "agents_used": [r["_source"] for r in ctx["sub"]],
+        "source": last["_source"] if last else subs[0]["_source"],
+        "agents_used": [r["_source"] for r in subs],
     }
 
 
-def _tool_name(source_name):
-    return "ask_" + re.sub(r"\W", "_", source_name)
-
-
-def _skill_description(skill_md):
-    m = re.search(r"^description:\s*(.+)$", skill_md, re.MULTILINE)
-    return m.group(1).strip() if m else ""
-
-
-def _source_tool(s, ctx, user, model):
-    """Wrap one database's agent as an orchestrator tool. The sub-agent gets
-    the source's skill file and only that source's RBAC-allowed tables."""
-    conn = s["connector"]
-
-    def _ask(question: str) -> str:
-        sub = agent.run_agent(question, conn, "*", s["allowed"], s["schemas"],
-                              [], user, model, skill_md=s["skill"])
+def _fanout(prompt, sources, user, model):
+    """Scatter: run every source's agent concurrently and independently. One
+    thread per source (each has its own connector), so the agents never touch
+    each other's state. Returns each agent's result tagged with its source."""
+    def _ask(s):
+        conn = s["connector"]
+        try:
+            sub = agent.run_agent(prompt, conn, "*", s["allowed"], s["schemas"],
+                                  [], user, model, skill_md=s["skill"])
+        except Exception as e:
+            sub = {"text": f"(agent error: {e})", "sql": None, "columns": [],
+                   "rows": [], "chart": None, "panels": [], "errors": [str(e)]}
         sub["_source"] = conn.name
-        ctx["sub"].append(sub)
-        for p in sub.get("panels") or []:
-            ctx["panels"].append({**p, "source": conn.name})
-        ctx["errors"].extend(sub.get("errors") or [])
-        return json.dumps({
-            "source": conn.name,
-            "answer": sub.get("text"),
-            "sql": sub.get("sql"),
-            "columns": sub.get("columns"),
-            "rows_preview": (sub.get("rows") or [])[:20],
-            "total_rows": len(sub.get("rows") or []),
-            "charts": len(sub.get("panels") or []),
-        }, default=str)
+        return sub
 
-    _ask.__name__ = _tool_name(conn.name)
-    _ask.__doc__ = f"""{_skill_description(s['skill']) or f'Ask the {conn.name} database agent.'}
-
-    Args:
-        question: A plain-English analytics question answerable from the
-            {conn.name} source alone. The agent writes and runs the SQL and
-            may render charts; you get back its answer plus a result preview.
-    """
-    from langchain_core.tools import tool as lc_tool
-    return lc_tool(_ask)
+    subs = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(sources), MAX_PARALLEL)) as ex:
+        for sub in ex.map(_ask, sources):
+            subs.append(sub)
+    # Deterministic order regardless of which agent finished first.
+    subs.sort(key=lambda r: r["_source"])
+    return subs
 
 
-def _orchestrator_prompt(sources):
-    briefs = "\n".join(
-        f"- {_tool_name(s['connector'].name)} — {s['connector'].name} "
-        f"({s['connector'].dialect}); tables: {', '.join(s['allowed'][:12])}"
-        for s in sources
-    )
-    return f"""You are Studio's orchestrator. You answer analytics questions by delegating to per-database agents — one per data source, each seeing only the tables this user may access:
-
-{briefs}
+_AGG_SYS = """You are the aggregator over independent per-database agents. Each agent answered the user's question from its own data source, in isolation. Synthesize ONE answer.
 
 Rules:
-- Route to the single best database when one source can answer. Call several
-  agents only when the question genuinely spans databases; then compare or
-  combine their answers yourself.
-- Phrase each agent's question in that database's own terms — an agent knows
-  nothing about the other sources.
-- Never invent numbers: report only what the agents returned. Their charts
-  and tables are already shown to the user as panels.
-- If an agent errors or lacks the data, say so or try a better-suited source.
-- Final answer: a short, direct synthesis (2-4 sentences) with concrete
-  numbers, noting which database(s) it came from."""
+- Use only what the agents returned — never invent numbers.
+- Compare and combine across sources where they relate; note which database each figure came from.
+- Their charts and tables are already shown to the user as panels; don't paste raw tables.
+- 2–5 sentences, direct, with concrete numbers."""
 
 
-def _route_fallback(prompt, sources, history, user, model):
-    """No LLM key: deterministic routing — the source whose table/column names
-    best match the prompt answers in fallback mode."""
-    best, best_score = sources[0], -1
-    for s in sources:
-        score = sum(m["score"] for m in match_tables(prompt, s["schemas"]))
-        if score > best_score:
-            best, best_score = s, score
-    result = agent.run_agent(prompt, best["connector"], "*", best["allowed"], best["schemas"],
-                             history, user, model, skill_md=best["skill"])
-    result["source"] = best["connector"].name
-    result["agents_used"] = [best["connector"].name]
-    return result
+def _aggregate(prompt, subs, user, spec):
+    """Reduce: synthesize the independent answers into one. LLM if available,
+    else a deterministic per-source summary."""
+    named = [s for s in subs if (s.get("text") or "").strip()]
+    summary = "\n\n".join(f"**{s['_source']}** — {s['text'].strip()}" for s in named)
+
+    if not agent.llm_available(spec, user):
+        heads = ", ".join(s["_source"] for s in subs)
+        return f"Combined results from {heads}:\n\n{summary}" if summary else \
+            f"Queried {heads}; see the panels for each database's result."
+
+    try:
+        llm = agent.make_llm(spec, user)
+        payload = json.dumps([{
+            "source": s["_source"],
+            "answer": s.get("text"),
+            "sql": s.get("sql"),
+            "columns": s.get("columns"),
+            "total_rows": len(s.get("rows") or []),
+        } for s in subs], default=str)
+        reply = llm.invoke([("system", _AGG_SYS),
+                            ("user", f"Question: {prompt}\n\nPer-database answers:\n{payload}")])
+        text = reply.content if isinstance(reply.content, str) else "".join(
+            b.get("text", "") for b in reply.content if isinstance(b, dict))
+        return text.strip() or summary
+    except Exception:
+        return summary or "Combined results — see the panels for each database."
