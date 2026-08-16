@@ -121,9 +121,10 @@ export default function Agents({ onClose }) {
         <div className="mcp-block">
           <div className="canvas-title" style={{ fontSize: 15 }}>Train our own model</div>
           <div className="meta">
-            Every prompt users ask is collected as a rollout. Once enough accumulate,
-            they train our own policy — prompt optimization now, weight RL when a
-            self-hosted model is available.
+            The frontier LLM handles new use cases; their successful runs are collected
+            as rollouts and train BitNet. Once a use case is learned (repeated + reliable)
+            it joins BitNet's scope — future asks route to BitNet, and only genuinely new
+            contexts reach the frontier. RBAC governs data access either way.
           </div>
           <div className="train-bar">
             <div className="train-fill" style={{ width: `${Math.round(training.progress * 100)}%` }} />
@@ -149,6 +150,11 @@ export default function Agents({ onClose }) {
                 <span className="meta">tool-calling adapter v{online.tool_call_adapter.version}</span>
                 <span className="meta">{online.user_adapters} per-user adapter{online.user_adapters === 1 ? "" : "s"}</span>
                 <span className="meta">{online.rollouts_since_last_train} rollouts since last train</span>
+                {online.scope && (
+                  <span className="query-tag flow-badge-ok" title="use cases BitNet covers · still being learned by the frontier">
+                    scope: {online.scope.in_scope} in · {online.scope.learning} learning
+                  </span>
+                )}
               </>
             ) : (
               <span className="meta">

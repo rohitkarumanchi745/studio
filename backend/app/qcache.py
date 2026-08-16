@@ -164,6 +164,20 @@ def lookup(user, source, table_scope, prompt):
     }
 
 
+def scope_stats():
+    """BitNet's scope: how many use cases it covers (patterns that have crossed
+    'repeated + successful'), plus how many are still being learned (handled by
+    the frontier until they cross over). Centralized across roles."""
+    c = db._conn()
+    total = c.execute("SELECT COUNT(DISTINCT signature) n FROM query_cache").fetchone()["n"]
+    row = c.execute(
+        "SELECT COUNT(*) n FROM (SELECT signature FROM query_cache GROUP BY signature "
+        "HAVING SUM(seen) >= ? AND AVG(avg_reward) >= ?) sub", (MIN_SEEN, MIN_REWARD)).fetchone()
+    c.close()
+    in_scope = row["n"]
+    return {"in_scope": in_scope, "total_patterns": total, "learning": max(0, total - in_scope)}
+
+
 def store(user, source, table_scope, prompt, result, reward=None):
     """Cache a successful single-SQL run's plan, and track how often this pattern
     recurs and how well it scores — so `learned()` can tell a repeated, reliable

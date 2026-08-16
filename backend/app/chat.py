@@ -310,7 +310,12 @@ def _run_turn(ctx, user):
                 r = _run(model_router.bitnet_spec())
                 if r.get("sql") and not r.get("errors"):
                     r["served_by"] = "bitnet"
-                    r["routed"] = {"model": "bitnet", **{k: pattern[k] for k in ("seen", "avg_reward", "similarity")}}
+                    routed = {"model": "bitnet"}
+                    if pattern:   # a matched learned pattern (confidence)
+                        routed.update({k: pattern[k] for k in ("seen", "avg_reward", "similarity")})
+                    else:         # BitNet answered as the promoted primary
+                        routed["primary"] = True
+                    r["routed"] = routed
                     result = r
             except Exception:
                 result = None   # escalate below

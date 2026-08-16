@@ -25,7 +25,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from . import db
+from . import db, qcache
 from .auth import current_user
 
 router = APIRouter(prefix="/training", tags=["training"])
@@ -159,6 +159,9 @@ def status():
         "last_publish_at": last_at or None,
         "rollouts_since_last_train": fresh,
         "loop": "live" if (last_at and (fresh == 0)) else ("training-behind" if last_at else "idle"),
+        # BitNet's scope: how many use cases it now covers, and how many are
+        # still being learned (handled by the frontier until they cross over).
+        "scope": qcache.scope_stats(),
     }
 
 
@@ -210,6 +213,6 @@ def adapters_for_user(uid: str, user=Depends(current_user)):
 @router.get("/online")
 def online(user=Depends(current_user)):
     """Online-training status for the dashboard: current adapter, user adapters,
-    and how far the trainer is behind the live rollout stream."""
+    how far the trainer is behind the stream, and BitNet's growing scope."""
     _admin(user)
     return status()

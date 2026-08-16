@@ -54,13 +54,21 @@ def _has_access(user, source, sql):
 
 
 def choose(user, source, table_scope, prompt):
-    """First-choice model for this prompt: ('bitnet', pattern) when a
-    CENTRALIZED learned pattern matches AND the requester has access to what it
-    needs, else ('frontier', None). The caller still escalates to frontier if
-    the BitNet attempt fails."""
+    """Which model answers this prompt, by BitNet's SCOPE.
+
+    BitNet's scope is the set of use cases it has learned — patterns that have
+    recurred and scored well (centralized across users). A prompt IN scope, that
+    the requester has access to, goes to BitNet. A NEW prompt, out of scope, goes
+    to the frontier LLM — whose successful answers accumulate until that use case
+    is itself learned and joins BitNet's scope. So the scope grows over time and
+    the frontier is always just the frontier of what's new.
+
+    Returns ('bitnet', pattern) or ('frontier', None). The caller escalates to
+    the frontier if a BitNet attempt fails (e.g. BitNet hasn't trained on a
+    just-learned case yet) — so routing is safe even during the training lag."""
     if not bitnet_ready(user):
         return "frontier", None
     pattern = qcache.learned(source, table_scope, prompt)   # centralized, role-agnostic
     if pattern and _has_access(user, source, pattern["sql"]):
         return "bitnet", pattern
-    return "frontier", None
+    return "frontier", None   # out of scope → frontier, then it becomes learnable

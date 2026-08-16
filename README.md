@@ -273,18 +273,22 @@ flowchart TB
   normalized token signature; a semantically-similar prompt reuses it but
   **always re-executes the SQL** through RBAC + guard + governance — fresh rows,
   access re-checked, never stale and never a bypass.
-- **Model cascade** (`router.py`) — learned, repeated work stops paying for the
-  frontier LLM. A turn is routed in three tiers: an **identical** prompt
-  (≥ cache threshold) reuses the cached plan with no model; a **learned
-  variation** (a pattern seen ≥ N times with good reward, matched below the cache
-  band) routes to the **self-hosted BitNet**; a **novel** prompt goes to the
-  frontier LLM. BitNet's SQL still passes the guard, and a failed BitNet attempt
-  escalates to the frontier — so it's cheaper, never wrong. The learned
-  repertoire is **centralized across users** — one user's repeated, successful
-  patterns benefit everyone (seen/reward aggregate across roles), and a
-  requester is routed to BitNet only when their role can access every table the
-  pattern touches ("same access"). Dormant until a BitNet endpoint is configured
-  (`STUDIO_LLM_BASE_URL`), so it changes nothing on its own.
+- **Model cascade with a growing scope** (`router.py`) — the frontier LLM is the
+  frontier of what's *new*; learned work moves to a cheap self-hosted BitNet. A
+  turn routes in three tiers: an **identical** prompt (≥ cache threshold) reuses
+  the cached plan with no model; an **in-scope** prompt — a use case BitNet has
+  learned (a pattern seen ≥ N times with good reward, matched below the cache
+  band) — routes to **BitNet**; a **new, out-of-scope** prompt goes to the
+  **frontier LLM**, whose successful answers accumulate until that use case
+  itself crosses the threshold and **joins BitNet's scope**. So the scope grows
+  and frontier usage shrinks toward only-the-new. BitNet's SQL still passes the
+  guard, and a failed BitNet attempt (e.g. it hasn't trained on a just-learned
+  case yet) escalates to the frontier — cheaper, never wrong, safe through the
+  training lag. The scope is **centralized across users** (seen/reward aggregate
+  across roles) and a requester routes to BitNet only when their role can access
+  every table the pattern touches ("same access"). **RBAC governs data access
+  regardless of which model decides.** Dormant until a BitNet endpoint is
+  configured (`STUDIO_LLM_BASE_URL`).
 
 `usage` on each answer (input/output + cache-read/write tokens) makes the reuse
 measurable.
