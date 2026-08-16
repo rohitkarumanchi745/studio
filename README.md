@@ -526,6 +526,10 @@ picker automatically once configured.
 ## Roadmap
 - Streaming agent steps to the UI (LangGraph `stream`)
 - Embedding-backed semantic cache (pluggable behind the current lexical signature)
-- Self-hosted open-weight model → true weight RL from the exported rollouts
+- Self-hosted BitNet → true weight training from the rollouts. Studio is the
+  producer + adapter server (`trainer.py`); a **CPU worker**
+  (`scripts/train_online.py`, no GPU — BitNet's 1-bit base + small LoRA train on
+  CPU) consumes the rollout stream and publishes a global tool-calling adapter +
+  per-user style adapters that serving hot-swaps in. Simultaneous by design.
 - Drill-through from a dashboard tile back into chat
 - Scheduled dashboard email digests

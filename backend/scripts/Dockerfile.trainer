@@ -1,0 +1,16 @@
+# The online BitNet trainer as a standalone CPU worker service.
+# Runs alongside Studio (a separate Railway service / container) — no GPU.
+# It only needs STUDIO_URL + STUDIO_TOKEN to pull rollouts and publish adapters.
+FROM python:3.12-slim
+
+WORKDIR /trainer
+COPY requirements-trainer.txt .
+
+# CPU torch wheel — small enough for a plain CPU box.
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
+    && pip install --no-cache-dir -r requirements-trainer.txt
+
+COPY train_online.py .
+
+# STUDIO_URL, STUDIO_TOKEN, BITNET_BASE come from the environment.
+CMD ["python", "train_online.py", "--device", "cpu", "--poll", "60"]

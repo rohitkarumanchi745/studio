@@ -3,18 +3,20 @@
 Agent Lightning decouples the AGENT (many concurrent rollout producers) from the
 TRAINER (consumes rollouts, updates the policy). They run at the same time:
 
-    Studio agent ──rollouts──▶  trainer (GPU host)  ──adapters──▶  Studio serving
-      (produces)                (SFT / DPO / GRPO)                 (hot-swaps)
-         ▲                                                              │
-         └──────────────────── keeps serving with the newest ──────────┘
+    Studio agent ──rollouts──▶  trainer (CPU worker)  ──adapters──▶  Studio serving
+      (produces)                (SFT / DPO / GRPO)                   (hot-swaps)
+         ▲                                                               │
+         └──────────────────── keeps serving with the newest ───────────┘
 
-Studio can't run the GPU trainer on Railway, so this module is the producer +
-adapter server: it streams reward-labeled rollouts to the trainer, holds the
-registry of published LoRA adapters, and tells the serving layer which adapters
+The trainer is a CPU worker — BitNet's 1-bit base is CPU-efficient and its LoRA
+adapters are small, so no GPU is required (one only speeds it up). This module is
+the producer + adapter server: it streams reward-labeled rollouts to the trainer,
+holds the registry of published LoRA adapters, and tells the serving layer which
 to load — a GLOBAL tool-calling adapter plus an optional PER-USER style adapter,
 composed per request. The trainer loop (scripts/train_online.py) polls the
-stream, trains, and publishes new adapter versions here; serving picks them up
-on the next call, so training and serving are genuinely simultaneous.
+stream, trains, and publishes new adapter versions here; serving picks them up on
+the next call, so training and serving are genuinely simultaneous. The trainer's
+heavy ML deps live in scripts/requirements-trainer.txt, out of the lean API image.
 """
 import json
 import time
