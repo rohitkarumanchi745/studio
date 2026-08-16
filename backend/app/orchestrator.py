@@ -19,7 +19,7 @@ deterministic fallback, and the aggregator falls back to a per-source summary.
 import concurrent.futures
 import json
 
-from . import agent, rbac, roster, skills
+from . import agent, rbac, roster, skills, util
 from .connectors import all_sources, get_connector
 
 MAX_PARALLEL = 6
@@ -27,34 +27,30 @@ MAX_PARALLEL = 6
 
 def accessible_sources(user, max_schema_tables=10):
     """[{connector, allowed, schemas, skill}] for every configured source the
-    user's role may query — the roster of database agents."""
-    out = []
+    user's role may query — the roster of database agents. Sources are probed
+    concurrently (list_tables + schema fetch are independent per source), so the
+    roster's latency is the slowest single source, not their sum."""
     role = user["role"]
-    for meta in all_sources():
+
+    def build(meta):
         name = meta["name"]
         if name not in rbac.allowed_sources(role) or not meta["configured"]:
-            continue
+            return None
         conn = get_connector(name)
         try:
             all_tables = conn.list_tables()
         except Exception:
-            continue  # unreachable source — leave it off the roster
+            return None  # unreachable source — leave it off the roster
         allowed = rbac.allowed_tables(role, name, all_tables)
         if not allowed:
-            continue
-        schemas = {}
-        for t in allowed[:max_schema_tables]:
-            try:
-                schemas[t] = conn.get_schema(t)
-            except Exception:
-                schemas[t] = []
-        out.append({
-            "connector": conn,
-            "allowed": allowed,
-            "schemas": schemas,
-            "skill": skills.get_skill(conn, role, allowed, schemas),
-        })
-    return out
+            return None
+        tabs = allowed[:max_schema_tables]
+        cols = util.pmap(conn.get_schema, tabs, default=[])
+        schemas = {t: (c or []) for t, c in zip(tabs, cols)}
+        return {"connector": conn, "allowed": allowed, "schemas": schemas,
+                "skill": skills.get_skill(conn, role, allowed, schemas)}
+
+    return [e for e in util.pmap(build, all_sources(), workers=MAX_PARALLEL) if e]
 
 
 def run_orchestrated(prompt, user, history, model=None):

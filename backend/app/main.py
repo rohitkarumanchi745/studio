@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from . import (auth, catalog, chat, dashboards, db, flow, governance, keys, mcp,
-               pipelines, pybuild, queries, repos, sessions, supervisor)
+               pipelines, pybuild, qcache, queries, repos, sessions, supervisor)
 from .agent import llm_available, llm_spec
 from .connectors.demo import seed
 
@@ -68,6 +68,7 @@ def startup():
     repos.init_tables()
     sessions.init_tables()
     flow.init_tables()
+    qcache.init_tables()
     seed()
 
 

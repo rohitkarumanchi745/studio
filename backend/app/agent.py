@@ -193,6 +193,28 @@ def _apply_prompt_cache(system, spec):
         return system
 
 
+def _cache_history(history, spec):
+    """Build the conversation-history messages, marking the LAST one with an
+    Anthropic cache breakpoint. Combined with the cached system prompt, this
+    reuses the whole prior-turn prefix's KV cache server-side on the next turn —
+    KV-cache reuse across conversation turns. Non-Anthropic / disabled → plain
+    (role, text) tuples (no behaviour change)."""
+    msgs = [("user" if h["role"] == "user" else "assistant", h["text"]) for h in history]
+    if not msgs or os.getenv("STUDIO_PROMPT_CACHE", "1").lower() not in ("1", "true", "yes"):
+        return msgs
+    if (spec or "").split(":", 1)[0] != "anthropic":
+        return msgs
+    try:
+        from langchain_core.messages import AIMessage, HumanMessage
+        last = history[-1]
+        block = [{"type": "text", "text": last["text"],
+                  "cache_control": {"type": "ephemeral"}}]
+        marked = HumanMessage(content=block) if last["role"] == "user" else AIMessage(content=block)
+        return msgs[:-1] + [marked]
+    except Exception:
+        return msgs
+
+
 def _graph(llm, tools, system, spec):
     """Build the agent graph, preferring a cache-marked system prompt. Falls
     back to the plain string if this LangChain build won't take a SystemMessage,
@@ -371,8 +393,8 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
     try:
         llm = make_llm(spec, user)
         base_tools = [run_sql, render_chart, remember, email_report]
-        messages = [("user" if h["role"] == "user" else "assistant", h["text"]) for h in history]
-        messages.append(("user", prompt))
+        # Cache the system prompt + prior-turn prefix (KV reuse across turns).
+        messages = _cache_history(history, spec) + [("user", prompt)]
         mcp_cfg = mcp_servers()
         if mcp_cfg:
             # MCP tools are async — load them and run the graph on an event loop.

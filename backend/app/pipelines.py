@@ -74,25 +74,25 @@ def _accessible(user):
     the router picks from. RBAC is applied here, so the router can never route
     to a source the user has no access to."""
     role = user["role"]
-    out = []
-    for meta in all_sources():
+    from . import util
+
+    def build(meta):
         if not meta["configured"] or meta["name"] not in rbac.allowed_sources(role):
-            continue
+            return None
         conn = get_connector(meta["name"])
         try:
             allowed = rbac.allowed_tables(role, meta["name"], conn.list_tables())
         except Exception:
-            continue
+            return None
         if not allowed:
-            continue
-        schemas = {}
-        for t in allowed[:20]:
-            try:
-                schemas[t] = conn.get_schema(t)
-            except Exception:
-                schemas[t] = []
-        out.append({"connector": conn, "allowed": allowed, "schemas": schemas})
-    return out
+            return None
+        tabs = allowed[:20]
+        cols = util.pmap(conn.get_schema, tabs, default=[])
+        schemas = {t: (c or []) for t, c in zip(tabs, cols)}
+        return {"connector": conn, "allowed": allowed, "schemas": schemas}
+
+    # Independent per source → probe concurrently.
+    return [e for e in util.pmap(build, all_sources(), workers=6) if e]
 
 
 def route(user, prompt):

@@ -452,12 +452,18 @@ function AssistantMessage({ m, requirement, onOpenCanvas }) {
         <div className="assistant-head">
           <span className="brand-mark">◆</span>
           <span className="meta">
-            {m.mode === "fallback" ? "fallback" : m.model} · {m.source}/{m.table === "*" ? "all tables" : m.table}
+            {m.mode === "cached" ? "⚡ cached" : m.mode === "fallback" ? "fallback" : m.model}
+            {" · "}{m.source}/{m.table === "*" ? "all tables" : m.table}
             {m.agents?.length > 0
               ? ` · ${agentLabel(m.agents)}`
               : m.mode === "orchestrated" && m.agents_used?.length > 0
                 ? ` · agents: ${m.agents_used.join(", ")}`
                 : ""}
+            {m.cached && (
+              <span title={`reused the plan for: "${m.cached.from_prompt}"`}>
+                {" · "}reused plan{m.cached.similarity < 1 ? ` (${Math.round(m.cached.similarity * 100)}% match)` : ""} · fresh data
+              </span>
+            )}
           </span>
         </div>
         {m.text && <p className="answer">{m.text}</p>}

@@ -10,8 +10,8 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from . import (agent, db, email_service, keys, lightning, orchestrator, queryguard,
-               rbac, roster, sessions, skills)
+from . import (agent, db, email_service, keys, lightning, orchestrator, qcache,
+               queryguard, rbac, roster, sessions, skills)
 from .auth import current_user
 from .catalog import _connector_or_400, match_tables
 
@@ -237,7 +237,12 @@ def _prepare(body, user):
 
     try:
         if table_param == "*":
-            schemas = {t: connector.get_schema(t) for t in allowed[:10]}
+            from . import util
+            tabs = allowed[:10]
+            cols = util.pmap(connector.get_schema, tabs)   # independent → parallel
+            if any(c is None for c in cols):
+                raise RuntimeError("schema fetch failed")
+            schemas = dict(zip(tabs, cols))
         else:
             schemas = {table_param: connector.get_schema(table_param)}
     except Exception as e:
@@ -280,11 +285,18 @@ def _run_turn(ctx, user):
         return result
 
     connector = ctx["connector"]
-    result = agent.run_agent(
-        prompt=prompt, connector=connector, table=ctx["table_param"],
-        allowed_tables=ctx["allowed"], schemas=ctx["schemas"], history=ctx["history"],
-        user=user, model=model,
-        skill_md=skills.get_skill(connector, user["role"], ctx["allowed"], ctx["schemas"]))
+    # Semantic cache: a prompt that means the same as an earlier one reuses its
+    # plan (SQL + chart), re-executed fresh — skipping the agent entirely.
+    cached = qcache.lookup(user, ctx["source"], ctx["table_label"], prompt)
+    if cached is not None:
+        result = cached
+    else:
+        result = agent.run_agent(
+            prompt=prompt, connector=connector, table=ctx["table_param"],
+            allowed_tables=ctx["allowed"], schemas=ctx["schemas"], history=ctx["history"],
+            user=user, model=model,
+            skill_md=skills.get_skill(connector, user["role"], ctx["allowed"], ctx["schemas"]))
+        qcache.store(user, ctx["source"], ctx["table_label"], prompt, result)
     result["source"] = ctx["source"]
     result["table"] = ctx["table_label"]
     try:
