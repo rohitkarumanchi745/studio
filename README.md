@@ -270,9 +270,12 @@ flowchart TB
 - **KV reuse across conversation turns** marks the last prior-turn message with
   a second breakpoint, so each turn reuses the whole system + history prefix.
 - **Semantic query cache** (`qcache.py`) caches a successful run's plan under a
-  normalized token signature; a semantically-similar prompt reuses it but
-  **always re-executes the SQL** through RBAC + guard + governance — fresh rows,
-  access re-checked, never stale and never a bypass.
+  signature; a semantically-similar prompt reuses it but **always re-executes the
+  SQL** through RBAC + guard + governance — fresh rows, access re-checked, never
+  stale and never a bypass. Similarity is **Harrier embeddings** (`embed.py`,
+  `microsoft/harrier-oss-v1-0.6b`, 1024-dim, instruction-prefixed queries) when
+  `HARRIER_EMBED_URL` is set — so different-word paraphrases match — and falls
+  back to lexical token-Jaccard otherwise.
 - **Model cascade with a growing scope** (`router.py`) — the frontier LLM is the
   frontier of what's *new*; learned work moves to a cheap self-hosted BitNet. A
   turn routes in three tiers: an **identical** prompt (≥ cache threshold) reuses
@@ -448,7 +451,7 @@ in-process cache silently.
 | **Agent Lightning optimizes the prompt, not weights** (APO / RLAIF) | Frozen hosted weights make prompt-opt the reachable lever | No true policy-gradient learning until a self-hosted model is added — rollouts export ready for it |
 | **Prompt/KV caching via provider `cache_control`** | Hosted APIs don't expose the raw attention KV cache | You cache the *prefix* (server-side, TTL-bound), not tensors |
 | **Semantic cache re-executes the SQL** (never returns stored rows) | Fresh data + RBAC/guard/governance re-checked on every hit | A hit still pays the warehouse round-trip (but skips the LLM) |
-| **Lexical-normalized signature**, not embeddings, for that cache | Zero model dependency; deterministic; works offline | Misses paraphrases with entirely different content words — embeddings are a pluggable upgrade |
+| **Harrier embeddings when configured, lexical signature otherwise** | Real semantic match (different-word paraphrases) with Harrier; deterministic lexical fallback keeps it working offline with zero deps | Embeddings need a Harrier endpoint stood up; the lexical fallback misses different-word paraphrases |
 | **Read-only by default; writes go through supervisor + a human** | An analytics tool must never silently mutate production | Every write is gated — latency and a human in the loop, by design |
 | **Studio generates Python but never runs it** | Arbitrary code execution is the blast radius to avoid | Running requires the supervised Jobs path (an extra, deliberate step) |
 | **Dashboards/queries store the recipe, not rows** | RBAC evaluated at view time, not frozen at pin time | Every view re-runs SQL (mitigated by the tile cache) |
@@ -526,7 +529,10 @@ alone; FastAPI serves the built frontend on one origin.
 | `STUDIO_DB_PATH` | SQLite path — point at a mounted volume, or deploys wipe it |
 | `REDIS_URL` | Tile cache; unset falls back to in-process |
 | `STUDIO_PROMPT_CACHE` | Toggle Anthropic prompt/KV caching (default on) |
-| `STUDIO_QCACHE_THRESHOLD` | Semantic-cache similarity threshold (default 0.82) |
+| `STUDIO_QCACHE_THRESHOLD` | Cache-band similarity threshold (default 0.9) |
+| `HARRIER_EMBED_URL` | Harrier embedding endpoint (OpenAI-compatible `/embeddings`); unset → lexical matching |
+| `HARRIER_EMBED_MODEL` / `HARRIER_EMBED_INSTRUCT` / `HARRIER_EMBED_KEY` | Harrier model id (default `microsoft/harrier-oss-v1-0.6b`), query instruction, optional auth |
+| `STUDIO_LLM_BASE_URL` / `STUDIO_BITNET_LLM` | Self-hosted BitNet endpoint + model spec for the learned-scope router |
 | `STUDIO_TRAIN_THRESHOLD` | Prompts to collect before "ready to train" (default 500) |
 | `STUDIO_MODELS` | The model menu offered in the composer |
 | `STUDIO_MCP_SERVERS` | JSON map of MCP servers exposed to the agent as extra tools |
@@ -541,7 +547,6 @@ picker automatically once configured.
 
 ## Roadmap
 - Streaming agent steps to the UI (LangGraph `stream`)
-- Embedding-backed semantic cache (pluggable behind the current lexical signature)
 - Self-hosted BitNet → true weight training from the rollouts. Studio is the
   producer + adapter server (`trainer.py`); a **CPU worker**
   (`scripts/train_online.py`, no GPU — BitNet's 1-bit base + small LoRA train on

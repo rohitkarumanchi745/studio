@@ -21,7 +21,7 @@ import re
 import time
 import uuid
 
-from . import db
+from . import db, embed
 
 # Two distinct bands so the tiers don't overlap:
 #   >= CACHE_THRESHOLD           → near-identical, reuse the exact plan (cache)
@@ -64,6 +64,7 @@ def init_tables():
             hits INTEGER NOT NULL DEFAULT 0,
             seen INTEGER NOT NULL DEFAULT 0,
             avg_reward REAL,
+            embedding TEXT,
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL
         );
@@ -71,13 +72,15 @@ def init_tables():
             ON query_cache(role, source, table_scope);
         """
     )
-    # Learned-pattern columns for any table created before routing existed.
+    # Columns for any table created before routing / embeddings existed.
     if db.IS_PG:
         c.execute("ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS seen INTEGER NOT NULL DEFAULT 0")
         c.execute("ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS avg_reward REAL")
+        c.execute("ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS embedding TEXT")
     else:
         for ddl in ("ALTER TABLE query_cache ADD COLUMN seen INTEGER NOT NULL DEFAULT 0",
-                    "ALTER TABLE query_cache ADD COLUMN avg_reward REAL"):
+                    "ALTER TABLE query_cache ADD COLUMN avg_reward REAL",
+                    "ALTER TABLE query_cache ADD COLUMN embedding TEXT"):
             try:
                 c.execute(ddl)
             except Exception:
@@ -107,6 +110,31 @@ def _jaccard(a, b):
     return len(sa & sb) / len(sa | sb)
 
 
+def _sig_text(sig):
+    return " ".join(sig)
+
+
+def _query_vec(sig):
+    """Harrier embedding of an INCOMING prompt (query side — instruction-prefixed),
+    or None (→ lexical fallback)."""
+    return embed.embed(_sig_text(sig), kind="query") if embed.available() else None
+
+
+def _doc_vec(sig):
+    """Harrier embedding of a STORED pattern (document side — plain)."""
+    return embed.embed(_sig_text(sig), kind="document") if embed.available() else None
+
+
+def _sim(q_vec, q_sig, e_vec, e_sig):
+    """Similarity between a query and a stored entry: Harrier cosine when both
+    sides have a vector, else lexical Jaccard. One consistent scale for the
+    cache / learn bands either way (paraphrases score high on both, just wider
+    with embeddings)."""
+    if q_vec and e_vec:
+        return embed.cosine(q_vec, e_vec)
+    return _jaccard(q_sig, e_sig)
+
+
 def _exec_full(user, source, sql):
     """Re-run cached SQL with full rows, re-checking RBAC + guard + governance.
     Returns (columns, rows) or None on any failure (→ cache miss, run the agent)."""
@@ -129,6 +157,7 @@ def lookup(user, source, table_scope, prompt):
     sig = _sig(prompt)
     if not sig:
         return None
+    q_vec = _query_vec(sig)
     c = db._conn()
     rows = c.execute(
         "SELECT * FROM query_cache WHERE role=? AND source=? AND table_scope=?",
@@ -136,7 +165,8 @@ def lookup(user, source, table_scope, prompt):
     c.close()
     best, best_score = None, 0.0
     for r in rows:
-        score = _jaccard(sig, json.loads(r["signature"]))
+        e_vec = json.loads(r["embedding"]) if r["embedding"] else None
+        score = _sim(q_vec, sig, e_vec, json.loads(r["signature"]))
         if score > best_score:
             best, best_score = r, score
     if not best or best_score < CACHE_THRESHOLD:
@@ -193,25 +223,28 @@ def store(user, source, table_scope, prompt, result, reward=None):
     if reward is None:
         reward = 1.0 if result.get("rows") else 0.5
     chart = json.dumps(result.get("chart")) if result.get("chart") else None
+    emb = _doc_vec(sig)                            # stored pattern = document side
+    emb_json = json.dumps(emb) if emb else None
     now = time.time()
     c = db._conn()
-    row = c.execute("SELECT id, seen, avg_reward FROM query_cache WHERE role=? AND source=? "
-                    "AND table_scope=? AND signature=?",
+    row = c.execute("SELECT id, seen, avg_reward, embedding FROM query_cache WHERE role=? "
+                    "AND source=? AND table_scope=? AND signature=?",
                     (user["role"], source, table_scope, json.dumps(sig))).fetchone()
     if row:
         seen = (row["seen"] or 0) + 1
         prev = row["avg_reward"] if row["avg_reward"] is not None else reward
         avg = (prev * (seen - 1) + reward) / seen        # running average
         c.execute("UPDATE query_cache SET sql=?, chart=?, text=?, seen=?, avg_reward=?, "
-                  "updated_at=? WHERE id=?",
-                  (sql, chart, text[:2000], seen, avg, now, row["id"]))
+                  "embedding=?, updated_at=? WHERE id=?",
+                  (sql, chart, text[:2000], seen, avg,
+                   emb_json or row["embedding"], now, row["id"]))
     else:
         c.execute(
             "INSERT INTO query_cache (id, role, source, table_scope, prompt, signature, sql, "
-            "chart, text, hits, seen, avg_reward, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "chart, text, hits, seen, avg_reward, embedding, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (str(uuid.uuid4()), user["role"], source, table_scope, prompt[:500],
-             json.dumps(sig), sql, chart, text[:2000], 0, 1, reward, now, now))
+             json.dumps(sig), sql, chart, text[:2000], 0, 1, reward, emb_json, now, now))
     c.commit()
     c.close()
 
@@ -226,16 +259,19 @@ def learned(source, table_scope, prompt):
     sig = _sig(prompt)
     if not sig:
         return None
+    q_vec = _query_vec(sig)
     c = db._conn()
     rows = c.execute(
         "SELECT signature, SUM(seen) seen, AVG(avg_reward) avg_reward, MAX(sql) sql, "
-        "MAX(prompt) prompt FROM query_cache WHERE source=? AND table_scope=? "
-        "GROUP BY signature HAVING SUM(seen) >= ? AND AVG(avg_reward) >= ?",
+        "MAX(prompt) prompt, MAX(embedding) embedding FROM query_cache "
+        "WHERE source=? AND table_scope=? GROUP BY signature "
+        "HAVING SUM(seen) >= ? AND AVG(avg_reward) >= ?",
         (source, table_scope, MIN_SEEN, MIN_REWARD)).fetchall()
     c.close()
     best, score = None, 0.0
     for r in rows:
-        s = _jaccard(sig, json.loads(r["signature"]))
+        e_vec = json.loads(r["embedding"]) if r["embedding"] else None
+        s = _sim(q_vec, sig, e_vec, json.loads(r["signature"]))
         if s > score:
             best, score = r, s
     # The learned band sits below the cache threshold — a variation the exact
