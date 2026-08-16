@@ -109,6 +109,46 @@ def route(user, prompt):
     return best, best_matched
 
 
+def _step_tables(step):
+    """Tables a step reads, from its SQL (falls back to the declared table)."""
+    from .queryguard import TABLE_REF
+    refs = {r.strip('"').split(".")[-1].lower()
+            for r in TABLE_REF.findall(step.get("sql") or "")}
+    if not refs and step.get("table"):
+        refs = {step["table"].lower()}
+    return sorted(refs)
+
+
+def lineage(steps, failed_index=None):
+    """Provenance graph for a set of steps: which SOURCE feeds which TABLE feeds
+    which STEP. Rendered as a diagram under a pipeline so a multi-source request
+    shows exactly where each table comes from; the failing step is marked."""
+    sources, tables, snodes, edges = {}, {}, [], []
+    for i, st in enumerate(steps):
+        src = st.get("source") or "?"
+        sources.setdefault(src, {"id": f"s:{src}", "label": src})
+        step_tables = []
+        for t in _step_tables(st):
+            tid = f"t:{src}.{t}"
+            if tid not in tables:
+                tables[tid] = {"id": tid, "label": t, "source": src}
+                edges.append({"from": f"s:{src}", "to": tid})
+            step_tables.append(tid)
+        sid = f"step:{i}"
+        snodes.append({"id": sid, "label": st.get("name") or f"Step {i + 1}",
+                       "index": i, "tables": step_tables,
+                       "failed": i == failed_index})
+        for tid in step_tables:
+            edges.append({"from": tid, "to": sid})
+    return {
+        "sources": list(sources.values()),
+        "tables": list(tables.values()),
+        "steps": snodes,
+        "edges": edges,
+        "multi_source": len(sources) > 1,
+    }
+
+
 def _draft_sql(connector, table, columns):
     """A sensible verified step for one table: aggregate a measure over a
     dimension/date when the shape allows, else a bounded preview."""
@@ -182,13 +222,30 @@ def build(user, prompt):
             "columns": v.get("columns", []),
             "error": None if v["ok"] else v.get("error"),
         })
+    kept = [st for st in steps if st["verified"]] or steps
     return {
         "prompt": prompt,
         "source": source,
         "matched_tables": [m["table"] for m in matched[:5]],
-        "steps": [st for st in steps if st["verified"]] or steps,
+        "steps": kept,
         "dropped": [st for st in steps if not st["verified"]],
+        "repo": _pick_repo(prompt),
+        "lineage": lineage(kept),
     }
+
+
+def _pick_repo(prompt):
+    """The registered GitHub repo whose scripts best fit this prompt (if any).
+    Best-effort — pipelines still build with no repos registered."""
+    try:
+        from . import repos
+        best, _ = repos.pick(prompt)
+        if not best or best.get("score", 0) <= 0:
+            return None
+        return {"name": best["name"], "url": best["url"],
+                "description": best.get("description"), "score": best["score"]}
+    except Exception:
+        return None
 
 
 # ── Execution: trigger a pipeline, email on failure, trace the run ──────
@@ -231,7 +288,7 @@ def run_pipeline(pipeline, user):
                     error=error, duration_ms=dur)
     return {"id": rid, "status": status, "failed_step": failed_step, "error": error,
             "steps_result": results, "trace_id": trace_id, "emailed": bool(emailed),
-            "took_ms": dur}
+            "lineage": lineage(steps, failed_index=failed_step), "took_ms": dur}
 
 
 def _trace(user, pipeline, status, results, error, dur):
@@ -254,10 +311,13 @@ def _trace(user, pipeline, status, results, error, dur):
 
 def _email_failure(user, pipeline, step_idx, error, results):
     step = results[step_idx] if step_idx is not None and step_idx < len(results) else {}
+    defn = pipeline["steps"][step_idx] if step_idx is not None and step_idx < len(pipeline["steps"]) else {}
+    src = step.get("source") or pipeline["source"]
+    tbls = ", ".join(_step_tables(defn)) or defn.get("table") or "—"
     html = (
         f"<p>Your pipeline <b>{pipeline['name']}</b> failed while you triggered it.</p>"
-        f"<p><b>Step {(step_idx or 0) + 1}: {step.get('name', '?')}</b> "
-        f"(source: {pipeline['source']})</p>"
+        f"<p><b>Step {(step_idx or 0) + 1}: {step.get('name', '?')}</b></p>"
+        f"<p>Source <b>{src}</b> → table(s) <b>{tbls}</b></p>"
         f"<pre style='background:#f6f6f6;padding:8px;border-radius:6px'>{step.get('sql', '')}</pre>"
         f"<p style='color:#b00'>{error}</p>"
         f"<p>Fix the step in Studio and re-run.</p>"
@@ -364,6 +424,7 @@ def listing(user=Depends(current_user)):
 def get(pid: str, user=Depends(current_user)):
     d = _own_or_404(pid, user)
     d["mine"] = d["user_id"] == user["id"]
+    d["lineage"] = lineage(d.get("steps") or [])
     return d
 
 
@@ -394,4 +455,9 @@ def runs(pid: str, user=Depends(current_user)):
         "SELECT * FROM pipeline_runs WHERE pipeline_id=? ORDER BY started_at DESC LIMIT 50",
         (pid,)).fetchall()
     c.close()
-    return {"runs": [_row(r) for r in rows]}
+    out = []
+    for r in rows:
+        d = _row(r)
+        d["lineage"] = lineage(d.get("steps_result") or [], failed_index=d.get("failed_step"))
+        out.append(d)
+    return {"runs": out}

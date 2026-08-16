@@ -4,6 +4,7 @@
 // step; every run is traced through Agent Lightning.
 import { useEffect, useState } from "react";
 import { api } from "../api";
+import Lineage from "./Lineage";
 
 export default function Pipelines({ onClose }) {
   const [list, setList] = useState(null);
@@ -155,6 +156,13 @@ export default function Pipelines({ onClose }) {
               Routed to <b>{draft.source}</b> · matched:{" "}
               {draft.matched_tables?.slice(0, 5).join(", ") || "—"}
             </div>
+            {draft.repo && (
+              <div className="meta pl-repo">
+                📦 scripts from{" "}
+                <a href={draft.repo.url} target="_blank" rel="noreferrer">{draft.repo.name}</a>
+                {draft.repo.description ? ` — ${draft.repo.description}` : ""}
+              </div>
+            )}
             {draft.steps.map((s, i) => (
               <div key={i} className="pl-step">
                 <div className="pl-step-head">
@@ -170,6 +178,7 @@ export default function Pipelines({ onClose }) {
                 {draft.dropped.length} step(s) dropped — they didn't verify.
               </div>
             )}
+            <Lineage lineage={draft.lineage} />
             <div className="pl-draft-actions">
               <input
                 className="sqllab-prompt"
@@ -241,6 +250,7 @@ export default function Pipelines({ onClose }) {
                               {r.emailed ? " · you were emailed" : ""}
                             </div>
                           )}
+                          <Lineage lineage={r.lineage} />
                         </div>
                       ))
                     )}

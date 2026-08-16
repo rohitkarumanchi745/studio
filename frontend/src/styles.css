@@ -288,6 +288,15 @@ td { color: var(--ink-2); }
 .pl-status.pl-success { color: #b7e4a0; }
 .pl-status.pl-failed { color: #e5679a; }
 .pl-run-err { color: #e5679a; margin-top: 3px; }
+.pl-repo { margin-top: 4px; }
+.pl-repo a { color: #c9a86a; text-decoration: none; }
+.pl-repo a:hover { text-decoration: underline; }
+
+/* ── Lineage diagram (source → table → step) ── */
+.lineage { margin-top: 12px; border-top: 1px dashed var(--line); padding-top: 10px; }
+.lineage-head { margin-bottom: 6px; }
+.lineage-scroll { overflow-x: auto; }
+.lineage svg { display: block; }
 
 /* ── Suggested questions + answer provenance ── */
 .suggestion { display: flex; justify-content: space-between; align-items: center; gap: 10px; }

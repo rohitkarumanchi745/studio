@@ -96,6 +96,78 @@ function McpServers() {
   );
 }
 
+function GithubRepos() {
+  const [repos, setRepos] = useState([]);
+  const [form, setForm] = useState({ name: "", url: "", description: "" });
+  const [err, setErr] = useState("");
+
+  const load = () =>
+    api("/settings/repos")
+      .then((d) => setRepos(d.repos || []))
+      .catch((e) => setErr(e.message));
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  async function add() {
+    setErr("");
+    try {
+      await api("/settings/repos", {
+        method: "POST",
+        body: JSON.stringify({
+          name: form.name.trim(),
+          url: form.url.trim(),
+          description: form.description.trim() || undefined,
+        }),
+      });
+      setForm({ name: "", url: "", description: "" });
+      load();
+    } catch (e) {
+      setErr(e.message);
+    }
+  }
+
+  async function remove(name) {
+    await api(`/settings/repos/${name}`, { method: "DELETE" });
+    load();
+  }
+
+  return (
+    <div className="mcp-block">
+      <div className="canvas-title" style={{ fontSize: 15 }}>GitHub repositories</div>
+      <div className="meta">
+        Register the repos where your scripts live. When someone builds a pipeline,
+        the agent picks the repo whose scripts best fit the prompt and pulls them in
+        as context. (Set a GITHUB_TOKEN env var to read private repos.)
+      </div>
+      {err && <div className="error">{err}</div>}
+      <div className="job-form-row" style={{ marginTop: 8 }}>
+        <input className="sqllab-prompt" style={{ maxWidth: 150 }} placeholder="name"
+          value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
+        <input className="sqllab-prompt" style={{ flex: 1 }} placeholder="https://github.com/org/repo"
+          value={form.url} onChange={(e) => setForm({ ...form, url: e.target.value })} />
+        <input className="sqllab-prompt" style={{ flex: 1 }} placeholder="what it does (keywords help matching)"
+          value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} />
+        <button className="chip chip-on" onClick={add}
+          disabled={!form.name.trim() || !form.url.includes("github.com")}>＋ register</button>
+      </div>
+      <div className="share-list">
+        {repos.map((r) => (
+          <div key={r.name} className="share-row">
+            <div>
+              <div>{r.name}</div>
+              <div className="meta">{r.url}{r.description ? ` — ${r.description}` : ""}</div>
+            </div>
+            <button className="chip" onClick={() => remove(r.name)}>remove</button>
+          </div>
+        ))}
+        {repos.length === 0 && <div className="meta">No repositories registered.</div>}
+      </div>
+    </div>
+  );
+}
+
 export default function Governance({ onClose }) {
   const [text, setText] = useState("");
   const [meta, setMeta] = useState({ loaded: false, source: null });
@@ -256,6 +328,7 @@ export default function Governance({ onClose }) {
       />
 
       <McpServers />
+      <GithubRepos />
     </section>
   );
 }
