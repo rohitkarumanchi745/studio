@@ -18,6 +18,13 @@ they execute. On execution failure the job retries; after repeated failures it
 is ESCALATED — the requester is emailed and a human must approve a retry or
 abort it. An LLM supervisor, when a key is present, adds a written risk review;
 it advises, but policy — not the model — decides whether a write runs.
+
+platform_run jobs (kind "platform_run", target = an orchestration platform from
+platforms.PLATFORMS) trigger external pipelines. Platforms aren't data sources,
+so RBAC table policy doesn't apply — instead only admins and analysts may
+submit, and every run waits for a human admin. The platform's {run_ref, url}
+lands in the result JSON column (schema unchanged); GET /jobs/{id}/live then
+feeds status / logs / quality back from the platform.
 """
 import json
 import time
@@ -26,7 +33,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from . import agent, db, email_service, governance, queryguard, rbac
+from . import agent, db, email_service, governance, platforms, queryguard, rbac
 from .auth import current_user
 from .catalog import _connector_or_400
 
@@ -70,7 +77,7 @@ def init_tables():
 # ── Risk classification + supervisor agent ──────────────────────────────
 
 def classify(kind, script):
-    if kind == "spark_job":
+    if kind in ("spark_job", "platform_run"):
         return "job"
     # A SQL script: 'write' if any statement is not a plain SELECT/CTE.
     for stmt in _statements(script):
@@ -87,6 +94,8 @@ def _statements(script):
 def supervise(kind, target, script, user):
     """The supervisor agent's verdict on a job. Returns
     {decision: approve|reject|needs_human, risk, reasons}."""
+    if kind == "platform_run":
+        return _supervise_platform_run(target, script, user)
     reasons = []
     # RBAC first: you cannot run anything against a source you can't reach.
     if not rbac.can_access(user["role"], target, "*"):
@@ -111,6 +120,33 @@ def supervise(kind, target, script, user):
             "reasons": reasons + [f"{label} on {target} — requires human approval before it runs."]}
 
 
+def _supervise_platform_run(target, script, user):
+    """Platforms are orchestrators, not data sources, so rbac.can_access does
+    not apply. Submitting is a role gate (admin / analyst); every run still
+    waits for a human admin — policy, not the model, decides."""
+    if user["role"] not in ("admin", "analyst"):
+        return {"decision": "reject", "risk": "job",
+                "reasons": ["Your role cannot submit platform runs."]}
+    p = platforms.PLATFORMS.get(target)
+    if p is None:
+        return {"decision": "reject", "risk": "job",
+                "reasons": [f"Unknown platform '{target}' — choose one of: "
+                            f"{', '.join(sorted(platforms.PLATFORMS))}."]}
+    if not p.configured():
+        return {"decision": "reject", "risk": "job",
+                "reasons": [f"{p.label} is not configured — set its credentials "
+                            "in the environment first."]}
+    reasons = []
+    if agent.llm_available(agent.llm_spec(), user):
+        try:
+            reasons += _llm_review("platform_run", target, script, user)
+        except Exception:
+            pass
+    return {"decision": "needs_human", "risk": "job",
+            "reasons": reasons + [f"Pipeline run on {p.label} — requires human "
+                                  "approval before it runs."]}
+
+
 def _llm_review(kind, target, script, user):
     llm = agent.make_llm(agent.llm_spec(), user)
     sys = ("You are a data-platform supervisor. Review a job an agent wants to "
@@ -131,10 +167,32 @@ def _requester(job):
             "email": job["requester_email"], "name": job["requester_email"]}
 
 
+def _record_platform_rollout(user, target, run_ref):
+    """Agent Lightning rollout for a platform trigger (lightning.py
+    conventions: meta.agents names the acting agent, reward_source says where
+    the score came from). The reward is unknown until the run finishes, so it
+    stays None/"pending"; a later /live poll that discovers the terminal state
+    does NOT add a second trace — one rollout per run."""
+    try:
+        db.add_trace(user, prompt=f"platform:{target}", mode="platform_run",
+                     source=target, ok=True, reward=None, reward_source="pending",
+                     meta={"agents": [f"{target} executor"], "run_ref": run_ref})
+    except Exception:
+        pass  # learning must never break execution
+
+
 def _execute(job):
     """Run the job against its environment. Raises on any failure."""
     user = _requester(job)
     target = job["target"]
+
+    if job["kind"] == "platform_run":
+        # Adapters read their own env creds and raise RuntimeError with a clear
+        # message; {"run_ref","url"} lands in the result JSON column.
+        out = platforms.get_platform(target).trigger(json.loads(job["script"]))
+        _record_platform_rollout(user, target, out.get("run_ref"))
+        return out
+
     conn = _connector_or_400(target)
     if not conn.configured():
         raise RuntimeError(f"The {target} environment is not connected — configure its credentials.")
@@ -273,17 +331,22 @@ def _email(job, event, detail):
 # ── API ─────────────────────────────────────────────────────────────────
 
 class SubmitIn(BaseModel):
-    kind: str          # "sql_script" | "spark_job"
-    target: str        # source name (snowflake / databricks / demo / …)
-    script: str        # SQL text, or a Jobs run-submit JSON for spark_job
+    kind: str          # "sql_script" | "spark_job" | "platform_run"
+    target: str        # source name (snowflake / …) — or a platform name for platform_run
+    script: str        # SQL text, a Jobs run-submit JSON, or a platform payload JSON
 
 
 @router.post("", status_code=201)
 def submit_job(body: SubmitIn, user=Depends(current_user)):
-    if body.kind not in ("sql_script", "spark_job"):
-        raise HTTPException(400, "kind must be 'sql_script' or 'spark_job'")
+    if body.kind not in ("sql_script", "spark_job", "platform_run"):
+        raise HTTPException(400, "kind must be 'sql_script', 'spark_job' or 'platform_run'")
     if not (body.script or "").strip():
         raise HTTPException(400, "script is required")
+    if body.kind == "platform_run":
+        try:
+            json.loads(body.script)
+        except Exception:
+            raise HTTPException(400, "platform_run script must be a JSON payload")
     return _public(submit(body.kind, body.target, body.script, user))
 
 
@@ -301,12 +364,79 @@ def list_jobs(user=Depends(current_user)):
             "can_approve": user["role"] == "admin"}
 
 
+@router.get("/platforms")
+def list_platforms(user=Depends(current_user)):
+    """Platform picker for the submit form. Viewers cannot submit platform
+    runs, so they don't get the menu either. Registered before /{jid} so
+    "platforms" is never read as a job id."""
+    if user["role"] == "viewer":
+        raise HTTPException(403, "Your role cannot run pipelines")
+    return platforms.all_platforms()
+
+
 @router.get("/{jid}")
 def get_job(jid: str, user=Depends(current_user)):
     row = _get(jid)
     if not row or (row["user_id"] != user["id"] and user["role"] != "admin"):
         raise HTTPException(404, "Job not found")
     return _public(_row(row))
+
+
+@router.get("/{jid}/live")
+def live_job(jid: str, user=Depends(current_user)):
+    """Live platform state for a job — owner or admin, 404 for everyone else
+    (no oracle on other users' job ids). For a platform_run with a run_ref:
+    poll the platform best-effort (a logs failure must not kill the status),
+    persist the latest state into the result JSON, and flip the job's status
+    on a terminal state. Other jobs just report their stored state."""
+    row = _get(jid)
+    if not row or (row["user_id"] != user["id"] and user["role"] != "admin"):
+        raise HTTPException(404, "Job not found")
+
+    try:
+        stored = json.loads(row["result"]) if row.get("result") else {}
+    except Exception:
+        stored = {}
+    run_ref = stored.get("run_ref") if isinstance(stored, dict) else None
+
+    if row["kind"] != "platform_run" or not run_ref:
+        # Nothing to poll — the stored job is the truth.
+        return {"state": row["status"], "detail": row.get("last_error"),
+                "url": None, "metrics": {}, "logs": "", "quality": [],
+                "job": _public(row)}
+
+    p = platforms.get_platform(row["target"])
+    try:
+        st = p.status(run_ref)
+    except Exception as e:
+        st = {"state": "unknown", "detail": str(e), "url": None, "metrics": {}}
+    try:
+        logs = p.logs(run_ref)
+    except Exception:
+        logs = ""
+    try:
+        quality = p.quality(run_ref)
+    except Exception:
+        quality = []
+
+    merged = {**stored, "state": st["state"], "detail": st.get("detail"),
+              "metrics": st.get("metrics") or {}}
+    if st.get("url"):
+        merged["url"] = st["url"]
+    fields = {"result": json.dumps(merged, default=str)}
+    if st["state"] == "succeeded":
+        fields["status"] = "succeeded"      # idempotent: succeeded stays succeeded
+    elif st["state"] == "failed":
+        fields["status"] = "failed"
+        fields["last_error"] = (st.get("detail") or "platform reported failure")[:500]
+    _save(row, **fields)
+    # Deliberately NO second Agent Lightning trace when a poll discovers the
+    # terminal state — _execute already recorded this run's rollout.
+
+    return {"state": st["state"], "detail": st.get("detail"),
+            "url": st.get("url") or stored.get("url"),
+            "metrics": st.get("metrics") or {}, "logs": logs,
+            "quality": quality, "job": _public(row)}
 
 
 def _need_approver(jid, user):

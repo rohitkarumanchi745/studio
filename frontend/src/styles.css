@@ -619,3 +619,27 @@ td { color: var(--ink-2); }
 }
 .msg-panels .chartview { border-top: 1px solid var(--line); }
 .msg-panels .echart { height: 220px; }
+
+/* ── Platform runs: live status panel (Jobs.jsx) — append-only ── */
+.job-queued { color: var(--ink-2); }
+.job-failed { color: #e5679a; }
+.job-canceled { color: var(--ink-3); }
+.job-unknown { color: var(--ink-3); }
+.live-panel {
+  margin-top: 8px; border: 1px solid var(--line); border-radius: 8px;
+  padding: 10px 12px; background: var(--surface-2);
+}
+.live-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.live-detail { margin-top: 6px; }
+.live-logs { max-height: 240px; overflow: auto; white-space: pre-wrap; margin-top: 8px; }
+.qc-list { margin-top: 8px; }
+.qc-row { display: flex; align-items: baseline; gap: 8px; margin-top: 4px; font-size: 12.5px; }
+.qc-name { font-weight: 600; color: var(--ink-2); }
+.qc-badge {
+  font-size: 10.5px; border: 1px solid var(--line); border-radius: 999px;
+  padding: 1px 7px; color: var(--ink-3);
+}
+.qc-pass, .qc-success { color: #b7e4a0; }
+.qc-fail, .qc-error, .qc-failed { color: #e5679a; }
+.qc-warn, .qc-pending { color: #e9c46a; }
+.qc-detail { color: var(--ink-3); font-size: 11.5px; }

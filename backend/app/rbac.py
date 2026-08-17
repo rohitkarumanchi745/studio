@@ -9,17 +9,30 @@ exists). Swap this dict for a policy table / Azure AD group mapping later.
 _MARKETING = ["ga4", "braze", "powerbi_sap", "dynamic_yield", "qualtrics",
               "google_ads", "microsoft_ads", "sprinklr", "algolia"]
 
+# Object stores are one Studio source each; their "tables" are the datasets an
+# admin registers (connectors/objectstore.py), so "*" here means "every
+# registered dataset" — the registry, not the bucket, is the boundary.
+_OBJECT_STORES = ["s3", "azure_blob", "gcs"]
+
 POLICIES = {
     "admin": {
-        "demo": "*", "snowflake": "*", "databricks": "*", "neo4j": "*",
+        "demo": "*", "snowflake": "*", "databricks": "*", "bigquery": "*",
+        "neo4j": "*",
+        **{o: "*" for o in _OBJECT_STORES},
         **{m: "*" for m in _MARKETING},
     },
     "analyst": {
-        "demo": "*", "snowflake": "*", "databricks": "*", "neo4j": "*",
+        "demo": "*", "snowflake": "*", "databricks": "*", "bigquery": "*",
+        "neo4j": "*",
+        **{o: "*" for o in _OBJECT_STORES},
         **{m: "*" for m in _MARKETING},
     },
     "viewer": {
-        # Viewers get aggregate-friendly tables only — no customer PII.
+        # Viewers get aggregate-friendly tables only — no customer PII. The
+        # object stores and BigQuery are deliberately absent: their tables are
+        # whatever an admin registers or lands in a dataset, so no fixed
+        # allowlist can promise a viewer never sees PII. Fail closed until
+        # someone names the tables (or governance grants them).
         "demo": {"sales", "web_traffic"},
     },
 }

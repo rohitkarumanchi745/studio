@@ -2,7 +2,7 @@
 // access and per-table compliance (deny/mask columns, row caps). Validate
 // before applying; applying hot-reloads with no redeploy. Clearing reverts to
 // Studio's built-in RBAC.
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { api } from "../api";
 
 function McpServers() {
@@ -163,6 +163,105 @@ function GithubRepos() {
           </div>
         ))}
         {repos.length === 0 && <div className="meta">No repositories registered.</div>}
+      </div>
+    </div>
+  );
+}
+
+// Order here is the display order of the groups below.
+const STORE_SOURCES = ["s3", "azure_blob", "gcs"];
+const URI_HINT = {
+  s3: "s3://bucket/prefix/*.parquet",
+  azure_blob: "az://container/path/*.parquet",
+  gcs: "gs://bucket/prefix/*.parquet",
+};
+
+function ObjectStores() {
+  const [datasets, setDatasets] = useState([]);
+  const [form, setForm] = useState({ source: "s3", name: "", uri: "", format: "parquet" });
+  const [err, setErr] = useState("");
+
+  const load = () =>
+    api("/settings/objectstore")
+      .then((d) => setDatasets(d.datasets || []))
+      .catch((e) => setErr(e.message));
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  async function add() {
+    setErr("");
+    try {
+      await api("/settings/objectstore", {
+        method: "POST",
+        body: JSON.stringify({
+          source: form.source,
+          name: form.name.trim(),
+          uri: form.uri.trim(),
+          format: form.format,
+        }),
+      });
+      setForm({ source: form.source, name: "", uri: "", format: form.format });
+      load();
+    } catch (e) {
+      setErr(e.message);
+    }
+  }
+
+  async function remove(source, name) {
+    await api(`/settings/objectstore/${source}/${name}`, { method: "DELETE" });
+    load();
+  }
+
+  return (
+    <div className="mcp-block">
+      <div className="canvas-title" style={{ fontSize: 15 }}>Object storage datasets</div>
+      <div className="meta">
+        Object storage has no tables, so nothing is queryable until you name it here.
+        Each registered dataset becomes a named view that agents query with ordinary
+        SQL under the same RBAC and query guard as a warehouse table — agents never
+        see the raw bucket URI.
+      </div>
+      {err && <div className="error">{err}</div>}
+      <div className="job-form-row" style={{ marginTop: 8 }}>
+        <select value={form.source} onChange={(e) => setForm({ ...form, source: e.target.value })}>
+          {STORE_SOURCES.map((s) => (
+            <option key={s} value={s}>{s}</option>
+          ))}
+        </select>
+        <input className="sqllab-prompt" style={{ maxWidth: 150 }} placeholder="name (the table agents see)"
+          value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
+        <input className="sqllab-prompt" style={{ flex: 1 }} placeholder={URI_HINT[form.source]}
+          value={form.uri} onChange={(e) => setForm({ ...form, uri: e.target.value })} />
+        <select value={form.format} onChange={(e) => setForm({ ...form, format: e.target.value })}>
+          <option value="parquet">parquet</option>
+          <option value="csv">csv</option>
+          <option value="json">json</option>
+        </select>
+        <button className="chip chip-on" onClick={add}
+          disabled={!form.name.trim() || !form.uri.trim()}>＋ register</button>
+      </div>
+      <div className="share-list">
+        {STORE_SOURCES.map((s) => {
+          const rows = datasets.filter((d) => d.source === s);
+          if (rows.length === 0) return null;
+          return (
+            <Fragment key={s}>
+              <div className="meta">{s} — {URI_HINT[s]}</div>
+              {rows.map((d) => (
+                <div key={`${d.source}/${d.name}`} className="share-row">
+                  <div>
+                    <div>{d.name} <span className="query-tag">{d.format}</span></div>
+                    <div className="meta">{d.uri}</div>
+                  </div>
+                  <button className="chip" onClick={() => remove(d.source, d.name)}>remove</button>
+                </div>
+              ))}
+            </Fragment>
+          );
+        })}
+        {datasets.length === 0 && <div className="meta">No datasets registered.</div>}
       </div>
     </div>
   );
@@ -329,6 +428,7 @@ export default function Governance({ onClose }) {
 
       <McpServers />
       <GithubRepos />
+      <ObjectStores />
     </section>
   );
 }
