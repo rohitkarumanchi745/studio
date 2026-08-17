@@ -247,40 +247,54 @@ function DataTable({ columns, rows }) {
 
 function Echart({ option, tall, spec, onSelect, tileId }) {
   const ref = useRef(null);
-  // Kept in a ref so the click handler always sees the current callback
-  // without re-initializing the chart on every parent render.
+  const instRef = useRef(null);
+  const firstRef = useRef(true);
+  // Refs so the click handler / updates always see the current values without
+  // re-initializing the chart (a re-init replays the entrance animation).
   const selectRef = useRef(null);
   selectRef.current = onSelect;
-  const xCol = spec?.x;
+  const xColRef = useRef(spec?.x);
+  xColRef.current = spec?.x;
+
+  // Create the ECharts instance ONCE (per mount) and dispose only on unmount —
+  // never on a data change. So a live cell edit updates the chart in place
+  // instead of re-creating it and re-running the entrance animation, which is
+  // what made the lines "move" on every keystroke.
   useEffect(() => {
     const el = ref.current;
-    if (!el || !option) return;
+    if (!el) return;
     const inst = echarts.init(el, null, { renderer: "canvas" });
-    if (onSelect) {
-      inst.on("click", (p) => {
-        const value = p?.name ?? (Array.isArray(p?.value) ? p.value[0] : p?.value);
-        if (value == null || !xCol) return;
-        selectRef.current?.({ col: xCol, op: "eq", value: String(value), source_tile: tileId });
-      });
-      inst.getZr().setCursorStyle("pointer");
-    }
-    try {
-      inst.setOption(option);
-    } catch (e) {
-      inst.dispose();
-      el.innerHTML =
-        '<div class="chart-note">This data cannot be drawn as this chart type (' +
-        String(e.message || e).slice(0, 120) +
-        '). Pick another type.</div>';
-      return;
-    }
+    instRef.current = inst;
+    inst.on("click", (p) => {
+      const value = p?.name ?? (Array.isArray(p?.value) ? p.value[0] : p?.value);
+      if (value == null || !selectRef.current || !xColRef.current) return;
+      selectRef.current({ col: xColRef.current, op: "eq", value: String(value), source_tile: tileId });
+    });
+    if (onSelect) inst.getZr().setCursorStyle("pointer");
     const onResize = () => inst.resize();
     window.addEventListener("resize", onResize);
     return () => {
       window.removeEventListener("resize", onResize);
       inst.dispose();
+      instRef.current = null;
+      firstRef.current = true;
     };
-  }, [option, xCol]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tileId]);
+
+  // Update data in place. The first paint animates (a subtle entrance); every
+  // later update (a cell edit, a type switch) is static, so the chart stays put.
+  useEffect(() => {
+    const inst = instRef.current;
+    if (!inst || !option) return;
+    try {
+      inst.setOption(firstRef.current ? option : { ...option, animation: false }, { notMerge: true });
+      firstRef.current = false;
+    } catch {
+      /* bad option — keep the last good chart rather than blanking it */
+    }
+  }, [option]);
+
   return <div ref={ref} className={"echart" + (tall ? " echart-tall" : "")} />;
 }
 
