@@ -33,7 +33,28 @@ import Sidebar from "./components/Sidebar";
 export default function App() {
   const [user, setUser] = useState(getToken() ? getUser() : null);
   const [conversations, setConversations] = useState([]);
-  const [activeId, setActiveId] = useState(null);
+  const [convsLoaded, setConvsLoaded] = useState(false);
+  const [activeId, setActiveIdRaw] = useState(null);
+
+  // The open conversation survives a browser refresh: persist it per user and
+  // restore on load — otherwise a refresh lands on an empty "New chat" and the
+  // (server-saved) history looks lost.
+  const setActiveId = useCallback((id) => {
+    setActiveIdRaw(id);
+    const key = "studio_conv:" + (getUser()?.id || "");
+    if (id) localStorage.setItem(key, id);
+    else localStorage.removeItem(key);
+  }, []);
+  useEffect(() => {
+    if (!user) return;
+    const saved = localStorage.getItem("studio_conv:" + (user.id || ""));
+    if (saved) setActiveIdRaw(saved);
+  }, [user]);
+  // Drop a restored id that no longer exists (deleted / another account).
+  useEffect(() => {
+    if (!convsLoaded || !activeId) return;
+    if (!conversations.some((c) => c.id === activeId)) setActiveId(null);
+  }, [convsLoaded, conversations, activeId, setActiveId]);
   const [showActivity, setShowActivity] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [dashboardId, setDashboardId] = useState(null);
@@ -51,7 +72,12 @@ export default function App() {
 
   const refresh = useCallback(() => {
     if (!getToken()) return;
-    api("/conversations").then(setConversations).catch(() => {});
+    api("/conversations")
+      .then((c) => {
+        setConversations(c);
+        setConvsLoaded(true);
+      })
+      .catch(() => {});
   }, []);
 
   useEffect(refresh, [refresh, user]);

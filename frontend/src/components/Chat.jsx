@@ -69,6 +69,19 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
     api("/catalog/sources").then(setSources).catch(() => {});
   }, []);
 
+  // An unsent draft survives a refresh / conversation switch: keyed per
+  // conversation in localStorage, cleared once the prompt is sent (send()
+  // empties the input, which removes the stored draft).
+  const draftKey = "studio_draft:" + (conversationId || "new");
+  useEffect(() => {
+    setPrompt(localStorage.getItem(draftKey) || "");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [conversationId]);
+  useEffect(() => {
+    if (prompt) localStorage.setItem(draftKey, prompt);
+    else localStorage.removeItem(draftKey);
+  }, [prompt, draftKey]);
+
   useEffect(() => {
     setTables([]);
     setSel([]);
