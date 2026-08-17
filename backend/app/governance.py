@@ -30,6 +30,7 @@ Document shape:
           mask_columns: [lifetime_value]   # returned as ***
           max_rows: 5000
 """
+import re
 import time
 
 import yaml
@@ -203,6 +204,87 @@ def _rules_for(source, tables):
     return {"deny": deny, "mask": mask, "max_rows": cap}
 
 
+_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _split_top_commas(text):
+    """Split on commas that are not inside parentheses or quotes."""
+    items, buf, depth = [], [], 0
+    in_sq = in_dq = False
+    for ch in text:
+        if in_sq:
+            buf.append(ch)
+            if ch == "'":
+                in_sq = False
+            continue
+        if in_dq:
+            buf.append(ch)
+            if ch == '"':
+                in_dq = False
+            continue
+        if ch == "'":
+            in_sq = True
+        elif ch == '"':
+            in_dq = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "," and depth == 0:
+            items.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        items.append("".join(buf))
+    return items
+
+
+def _projection_idents(sql, ncols):
+    """The lowercased source identifiers feeding each projected column, so
+    deny/mask can key on the underlying column even when a projection aliases it
+    (`region AS "geo"`). Returns a list parallel to the output columns, or None
+    when the SELECT list can't be mapped 1:1 (SELECT *, CTEs, UNIONs, subselects
+    in the list) — callers then fall back to matching the output name, which is
+    exactly the source column in those cases. Deliberately fails safe: a
+    projection referencing a denied column is treated as denied even if the
+    reference is inside an aggregate, so masking can never be aliased away."""
+    s = (sql or "").strip()
+    low = s.lower()
+    if not low.startswith("select"):
+        return None
+    # Depth of each char (parens, ignoring quoted text), to find the top-level FROM.
+    depths, d = [], 0
+    in_sq = in_dq = False
+    for ch in s:
+        depths.append(d)
+        if in_sq:
+            if ch == "'":
+                in_sq = False
+        elif in_dq:
+            if ch == '"':
+                in_dq = False
+        elif ch == "'":
+            in_sq = True
+        elif ch == '"':
+            in_dq = True
+        elif ch == "(":
+            d += 1
+        elif ch == ")":
+            d -= 1
+    from_at = -1
+    for m in re.finditer(r"\bfrom\b", low):
+        if depths[m.start()] == 0:
+            from_at = m.start()
+            break
+    if from_at < 0:
+        return None
+    items = _split_top_commas(s[len("select"):from_at])
+    if len(items) != ncols:
+        return None                      # star-expansion / parse mismatch → fallback
+    return [{t.lower() for t in _IDENT_RE.findall(it)} for it in items]
+
+
 def filter_result(source, sql, columns, rows):
     """Apply compliance to a result BEFORE it leaves the backend: drop denied
     columns, mask masked ones, cap rows. Result-time enforcement means even a
@@ -213,8 +295,19 @@ def filter_result(source, sql, columns, rows):
     if not r:
         return columns, rows
 
-    keep = [i for i, c in enumerate(columns) if str(c).lower() not in r["deny"]]
-    mask_idx = {i for i in keep if str(columns[i]).lower() in r["mask"]}
+    # Key deny/mask on the OUTPUT name OR the SOURCE column(s) feeding it, so an
+    # alias (semantic layer: `region AS "geo"`) can't smuggle a denied column
+    # past the gate. src[i] is the projection's identifiers, or None to fall
+    # back to the name alone (SELECT * etc., where name == source column).
+    src = _projection_idents(sql, len(columns))
+
+    def _hit(i, colset):
+        if str(columns[i]).lower() in colset:
+            return True
+        return src is not None and bool(src[i] & colset)
+
+    keep = [i for i in range(len(columns)) if not _hit(i, r["deny"])]
+    mask_idx = {i for i in keep if _hit(i, r["mask"])}
     out_cols = [columns[i] for i in keep]
     out_rows = []
     limit = r["max_rows"]

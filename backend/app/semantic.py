@@ -196,6 +196,9 @@ def validate(text):
             if not expr:
                 errors.append(f"{where}.metric '{name}' needs an `expr`")
                 continue
+            if name.lower() in metrics:
+                errors.append(f"{where}.metric '{name}': duplicate metric name")
+                continue
             metrics[name.lower()] = {
                 "name": name, "agg": agg, "expr": expr,
                 "filter": (met.get("filter") or "").strip() or None,
@@ -218,6 +221,9 @@ def validate(text):
             if grain and str(grain).lower() not in _GRAINS:
                 errors.append(f"{where}.dimension '{name}': grain must be one of {list(_GRAINS)}")
                 continue
+            if name.lower() in dims:
+                errors.append(f"{where}.dimension '{name}': duplicate dimension name")
+                continue
             dims[name.lower()] = {
                 "name": name, "expr": expr,
                 "grain": str(grain).lower() if grain else None,
@@ -228,10 +234,19 @@ def validate(text):
             errors.append(f"{where} ({source}.{table}) defines no valid metrics")
             continue
         default_time = m.get("default_time")
+        dt = str(default_time).lower() if default_time else None
+        if dt:
+            # default_time must name a real time dimension (by grain or by name),
+            # else time-intent prompts would silently fall back to an arbitrary one.
+            time_keys = ({d["grain"] for d in dims.values() if d["grain"]}
+                         | {k for k, d in dims.items() if d["grain"]})
+            if dt not in time_keys:
+                errors.append(f"{where}: default_time '{dt}' matches no time dimension")
+                continue
         models.append({
             "source": str(source), "table": str(table),
             "filter": (m.get("filter") or "").strip() or None,
-            "default_time": str(default_time).lower() if default_time else None,
+            "default_time": dt,
             "metrics": metrics, "dimensions": dims,
         })
 
@@ -296,15 +311,47 @@ def _stem_tokens(text):
     return {_stem(t) for t in re.findall(r"[a-z0-9_]+", (text or "").lower())}
 
 
-def _matches(prompt_stems, terms):
+def _matches(prompt_stems, terms, neg_stems=frozenset()):
     """A term matches when every word of it (stemmed) is present in the prompt
-    (also stemmed). Multi-word synonyms like 'total sales' need all their words;
-    single words like 'region' match 'regions' via the stem."""
+    (also stemmed) and none of its words was negated ("ignore revenue"). Multi-
+    word synonyms like 'total sales' need all their words; single words like
+    'region' match 'regions' via the stem."""
     for t in terms:
-        words = re.findall(r"[a-z0-9_]+", (t or "").lower())
-        if words and all(_stem(w) in prompt_stems for w in words):
+        words = [_stem(w) for w in re.findall(r"[a-z0-9_]+", (t or "").lower())]
+        if words and all(w in prompt_stems for w in words) and not any(w in neg_stems for w in words):
             return True
     return False
+
+
+# Words that negate/exclude the term after them, so "revenue, not by region"
+# doesn't match `region`. A short window covers "not by region", "ignore revenue".
+_NEG_CUES = {"not", "no", "without", "excluding", "exclude", "except", "ignore",
+             "ignoring", "omit", "omitting", "drop", "minus", "rather"}
+
+
+def _matched_words(prompt_stems, terms):
+    """The widest fully-present (stemmed) synonym of a term set — used to tell a
+    strong multi-word match ('average order value') from an incidental one-word
+    overlap ('order'), so the broader match can shadow the narrower."""
+    best = set()
+    for t in terms:
+        w = {_stem(x) for x in re.findall(r"[a-z0-9_]+", (t or "").lower())}
+        if w and w <= prompt_stems and len(w) > len(best):
+            best = w
+    return best
+
+
+def _negated_stems(prompt_l):
+    """Stems appearing in a short window after a negation/exclusion cue."""
+    neg, window = set(), 0
+    for tok in re.findall(r"[a-z0-9_]+", prompt_l):
+        if tok in _NEG_CUES:
+            window = 3
+            continue
+        if window:
+            neg.add(_stem(tok))
+            window -= 1
+    return neg
 
 
 def resolve(source, prompt, table=None):
@@ -314,18 +361,39 @@ def resolve(source, prompt, table=None):
     to a metric, because a wrong-but-consistent number is worse than none."""
     prompt_l = (prompt or "").lower()
     prompt_stems = _stem_tokens(prompt_l)
+    prompt_tokens = set(re.findall(r"[a-z0-9_]+", prompt_l))
+    neg = _negated_stems(prompt_l)
     best = None
     for m in models_for(source, table):
-        metrics = [v for v in m["metrics"].values() if _matches(prompt_stems, v["terms"])]
+        metrics = [v for v in m["metrics"].values() if _matches(prompt_stems, v["terms"], neg)]
         if not metrics:
             continue
-        dims = [v for v in m["dimensions"].values() if _matches(prompt_stems, v["terms"])]
+        # Shadowing: drop a metric whose only match is a strict subset of a wider
+        # metric's match — "average order value" must not also fire `orders` via
+        # its lone word "order", which would silently change the ORDER BY.
+        mw = [_matched_words(prompt_stems, v["terms"]) for v in metrics]
+        metrics = [v for i, v in enumerate(metrics)
+                   if not any(j != i and mw[i] < mw[j] for j in range(len(metrics)))]
+
+        dims = [v for v in m["dimensions"].values() if _matches(prompt_stems, v["terms"], neg)]
 
         # Time intent: an explicit grain word, else a trend word → the model's
         # default time dimension (or the sole time dimension if unambiguous).
         grain = next((g for w, g in _GRAIN_WORDS.items() if w in prompt_l), None)
         wants_time = grain is not None or any(w in prompt_l for w in _TREND_WORDS)
         time_dims = [v for v in m["dimensions"].values() if v.get("grain")]
+
+        # Confidence floor: a single metric with no dimension and no time intent
+        # is the classic false-positive shape (an incidental word like "order" in
+        # "in order to"). Require a metric term to appear as a whole UNSTEMMED
+        # token — "orders" resolves, the filler "order" does not.
+        if len(metrics) == 1 and not dims and not wants_time:
+            exact = any(
+                all(w in prompt_tokens for w in re.findall(r"[a-z0-9_]+", t))
+                for t in metrics[0]["terms"])
+            if not exact:
+                continue
+
         if wants_time and not any(d.get("grain") for d in dims):
             pick = None
             if m.get("default_time"):
@@ -374,8 +442,17 @@ def _time_trunc(dialect, expr, grain):
     return f"date_trunc('{g}', CAST({expr} AS TIMESTAMP))"
 
 
-def _agg_sql(metric):
-    """The aggregate expression for a metric, with an optional CASE filter."""
+# median needs an ordered-set aggregate; these dialects have PERCENTILE_CONT.
+# Stock SQLite and BigQuery have no portable single-pass median, so a median
+# metric declines there (uniformly, dev and prod) rather than emitting SQL that
+# works only on a MEDIAN-enabled build.
+_MEDIAN_DIALECTS = {"ansi", "postgres", "duckdb", "snowflake", "databricks"}
+
+
+def _agg_sql(metric, dialect="ansi"):
+    """The aggregate SQL for a metric, dialect-aware, with an optional CASE
+    filter. Raises ValueError when the aggregate can't be expressed for the
+    dialect (median on sqlite/bigquery) so the caller declines consistently."""
     agg, expr, filt = metric["agg"], metric["expr"], metric.get("filter")
     if agg == "count" and expr == "*":
         base = "*" if not filt else f"CASE WHEN {filt} THEN 1 END"
@@ -390,10 +467,13 @@ def _agg_sql(metric):
             return f"COUNT(CASE WHEN {filt} THEN {expr} END)"
         if agg == "count_distinct":
             return f"COUNT(DISTINCT CASE WHEN {filt} THEN {expr} END)"
-    fn = {"sum": "SUM", "avg": "AVG", "min": "MIN", "max": "MAX",
-          "count": "COUNT", "count_distinct": "COUNT", "median": "MEDIAN"}[agg]
     if agg == "count_distinct":
         return f"COUNT(DISTINCT {expr})"
+    if agg == "median":
+        if dialect not in _MEDIAN_DIALECTS:
+            raise ValueError(f"median is not supported on the {dialect} dialect")
+        return f"PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY {expr})"
+    fn = {"sum": "SUM", "avg": "AVG", "min": "MIN", "max": "MAX", "count": "COUNT"}[agg]
     return f"{fn}({expr})"
 
 
@@ -413,7 +493,7 @@ def compile_sql(model, metrics, dimensions, dialect, limit=5000):
         dim_exprs.append(f"{e} AS {_q(d['name'])}")
         group_terms.append(e)
 
-    met_exprs = [f"{_agg_sql(mt)} AS {_q(mt['name'])}" for mt in metrics]
+    met_exprs = [f"{_agg_sql(mt, dialect)} AS {_q(mt['name'])}" for mt in metrics]
     select = ", ".join(dim_exprs + met_exprs)
     sql = f"SELECT {select} FROM {model['table']}"
     if model.get("filter"):
@@ -425,15 +505,15 @@ def compile_sql(model, metrics, dimensions, dialect, limit=5000):
                           for d in dimensions if d.get("grain"))
             sql += f" ORDER BY {time_e}"
         else:
-            sql += f" ORDER BY {_agg_sql(metrics[0])} DESC"
+            sql += f" ORDER BY {_agg_sql(metrics[0], dialect)} DESC"
     sql += f" LIMIT {int(limit)}"
     return sql
 
 
-def explain(model, metrics, dimensions):
+def explain(model, metrics, dimensions, dialect="ansi"):
     """A plain-language note of exactly how each number was computed — shown on
     the answer so 'revenue' is never a black box."""
-    defs = [f"{m['name']} = {_agg_sql(m)}" for m in metrics]
+    defs = [f"{m['name']} = {_agg_sql(m, dialect)}" for m in metrics]
     by = ", ".join(d["name"] + (f" ({d['grain']})" if d.get("grain") else "") for d in dimensions)
     note = f"From the semantic layer · {', '.join(defs)}"
     if by:
@@ -481,7 +561,7 @@ def answer(user, source, prompt, table=None):
     chart = _auto_chart(columns, rows, model["table"]) or {
         "type": "table", "title": model["table"],
         "x": columns[0] if columns else None, "y": columns[1:2]}
-    note = explain(model, match["metrics"], match["dimensions"])
+    note = explain(model, match["metrics"], match["dimensions"], dialect)
     panel = {"sql": res["sql"], "columns": columns, "rows": rows, "chart": chart}
     return {
         "text": note,
@@ -491,7 +571,7 @@ def answer(user, source, prompt, table=None):
         "agents": [roster.SEMANTIC],
         "semantic": {
             "source": model["source"], "table": model["table"],
-            "metrics": [{"name": m["name"], "sql": _agg_sql(m)} for m in match["metrics"]],
+            "metrics": [{"name": m["name"], "sql": _agg_sql(m, dialect)} for m in match["metrics"]],
             "dimensions": [{"name": d["name"], "grain": d.get("grain")} for d in match["dimensions"]],
         },
     }
@@ -520,7 +600,7 @@ models:
       - name: orders
         agg: count
         expr: "*"
-        synonyms: [order, purchase, transaction]
+        synonyms: [purchases, transactions, order count]
       - name: units
         agg: sum
         expr: units
@@ -633,15 +713,23 @@ def post_compile(body: CompileIn, user=Depends(current_user)):
     match = resolve(body.source, body.prompt, body.table)
     if not match:
         return {"resolved": False}
+    # Per-table RBAC: a metric may live on a table the caller can't reach even
+    # though the source is generally accessible. Treat a denied model as
+    # unresolved so /compile can't disclose that table's existence or columns.
+    if not rbac.can_access(user["role"], body.source, match["model"]["table"]):
+        return {"resolved": False}
     from .connectors import get_connector
     try:
         dialect = get_connector(body.source).dialect
     except Exception:
         dialect = "ansi"
-    sql = compile_sql(match["model"], match["metrics"], match["dimensions"], dialect)
+    try:
+        sql = compile_sql(match["model"], match["metrics"], match["dimensions"], dialect)
+    except ValueError as e:
+        return {"resolved": False, "reason": str(e)}
     return {
         "resolved": True, "sql": sql,
-        "explain": explain(match["model"], match["metrics"], match["dimensions"]),
+        "explain": explain(match["model"], match["metrics"], match["dimensions"], dialect),
         "metrics": [m["name"] for m in match["metrics"]],
         "dimensions": [{"name": d["name"], "grain": d.get("grain")} for d in match["dimensions"]],
     }
