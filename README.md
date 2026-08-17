@@ -25,7 +25,7 @@ flowchart TB
     end
 
     subgraph api["FastAPI — one origin, API at /api/*"]
-        routers["Routers · auth · chat · pipelines · flow<br/>queries · governance · supervisor · sessions<br/>mcp · repos · dashboards · catalog"]
+        routers["Routers · auth · chat · pipelines · flow<br/>queries · governance · supervisor · sessions<br/>mcp · repos · dashboards · catalog · freshness"]
 
         subgraph agents["Agent layer"]
             orch["orchestrator.py<br/>fan-out + aggregator"]
@@ -119,7 +119,10 @@ sequenceDiagram
 ```
 
 Without an API key the agent degrades to a deterministic preview
-(`SELECT * … LIMIT` + auto chart), so the whole flow stays demoable.
+(`SELECT * … LIMIT` + auto chart), so the whole flow stays demoable. An
+*invalid* key is a different case and is called out as one — "the server's key
+was rejected; fix it or connect your own under ⚿ API keys" — instead of
+pretending no key was set.
 
 ---
 
@@ -159,6 +162,22 @@ execution), and only then save it with the requirement prompt that produced it.
 Verification is a hard gate — a query that doesn't run is never stored, and
 re-running a saved query re-validates against the *runner's* role, so the
 library can never become an RBAC bypass.
+
+### Data freshness — "as of when"
+
+Studio reads live data on every question, but it doesn't own the warehouse's
+ingestion (dbt / Fivetran / Airflow do). It answers *"how current is this?"*
+from what each table records about itself: `freshness.py` detects the best
+freshness column — a load/ingest stamp (`loaded_at`, `snapshot_date`, `_ts`)
+beats a business date, time-*typed* columns beat date-*named* ones (TEXT dates
+are common) — and reads `MAX(col)` + row count through the same query guard +
+RBAC allowlist as everything else. Load stamps and record dates are labeled
+distinctly: *when the pipeline last wrote* vs *the newest business date
+present*. Surfaced three ways: a `data_freshness` agent tool (ask "as of when
+is this data current?" in chat), a 🕒 button per source in the **Skill files**
+panel, and `GET /freshness/{source}`. Honest limit: it reports what's *in* the
+tables — a silently failed pipeline shows up as a freshness value that stops
+advancing, not as a schedule alert.
 
 ### Prompt-built pipelines + data lineage
 
@@ -375,6 +394,10 @@ measurable.
   worker pool and returns immediately, so you can start a question in one chat,
   switch to another and start a different one, and a **blue dot** lights up each
   conversation when its task finishes (cleared when opened).
+- **Refresh-proof UI** — a browser refresh restores the open conversation (with
+  its charts, and a still-running task's live state) and any unsent composer
+  draft, both kept per user. History itself always lives server-side in
+  Postgres — the refresh only ever risked the *view*, and now not even that.
 
 ---
 
@@ -395,6 +418,9 @@ Stages run in a fixed order — `derive → bin → filters → unpivot → grou
 `SELECT`, so a finer grain the current result aggregated away is re-queried
 through the same guard. **Cross-filtering** is a server-side predicate applied to
 every tile — no JS mirror, so filtering means the same thing everywhere.
+**Live cell edits update charts in place** — the ECharts instance persists
+across data changes, so an edit moves one value instead of re-running the
+entrance animation on the whole chart.
 
 ---
 
@@ -473,6 +499,13 @@ Alongside these: `governance_docs`, `mcp_servers`, `github_repos`, `chat_tasks`,
 has no implicit autoincrement, and a `REAL` epoch would round; the facade maps
 `REAL → DOUBLE PRECISION`). `query_cache` doubles as the semantic cache and
 BitNet's learned-scope repertoire (repetition + reward + Harrier embedding).
+
+Warehouse connectors coerce every result cell to JSON-safe values
+(`base.to_jsonable`: dates/times → ISO strings, `Decimal` → numbers so numeric
+columns stay numeric for charts, bytes → text, nested structs recursed). Real
+warehouses return Python objects SQLite never did, and both the API response
+and the Redis tile-cache round-trip need plain JSON — this surfaced as a real
+production bug the day Databricks was connected.
 
 **Two deliberate choices:** dashboards and saved queries store the **recipe**
 (SQL + spec), never rows, so RBAC is evaluated at *view* time; messages **do**
@@ -625,11 +658,31 @@ alone; FastAPI serves the built frontend on one origin.
 
 Warehouse credentials (`SNOWFLAKE_*`, `DATABRICKS_*`, `NEO4J_*`) and the
 marketing connectors are listed in `backend/.env.example`; sources appear in the
-picker automatically once configured.
+picker automatically once configured. The Databricks driver ships installed
+(set the three `DATABRICKS_*` vars and the source appears); Snowflake's is a
+one-line uncomment in `requirements.txt`.
 
 ---
 
 ## Roadmap
+
+**In progress** (building + adversarially verifying now, not yet on `main`):
+- **Object storage + BigQuery connectors** — S3 / Azure Blob / GCS as
+  DuckDB-backed **named views**: admins register datasets (name → URI + format),
+  agents query ordinary table names under the same RBAC + guard and never see a
+  raw bucket URI; a BigQuery connector with a `maximum_bytes_billed` cost cap;
+  and a hardened query guard that closes path-literal (`FROM 's3://…'`) and
+  `read_*`/`*_scan` table-function escapes while fixing existing false
+  positives (`;` in string literals, identifiers like `created_at`). A
+  supervised Spark job's declared output (Parquet on S3) will auto-register as
+  a dataset on success — the write→read loop closed.
+- **Pipeline Control Service** — one adapter contract (trigger / status / logs /
+  data-quality) for **Airflow, Databricks Jobs, dbt Cloud, Kubernetes/Spark**
+  behind the supervisor's human-approval gate, with run status, logs, metrics,
+  and data-quality results (dbt test outcomes, Airflow task states) fed back
+  into the Jobs UI. Every trigger is an Agent Lightning rollout.
+
+Planned:
 - Streaming agent steps to the UI (LangGraph `stream`)
 - Decision-level (per-tool-call) rollouts, so tool-calling training data is at
   the granularity of the model's decisions
