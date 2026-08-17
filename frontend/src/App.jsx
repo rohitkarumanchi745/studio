@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, getToken, getUser, setSession } from "./api";
 import Activity from "./components/Activity";
 import Agents from "./components/Agents";
@@ -45,15 +45,25 @@ export default function App() {
     if (id) localStorage.setItem(key, id);
     else localStorage.removeItem(key);
   }, []);
+  const restoredRef = useRef(null);
   useEffect(() => {
     if (!user) return;
     const saved = localStorage.getItem("studio_conv:" + (user.id || ""));
-    if (saved) setActiveIdRaw(saved);
+    if (saved) {
+      restoredRef.current = saved;   // only THIS id may be dropped as stale
+      setActiveIdRaw(saved);
+    }
   }, [user]);
-  // Drop a restored id that no longer exists (deleted / another account).
+  // Validate ONLY the id restored from localStorage, and only once the list has
+  // loaded — it may point at a deleted conversation or another account's.
+  // This must never run against a freshly created conversation: `conversations`
+  // lags the create by one refresh, so a general "is activeId in the list?"
+  // check deselects the chat the moment you ask your first question in it.
   useEffect(() => {
-    if (!convsLoaded || !activeId) return;
-    if (!conversations.some((c) => c.id === activeId)) setActiveId(null);
+    if (!convsLoaded || !restoredRef.current) return;
+    const stale = !conversations.some((c) => c.id === restoredRef.current);
+    if (stale && activeId === restoredRef.current) setActiveId(null);
+    restoredRef.current = null;      // one-shot
   }, [convsLoaded, conversations, activeId, setActiveId]);
   const [showActivity, setShowActivity] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);

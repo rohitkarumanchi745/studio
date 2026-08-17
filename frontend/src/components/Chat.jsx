@@ -189,26 +189,46 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
   function pollFor(taskId, cid) {
     if (pollingRef.current === taskId) return;
     pollingRef.current = taskId;
+    const started = Date.now();
+    let failures = 0;
     const tick = async () => {
       if (pollingRef.current !== taskId) return;        // superseded by a newer task
       let st;
       try {
         st = await api(`/tasks/${taskId}`);
-      } catch {
-        setTimeout(tick, 3000);                         // transient — keep trying
+        failures = 0;
+      } catch (e) {
+        // Never spin forever on a broken poll: after repeated failures, say so.
+        if (++failures >= 5) {
+          pollingRef.current = null;
+          setBusy(false);
+          setError(`Lost contact with the server while waiting for the answer (${e.message}). It may still have completed — reopen this chat to check.`);
+          return;
+        }
+        setTimeout(tick, 3000);
         return;
       }
       if (st.status === "running") {
+        // Watchdog: a task that never reaches a terminal state must not hang the
+        // UI silently — surface it so the failure is diagnosable, not invisible.
+        if (Date.now() - started > 5 * 60 * 1000) {
+          pollingRef.current = null;
+          setBusy(false);
+          setError("The agent is taking unusually long. It's still running server-side — reopen this chat shortly to see the answer.");
+          return;
+        }
         setTimeout(tick, 2500);
         return;
       }
       pollingRef.current = null;                        // done or failed
+      // Clear the spinner even if the user switched chats — leaving busy set
+      // is what made the composer look permanently stuck.
+      setBusy(false);
       if (activeConvRef.current === cid) {
         try {
           handleModelError(loadMessages(await api(`/conversations/${cid}/messages`)));
         } catch { /* keep the optimistic messages rather than blank the view */ }
         if (st.status === "failed") setError(st.error || "The task failed.");
-        setBusy(false);
       }
     };
     setTimeout(tick, 1500);
