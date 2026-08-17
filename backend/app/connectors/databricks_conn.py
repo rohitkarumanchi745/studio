@@ -4,7 +4,7 @@ requires `pip install databricks-sql-connector` (commented in requirements.txt).
 import os
 import threading
 
-from .base import Connector
+from .base import Connector, jsonify_rows
 
 
 class DatabricksConnector(Connector):
@@ -105,7 +105,9 @@ class DatabricksConnector(Connector):
             cur = con.cursor()
             cur.execute(sql_text)
             columns = [d[0] for d in cur.description]
-            rows = [list(r) for r in cur.fetchmany(int(os.getenv("STUDIO_MAX_ROWS", "50000")))]
+            # Databricks returns date/datetime/Decimal — coerce to JSON-safe so
+            # results survive the tile cache and the API response.
+            rows = jsonify_rows(cur.fetchmany(int(os.getenv("STUDIO_MAX_ROWS", "50000"))))
             return columns, rows
         return self._execute(go)
 

@@ -1,4 +1,37 @@
 """Connector interface every data source implements."""
+import datetime
+import decimal
+
+
+def to_jsonable(v):
+    """Coerce a warehouse cell value to something JSON-serializable, so results
+    survive the tile cache (JSON round-trip) and the API response. Real
+    warehouses (Databricks / Snowflake) return `date`/`datetime`/`Decimal`/
+    `bytes` that FastAPI's encoder rejects; SQLite already returns str/num.
+    Decimals become numbers (charts need numeric columns to stay numeric);
+    dates/times become ISO strings."""
+    if v is None or isinstance(v, (str, int, float, bool)):
+        return v
+    if isinstance(v, decimal.Decimal):
+        f = float(v)
+        return int(f) if f.is_integer() else f
+    if isinstance(v, (datetime.datetime, datetime.date, datetime.time)):
+        return v.isoformat()
+    if isinstance(v, (bytes, bytearray, memoryview)):
+        try:
+            return bytes(v).decode("utf-8", "replace")
+        except Exception:
+            return str(v)
+    if isinstance(v, (list, tuple)):
+        return [to_jsonable(x) for x in v]
+    if isinstance(v, dict):
+        return {str(k): to_jsonable(x) for k, x in v.items()}
+    return str(v)
+
+
+def jsonify_rows(rows):
+    """Apply to_jsonable across a result set (list of row lists)."""
+    return [[to_jsonable(v) for v in r] for r in rows]
 
 
 class Connector:

@@ -4,7 +4,7 @@
 import os
 import threading
 
-from .base import Connector
+from .base import Connector, jsonify_rows
 
 
 class SnowflakeConnector(Connector):
@@ -101,7 +101,7 @@ class SnowflakeConnector(Connector):
             cur = con.cursor()
             cur.execute(sql)
             columns = [d[0] for d in cur.description]
-            rows = [list(r) for r in cur.fetchmany(int(os.getenv("STUDIO_MAX_ROWS", "50000")))]
+            rows = jsonify_rows(cur.fetchmany(int(os.getenv("STUDIO_MAX_ROWS", "50000"))))
             return columns, rows
         return self._execute(go)
 
