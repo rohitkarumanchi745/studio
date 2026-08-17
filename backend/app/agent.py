@@ -431,24 +431,39 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         text = _final_text(result) or "Done."
         usage = _extract_usage(result)
     except Exception as e:
-        # Provider/graph failure — fall back so the product keeps working,
-        # surface the reason, and alert the user by email (best-effort).
-        try:
-            email_service.send(
-                user["email"],
-                "Studio agent issue",
-                f"<p>Your question <b>{prompt[:200]}</b> hit an agent error:</p>"
-                f"<pre>{str(e)[:500]}</pre><p>A basic preview was shown instead.</p>",
-            )
-        except Exception:
-            pass
+        # Provider/graph failure — fall back so the product keeps working.
+        msg = str(e)
+        provider = spec.split(":", 1)[0]
+        key_var = _KEY_FOR_PROVIDER.get(provider, "the API key")
+        # An auth failure means the CONFIGURED key was rejected (invalid/expired)
+        # — a persistent config problem, not a per-question error. Switching model
+        # won't help (same key), and emailing every turn would be spam.
+        is_auth = ("401" in msg or "authentication_error" in msg
+                   or "api key" in msg.lower() and ("invalid" in msg.lower()
+                                                    or "incorrect" in msg.lower()))
         out = _fallback(prompt, connector, table, allowed_tables)
-        out["text"] = f"(Agent error: {e}) — showing a basic preview instead.\n\n" + out["text"]
-        # Name the model that failed so the client can stop using it. A key
-        # being set only means the provider is configured, not that the
-        # account can actually bill — quota and auth errors surface here.
-        out["model_error"] = {"spec": spec, "detail": str(e)[:300],
-                              "retryable_with_default": spec != llm_spec()}
+        if is_auth:
+            n = len(out.get("rows") or [])
+            out["text"] = (
+                f"The {provider} API key configured on the server was rejected "
+                f"(invalid or expired), so the agent is offline — showing a basic "
+                f"preview ({n} rows). An admin can fix {key_var}, or you can connect "
+                f"your own key under ⚿ API keys to enable natural-language analysis.")
+            out["model_error"] = {"spec": spec, "detail": msg[:300], "auth": True,
+                                  "retryable_with_default": False}
+        else:
+            # Transient/other error — alert the user (best-effort) and let the
+            # client retry with the default model if a non-default was chosen.
+            try:
+                email_service.send(
+                    user["email"], "Studio agent issue",
+                    f"<p>Your question <b>{prompt[:200]}</b> hit an agent error:</p>"
+                    f"<pre>{msg[:500]}</pre><p>A basic preview was shown instead.</p>")
+            except Exception:
+                pass
+            out["text"] = f"(Agent error: {e}) — showing a basic preview instead.\n\n" + out["text"]
+            out["model_error"] = {"spec": spec, "detail": msg[:300],
+                                  "retryable_with_default": spec != llm_spec()}
         out["agents"] = [me]
         return out
 
