@@ -44,6 +44,9 @@ STAGE_AGENTS = [
 # Utility agents that aren't source workers or a flow stage but are still named,
 # traced agents in their own right.
 SQL_VERIFIER = {"name": "SQL verifier", "role": "verifier", "produces": "verified SQL"}
+# The semantic layer answers from admin-defined metrics, so every phrasing of the
+# same question compiles to the same SQL — no model reinventing "revenue".
+SEMANTIC = {"name": "Semantic layer", "role": "semantic", "produces": "governed metric SQL"}
 
 
 def stage(name):
@@ -90,7 +93,7 @@ def summary(user):
         "orchestrator": ORCHESTRATOR,
         "aggregator": AGGREGATOR,
         "pipeline_crew": STAGE_AGENTS,
-        "utility_agents": [SQL_VERIFIER],
+        "utility_agents": [SQL_VERIFIER, SEMANTIC],
         "multi_source": len(accessible) > 1,
         "accessible_count": len(accessible),
     }

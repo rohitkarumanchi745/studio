@@ -11,7 +11,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from . import (agent, db, email_service, keys, lightning, orchestrator, qcache,
-               queryguard, rbac, roster, router as model_router, sessions, skills)
+               queryguard, rbac, roster, router as model_router, semantic,
+               sessions, skills)
 from .auth import current_user
 from .catalog import _connector_or_400, match_tables
 
@@ -294,10 +295,16 @@ def _run_turn(ctx, user):
             allowed_tables=ctx["allowed"], schemas=ctx["schemas"], history=ctx["history"],
             user=user, model=spec, skill_md=skill_md)
 
+    # Tier -1 — semantic layer: if the prompt resolves to admin-defined metrics,
+    # answer from the ONE canonical definition. Deterministic, needs no model,
+    # and guarantees every phrasing of the same question returns the same number.
+    # Anything it can't resolve returns None and falls through to the agent.
+    result = semantic.answer(user, ctx["source"], prompt, ctx["table_param"])
+    if result is not None:
+        pass
     # Tier 0 — semantic cache: an equivalent prompt reuses its plan (SQL+chart),
     # re-executed fresh, with no model at all.
-    cached = qcache.lookup(user, ctx["source"], ctx["table_label"], prompt)
-    if cached is not None:
+    elif (cached := qcache.lookup(user, ctx["source"], ctx["table_label"], prompt)) is not None:
         result = cached
     else:
         # Tier 1/2 — route learned, repeated work to the self-hosted BitNet;
