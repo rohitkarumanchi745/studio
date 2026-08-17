@@ -23,7 +23,11 @@ function buildCanvas(m) {
     selected: 0,
     source: m.source,
     note: "",
-    original: panels.map((p) => ({ ...p, rows: p.rows.map((r) => [...r]) })),
+    // `p.rows ?? []`: a panel without rows (a redacted message, a cached plan
+    // that returned none) used to throw here — and the caller swallowed it and
+    // re-polled forever, so the chat hung on "agent is querying…" with the
+    // answer already saved. A missing-rows panel must degrade, never throw.
+    original: panels.map((p) => ({ ...p, rows: (p.rows ?? []).map((r) => [...r]) })),
   };
 }
 
@@ -62,8 +66,16 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
   const [prompt, setPrompt] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [pollTask, setPollTask] = useState(null); // {id, cid} of a running background task
   const endRef = useRef(null);
+  // Background-task polling lives in refs, NOT state/effects: creating a new
+  // conversation changes conversationId, and an effect keyed on it used to
+  // reset the poll mid-flight — so a fast (cached) task finished but nothing
+  // reloaded and the chat sat on "agent is querying…" forever. Refs survive
+  // re-renders and conversation switches; the loop reconciles against the
+  // *current* open conversation each tick.
+  const activeConvRef = useRef(conversationId);
+  activeConvRef.current = conversationId;
+  const pollingRef = useRef(null); // task id currently being polled (dedup)
 
   useEffect(() => {
     api("/catalog/sources").then(setSources).catch(() => {});
@@ -96,9 +108,6 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
 
   useEffect(() => {
     setError("");
-    // Switching chats abandons any poll tied to the previous conversation; its
-    // task keeps running server-side and its blue dot appears when it finishes.
-    setPollTask(null);
     setBusy(false);
     if (!conversationId) {
       setMessages([]);
@@ -107,20 +116,15 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
     }
     api(`/conversations/${conversationId}/messages`)
       .then((ms) => {
-        const loaded = ms.map((m) => ({ role: m.role, ...m.content }));
-        setMessages(loaded);
-        // Reopening a conversation restores its charts to the canvas — the
-        // visualization is part of the saved conversation, not a transient view.
-        const last = [...loaded]
-          .reverse()
-          .find((m) => m.role === "assistant" && (m.panels?.length || (m.chart && m.rows?.length)));
-        setCanvas(last ? buildCanvas(last) : null);
-        // If a background task is still running here, resume the live state.
+        loadMessages(ms);
+        // If a background task is still running here (e.g. after a refresh or a
+        // chat switch), resume the live "working…" state. pollFor dedups, so
+        // this never double-polls a task send() already started.
         api(`/conversations/${conversationId}/task`)
           .then((t) => {
             if (t.status === "running") {
               setBusy(true);
-              setPollTask({ id: t.id, cid: conversationId });
+              pollFor(t.id, conversationId);
             }
           })
           .catch(() => {});
@@ -130,38 +134,6 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
         setCanvas(null);
       });
   }, [conversationId]);
-
-  // Poll a running background task; when it finishes, reload the conversation.
-  useEffect(() => {
-    if (!pollTask) return;
-    let stop = false;
-    let handle;
-    const tick = async () => {
-      if (stop) return;
-      try {
-        const st = await api(`/tasks/${pollTask.id}`);
-        if (st.status !== "running") {
-          // Only apply to the view if this is still the open conversation.
-          if (pollTask.cid === conversationId) {
-            const ms = await api(`/conversations/${pollTask.cid}/messages`);
-            const loaded = ms.map((m) => ({ role: m.role, ...m.content }));
-            setMessages(loaded);
-            const last = [...loaded].reverse().find(
-              (m) => m.role === "assistant" && (m.panels?.length || (m.chart && m.rows?.length)));
-            setCanvas(last ? buildCanvas(last) : null);
-            handleModelError(loaded);
-            if (st.status === "failed") setError(st.error || "The task failed.");
-            setBusy(false);
-          }
-          setPollTask(null);
-          return;
-        }
-      } catch { /* keep polling */ }
-      if (!stop) handle = setTimeout(tick, 2500);
-    };
-    handle = setTimeout(tick, 2000);
-    return () => { stop = true; clearTimeout(handle); };
-  }, [pollTask, conversationId]);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -191,11 +163,55 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
         }),
       });
       if (!conversationId) onConversationCreated(data.conversation_id);
-      setPollTask({ id: data.task_id, cid: data.conversation_id });
+      pollFor(data.task_id, data.conversation_id);
     } catch (err) {
       setError(err.message);
       setBusy(false);
     }
+  }
+
+  function loadMessages(ms) {
+    const loaded = ms.map((m) => ({ role: m.role, ...m.content }));
+    setMessages(loaded);
+    // Reopening a conversation restores its charts to the canvas — the
+    // visualization is part of the saved conversation, not a transient view.
+    const last = [...loaded].reverse().find(
+      (m) => m.role === "assistant" && (m.panels?.length || (m.chart && m.rows?.length)));
+    setCanvas(last ? buildCanvas(last) : null);
+    return loaded;
+  }
+
+  // Poll one background task to completion, then — only if its conversation is
+  // still the open one — reload it. Ref-driven so re-renders and conversation
+  // switches can't cancel it (the old effect-based poll did, and lost the race
+  // on a fast task → stuck on "agent is querying…"); dedups on task id so it
+  // never runs twice.
+  function pollFor(taskId, cid) {
+    if (pollingRef.current === taskId) return;
+    pollingRef.current = taskId;
+    const tick = async () => {
+      if (pollingRef.current !== taskId) return;        // superseded by a newer task
+      let st;
+      try {
+        st = await api(`/tasks/${taskId}`);
+      } catch {
+        setTimeout(tick, 3000);                         // transient — keep trying
+        return;
+      }
+      if (st.status === "running") {
+        setTimeout(tick, 2500);
+        return;
+      }
+      pollingRef.current = null;                        // done or failed
+      if (activeConvRef.current === cid) {
+        try {
+          handleModelError(loadMessages(await api(`/conversations/${cid}/messages`)));
+        } catch { /* keep the optimistic messages rather than blank the view */ }
+        if (st.status === "failed") setError(st.error || "The task failed.");
+        setBusy(false);
+      }
+    };
+    setTimeout(tick, 1500);
   }
 
   // A model can be "available" yet fail (no credit, revoked key). After a run

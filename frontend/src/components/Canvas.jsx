@@ -67,7 +67,7 @@ export default function Canvas({ state, setState, onClose, chatOpen, onToggleCha
         ...state,
         panels: next,
         selected: composed ? 0 : selected,
-        original: composed ? next.map((p) => ({ ...p, rows: p.rows.map((r) => [...r]) })) : original,
+        original: composed ? next.map((p) => ({ ...p, rows: (p.rows ?? []).map((r) => [...r]) })) : original,
         note: d.note + (d.warnings?.length ? ` (${d.warnings.length} warning${d.warnings.length > 1 ? "s" : ""})` : ""),
       });
       // Each edit is a NEW version: it appears as its own chat message, so
@@ -121,7 +121,7 @@ export default function Canvas({ state, setState, onClose, chatOpen, onToggleCha
   function reset() {
     setState({
       ...state,
-      panels: original.map((p) => ({ ...p, rows: p.rows.map((r) => [...r]) })),
+      panels: original.map((p) => ({ ...p, rows: (p.rows ?? []).map((r) => [...r]) })),
       note: "Reset to original results.",
     });
   }
