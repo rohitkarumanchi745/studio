@@ -59,10 +59,18 @@ def init_tables():
 
 # ── Verification: the gate everything passes through ────────────────────
 
-def verify_sql(user, source, table_label, sql):
+def verify_sql(user, source, table_label, sql, full_rows=False):
     """RBAC + query guard + real execution. Returns
     {ok, columns, rows, row_count, sql, error}. Never raises for a rejected
-    query — a failed verification is a normal result the caller surfaces."""
+    query — a failed verification is a normal result the caller surfaces.
+
+    `rows` is a PREVIEW (PREVIEW_ROWS) because every caller so far only shows
+    the user a sample; `row_count` is always the true count. full_rows=True
+    returns every row (still capped at agent.MAX_ROWS) for callers that need the
+    data itself — blend.py materializes parts into DuckDB. It stays a flag on
+    this one function rather than a second fetch path, so there is exactly one
+    gate: re-implementing RBAC + guard + governance elsewhere is how they drift.
+    """
     sql = (sql or "").strip()
     if not sql:
         return {"ok": False, "error": "SQL is empty."}
@@ -100,7 +108,7 @@ def verify_sql(user, source, table_label, sql):
         "ok": True,
         "sql": cleaned,
         "columns": columns,
-        "rows": rows[:PREVIEW_ROWS],
+        "rows": rows if full_rows else rows[:PREVIEW_ROWS],
         "row_count": len(rows),
         "took_ms": int((time.time() - t0) * 1000),
     }
