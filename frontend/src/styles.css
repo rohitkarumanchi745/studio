@@ -306,6 +306,13 @@ td { color: var(--ink-2); }
   display: inline-block; }
 @keyframes convspin { to { transform: rotate(360deg); } }
 
+/* ── Data freshness ── */
+.fresh-list { margin-top: 8px; border-top: 1px dashed var(--line); padding-top: 8px; }
+.fresh-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+  padding: 4px 0; font-size: 12.5px; border-top: 1px solid var(--line); }
+.fresh-row:first-of-type { border-top: none; }
+.fresh-table { min-width: 160px; color: var(--ink-2); }
+
 /* ── Training readiness bar ── */
 .train-bar { height: 8px; background: var(--surface-2); border: 1px solid var(--line);
   border-radius: 6px; overflow: hidden; margin-top: 10px; }

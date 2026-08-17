@@ -7,11 +7,25 @@ import { api } from "../api";
 export default function Skills({ onClose }) {
   const [data, setData] = useState(null);
   const [open, setOpen] = useState({});
+  const [fresh, setFresh] = useState({});   // source -> {loading|tables}
   const [error, setError] = useState("");
 
   useEffect(() => {
     api("/skills").then(setData).catch((e) => setError(e.message));
   }, []);
+
+  // "As of when" is the warehouse's ingestion, not Studio's — Studio reads live
+  // data every query, so this reports the newest timestamp each table carries.
+  async function checkFreshness(source) {
+    setFresh((f) => ({ ...f, [source]: "loading" }));
+    try {
+      const d = await api(`/freshness/${source}`);
+      setFresh((f) => ({ ...f, [source]: d.tables || [] }));
+    } catch (e) {
+      setFresh((f) => ({ ...f, [source]: [] }));
+      setError(e.message);
+    }
+  }
 
   const skills = data?.skills || [];
 
@@ -60,6 +74,35 @@ export default function Skills({ onClose }) {
                 ))}
                 {s.tables.length > 14 && <span className="meta">+{s.tables.length - 14}</span>}
               </div>
+              <div className="gov-actions" style={{ marginTop: 6 }}>
+                <button className="chip" onClick={(e) => { e.stopPropagation(); checkFreshness(s.source); }}
+                  disabled={fresh[s.source] === "loading"}>
+                  {fresh[s.source] === "loading" ? "checking…" : "🕒 data freshness"}
+                </button>
+              </div>
+              {Array.isArray(fresh[s.source]) && (
+                <div className="fresh-list">
+                  <div className="meta">
+                    Newest timestamp each table carries — Studio queries live data, so this
+                    reflects your warehouse's last ingestion (which Studio doesn't schedule).
+                  </div>
+                  {fresh[s.source].map((t) => (
+                    <div key={t.table} className="fresh-row">
+                      <span className="fresh-table">{t.table}</span>
+                      {t.column ? (
+                        <>
+                          <span className="query-tag">{t.kind === "load" ? "load stamp" : "record date"}</span>
+                          <span className="meta">{t.column}</span>
+                          <b>{String(t.latest ?? "—")}</b>
+                          <span className="meta">{t.rows != null ? `${t.rows} rows` : ""}</span>
+                        </>
+                      ) : (
+                        <span className="meta">{t.error || t.note || "no date column"}</span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
               {open[s.source] && (
                 <pre className="flow-json" style={{ marginLeft: 0, whiteSpace: "pre-wrap" }}>{s.skill}</pre>
               )}

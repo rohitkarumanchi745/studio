@@ -373,6 +373,26 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         return f"Chart panel {len(ctx['panels'])} recorded."
 
     @tool
+    def data_freshness(table: str) -> str:
+        """How current a table's data is — the latest value of its load/update
+        timestamp (or date) column and the row count. Use this to answer
+        "as of when", "how fresh is the data", or "when was this last loaded".
+
+        Args:
+            table: A table you have access to (from the schema above).
+        """
+        from . import freshness
+        r = freshness.for_table(connector, allowed_tables, table)
+        if r.get("error"):
+            return f"Couldn't check {table}: {r['error']}"
+        if not r.get("column"):
+            return f"{table} has no date/timestamp column to gauge freshness by."
+        label = "latest load timestamp" if r.get("kind") == "load" else "latest record date"
+        return (f"{table}: {label} is {r['latest']} (column `{r['column']}`), "
+                f"{r['rows']} rows. Studio reads live data, so this is current now; "
+                f"it reflects the warehouse's last ingestion, which Studio doesn't schedule.")
+
+    @tool
     def remember(note: str) -> str:
         """Save a durable note about this user's preferences or context
         (e.g. "prefers revenue in bar charts", "cares about the West region").
@@ -411,7 +431,7 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
 
     try:
         llm = make_llm(spec, user)
-        base_tools = [run_sql, render_chart, remember, email_report]
+        base_tools = [run_sql, render_chart, data_freshness, remember, email_report]
         # Cache the system prompt + prior-turn prefix (KV reuse across turns).
         messages = _cache_history(history, spec) + [("user", prompt)]
         mcp_cfg = mcp_servers()
