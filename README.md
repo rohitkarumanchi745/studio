@@ -126,6 +126,69 @@ pretending no key was set.
 
 ---
 
+## Semantic layer — one definition of truth
+
+Left to itself, the agent writes SQL from scratch for every question. That makes
+"revenue" a moving target: two phrasings of the same question can compile to
+different SQL and return *different numbers*, and nobody can say how any figure
+was computed. That's the classic self-serve-analytics failure — the numbers are
+fast but untrustworthy.
+
+The **semantic layer** (`semantic.py`) fixes it. An admin defines each metric and
+dimension **once**, in YAML:
+
+```yaml
+models:
+  - source: demo
+    table: sales
+    metrics:
+      - name: revenue
+        agg: sum
+        expr: revenue
+        synonyms: [sales, turnover, income, earnings]
+    dimensions:
+      - name: region
+        expr: region
+        synonyms: [geography, area, market, location]
+      - name: month
+        expr: order_date
+        grain: month              # truncated per the source's SQL dialect
+        synonyms: [over time, monthly, trend]
+```
+
+Now a chat turn tries the semantic layer **first** (a tier ahead of the cache,
+the BitNet router, and the frontier agent). A deterministic resolver maps the
+prompt to defined metrics/dimensions (whole-word + light-stem synonym matching —
+it never *force-fits*), and a dialect-aware compiler produces the one canonical
+SQL. `revenue by region`, `sales across geographies`, `turnover by market`, and
+`income by location` all resolve to the same metric+dimension and compile to
+**byte-identical SQL → identical numbers**. Anything the layer can't resolve
+returns nothing and falls through to the agent, untouched.
+
+Because it's deterministic it needs **no model at all** — the governed metrics
+work with no API key, and can't drift. And it decides only *what* to compute:
+the compiled SQL still goes through `queries.verify_sql`, so **RBAC, the query
+guard, and governance masking apply exactly as they do to any query**. The layer
+never widens access.
+
+The answer is labelled **▣ Semantic layer** in chat and carries its own
+definition note ("revenue = SUM(revenue) · by region"), so a number is never a
+black box. Admins edit the YAML under **▣ Semantic layer**; everyone can browse
+the metric catalog and type a prompt to preview the exact SQL it compiles to
+(`POST /semantic/compile`, no execution) — the consistency guarantee, made
+inspectable.
+
+```mermaid
+flowchart LR
+    Q["prompt"] --> R{resolves to a<br/>defined metric?}
+    R -- yes --> C["compile canonical SQL<br/>(deterministic, no model)"]
+    C --> V["verify_sql — RBAC +<br/>guard + governance"]
+    V --> ANS["▣ Semantic layer answer"]
+    R -- no --> AG["cache → BitNet → agent"]
+```
+
+---
+
 ## The agent platform
 
 ### A named crew, not one model

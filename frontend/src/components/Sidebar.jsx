@@ -5,7 +5,7 @@ import ShareDialog from "./ShareDialog";
 
 export default function Sidebar({
   conversations, activeId, onSelect, onNew, onDelete, onActivity, onCollapse,
-  onDashboards, onRename, onKeysChanged, onQueries, onPipelines, onGovernance, onJobs, onPyBuild,
+  onDashboards, onRename, onKeysChanged, onQueries, onPipelines, onGovernance, onSemantic, onJobs, onPyBuild,
   onSessions, onAgents, onFlow, onSkills,
 }) {
   const user = getUser();
@@ -201,6 +201,9 @@ export default function Sidebar({
         </button>
         <button className="logout" onClick={onSkills} style={{ marginBottom: 8 }}>
           ▤ Skill files
+        </button>
+        <button className="logout" onClick={onSemantic} style={{ marginBottom: 8 }}>
+          ▣ Semantic layer
         </button>
         {user?.role === "admin" && (
           <button className="logout" onClick={onGovernance} style={{ marginBottom: 8 }}>

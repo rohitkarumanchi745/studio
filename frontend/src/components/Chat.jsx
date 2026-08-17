@@ -501,13 +501,15 @@ function AssistantMessage({ m, requirement, onOpenCanvas }) {
         <div className="assistant-head">
           <span className="brand-mark">◆</span>
           <span className="meta">
-            {m.served_by === "bitnet"
-              ? "🧠 BitNet (learned)"
-              : m.mode === "cached"
-                ? "⚡ cached"
-                : m.mode === "fallback"
-                  ? "fallback"
-                  : m.model}
+            {m.served_by === "semantic"
+              ? "▣ Semantic layer"
+              : m.served_by === "bitnet"
+                ? "🧠 BitNet (learned)"
+                : m.mode === "cached"
+                  ? "⚡ cached"
+                  : m.mode === "fallback"
+                    ? "fallback"
+                    : m.model}
             {" · "}{m.source}/{m.table === "*" ? "all tables" : m.table}
             {m.agents?.length > 0
               ? ` · ${agentLabel(m.agents)}`

@@ -8,6 +8,7 @@ import DashboardList from "./components/DashboardList";
 import Flow from "./components/Flow";
 import Login from "./components/Login";
 import Governance from "./components/Governance";
+import Semantic from "./components/Semantic";
 import Jobs from "./components/Jobs";
 import PyBuild from "./components/PyBuild";
 import Pipelines from "./components/Pipelines";
@@ -71,6 +72,7 @@ export default function App() {
   const [showQueries, setShowQueries] = useState(false);
   const [showPipelines, setShowPipelines] = useState(false);
   const [showGovernance, setShowGovernance] = useState(false);
+  const [showSemantic, setShowSemantic] = useState(false);
   const [showJobs, setShowJobs] = useState(false);
   const [showPy, setShowPy] = useState(false);
   const [showSessions, setShowSessions] = useState(false);
@@ -127,6 +129,7 @@ export default function App() {
         onQueries={() => setShowQueries(true)}
         onPipelines={() => setShowPipelines(true)}
         onGovernance={() => setShowGovernance(true)}
+        onSemantic={() => setShowSemantic(true)}
         onJobs={() => setShowJobs(true)}
         onPyBuild={() => setShowPy(true)}
         onSessions={() => setShowSessions(true)}
@@ -166,6 +169,8 @@ export default function App() {
         <Jobs onClose={() => setShowJobs(false)} />
       ) : showGovernance ? (
         <Governance onClose={() => setShowGovernance(false)} />
+      ) : showSemantic ? (
+        <Semantic user={user} onClose={() => setShowSemantic(false)} />
       ) : showPipelines ? (
         <Pipelines onClose={() => setShowPipelines(false)} />
       ) : showQueries ? (
