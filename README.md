@@ -6,7 +6,10 @@ Power BI / Tableau-class visualizations you can pin, cross-filter, and share.
 Beyond chat it builds **verified SQL**, **prompt-driven pipelines** with data
 lineage, a **safe-production pipeline flow** (generate → validate → approve →
 deploy → run) with a human in the loop, **governance-as-code**, and a learning
-loop (**Agent Lightning**) that records every run as a rewarded rollout.
+loop (**Agent Lightning**) that records every run as a rewarded rollout. Once a
+use case has been learned, a **self-hosted BitNet** — trained continuously from
+those rollouts — takes over the recurring work, leaving the frontier LLM to
+handle only what's genuinely new.
 
 **Live demo:** https://studio-production-ac35.up.railway.app
 
@@ -39,9 +42,12 @@ flowchart TB
             verify["verify_sql · the execution gate"]
         end
 
-        subgraph learn["Agent Lightning + caching"]
-            light["lightning.py<br/>rollouts + reward"]
+        subgraph learn["Agent Lightning · caching · routing"]
+            light["lightning.py<br/>rollouts + per-agent reward"]
             qc["qcache.py<br/>semantic cache"]
+            route["router.py<br/>learned-scope cascade"]
+            emb2["embed.py<br/>Harrier similarity"]
+            tr["trainer.py<br/>online adapters"]
             sess["sessions.py<br/>serialize + prompt cache"]
         end
     end
@@ -52,7 +58,9 @@ flowchart TB
     end
 
     subgraph ext["External"]
-        llm{{"LLM · Claude / GPT (BYOK)"}}
+        llm{{"Frontier LLM · Claude / GPT (BYOK)"}}
+        bit{{"BitNet · self-hosted (learned scope)"}}
+        harr{{"Harrier · embeddings"}}
         mcp{{"MCP servers"}}
         gh{{"GitHub repos"}}
         src[("Connectors · demo · Snowflake<br/>Databricks · Neo4j · marketing APIs")]
@@ -60,10 +68,13 @@ flowchart TB
 
     client -->|JWT| routers
     routers --> agents
-    agent <--> llm
+    agents --> learn
+    route <--> llm
+    route <--> bit
+    emb2 <--> harr
+    tr -.adapters.-> bit
     agents --> gate
     gate --> src
-    agents --> learn
     agent -.tools.-> mcp
     flowm -.scripts.-> gh
     routers --> pg
@@ -72,7 +83,7 @@ flowchart TB
     classDef store fill:#1f6f4a,stroke:#2e9e6b,color:#fff
     classDef extc fill:#2b4a7d,stroke:#3d6bb3,color:#fff
     class pg,redis store
-    class llm,mcp,gh,src extc
+    class llm,bit,harr,mcp,gh,src extc
 ```
 
 **One gate for data.** Every path that returns rows — the agent's `run_sql`
@@ -239,10 +250,81 @@ exact shape a real RL trainer consumes, so the day a self-hosted open-weight
 model is added, the same rewarded data drives true weight RL — nothing about
 collection changes.
 
+**Per-agent reward shaping.** Each named agent is scored on its *own* decision,
+not a blended answer-level reward: a worker on grounded SQL + rows + a real
+chart, the aggregator on genuine synthesis, each flow stage on its own artifact,
+the SQL verifier on whether its check ran. So the orchestrated crew produces a
+per-worker rollout plus an aggregator rollout, and the `/learning` tally counts
+only single-agent rollouts — no agent's average is smeared by another's work.
+Each agent's reward + rollout count shows on its card in the **Agents** panel.
+
 **Train our own model.** `GET /training` reports prompts collected vs. a
 threshold, reward-labeled and human-rated counts, and readiness; the admin
 **Agents** panel shows the progress bar. `POST /training/export` writes the
-rollout JSONL.
+rollout JSONL — the bridge to the self-hosted BitNet path below.
+
+---
+
+## Self-hosted BitNet — learned-scope routing + simultaneous training
+
+The frontier LLM (Claude / GPT) is the *frontier of what's new*; recurring,
+learned work moves to a cheap, self-hosted **BitNet** whose **scope grows** over
+time. Every prompt routes in three tiers, all keyed on *meaning* via Harrier:
+
+```mermaid
+flowchart TB
+    p["Prompt"] --> emb["Harrier embedding · cosine<br/>(embed.py)"]
+    emb --> tier{"scope?"}
+    tier -->|"identical · cache band"| cache["cached plan · no model"]
+    tier -->|"in scope · learn band"| bit["BitNet · self-hosted, cheap"]
+    tier -->|"new · out of scope"| fr["Frontier LLM · Claude / GPT"]
+    bit -->|"fails / not trained yet"| fr
+    bit --> roll[("rollout + reward<br/>agent_traces")]
+    fr --> roll
+    roll --> grow["recurs + scores well →<br/>joins BitNet's scope"]
+    roll --> trainer["trainer (CPU worker)<br/>scripts/train_online.py"]
+    trainer -->|"publishes LoRA"| ad[("adapters · tool_call · per-user")]
+    ad -.->|"hot-swap"| bit
+    grow -.-> tier
+```
+
+- **The scope grows, frontier usage shrinks.** A new prompt goes to the frontier
+  LLM; its successful answers accumulate until that use case is *learned*
+  (recurs, scores well) and joins BitNet's scope — future variations then route
+  to BitNet, and only genuinely new contexts reach the frontier (`router.py`).
+- **Harrier defines "same meaning."** `embed.py` embeds prompts with
+  `microsoft/harrier-oss-v1-0.6b` (1024-dim, instruction-prefixed queries,
+  documents plain) and scores cosine similarity — so different-word paraphrases
+  match. It falls back to lexical token-Jaccard when `HARRIER_EMBED_URL` is unset.
+- **Centralized + access-gated.** The learned scope is shared across users —
+  one user's repeated, successful patterns benefit everyone (seen/reward
+  aggregate across roles) — but a requester routes to BitNet only when their role
+  can access every table the pattern touches ("same access"). **RBAC governs data
+  access regardless of which model decides**; BitNet's SQL passes the same guard.
+- **Safe through the training lag.** If BitNet hasn't actually trained on a
+  just-learned case yet, its attempt fails and *escalates to the frontier* —
+  cheaper, never wrong.
+
+**Simultaneous training** (`trainer.py` + `scripts/train_online.py`). Studio is
+the concurrent **producer + adapter server**; a **CPU worker** is the trainer —
+BitNet's 1-bit base is CPU-efficient and its LoRA adapters are small, so **no GPU
+is required**. They run at the same time:
+
+```
+Studio agent ──rollouts──▶  trainer (CPU worker)  ──adapters──▶  Studio serving
+  (produces)                (SFT → DPO → GRPO)                   (hot-swaps)
+     ▲                                                                │
+     └──────────────────── keeps serving with the newest ────────────┘
+```
+
+The trainer pulls reward-labeled rollouts (`GET /training/rollouts`), trains a
+**global tool-calling** LoRA plus **per-user style** LoRAs, and publishes them
+(`POST /training/adapters`); serving composes both per request and hot-swaps to
+the newest version. `GET /training/online` reports the loop status and BitNet's
+growing scope. The heavy ML deps live in `scripts/requirements-trainer.txt`
+(kept out of the lean API image); run the worker via `scripts/Dockerfile.trainer`.
+The whole path is **dormant until `STUDIO_LLM_BASE_URL` (BitNet) and
+`HARRIER_EMBED_URL` (Harrier) are configured**, so it changes nothing on its own.
 
 ---
 
@@ -272,26 +354,11 @@ flowchart TB
 - **Semantic query cache** (`qcache.py`) caches a successful run's plan under a
   signature; a semantically-similar prompt reuses it but **always re-executes the
   SQL** through RBAC + guard + governance — fresh rows, access re-checked, never
-  stale and never a bypass. Similarity is **Harrier embeddings** (`embed.py`,
-  `microsoft/harrier-oss-v1-0.6b`, 1024-dim, instruction-prefixed queries) when
-  `HARRIER_EMBED_URL` is set — so different-word paraphrases match — and falls
-  back to lexical token-Jaccard otherwise.
-- **Model cascade with a growing scope** (`router.py`) — the frontier LLM is the
-  frontier of what's *new*; learned work moves to a cheap self-hosted BitNet. A
-  turn routes in three tiers: an **identical** prompt (≥ cache threshold) reuses
-  the cached plan with no model; an **in-scope** prompt — a use case BitNet has
-  learned (a pattern seen ≥ N times with good reward, matched below the cache
-  band) — routes to **BitNet**; a **new, out-of-scope** prompt goes to the
-  **frontier LLM**, whose successful answers accumulate until that use case
-  itself crosses the threshold and **joins BitNet's scope**. So the scope grows
-  and frontier usage shrinks toward only-the-new. BitNet's SQL still passes the
-  guard, and a failed BitNet attempt (e.g. it hasn't trained on a just-learned
-  case yet) escalates to the frontier — cheaper, never wrong, safe through the
-  training lag. The scope is **centralized across users** (seen/reward aggregate
-  across roles) and a requester routes to BitNet only when their role can access
-  every table the pattern touches ("same access"). **RBAC governs data access
-  regardless of which model decides.** Dormant until a BitNet endpoint is
-  configured (`STUDIO_LLM_BASE_URL`).
+  stale and never a bypass. Similarity uses Harrier embeddings when configured,
+  lexical Jaccard otherwise (see the BitNet section).
+- **Model cascade** (`router.py`) — learned, recurring work is served by the
+  cheap self-hosted BitNet instead of the frontier LLM; only new use cases pay
+  for the frontier. Full treatment in the [BitNet section](#self-hosted-bitnet--learned-scope-routing--simultaneous-training).
 
 `usage` on each answer (input/output + cache-read/write tokens) makes the reuse
 measurable.
@@ -387,11 +454,25 @@ erDiagram
         text deployment
         text execution
     }
+    query_cache {
+        text signature
+        int seen
+        double avg_reward
+        text embedding "Harrier vector"
+    }
+    training_adapters {
+        text id PK
+        text scope "global | user_id"
+        text kind "tool_call | user_style"
+        int version
+    }
 ```
 
-Alongside these: `governance_docs`, `mcp_servers`, `github_repos` — each a small
-table with a TEXT-uuid primary key (Postgres has no implicit autoincrement, and
-a `REAL` epoch would round; the facade maps `REAL → DOUBLE PRECISION`).
+Alongside these: `governance_docs`, `mcp_servers`, `github_repos`, `chat_tasks`,
+`training_adapters` — each a small table with a TEXT-uuid primary key (Postgres
+has no implicit autoincrement, and a `REAL` epoch would round; the facade maps
+`REAL → DOUBLE PRECISION`). `query_cache` doubles as the semantic cache and
+BitNet's learned-scope repertoire (repetition + reward + Harrier embedding).
 
 **Two deliberate choices:** dashboards and saved queries store the **recipe**
 (SQL + spec), never rows, so RBAC is evaluated at *view* time; messages **do**
@@ -448,7 +529,10 @@ in-process cache silently.
 | Decision | Why | Tradeoff accepted |
 |---|---|---|
 | **Hosted LLMs (Claude / GPT) via BYOK**, not self-hosted weights | No GPU fleet; users bring their own key; always the latest models | Can't do gradient/weight RL — learning is prompt-level |
-| **Agent Lightning optimizes the prompt, not weights** (APO / RLAIF) | Frozen hosted weights make prompt-opt the reachable lever | No true policy-gradient learning until a self-hosted model is added — rollouts export ready for it |
+| **Agent Lightning optimizes the prompt for hosted models; weights for BitNet** | Hosted weights are frozen (prompt-opt only); a self-hosted BitNet's *are* trainable from the same rollouts | Two learning modes to reason about — but the rollout data is identical |
+| **BitNet serves the learned scope, frontier serves the new** (scope grows) | Recurring work shouldn't keep paying the frontier; the frontier bootstraps data and handles novelty | Runs two models; needs a BitNet + Harrier endpoint stood up; a training lag (covered by escalation) |
+| **Learned scope centralized + access-gated** | One user's learned patterns benefit everyone with the same access | The *cache* tier stays role-scoped (it reuses stored insight text) — only the routing is centralized |
+| **BitNet / LoRA trains on CPU** (no GPU) | 1-bit base + small adapters are CPU-feasible; deployable without a GPU fleet | Coarser (batch) cadence than a GPU; trainer's heavy deps live in a separate worker image |
 | **Prompt/KV caching via provider `cache_control`** | Hosted APIs don't expose the raw attention KV cache | You cache the *prefix* (server-side, TTL-bound), not tensors |
 | **Semantic cache re-executes the SQL** (never returns stored rows) | Fresh data + RBAC/guard/governance re-checked on every hit | A hit still pays the warehouse round-trip (but skips the LLM) |
 | **Harrier embeddings when configured, lexical signature otherwise** | Real semantic match (different-word paraphrases) with Harrier; deterministic lexical fallback keeps it working offline with zero deps | Embeddings need a Harrier endpoint stood up; the lexical fallback misses different-word paraphrases |
@@ -547,10 +631,8 @@ picker automatically once configured.
 
 ## Roadmap
 - Streaming agent steps to the UI (LangGraph `stream`)
-- Self-hosted BitNet → true weight training from the rollouts. Studio is the
-  producer + adapter server (`trainer.py`); a **CPU worker**
-  (`scripts/train_online.py`, no GPU — BitNet's 1-bit base + small LoRA train on
-  CPU) consumes the rollout stream and publishes a global tool-calling adapter +
-  per-user style adapters that serving hot-swaps in. Simultaneous by design.
+- Decision-level (per-tool-call) rollouts, so tool-calling training data is at
+  the granularity of the model's decisions
+- DPO / GRPO passes on the BitNet adapters (SFT is wired today)
 - Drill-through from a dashboard tile back into chat
 - Scheduled dashboard email digests
