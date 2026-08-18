@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""Online (simultaneous) BitNet trainer — the CPU worker half of the loop.
+
+Studio's API (app/trainer.py) is the PRODUCER + adapter registry:
+    Studio agent ──rollouts──▶  THIS worker (CPU)  ──adapters──▶  Studio serving
+This script is the CONSUMER that app/trainer.py's docstring references. It:
+
+  1. polls  GET  /training/rollouts?since=<cursor>   (reward-labeled rollouts)
+  2. formats successful trajectories into tool-calling SFT samples
+  3. trains a small LoRA adapter on a (1-bit) base model — CPU is enough
+  4. publishes it  POST /training/adapters   so serving hot-swaps to it,
+  then loops, so training and serving run at the same time.
+
+DESIGN NOTES
+- Runs OUTSIDE the lean API image (heavy ML deps in requirements-trainer.txt).
+  It talks to Studio over HTTP as an admin service account — nothing here is
+  imported by the app.
+- The PLUMBING (auth, poll, cursor, format, publish) is pure stdlib, so
+  `--dry-run` runs with zero ML deps and is fully testable against a live API.
+  The TRAINING step imports torch/transformers/peft/trl lazily and prints a
+  clear install hint if they're absent — so the loop degrades, never crashes.
+- Reward-filtered SFT for v1 (train on successful, well-scored trajectories —
+  a standard, safe policy-improvement baseline). DPO/GRPO from the paired /
+  advantage signal are natural extensions on the same stream.
+
+CONFIG (env, all optional except credentials):
+  STUDIO_API_URL            base URL of the Studio API      (default http://localhost:8000)
+  STUDIO_TRAINER_TOKEN      admin JWT (skips login), OR
+  STUDIO_TRAINER_EMAIL/PASSWORD   admin service-account login
+  STUDIO_TRAIN_BASE_MODEL   HF id of the base            (default microsoft/bitnet-b1.58-2B-4T)
+  STUDIO_TRAIN_OUTPUT_DIR   where adapters + cursor live (default ./adapters)
+  STUDIO_TRAIN_MIN_REWARD   keep rollouts with reward >= (default 0.6 — the "learned" band)
+  STUDIO_TRAIN_MIN_NEW      min new usable samples before a training round (default 32)
+  STUDIO_TRAIN_POLL_SECONDS loop sleep between polls      (default 60)
+  STUDIO_TRAIN_EPOCHS       SFT epochs per round          (default 1)
+  STUDIO_TRAIN_ADAPTER_BASE_URI   uri prefix serving loads adapters from (default = output dir)
+
+USAGE
+  python train_online.py --once        # one round then exit
+  python train_online.py --dry-run     # pull + format only (no ML deps, no publish)
+  python train_online.py               # continuous online loop
+"""
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+API = os.getenv("STUDIO_API_URL", "http://localhost:8000").rstrip("/")
+OUT_DIR = os.getenv("STUDIO_TRAIN_OUTPUT_DIR", "./adapters")
+BASE_MODEL = os.getenv("STUDIO_TRAIN_BASE_MODEL", "microsoft/bitnet-b1.58-2B-4T")
+MIN_REWARD = float(os.getenv("STUDIO_TRAIN_MIN_REWARD", "0.6"))
+MIN_NEW = int(os.getenv("STUDIO_TRAIN_MIN_NEW", "32"))
+POLL_SECONDS = int(os.getenv("STUDIO_TRAIN_POLL_SECONDS", "60"))
+EPOCHS = int(os.getenv("STUDIO_TRAIN_EPOCHS", "1"))
+CURSOR_FILE = os.path.join(OUT_DIR, ".train_cursor.json")
+
+
+# ── API client (stdlib only) ─────────────────────────────────────────────
+
+def _req(method, path, token=None, body=None):
+    url = API + path
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode()[:300]
+        raise SystemExit(f"[trainer] {method} {path} -> HTTP {e.code}: {detail}")
+    except urllib.error.URLError as e:
+        raise SystemExit(f"[trainer] cannot reach {url}: {e.reason}")
+
+
+def login():
+    """Admin token from env, else a service-account login."""
+    tok = os.getenv("STUDIO_TRAINER_TOKEN", "").strip()
+    if tok:
+        return tok
+    email = os.getenv("STUDIO_TRAINER_EMAIL", "").strip()
+    password = os.getenv("STUDIO_TRAINER_PASSWORD", "").strip()
+    if not email or not password:
+        raise SystemExit("[trainer] set STUDIO_TRAINER_TOKEN, or STUDIO_TRAINER_EMAIL + "
+                         "STUDIO_TRAINER_PASSWORD (an admin service account).")
+    res = _req("POST", "/api/auth/login", body={"email": email, "password": password})
+    tok = res.get("access_token")
+    if not tok:
+        raise SystemExit("[trainer] login returned no access_token")
+    return tok
+
+
+def pull_rollouts(token, since, limit=2000):
+    return _req("GET", f"/api/training/rollouts?since={since}&limit={limit}", token=token)
+
+
+def publish_adapter(token, scope, kind, uri, base_model, metrics):
+    return _req("POST", "/api/training/adapters", token=token, body={
+        "scope": scope, "kind": kind, "uri": uri,
+        "base_model": base_model, "metrics": metrics})
+
+
+def get_status(token):
+    return _req("GET", "/api/training/online", token=token)
+
+
+# ── Cursor persistence (train only on new experience) ────────────────────
+
+def load_cursor():
+    try:
+        with open(CURSOR_FILE) as f:
+            return float(json.load(f).get("cursor", 0.0))
+    except (OSError, ValueError):
+        return 0.0
+
+
+def save_cursor(cursor):
+    os.makedirs(OUT_DIR, exist_ok=True)
+    with open(CURSOR_FILE, "w") as f:
+        json.dump({"cursor": cursor, "at": time.time()}, f)
+
+
+# ── Rollouts -> tool-calling SFT samples ─────────────────────────────────
+
+def to_samples(rollouts):
+    """Keep successful, well-scored trajectories that took a real action, and
+    format each as a (prompt -> tool-call) example the adapter learns. The
+    target is the action the decision-maker actually took (its run_sql +
+    render_chart), as compact JSON — a faithful tool-calling label."""
+    samples = []
+    for r in rollouts:
+        reward = r.get("reward")
+        action = r.get("action") or {}
+        sql = (action.get("sql") or "").strip()
+        prompt = (r.get("prompt") or "").strip()
+        # Only successful trajectories with a concrete tool call train the policy.
+        if reward is None or reward < MIN_REWARD or not sql or not prompt:
+            continue
+        if (r.get("mode") or "").startswith(("fallback", "error")):
+            continue  # deterministic fallback / errors aren't policy to imitate
+        target = {"tool": "run_sql", "sql": sql}
+        if action.get("chart_type"):
+            target = [target, {"tool": "render_chart", "chart_type": action["chart_type"]}]
+        samples.append({
+            "prompt": prompt,
+            "completion": json.dumps(target, separators=(",", ":")),
+            "reward": float(reward),
+        })
+    return samples
+
+
+def write_samples_jsonl(samples, path):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w") as f:
+        for s in samples:
+            f.write(json.dumps(s) + "\n")
+    return path
+
+
+# ── LoRA training (real; heavy deps imported lazily) ─────────────────────
+
+def train_lora(samples, base_model, out_dir, epochs):
+    """Reward-filtered SFT of a small LoRA adapter on the base model. CPU is
+    sufficient for a 1-bit base + a small adapter. Returns (adapter_dir, metrics).
+    Raises a clear, actionable error if the ML stack isn't installed."""
+    try:
+        import torch
+        from datasets import Dataset
+        from peft import LoraConfig
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from trl import SFTConfig, SFTTrainer
+    except ImportError as e:
+        raise SystemExit(
+            "[trainer] training needs the ML stack — install it (CPU is fine):\n"
+            "    pip install -r scripts/requirements-trainer.txt\n"
+            f"  (missing: {e.name}). Use --dry-run to exercise the loop without it.")
+
+    tok = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+
+    # One chat-formatted text per sample: the prompt, then the tool-call target.
+    def _fmt(s):
+        msgs = [{"role": "user", "content": s["prompt"]},
+                {"role": "assistant", "content": s["completion"]}]
+        try:
+            return tok.apply_chat_template(msgs, tokenize=False)
+        except Exception:
+            return f"<|user|>\n{s['prompt']}\n<|assistant|>\n{s['completion']}{tok.eos_token}"
+
+    ds = Dataset.from_dict({"text": [_fmt(s) for s in samples]})
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model, trust_remote_code=True, torch_dtype=torch.float32)
+    lora = LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05, bias="none",
+                      task_type="CAUSAL_LM",
+                      target_modules=["q_proj", "k_proj", "v_proj", "o_proj"])
+    adapter_dir = os.path.join(out_dir, f"tool_call-{int(time.time())}")
+    cfg = SFTConfig(output_dir=adapter_dir, num_train_epochs=epochs,
+                    per_device_train_batch_size=1, gradient_accumulation_steps=8,
+                    learning_rate=2e-4, logging_steps=10, save_strategy="no",
+                    report_to=[], max_length=1024)
+    trainer = SFTTrainer(model=model, args=cfg, train_dataset=ds, peft_config=lora)
+    result = trainer.train()
+    trainer.save_model(adapter_dir)      # saves the LoRA adapter only
+    tok.save_pretrained(adapter_dir)
+    metrics = {
+        "loss": float(getattr(result, "training_loss", 0.0) or 0.0),
+        "steps": int(getattr(result, "global_step", 0) or 0),
+        "n_rollouts": len(samples),
+        "avg_reward": round(sum(s["reward"] for s in samples) / max(1, len(samples)), 4),
+        "epochs": epochs,
+    }
+    return adapter_dir, metrics
+
+
+# ── One training round + the online loop ─────────────────────────────────
+
+def run_once(token, dry_run=False):
+    since = load_cursor()
+    pulled = pull_rollouts(token, since)
+    rollouts, cursor = pulled["rollouts"], pulled["cursor"]
+    samples = to_samples(rollouts)
+    print(f"[trainer] pulled {len(rollouts)} rollouts since {since:.3f} -> "
+          f"{len(samples)} usable samples (reward>={MIN_REWARD})")
+
+    if len(samples) < MIN_NEW:
+        print(f"[trainer] {len(samples)} < MIN_NEW={MIN_NEW} — not enough new experience; "
+              f"advancing cursor, will accumulate.")
+        save_cursor(cursor)
+        return {"trained": False, "samples": len(samples), "cursor": cursor}
+
+    samples_path = write_samples_jsonl(samples, os.path.join(OUT_DIR, "last_samples.jsonl"))
+    if dry_run:
+        print(f"[trainer] --dry-run: wrote {len(samples)} samples to {samples_path}; "
+              f"skipping training + publish.")
+        save_cursor(cursor)
+        return {"trained": False, "dry_run": True, "samples": len(samples),
+                "samples_path": samples_path, "cursor": cursor}
+
+    print(f"[trainer] training LoRA on {len(samples)} samples (base={BASE_MODEL}) …")
+    adapter_dir, metrics = train_lora(samples, BASE_MODEL, OUT_DIR, EPOCHS)
+    base_uri = os.getenv("STUDIO_TRAIN_ADAPTER_BASE_URI", os.path.abspath(OUT_DIR))
+    uri = os.path.join(base_uri, os.path.basename(adapter_dir))
+    pub = publish_adapter(token, "global", "tool_call", uri, BASE_MODEL, metrics)
+    print(f"[trainer] published global/tool_call v{pub['version']} <- {uri}  metrics={metrics}")
+    save_cursor(cursor)
+    return {"trained": True, "adapter": uri, "version": pub["version"],
+            "metrics": metrics, "cursor": cursor}
+
+
+def run_loop(token, dry_run=False):
+    print(f"[trainer] online loop: {API}  poll={POLL_SECONDS}s  base={BASE_MODEL}")
+    while True:
+        try:
+            run_once(token, dry_run=dry_run)
+        except SystemExit as e:
+            print(str(e))            # transient API/auth error — keep looping
+        time.sleep(POLL_SECONDS)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Studio online BitNet trainer (CPU worker).")
+    ap.add_argument("--once", action="store_true", help="one training round then exit")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="pull + format only (no ML deps, no publish)")
+    ap.add_argument("--status", action="store_true", help="print training status and exit")
+    args = ap.parse_args()
+
+    token = login()
+    if args.status:
+        print(json.dumps(get_status(token), indent=2))
+        return
+    if args.once or args.dry_run:
+        result = run_once(token, dry_run=args.dry_run)
+        print(json.dumps(result, indent=2, default=str))
+        return
+    run_loop(token, dry_run=args.dry_run)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

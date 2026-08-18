@@ -1,0 +1,16 @@
+# Heavy ML deps for the CPU trainer worker (scripts/train_online.py).
+# Deliberately OUT of the lean API image (backend/requirements.txt) — this runs
+# on a separate CPU box that talks to Studio over HTTP. CPU-only is fine:
+# BitNet's 1-bit base + a small LoRA adapter trains without a GPU.
+#
+#   pip install -r scripts/requirements-trainer.txt
+#
+# The plumbing (poll / format / publish) needs none of these — `--dry-run` and
+# `--status` run on the Python stdlib alone.
+
+torch>=2.2            # CPU wheels are fine (pip install torch)
+transformers>=4.44    # BitNet base support lands in recent transformers
+peft>=0.12            # LoRA adapters
+trl>=0.9              # SFTTrainer / SFTConfig
+datasets>=2.20
+accelerate>=0.33
