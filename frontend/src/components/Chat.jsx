@@ -543,6 +543,18 @@ function AssistantMessage({ m, requirement, onOpenCanvas }) {
             {m.inputs.row_count > 0 && <span className="meta">· {m.inputs.row_count} rows</span>}
           </div>
         )}
+        {/* KAG: documents the agent grounded this answer on (knowledge_search). */}
+        {m.citations?.length > 0 && (
+          <div className="inputs-row">
+            <span className="meta">grounded on</span>
+            {m.citations.map((c, i) => (
+              <span key={i} className="chip chip-input"
+                title={`from your documents${c.collection ? ` · ${c.collection}` : ""}${c.score != null ? ` · relevance ${Math.round(c.score * 100)}%` : ""}`}>
+                📄 {c.source}{c.page ? ` p.${c.page}` : c.sheet ? ` · ${c.sheet}` : ""}
+              </span>
+            ))}
+          </div>
+        )}
         {m.matched_tables?.length > 0 && (
           <div className="match-row">
             <span className="meta">matched tables:</span>

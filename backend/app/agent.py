@@ -313,6 +313,7 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         return out
 
     ctx = {"sql": None, "columns": [], "rows": [], "chart": None, "email": None, "panels": [],
+           "citations": [],
            "errors": []}
 
     from langchain_core.tools import tool
@@ -446,6 +447,13 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         hits = kag.search(query, role=user["role"], k=5)
         if not hits:
             return "No matching passages in the knowledge base."
+        # Surface the retrieved sources on the answer (citation chips) — the
+        # passages themselves stay quoted reference in the tool return.
+        for h in hits:
+            key = (h.get("source"), h.get("page") or h.get("sheet"))
+            if key not in {(c.get("source"), c.get("page") or c.get("sheet")) for c in ctx["citations"]}:
+                ctx["citations"].append({k: h.get(k) for k in
+                                         ("source", "source_type", "page", "sheet", "collection", "score")})
         # Framed as reference data in a labeled envelope — quoted, cited strings
         # with no privileges. The tool cannot run SQL, widen RBAC, or change the
         # guard; a data query still goes through run_sql → queryguard.
@@ -534,6 +542,7 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         "panels": panels,
         "email": ctx["email"],
         "errors": ctx["errors"],
+        "citations": ctx["citations"],
         "usage": usage,
         "agents": [me],
         "mode": "agent",
