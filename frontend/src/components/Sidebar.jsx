@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { clearSession, getUser } from "../api";
 import KeySettings from "./KeySettings";
+import DataConnections from "./DataConnections";
 import ShareDialog from "./ShareDialog";
 
 export default function Sidebar({
@@ -14,6 +15,7 @@ export default function Sidebar({
   const [draft, setDraft] = useState("");
   const [sharing, setSharing] = useState(null);   // {id, title}
   const [keysOpen, setKeysOpen] = useState(false);
+  const [dataConnOpen, setDataConnOpen] = useState(false);
   const inputRef = useRef(null);
 
   // The menu is positioned in viewport coordinates, so any scroll, resize or
@@ -166,6 +168,8 @@ export default function Sidebar({
 
       {keysOpen && <KeySettings onClose={() => setKeysOpen(false)} onChanged={onKeysChanged} />}
 
+      {dataConnOpen && <DataConnections onClose={() => setDataConnOpen(false)} />}
+
       {sharing && (
         <ShareDialog
           conversationId={sharing.id}
@@ -198,6 +202,9 @@ export default function Sidebar({
         </button>
         <button className="logout" onClick={onKag} style={{ marginBottom: 8 }}>
           ▤ Knowledge (KAG)
+        </button>
+        <button className="logout" onClick={() => setDataConnOpen(true)} style={{ marginBottom: 8 }}>
+          ⧉ Data connections
         </button>
         <button className="logout" onClick={onSessions} style={{ marginBottom: 8 }}>
           ⟳ Sessions

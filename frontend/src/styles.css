@@ -869,3 +869,21 @@ input:focus, select:focus, .composer-pill:focus-within { box-shadow: 0 0 0 1px v
   color: var(--ink-2); font-size: 13px; white-space: pre-wrap;
   max-height: 180px; overflow-y: auto;
 }
+
+/* ── Data connections (Microsoft 365) ── */
+.m365-modal { width: min(560px, 92vw); }
+.m365-card {
+  background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
+  padding: 14px 16px; margin-top: 12px; display: flex; flex-direction: column; gap: 10px;
+}
+.m365-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.m365-title { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; color: var(--ink); }
+.m365-glyph { color: var(--accent); }
+.m365-badge {
+  font-size: 11px; padding: 2px 8px; border-radius: 999px;
+  border: 1px solid var(--line); color: var(--ink-2); background: var(--surface-2);
+}
+.m365-badge-on { border-color: var(--accent); color: var(--accent); }
+.m365-badge-off { opacity: 0.7; }
+.m365-facts { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.m365-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 2px; }

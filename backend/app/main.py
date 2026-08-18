@@ -16,6 +16,7 @@ from . import (auth, autopilot, catalog, chat, dashboards, db, flow, freshness,
 from .agent import llm_available, llm_spec
 from .connectors import objectstore
 from .connectors.demo import seed
+from .extraction import routes as m365, sync as m365_sync
 
 app = FastAPI(title="Studio", version="0.1.0")
 
@@ -52,6 +53,7 @@ app.include_router(freshness.router)
 app.include_router(objectstore.router)
 app.include_router(semantic.router)
 app.include_router(autopilot.router)
+app.include_router(m365.router)
 
 # In production the built frontend calls the API at /api/* (the Vite dev
 # server proxies and strips that prefix, so dev keeps the unprefixed routes).
@@ -61,7 +63,7 @@ for _router in (auth.router, catalog.router, chat.router, dashboards.router,
                 kag.router,
                 repos.router, repos._settings, sessions.router, flow.router,
                 trainer.router, freshness.router, objectstore.router,
-                semantic.router, autopilot.router):
+                semantic.router, autopilot.router, m365.router):
     app.include_router(_router, prefix="/api", include_in_schema=False)
 
 
@@ -88,17 +90,24 @@ def startup():
     trainer.init_tables()
     objectstore.init_tables()
     autopilot.init_tables()
+    # Microsoft 365 / Graph extraction tables (graph_accounts / _subscriptions /
+    # _items). CREATE-only DDL, safe on SQLite and Postgres; inert when dormant.
+    m365_sync.init_tables()
     seed()
     # Proactive half: a background ticker fires due autopilot agents. Daemon
     # thread, guarded by STUDIO_AUTOPILOT_TICKER, so it never blocks startup and
     # tests can disable it. Dormant-safe: with no due agents / no LLM key it is
     # inert and can never crash startup.
     autopilot.start_ticker()
+    # M365 delta-sync ticker: daemon thread guarded by STUDIO_GRAPH_SYNC_TICKER
+    # AND configured(), so it never starts (nor touches Graph) when dormant.
+    m365_sync.start_ticker()
 
 
 @app.on_event("shutdown")
 def shutdown():
     autopilot.stop_ticker()
+    m365_sync.stop_ticker()
     # Close pooled warehouse connections cleanly.
     from .connectors import _REGISTRY
     for conn in _REGISTRY.values():

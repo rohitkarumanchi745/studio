@@ -143,7 +143,7 @@ def available_models(user=None):
     # actually has content \u2014 selecting it grounds the turn in documents first.
     try:
         from . import kag
-        if user and kag.reachable_collections(user.get("role")):
+        if user and kag.reachable_collections(user.get("role"), user.get("id")):
             out.append({"spec": "kag", "provider": "kag", "name": "kag",
                         "label": "\U0001f4c4 KAG \u2014 your documents",
                         "available": True, "byok": False, "default": False})
@@ -466,7 +466,7 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
             query: What to look up in the company's own documents.
         """
         from . import kag
-        hits = kag.search(query, role=user["role"], k=5)
+        hits = kag.search(query, role=user["role"], k=5, user_id=user.get("id"))
         if not hits:
             return "No matching passages in the knowledge base."
         # Surface the retrieved sources on the answer (citation chips) — the
@@ -499,7 +499,7 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         # a role never even sees that another scope's knowledge base exists.
         try:
             from . import kag
-            if kag.reachable_collections(user["role"]):
+            if kag.reachable_collections(user["role"], user.get("id")):
                 base_tools.append(knowledge_search)
         except Exception:
             pass

@@ -115,6 +115,28 @@ def init_tables():
     )
     c.commit()
     c.close()
+    # Teach kag about the Word/.docx and PowerPoint/.pptx parsers the M365/Graph
+    # connector adds. Idempotent, lazy, and dormancy-safe: a missing optional
+    # wheel (python-docx / python-pptx) surfaces only if such a file is actually
+    # ingested, never at import/init.
+    try:
+        from .extraction import parsers as _m365_parsers
+        _m365_parsers.register()
+    except Exception:
+        pass
+
+
+def delete_source(collection, source_name):
+    """Remove every chunk of one source from a collection — the wholesale DELETE
+    keyed on (collection, source_name) that re-ingest already uses, exposed so a
+    tombstoned Graph item's chunks are dropped on delta. Returns the row count."""
+    c = db._conn()
+    cur = c.execute("DELETE FROM kag_chunks WHERE collection=? AND source_name=?",
+                    (collection, source_name))
+    n = getattr(cur, "rowcount", 0) or 0
+    c.commit()
+    c.close()
+    return n
 
 
 def _valid_name(name):
@@ -128,28 +150,47 @@ def _collection(name):
     return dict(r) if r else None
 
 
-def _reachable(scope, role):
-    """True iff `role` may retrieve from a collection whose access_scope=scope."""
-    scopes = rbac.kag_scopes_for(role)
+def _scope_sql(role, user_id, col="access_scope"):
+    """SQL predicate + params for READ scope. Private per-user M365 scopes
+    ('u:%') are identity-gated even under the admin wildcard: admin reaches every
+    role/org scope but NEVER another user's private documents — the Microsoft
+    source ACL is the authority there, not Studio's role hierarchy. ('u:' can only
+    arise from M365 sync; the create-collection route forbids ':' so no org
+    collection collides with this namespace.)"""
+    scopes = rbac.kag_scopes_for(role, user_id)
+    self_scope = ("u:" + user_id) if user_id else None
+    if scopes == "*":
+        if self_scope:
+            return f"({col} NOT LIKE 'u:%' OR {col}=?)", [self_scope]
+        return f"{col} NOT LIKE 'u:%'", []
+    if not scopes:
+        return "1=0", []
+    ph = ",".join("?" for _ in scopes)
+    return f"{col} IN ({ph})", list(scopes)
+
+
+def _reachable(scope, role, user_id=None):
+    """True iff `role` may retrieve from a collection whose access_scope=scope.
+    Optional user_id (default None → prior behaviour) also reaches the caller's
+    own private M365 scope 'u:{user_id}'."""
+    scopes = rbac.kag_scopes_for(role, user_id)
     return scopes == "*" or scope in scopes
 
 
-def reachable_collections(role):
+def reachable_collections(role, user_id=None):
     """Collection rows this role may retrieve from — RBAC-filtered, the same
     server-side scope test the tool and /kag/search apply. The agent uses the
-    non-empty check to decide whether to OFFER knowledge_search at all."""
-    scopes = rbac.kag_scopes_for(role)
+    non-empty check to decide whether to OFFER knowledge_search at all.
+    Optional user_id (default None → prior behaviour) also surfaces the caller's
+    own private M365 collection."""
+    if not rbac.kag_scopes_for(role, user_id):
+        return []
+    pred, sp = _scope_sql(role, user_id)           # admin excludes others' private 'u:' scopes
     c = db._conn()
-    if scopes == "*":
-        rows = c.execute("SELECT * FROM kag_collections WHERE name IN (SELECT DISTINCT collection FROM kag_chunks) ORDER BY name").fetchall()
-    elif not scopes:
-        rows = []
-    else:
-        ph = ",".join("?" for _ in scopes)
-        rows = c.execute(
-            f"SELECT * FROM kag_collections WHERE access_scope IN ({ph}) "
-            f"AND name IN (SELECT DISTINCT collection FROM kag_chunks) ORDER BY name",
-            tuple(scopes)).fetchall()
+    rows = c.execute(
+        f"SELECT * FROM kag_collections WHERE {pred} "
+        f"AND name IN (SELECT DISTINCT collection FROM kag_chunks) ORDER BY name",
+        tuple(sp)).fetchall()
     c.close()
     return [dict(r) for r in rows]
 
@@ -448,7 +489,7 @@ def _lexical(query, text):
     return len(a & b) / len(a | b)
 
 
-def search(query, role, k=None, collection=None):
+def search(query, role, k=None, collection=None, user_id=None):
     """RBAC-scoped top-k cited passages for a query.
 
     The scope filter is applied SERVER-SIDE in the SQL WHERE, before any vector
@@ -456,20 +497,22 @@ def search(query, role, k=None, collection=None):
     Scoring is cosine when the query and a row both have embeddings, else lexical
     Jaccard — so retrieval works dormant and over a mixed store. Returns
     [{text, source, source_type, page|sheet, score, collection}].
+
+    Optional user_id (default None → prior behaviour/signature) also lets the
+    caller reach their OWN private M365 scope 'u:{user_id}' — never anyone
+    else's, still enforced in the same server-side WHERE.
     """
     k = k or TOP_K
     query = (query or "").strip()
     if not query:
         return []
-    scopes = rbac.kag_scopes_for(role)
-    if not scopes:
+    if not rbac.kag_scopes_for(role, user_id):
         return []
 
     clauses, params = [], []
-    if scopes != "*":
-        ph = ",".join("?" for _ in scopes)
-        clauses.append(f"access_scope IN ({ph})")
-        params.extend(scopes)
+    pred, sparams = _scope_sql(role, user_id)      # owner-gated for private 'u:' scopes
+    clauses.append(pred)
+    params.extend(sparams)
     if collection is not None:
         clauses.append("collection=?")
         params.append(collection)
@@ -520,11 +563,16 @@ def _admin(user):
         raise HTTPException(403, "KAG collection administration is admin-only")
 
 
-def _reach_or_404(name, user):
-    """The collection row iff the caller's role may reach it, else 404 — never
-    disclosing that another scope's collection exists."""
+def _reach_or_404(name, user, retrieval=True):
+    """The collection row iff the caller may reach it, else 404 — never
+    disclosing that another scope's collection exists. On the READ paths
+    (retrieval=True) a private per-user 'u:' scope is owner-only, so not even an
+    admin can confirm or read another user's private M365 collection."""
     coll = _collection(name)
-    if not coll or not _reachable(coll["access_scope"], user["role"]):
+    ok = bool(coll) and _reachable(coll["access_scope"], user["role"], user.get("id"))
+    if ok and retrieval and str(coll["access_scope"]).startswith("u:"):
+        ok = coll["access_scope"] == "u:" + str(user.get("id"))
+    if not ok:
         raise HTTPException(404, "Not found")
     return coll
 
@@ -679,13 +727,14 @@ def search_preview(body: SearchIn, user=Depends(current_user)):
     if body.collection is not None:
         _reach_or_404(body.collection, user)   # 404 for an invisible collection
     k = min(int(body.k or TOP_K), 20)
-    passages = search(body.query, role=user["role"], k=k, collection=body.collection)
+    passages = search(body.query, role=user["role"], k=k, collection=body.collection,
+                      user_id=user.get("id"))
     return {"passages": passages}
 
 
 @router.delete("/collections/{name}/docs/{source_name}")
 def delete_doc(name: str, source_name: str, user=Depends(current_user)):
-    coll = _reach_or_404(name, user)
+    coll = _reach_or_404(name, user, retrieval=False)   # management path, not a read
     # Deleting content requires admin, or a role that can ingest into the scope.
     if user["role"] != "admin" and not _reachable(coll["access_scope"], user["role"]):
         raise HTTPException(403, "not permitted")

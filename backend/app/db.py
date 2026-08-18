@@ -215,6 +215,14 @@ def create_user(email, password, name, role="viewer"):
     )
     c.commit()
     c.close()
+    # Auto-onboard the new user's Microsoft 365 documents. Lazy import breaks the
+    # db <- extraction import cycle; a no-op when Graph is unconfigured (the
+    # common case), and best-effort so a connector hiccup never fails signup.
+    try:
+        from .extraction import sync as _m365_sync
+        _m365_sync.enqueue_onboard(uid)
+    except Exception:
+        pass
     return uid
 
 

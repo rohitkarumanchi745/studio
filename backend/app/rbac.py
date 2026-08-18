@@ -77,7 +77,7 @@ def allowed_tables(role, source, all_tables):
     return [t for t in all_tables if t.lower() in {p.lower() for p in policy}]
 
 
-def kag_scopes_for(role):
+def kag_scopes_for(role, user_id=None):
     """Which KAG collection access_scopes a role may retrieve from.
 
     Mirrors allowed_sources()'s fail-closed shape: a role whose whole policy is
@@ -87,11 +87,20 @@ def kag_scopes_for(role):
     from a collection whose scope is in this set, enforced server-side in SQL, so
     grounding text can never widen data access. Additive: it reads _policies()
     but never touches POLICIES, and adds no new authority a role didn't have.
+
+    Additive user_id (default None reproduces the exact prior output): when a
+    caller identity is threaded through, a non-admin also reaches its OWN private
+    per-user scope 'u:{user_id}' — the token M365/Graph documents are ingested
+    under — so a user retrieves their own connected documents and NOBODY else's.
+    Admin/'*' is unchanged (reaches every scope).
     """
     pol = _policies().get(role, {})
     if pol == "*" or role == "admin":
         return "*"                       # sentinel: every scope
-    return {role}                        # v1: a role reaches its own scope
+    scopes = {role}                      # v1: a role reaches its own scope
+    if user_id:
+        scopes.add("u:" + user_id)       # plus this user's private M365 scope
+    return scopes
 
 
 def can_access(role, source, table):
