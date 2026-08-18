@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, getToken, getUser, setSession } from "./api";
 import Activity from "./components/Activity";
 import Agents from "./components/Agents";
+import Autopilot from "./components/Autopilot";
 import Chat from "./components/Chat";
 import Dashboard from "./components/Dashboard";
 import DashboardList from "./components/DashboardList";
@@ -79,6 +80,7 @@ export default function App() {
   const [showAgents, setShowAgents] = useState(false);
   const [showFlow, setShowFlow] = useState(false);
   const [showSkills, setShowSkills] = useState(false);
+  const [showAutopilot, setShowAutopilot] = useState(false);
   // Bumped when a user connects/removes a key so the model menu refetches.
   const [modelsEpoch, setModelsEpoch] = useState(0);
 
@@ -136,6 +138,7 @@ export default function App() {
         onAgents={() => setShowAgents(true)}
         onFlow={() => setShowFlow(true)}
         onSkills={() => setShowSkills(true)}
+        onAutopilot={() => setShowAutopilot(true)}
         onKeysChanged={() => setModelsEpoch((n) => n + 1)}
         onRename={async (id, title) => {
           await api(`/conversations/${id}`, {
@@ -149,6 +152,12 @@ export default function App() {
       {showActivity && <Activity onClose={() => setShowActivity(false)} />}
       {showSkills ? (
         <Skills onClose={() => setShowSkills(false)} />
+      ) : showAutopilot ? (
+        <Autopilot
+          user={user}
+          onClose={() => setShowAutopilot(false)}
+          onOpenJobs={() => { setShowAutopilot(false); setShowJobs(true); }}
+        />
       ) : showFlow ? (
         <Flow onClose={() => setShowFlow(false)} onOpenJobs={() => { setShowFlow(false); setShowJobs(true); }} />
       ) : showAgents ? (

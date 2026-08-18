@@ -803,3 +803,41 @@ input:focus, select:focus, .composer-pill:focus-within { box-shadow: 0 0 0 1px v
 .pl-gerr { margin-top: 5px; font-size: 11px; color: var(--bad); }
 .pl-gstatus { margin-top: 6px; font-size: 11px; font-weight: 700; }
 .pl-graph-title { font-size: 12px; font-weight: 700; color: var(--ink-2); margin: 12px 0 4px; }
+
+/* ── Autopilot agents ── */
+.ap-create { background: var(--surface); border: 1px solid var(--line); }
+.ap-goal {
+  width: 100%; min-height: 64px; resize: vertical; margin: 8px 0;
+  font: inherit; color: var(--ink); background: var(--surface-2);
+  border: 1px solid var(--line); border-radius: 8px; padding: 9px 12px; outline: none;
+}
+.ap-goal:focus { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.ap-label { font-weight: 700; text-transform: uppercase; letter-spacing: .04em; margin: 12px 0 4px; }
+.ap-hint { margin: 4px 0; }
+.ap-threshold { margin: 4px 0; }
+.ap-tables { max-height: 132px; overflow: auto; margin: 4px 0; }
+.ap-adv { margin-top: 12px; }
+.ap-action { border-left: 2px solid var(--gold); padding-left: 10px; margin: 8px 0; }
+
+.ap-list { margin-top: 4px; }
+.ap-card { margin-bottom: 10px; }
+.ap-head { cursor: default; }
+.ap-head:hover { background: transparent; }
+.ap-owner { font-weight: 400; }
+.ap-goal-text { color: var(--ink-2); font-size: 12.5px; }
+.ap-status-dot {
+  width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: none;
+}
+.ap-status-dot.ap-on { background: var(--ok); }
+.ap-status-dot.ap-off { background: var(--axis); }
+
+.ap-runs { margin-top: 8px; border-top: 1px solid var(--line); padding-top: 8px; }
+.ap-run { border-bottom: 1px solid var(--line); padding: 6px 0; }
+.ap-run:last-child { border-bottom: none; }
+.ap-run-head {
+  display: flex; align-items: center; gap: 8px; cursor: pointer; flex-wrap: wrap;
+}
+.ap-run-summary { flex: 1; min-width: 120px; font-size: 12.5px; color: var(--ink-2); }
+.ap-run-gate { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+.ap-run-body { margin-top: 6px; }
+.ap-run-text { color: var(--ink-2); font-size: 12.5px; white-space: pre-wrap; }

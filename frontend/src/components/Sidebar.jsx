@@ -6,7 +6,7 @@ import ShareDialog from "./ShareDialog";
 export default function Sidebar({
   conversations, activeId, onSelect, onNew, onDelete, onActivity, onCollapse,
   onDashboards, onRename, onKeysChanged, onQueries, onPipelines, onGovernance, onSemantic, onJobs, onPyBuild,
-  onSessions, onAgents, onFlow, onSkills,
+  onSessions, onAgents, onFlow, onSkills, onAutopilot,
 }) {
   const user = getUser();
   const [menu, setMenu] = useState(null);     // {id, title, x, y, canEdit, owned}
@@ -198,6 +198,9 @@ export default function Sidebar({
         </button>
         <button className="logout" onClick={onAgents} style={{ marginBottom: 8 }}>
           ⚇ Agents
+        </button>
+        <button className="logout" onClick={onAutopilot} style={{ marginBottom: 8 }}>
+          ✦ Autopilot
         </button>
         <button className="logout" onClick={onSkills} style={{ marginBottom: 8 }}>
           ▤ Skill files
