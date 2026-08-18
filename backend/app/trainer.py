@@ -72,7 +72,7 @@ def stream(since=0.0, limit=500):
     c = db._conn()
     rows = c.execute(
         "SELECT id, created_at, user_id, role, prompt, sql, chart_type, mode, reward, "
-        "reward_source, meta FROM agent_traces WHERE created_at > ? AND reward IS NOT NULL "
+        "reward_source, source, tbl, meta FROM agent_traces WHERE created_at > ? AND reward IS NOT NULL "
         "ORDER BY created_at LIMIT ?", (since, limit)).fetchall()
     c.close()
     out = []
@@ -90,6 +90,11 @@ def stream(since=0.0, limit=500):
             # the action the decision-maker took (tool call), for tool-call training
             "action": {"sql": r["sql"], "chart_type": r["chart_type"]},
             "reward": r["reward"], "reward_source": r["reward_source"],
+            # Which warehouse this rollout came from (dialect + schema regime).
+            # The trainer conditions each sample on this source's skill file so a
+            # Databricks sample never teaches the sqlite/demo policy, and vice
+            # versa. Additive: prior keys are unchanged.
+            "source": r["source"], "tbl": r["tbl"],
             "mode": r["mode"], "agents": meta.get("agents") or [],
         })
     cursor = out[-1]["created_at"] if out else since

@@ -24,6 +24,22 @@ DESIGN NOTES
   not RL); 'dpo' = Direct Preference Optimization = genuine preference-based RL —
   same-prompt outcomes are turned into (chosen > rejected) pairs by the reward,
   and DPO puts that preference in the objective. GRPO/PPO are the next step.
+- SOURCE-CONDITIONED (train == serve): rollouts come from DIFFERENT warehouses
+  (Databricks/Snowflake/BigQuery/S3/demo), each a distinct dialect + schema. Every
+  training sample is conditioned on ITS source's skill file — the same schema+
+  dialect briefing the live agent runs on (fetched once per round from GET
+  /api/skills). SYSTEM = the source's skill/schema/dialect context, USER = the
+  question, ASSISTANT = the SQL tool call. DPO pairs are mined WITHIN one source
+  only: a Databricks `date_trunc(...)` "chosen" must never be preferred over a
+  sqlite `strftime(...)` "rejected" — that manufactures a false cross-dialect
+  preference and corrupts the demo policy. Source-blind training is the bug.
+- CHANGING DATA is handled by design: the label is action.sql — a QUERY string
+  that serving RE-EXECUTES live (qcache re-runs the stored SQL fresh). The adapter
+  learns "given this schema+dialect and this question, emit this SQL", never the
+  rows, so row churn between rounds needs no retraining. CHANGING SCHEMA is handled
+  by re-fetching /api/skills each round (a schema change flips the source's skill,
+  so the round's context is always current) and DROPPING rollouts whose referenced
+  tables are no longer in the source's allowed set (stale — can't be re-executed).
 
 CONFIG (env, all optional except credentials):
   STUDIO_API_URL            base URL of the Studio API      (default http://localhost:8000)
@@ -116,6 +132,88 @@ def login():
 
 def pull_rollouts(token, since, limit=2000):
     return _req("GET", f"/api/training/rollouts?since={since}&limit={limit}", token=token)
+
+
+# ── Per-source schema+dialect context (train == serve) ───────────────────
+# Every rollout is conditioned on ITS source's skill file — the same RBAC-scoped
+# schema+dialect briefing the live agent runs on (app/agent.py wraps it exactly as
+# below). Fetched once per round from GET /api/skills so the context is always the
+# CURRENT schema: a schema change flips the source's skill, so drift is handled by
+# re-fetching, and rollouts that reference now-gone tables are dropped (§stale).
+# Pure stdlib — the --dry-run path needs no ML deps.
+
+# The per-source skill file — the SUBSTANTIVE conditioning the serving agent
+# uses (schema + dialect + allowed tables), wrapped as app/agent.py::_system_prompt
+# wraps it. NOTE (train≈serve, not ==): the live system prompt ALSO carries the
+# persona line, scope, memory notes and Rules block, and — because /api/skills is
+# fetched by the admin trainer — the ADMIN (superset) table set, not each
+# rollout's own role. So the schema/dialect match; the surrounding wrapper and
+# per-role table scoping are a known, guard-covered gap (a follow-up).
+def _skill_context(skill_md):
+    return f"Your skill file for this database:\n\n{skill_md}"
+
+
+# Copy of app/queryguard.TABLE_REF (the script runs outside the API image, so it
+# cannot import app.*). Captures from/join targets incl. schema-qualified names;
+# `.split('.')[-1]` then takes the bare table, matching how allowed_tables key.
+TABLE_REF = re.compile(
+    r"\b(?:from|join)\b(?:\s|/\*[^*]*(?:\*(?!/)[^*]*)*\*/)*[\"`\[]?"
+    r"([a-zA-Z_][\w$-]*(?:[\"`\]]?\.[\"`\[]?[a-zA-Z_][\w$-]*)*)",
+    re.IGNORECASE,
+)
+
+
+# CTE names bound by `WITH x AS (...)` / `, y AS (...)` — they are query-local,
+# not real tables, so the stale-drop must not treat them as removed tables.
+_CTE_RE = re.compile(r"(?:\bwith\b|,)\s+[\"`\[]?([a-zA-Z_]\w*)[\"`\]]?\s+as\s*\(", re.IGNORECASE)
+
+
+def _referenced_tables(sql):
+    """Bare table names a SQL statement reads from, EXCLUDING CTE bindings —
+    normalized as app/router.py:52 and app/governance.py:183 do. Dropping CTE
+    names avoids false-positive stale drops on valid `WITH ... SELECT FROM cte`."""
+    sql = sql or ""
+    cte = {m.lower() for m in _CTE_RE.findall(sql)}
+    return {r.strip('"').split(".")[-1].lower() for r in TABLE_REF.findall(sql)} - cte
+
+
+def fetch_skills(token):
+    """GET /api/skills once per round -> {source: {context, allowed, dialect}}.
+    The trainer runs as the admin service account, so it sees every configured
+    source. `context` is the verbatim skill file wrapped as serving wraps it;
+    `allowed` is the source's CURRENT allowed-table set (for the stale-drop)."""
+    res = _req("GET", "/api/skills", token=token)
+    out = {}
+    for s in res.get("skills", []):
+        src = s.get("source")
+        if not src:
+            continue
+        out[src] = {
+            "context": _skill_context(s.get("skill") or ""),
+            "allowed": {str(t).lower() for t in (s.get("tables") or [])},
+            "dialect": s.get("dialect"),
+        }
+    return out
+
+
+def _condition(r, skills, stale):
+    """Resolve a rollout's source context, or a reason to drop it. Returns
+    (source, context) to keep, or (None, reason) to drop. `stale` accumulates
+    per-reason drop counts. Enforces the non-negotiable: a rollout with no
+    current source context is never used (it would teach a vanished policy)."""
+    src = r.get("source")
+    if not src:
+        stale["no_source"] += 1          # legacy pre-column trace / source-blind
+        return None, "no_source"
+    ctx = skills.get(src)
+    if ctx is None:
+        stale["source_gone"] += 1        # deconfigured / renamed / RBAC-revoked
+        return None, "source_gone"
+    refs = _referenced_tables((r.get("action") or {}).get("sql"))
+    if refs and not refs.issubset(ctx["allowed"]):
+        stale["stale_tables"] += 1       # references a table no longer allowed
+        return None, "stale_tables"
+    return src, ctx["context"]
 
 
 def publish_adapter(token, scope, kind, uri, base_model, metrics):
@@ -220,9 +318,21 @@ def _norm_prompt(p):
     return re.sub(r"\s+", " ", (p or "").strip().lower())
 
 
-def to_samples(rollouts):
+def to_samples(rollouts, skills=None):
     """SFT: keep successful, well-scored trajectories that took a real action,
-    formatted as (prompt -> tool-call) examples. The reward FILTERS the data."""
+    formatted as (source-context -> prompt -> tool-call) examples. The reward
+    FILTERS the data; the source's skill file CONDITIONS each sample so the
+    adapter learns dialect-correct, schema-grounded SQL per warehouse.
+
+    Every kept sample carries `system` (the source's schema+dialect context) and
+    `source`. Rollouts with no current source context, or that reference a table
+    no longer in the source's allowed set (schema drift), are DROPPED — source-
+    blind cross-dialect imitation is the bug this avoids. `skills` is the
+    {source: {context, allowed, ...}} map from fetch_skills(); a defaultdict of
+    stale-drop counters is returned alongside the samples for reporting."""
+    from collections import defaultdict
+    skills = skills or {}
+    stale = defaultdict(int)
     samples = []
     for r in rollouts:
         reward = r.get("reward")
@@ -234,21 +344,33 @@ def to_samples(rollouts):
         completion = _completion_for(r.get("action"))
         if completion is None:
             continue
-        samples.append({"prompt": prompt, "completion": completion, "reward": float(reward)})
-    return samples
+        src, ctx = _condition(r, skills, stale)
+        if src is None:
+            continue  # no current source context / stale schema -> not trainable
+        samples.append({"system": ctx, "prompt": prompt, "completion": completion,
+                        "reward": float(reward), "source": src})
+    return samples, stale
 
 
-def mine_preference_pairs(rollouts):
-    """DPO: reward-labeled rollouts -> preference pairs. For each prompt seen with
-    MORE THAN ONE distinct completion, pair its highest-reward completion (chosen)
-    with each lower-reward one (rejected) when the reward gap clears PAIR_MARGIN.
+def mine_preference_pairs(rollouts, skills=None):
+    """DPO: reward-labeled rollouts -> preference pairs, mined WITHIN one source.
+    For each (source, prompt) seen with MORE THAN ONE distinct completion, pair its
+    highest-reward completion (chosen) with each lower-reward one (rejected) when
+    the reward gap clears PAIR_MARGIN.
 
     This is the genuine RL step: the heuristic reward now decides a PREFERENCE
     (chosen > rejected) that DPO puts in the objective — no human labels, and the
-    reward is no longer just a data filter. Same-prompt pairs are the clean signal;
-    a prompt that only ever had one outcome yields no pair (nothing to prefer)."""
+    reward is no longer just a data filter. The group key is (source, norm_prompt),
+    so pairs NEVER cross warehouses: the same question asked of two dialects has two
+    different correct answers, and pairing them would teach BitNet that one dialect's
+    SQL is "better than" the other's — corrupting the losing source's policy. Each
+    pair carries its source's schema+dialect `system` context. Returns (pairs, stale)
+    where `stale` counts rollouts dropped for having no current source context."""
     from collections import defaultdict
-    groups = defaultdict(dict)   # norm-prompt -> {completion: (best_reward, raw_prompt)}
+    skills = skills or {}
+    stale = defaultdict(int)
+    # (source, norm-prompt) -> {completion: (best_reward, raw_prompt, context)}
+    groups = defaultdict(dict)
     for r in rollouts:
         prompt = (r.get("prompt") or "").strip()
         reward = r.get("reward")
@@ -259,21 +381,25 @@ def mine_preference_pairs(rollouts):
         completion = _completion_for(r.get("action"))
         if completion is None:
             continue
-        g = groups[_norm_prompt(prompt)]
+        src, ctx = _condition(r, skills, stale)
+        if src is None:
+            continue  # no current source context / stale schema -> unpaired
+        g = groups[(src, _norm_prompt(prompt))]
         if completion not in g or float(reward) > g[completion][0]:
-            g[completion] = (float(reward), prompt)   # best reward per distinct completion
+            g[completion] = (float(reward), prompt, ctx)  # best reward per distinct completion
     pairs = []
-    for by_comp in groups.values():
+    for (src, _norm), by_comp in groups.items():
         if len(by_comp) < 2:
             continue
-        ranked = sorted(((rw, pr, comp) for comp, (rw, pr) in by_comp.items()),
+        ranked = sorted(((rw, pr, ctx, comp) for comp, (rw, pr, ctx) in by_comp.items()),
                         key=lambda x: x[0], reverse=True)
-        best_rw, best_prompt, best_comp = ranked[0]
-        for rej_rw, _, rej_comp in ranked[1:]:
+        best_rw, best_prompt, best_ctx, best_comp = ranked[0]
+        for rej_rw, _, _, rej_comp in ranked[1:]:
             if best_rw - rej_rw >= PAIR_MARGIN:
-                pairs.append({"prompt": best_prompt, "chosen": best_comp,
-                              "rejected": rej_comp, "margin": round(best_rw - rej_rw, 3)})
-    return pairs
+                pairs.append({"system": best_ctx, "prompt": best_prompt, "chosen": best_comp,
+                              "rejected": rej_comp, "margin": round(best_rw - rej_rw, 3),
+                              "source": src})
+    return pairs, stale
 
 
 def write_samples_jsonl(samples, path):
@@ -306,14 +432,20 @@ def train_lora(samples, base_model, out_dir, epochs):
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
-    # One chat-formatted text per sample: the prompt, then the tool-call target.
+    # One chat-formatted text per sample: the source's schema+dialect context as
+    # the SYSTEM message, the question, then the tool-call target — the exact
+    # conditioning serving applies, so the adapter trains on what it's served under.
     def _fmt(s):
-        msgs = [{"role": "user", "content": s["prompt"]},
-                {"role": "assistant", "content": s["completion"]}]
+        msgs = []
+        if s.get("system"):
+            msgs.append({"role": "system", "content": s["system"]})
+        msgs += [{"role": "user", "content": s["prompt"]},
+                 {"role": "assistant", "content": s["completion"]}]
         try:
             return tok.apply_chat_template(msgs, tokenize=False)
         except Exception:
-            return f"<|user|>\n{s['prompt']}\n<|assistant|>\n{s['completion']}{tok.eos_token}"
+            sys_prefix = f"<|system|>\n{s['system']}\n" if s.get("system") else ""
+            return f"{sys_prefix}<|user|>\n{s['prompt']}\n<|assistant|>\n{s['completion']}{tok.eos_token}"
 
     ds = Dataset.from_dict({"text": [_fmt(s) for s in samples]})
     model = AutoModelForCausalLM.from_pretrained(
@@ -363,14 +495,20 @@ def train_dpo(pairs, base_model, out_dir, epochs):
         tok.pad_token = tok.eos_token
 
     def _prompt(p):
-        msgs = [{"role": "user", "content": p}]
+        # Same source-conditioning as SFT: the schema+dialect SYSTEM context leads,
+        # so DPO's chosen>rejected preference is learned WITHIN that source's regime.
+        msgs = []
+        if p.get("system"):
+            msgs.append({"role": "system", "content": p["system"]})
+        msgs.append({"role": "user", "content": p["prompt"]})
         try:
             return tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
         except Exception:
-            return f"<|user|>\n{p}\n<|assistant|>\n"
+            sys_prefix = f"<|system|>\n{p['system']}\n" if p.get("system") else ""
+            return f"{sys_prefix}<|user|>\n{p['prompt']}\n<|assistant|>\n"
 
     ds = Dataset.from_dict({
-        "prompt": [_prompt(p["prompt"]) for p in pairs],
+        "prompt": [_prompt(p) for p in pairs],
         "chosen": [p["chosen"] for p in pairs],
         "rejected": [p["rejected"] for p in pairs]})
     model = AutoModelForCausalLM.from_pretrained(
@@ -403,48 +541,92 @@ def train_dpo(pairs, base_model, out_dir, epochs):
 
 # ── One training round + the online loop ─────────────────────────────────
 
+def _per_source_samples(samples):
+    """{source: {n, avg_reward}} for SFT samples — coverage per warehouse."""
+    from collections import defaultdict
+    agg = defaultdict(lambda: [0, 0.0])
+    for s in samples:
+        a = agg[s.get("source")]
+        a[0] += 1
+        a[1] += float(s.get("reward", 0.0))
+    return {src: {"n": n, "avg_reward": round(tot / max(1, n), 4)}
+            for src, (n, tot) in sorted(agg.items(), key=lambda kv: -kv[1][0])}
+
+
+def _per_source_pairs(pairs):
+    """{source: n_pairs} for DPO pairs — all within-source by construction."""
+    from collections import defaultdict
+    agg = defaultdict(int)
+    for p in pairs:
+        agg[p.get("source")] += 1
+    return dict(sorted(agg.items(), key=lambda kv: -kv[1]))
+
+
 def run_once(token, dry_run=False):
     since = load_cursor()
     pulled = pull_rollouts(token, since)
     rollouts, cursor = pulled["rollouts"], pulled["cursor"]
+    # Re-fetch the CURRENT per-source schema+dialect context once per round. This
+    # is the drift handler: a schema change flips the source's skill, so every
+    # sample this round is conditioned on the up-to-date schema (§changing schema).
+    skills = fetch_skills(token)
+    print(f"[trainer] source context: {len(skills)} source(s) from /api/skills "
+          f"{ {s: skills[s]['dialect'] for s in skills} }")
 
-    # Prepare the objective's training data: SFT filters, DPO mines pairs.
+    # Prepare the objective's training data: SFT filters, DPO mines pairs — both
+    # conditioned per source, both dropping rollouts with no current source context.
     if MODE == "dpo":
-        pairs = mine_preference_pairs(rollouts)
+        pairs, stale = mine_preference_pairs(rollouts, skills)
+        per_source = _per_source_pairs(pairs)
         print(f"[trainer] DPO: pulled {len(rollouts)} rollouts since {since:.3f} -> "
-              f"{len(pairs)} preference pairs (reward gap >= {PAIR_MARGIN})")
+              f"{len(pairs)} preference pairs (within-source, reward gap >= {PAIR_MARGIN})")
+        print(f"[trainer] DPO per-source pairs: {per_source}")
+        print(f"[trainer] dropped rollouts: {dict(stale)} "
+              f"(no_source=legacy/blind, source_gone=deconfigured, stale_tables=schema drift)")
         if len(pairs) < MIN_PAIRS:
             print(f"[trainer] {len(pairs)} < MIN_PAIRS={MIN_PAIRS} — not enough preference "
-                  f"signal yet (needs same-prompt, reward-differing outcomes); accumulating.")
+                  f"signal yet (needs same-source, same-prompt, reward-differing outcomes); accumulating.")
             save_cursor(cursor)
-            return {"trained": False, "mode": "dpo", "pairs": len(pairs), "cursor": cursor}
+            return {"trained": False, "mode": "dpo", "pairs": len(pairs),
+                    "per_source": per_source, "dropped": dict(stale), "cursor": cursor}
         data_path = write_samples_jsonl(pairs, os.path.join(OUT_DIR, "last_pairs.jsonl"))
         if dry_run:
             print(f"[trainer] --dry-run: wrote {len(pairs)} preference pairs to {data_path}; "
                   f"skipping training + publish.")
             save_cursor(cursor)
             return {"trained": False, "mode": "dpo", "dry_run": True, "pairs": len(pairs),
+                    "per_source": per_source, "dropped": dict(stale),
                     "pairs_path": data_path, "cursor": cursor}
         print(f"[trainer] DPO-training LoRA on {len(pairs)} preference pairs (base={BASE_MODEL}) …")
         adapter_dir, metrics = train_dpo(pairs, BASE_MODEL, OUT_DIR, EPOCHS)
+        metrics["per_source"] = per_source
+        metrics["dropped"] = dict(stale)
     else:
-        samples = to_samples(rollouts)
+        samples, stale = to_samples(rollouts, skills)
+        per_source = _per_source_samples(samples)
         print(f"[trainer] SFT: pulled {len(rollouts)} rollouts since {since:.3f} -> "
-              f"{len(samples)} usable samples (reward >= {MIN_REWARD})")
+              f"{len(samples)} usable samples (reward >= {MIN_REWARD}) across {len(per_source)} source(s)")
+        print(f"[trainer] SFT per-source samples: {per_source}")
+        print(f"[trainer] dropped rollouts: {dict(stale)} "
+              f"(no_source=legacy/blind, source_gone=deconfigured, stale_tables=schema drift)")
         if len(samples) < MIN_NEW:
             print(f"[trainer] {len(samples)} < MIN_NEW={MIN_NEW} — not enough new experience; "
                   f"advancing cursor, will accumulate.")
             save_cursor(cursor)
-            return {"trained": False, "mode": "sft", "samples": len(samples), "cursor": cursor}
+            return {"trained": False, "mode": "sft", "samples": len(samples),
+                    "per_source": per_source, "dropped": dict(stale), "cursor": cursor}
         data_path = write_samples_jsonl(samples, os.path.join(OUT_DIR, "last_samples.jsonl"))
         if dry_run:
             print(f"[trainer] --dry-run: wrote {len(samples)} samples to {data_path}; "
                   f"skipping training + publish.")
             save_cursor(cursor)
             return {"trained": False, "mode": "sft", "dry_run": True, "samples": len(samples),
+                    "per_source": per_source, "dropped": dict(stale),
                     "samples_path": data_path, "cursor": cursor}
         print(f"[trainer] SFT-training LoRA on {len(samples)} samples (base={BASE_MODEL}) …")
         adapter_dir, metrics = train_lora(samples, BASE_MODEL, OUT_DIR, EPOCHS)
+        metrics["per_source"] = per_source
+        metrics["dropped"] = dict(stale)
 
     # Shared publish + serving-push tail (same registry contract for either objective).
     base_uri = os.getenv("STUDIO_TRAIN_ADAPTER_BASE_URI", os.path.abspath(OUT_DIR))

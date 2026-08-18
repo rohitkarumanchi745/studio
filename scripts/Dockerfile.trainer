@@ -1,0 +1,22 @@
+# The online BitNet trainer as a standalone CPU worker (a separate container /
+# Railway service — NOT part of the lean API image). It pulls reward-labeled
+# rollouts from Studio and publishes LoRA adapters back. No GPU: BitNet's 1-bit
+# base + a small LoRA trains on CPU.
+#
+# Build from the repo root so this canonical scripts/train_online.py is used
+# (there is exactly one — do not reintroduce a copy under backend/):
+#   docker build -f scripts/Dockerfile.trainer -t studio/trainer scripts/
+FROM python:3.12-slim
+
+WORKDIR /trainer
+COPY requirements-trainer.txt .
+# CPU torch wheel — small enough for a plain CPU box.
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
+    && pip install --no-cache-dir -r requirements-trainer.txt
+COPY train_online.py .
+
+# Config comes from the environment (see train_online.py header):
+#   STUDIO_API_URL, STUDIO_TRAINER_EMAIL/PASSWORD (or STUDIO_TRAINER_TOKEN),
+#   STUDIO_TRAIN_MODE=sft|dpo, STUDIO_TRAIN_BASE_MODEL, STUDIO_SERVE_URL, …
+# Default: the continuous online loop (poll → train → publish → repeat).
+CMD ["python", "train_online.py"]
