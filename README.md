@@ -320,6 +320,68 @@ A **Neo4j / Cypher** connector (`graph_conn.py`) sits behind the same interface.
 
 ---
 
+## Knowledge (KAG) — your documents, RBAC-scoped
+
+Numbers answer "how many"; documents answer "why" and "which one". **KAG**
+(`kag.py`) grounds the agent in your own files — Excel, CSV, PDF, Word,
+PowerPoint, and email — as *quoted, cited reference*, never as instructions it can
+act on. A `knowledge_search` tool retrieves the most relevant passages (Harrier
+embeddings + cosine, lexical Jaccard fallback when `HARRIER_EMBED_URL` is unset),
+and every grounded answer shows **citation chips** naming the source document (and
+page / sheet) it stood on.
+
+- **RBAC on retrieval, server-side.** A collection carries an `access_scope`
+  denormalized onto every chunk; the same scope test gates the tool, the
+  `/kag/search` route, and which collections a role can even see — a role never
+  learns another scope's knowledge base exists.
+- **Private documents are owner-only.** Per-user documents (the M365 layer below)
+  are ingested under a private `u:{user}` scope; retrieval is **identity-gated
+  even for admins** — Studio's role hierarchy is not the authority, the source ACL
+  is. An unresolved ACL fails closed (the item is never ingested).
+- **Selectable as an engine.** When your role can reach a collection with content,
+  `📄 KAG — your documents` appears in the composer's model menu; choosing it runs
+  a documents-first turn that grounds in your files before touching the warehouse.
+
+### Microsoft 365 extraction layer
+
+The knowledge base fills itself. On signup, Studio **auto-onboards** a user's own
+Microsoft 365 documents (OneDrive / SharePoint files + Outlook mail) into a
+private, ACL-scoped KAG collection, then keeps it fresh — no manual upload.
+
+```mermaid
+flowchart LR
+    signup["signup · new file"] --> auth["GraphAuth<br/>app-level · delegated"]
+    auth --> pull["pull OneDrive/SharePoint<br/>+ mail (client.py)"]
+    pull --> acl{"source ACL grants<br/>this user read?"}
+    acl -->|"no / unresolved"| skip["SKIP — fail closed"]
+    acl -->|"yes"| parse["parse docx·pptx·pdf·xlsx·eml"]
+    parse --> ing[("kag.ingest_bytes<br/>scope u:{user}")]
+    hook["Graph webhook + delta"] -.->|"nudge"| tick["autopilot-style ticker"]
+    tick --> pull
+```
+
+- **Auth abstraction, both models.** One `GraphAuth` interface, two interchangeable
+  impls — **app-level** (application permissions, tenant-wide, admin-consented) and
+  **delegated** (per-user OAuth with silent refresh). Sync code is impl-agnostic.
+- **ACL → scope, fail-closed.** Each item's Microsoft permissions are resolved
+  against the user's principal set; a document is ingested at the private scope
+  only when the source actually grants that user read — otherwise it is skipped,
+  never ingested at a wider scope.
+- **Continuous, agent-run sync.** Graph **delta** queries + **change-notification
+  webhooks** drive incremental updates on an autopilot-style ticker (the webhook
+  does no Graph I/O — it validates a constant-time `clientState` and only nudges
+  the next run); changed files replace their prior version, tombstoned files are
+  deleted.
+- **Tokens encrypted at rest.** Access / refresh tokens are Fernet-encrypted
+  (domain-separated key), never logged, never returned in any response, and fail
+  closed on a rotated secret.
+- **Dormant until configured.** With no `AZURE_*` env the whole layer is inert —
+  routes return `{"configured": false}`, no ticker starts, no Graph call is made,
+  and imports never fail. Set the Azure app-registration vars (+
+  `STUDIO_GRAPH_SYNC_TICKER=1`) to activate it.
+
+---
+
 ## Agent Lightning — the learning loop
 
 Modeled on Microsoft's [Agent Lightning](https://github.com/microsoft/agent-lightning):
@@ -399,6 +461,13 @@ flowchart TB
 - **Safe through the training lag.** If BitNet hasn't actually trained on a
   just-learned case yet, its attempt fails and *escalates to the frontier* —
   cheaper, never wrong.
+
+**Pick the engine directly.** Automatic tiering is the default, but the
+composer's model menu also surfaces the self-hosted BitNet (`🧠 BitNet — learned`)
+and your knowledge base (`📄 KAG — your documents`) as explicit choices whenever
+each is usable — choosing BitNet forces the learned engine, choosing KAG runs a
+documents-first turn (see **Knowledge** above). Each appears only when it can
+actually serve, so no user learns another scope's engine or knowledge base exists.
 
 **Simultaneous training** (`trainer.py` + `scripts/train_online.py`). Studio is
 the concurrent **producer + adapter server**; a **CPU worker** is the trainer —
@@ -620,6 +689,9 @@ in-process cache silently.
   supervisor + human approval; Studio never executes arbitrary Python.
 - **Compliance filter** — governance strips denied columns, masks masked ones,
   and caps rows at every result exit — even `SELECT *` can't leak a denied field.
+- **Private documents are owner-only** — Microsoft 365-ingested docs carry a
+  per-user KAG scope; retrieval is identity-gated even for admins (the source ACL
+  is the authority, not Studio's role), and an unresolved ACL fails closed.
 - **Sharing is an RBAC boundary** — messages carry rows, so enforcement happens
   when messages are **read**, keyed off the *reader's* role (an owner gets no
   bypass). Messages are stamped server-side with the author's role and released
@@ -730,7 +802,8 @@ alone; FastAPI serves the built frontend on one origin.
 | `STUDIO_MODELS` | The model menu offered in the composer |
 | `STUDIO_MCP_SERVERS` | JSON map of MCP servers exposed to the agent as extra tools |
 | `GITHUB_TOKEN` | Read private repos in the GitHub repo registry |
-| `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` / `AZURE_GROUP_ROLE_MAP` | Entra SSO + group→role mapping |
+| `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` / `AZURE_GROUP_ROLE_MAP` | Entra SSO + group→role mapping, **and** the Microsoft 365 → KAG extraction layer (dormant until set) |
+| `STUDIO_GRAPH_SYNC_TICKER` | Run the background M365 delta / webhook sync loop (default off) |
 
 Warehouse credentials (`SNOWFLAKE_*`, `DATABRICKS_*`, `NEO4J_*`) and the
 marketing connectors are listed in `backend/.env.example`; sources appear in the
@@ -752,7 +825,12 @@ the **lakehouse write→read bridge** (S3 → Spark → S3 Parquet → auto-regi
 dataset → viz); **Autopilot agents** (schedule / threshold / event / manual, act-
 with-approval); and the self-hosted **BitNet** pipeline — the CPU **trainer**
 (reward-filtered SFT + DPO), **source-conditioned** training (per-source
-schema/dialect), and the **serving unit** (adapter-aware gateway + vLLM/BitNet.cpp).
+schema/dialect), and the **serving unit** (adapter-aware gateway + vLLM/BitNet.cpp). Also shipped:
+the **Knowledge (KAG)** layer — RBAC-scoped RAG over Excel / PDF / Word / PowerPoint
+/ email with cited grounding — and its **Microsoft 365 extraction layer** (app-level
++ delegated Graph auth, auto-onboard on signup, delta + webhook sync, ACL→scope
+fail-closed, encrypted tokens, dormant until Azure is configured); plus **BitNet and
+KAG as directly selectable engines** in the composer's model menu.
 
 ### Future rollouts
 
