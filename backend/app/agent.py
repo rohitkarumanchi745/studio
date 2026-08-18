@@ -129,26 +129,30 @@ def available_models(user=None):
         }
         for s in specs
     ]
-    # Self-hosted BitNet: a selectable engine only once a tool-calling adapter is
-    # trained and the serving endpoint is configured. Dormant (absent) until then.
+    # Self-hosted BitNet: a selectable engine once a tool-calling adapter is trained
+    # and the serving endpoint is configured. ALWAYS listed so the capability is
+    # visible; shown disabled with a reason until it can actually serve.
     try:
         from . import router as model_router
-        if model_router.bitnet_ready(user):
-            out.append({"spec": "bitnet", "provider": "bitnet", "name": "bitnet",
-                        "label": "\U0001f9e0 BitNet \u2014 self-hosted (learned)",
-                        "available": True, "byok": False, "default": False})
+        bitnet_ok = bool(model_router.bitnet_ready(user))
     except Exception:
-        pass
-    # KAG: offered only when this user's role can reach a knowledge collection that
-    # actually has content \u2014 selecting it grounds the turn in documents first.
+        bitnet_ok = False
+    out.append({"spec": "bitnet", "provider": "bitnet", "name": "bitnet",
+                "label": "\U0001f9e0 BitNet \u2014 self-hosted (learned)",
+                "available": bitnet_ok, "byok": False, "default": False,
+                "note": None if bitnet_ok else "needs a self-hosted endpoint"})
+    # KAG: grounds the turn in the user's OWN documents. Always listed; disabled
+    # until this user's role can reach a knowledge collection that has content
+    # (never revealing another scope's knowledge base — just "no documents yet").
     try:
         from . import kag
-        if user and kag.reachable_collections(user.get("role"), user.get("id")):
-            out.append({"spec": "kag", "provider": "kag", "name": "kag",
-                        "label": "\U0001f4c4 KAG \u2014 your documents",
-                        "available": True, "byok": False, "default": False})
+        kag_ok = bool(user and kag.reachable_collections(user.get("role"), user.get("id")))
     except Exception:
-        pass
+        kag_ok = False
+    out.append({"spec": "kag", "provider": "kag", "name": "kag",
+                "label": "\U0001f4c4 KAG \u2014 your documents",
+                "available": kag_ok, "byok": False, "default": False,
+                "note": None if kag_ok else "no documents yet"})
     return out
 
 

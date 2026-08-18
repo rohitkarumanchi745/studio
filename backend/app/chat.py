@@ -298,7 +298,7 @@ def _run_turn(ctx, user):
     # Explicit engine chosen in the model selector: honor it directly, ahead of the
     # automatic tiers. 'bitnet' forces the self-hosted engine; 'kag' forces a
     # documents-first turn grounded in the user's own knowledge collections.
-    if model == "bitnet":
+    if model == "bitnet" and model_router.bitnet_ready(user):
         result = _run(model_router.bitnet_spec())
         result.setdefault("served_by", "bitnet")
     elif model == "kag":
