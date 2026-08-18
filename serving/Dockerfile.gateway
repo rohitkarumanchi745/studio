@@ -1,0 +1,31 @@
+# Studio adapter-aware OpenAI gateway.
+#
+# Tiny, stdlib-only image: it just needs a Python runtime. No third-party wheels
+# (see requirements-gateway.txt — intentionally empty), so the build is fast and
+# the attack surface is minimal. Nothing here touches Studio's app image.
+FROM python:3.12-slim
+
+# Non-root for good measure.
+RUN useradd --create-home --uid 10001 gateway
+WORKDIR /app
+
+# Kept for parity / future deps; today it installs nothing.
+COPY requirements-gateway.txt /app/requirements-gateway.txt
+RUN pip install --no-cache-dir -r requirements-gateway.txt || true
+
+COPY gateway.py /app/gateway.py
+
+USER gateway
+
+# Config is via env (see gateway.py header). These are sane container defaults;
+# docker-compose overrides them per profile.
+ENV STUDIO_GATEWAY_HOST=0.0.0.0 \
+    STUDIO_GATEWAY_PORT=9000 \
+    STUDIO_BACKEND_URL=http://vllm:8000/v1 \
+    STUDIO_BACKEND_KIND=vllm \
+    STUDIO_BASE_MODEL_NAME=bitnet
+
+EXPOSE 9000
+
+# Stdlib HTTP server; no ASGI worker needed.
+CMD ["python", "-u", "gateway.py"]

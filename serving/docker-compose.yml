@@ -1,0 +1,152 @@
+# Studio BitNet serving unit — real, self-hosted, OpenAI-compatible.
+#
+# Two profiles (pick one):
+#   gpu → vLLM serving the BitNet base with runtime multi-LoRA  + gateway
+#   cpu → llama.cpp (BitNet.cpp-style GGUF) llama-server         + gateway
+#
+# The GATEWAY is what Studio points STUDIO_LLM_BASE_URL at; it reads the
+# `studio_adapters` block Studio sends and drives the engine's LoRA API. See
+# gateway.py and README.md.
+#
+# SHARED ADAPTER VOLUME
+#   ${STUDIO_ADAPTERS_DIR:-./adapters}  is bind-mounted into the server at
+#   /adapters. The trainer (scripts/train_online.py, run on the host or its own
+#   box) writes adapters there via STUDIO_TRAIN_OUTPUT_DIR=./adapters and
+#   publishes uris under STUDIO_TRAIN_ADAPTER_BASE_URI=/adapters, so the uri in a
+#   published adapter is exactly the path the SERVER sees. Trainer writes → server
+#   loads, same path, no copy.
+#
+# Usage:
+#   docker compose --profile gpu up -d      # GPU box (NVIDIA runtime required)
+#   docker compose --profile cpu up -d      # CPU box
+#   docker compose --profile gpu config     # validate without starting
+#
+# Pin the exact image tags below in production (the runtime-LoRA API and CLI
+# flags can change between releases — versions verified in README.md).
+#
+# The shared adapter dir is ${STUDIO_ADAPTERS_DIR:-./adapters} on the host,
+# bind-mounted to /adapters in every engine (see the volumes: blocks below).
+
+services:
+  # ── GPU PROFILE ─────────────────────────────────────────────────────────
+  # HEADS-UP: stock vLLM has NO BitNet (BitnetForCausalLM) support (vllm #17279,
+  # "not planned"), so --model microsoft/bitnet-b1.58-2B-4T will FAIL to load on
+  # the pinned image. Use this profile ONLY with a BitNet-enabled vLLM build, OR
+  # point STUDIO_VLLM_MODEL at a vLLM-supported base if you just want GPU
+  # multi-LoRA (incl. per-user style). For real BitNet, use the `cpu` profile
+  # (llama.cpp / BitNet.cpp) — BitNet's native runtime. See README section 1.
+  # vLLM OpenAI server: base + runtime multi-LoRA. Selects a LoRA by the
+  # OpenAI `model` field; loads/unloads adapters over HTTP at runtime.
+  #   --enable-lora                         turn on LoRA support
+  #   --max-lora-rank 16                    must be >= the trainer's LoRA r (=16)
+  #   --served-model-name bitnet            base model id clients send
+  #   VLLM_ALLOW_RUNTIME_LORA_UPDATING=True enables POST /v1/load_lora_adapter
+  vllm:
+    profiles: ["gpu"]
+    image: vllm/vllm-openai:v0.11.0        # pinned; see README "Verified versions"
+    command: >
+      --model ${STUDIO_VLLM_MODEL:-microsoft/bitnet-b1.58-2B-4T}
+      --served-model-name bitnet
+      --enable-lora
+      --max-lora-rank 16
+      --max-loras 4
+      --dtype auto
+      --host 0.0.0.0
+      --port 8000
+    environment:
+      VLLM_ALLOW_RUNTIME_LORA_UPDATING: "True"   # required for runtime LoRA load
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+    volumes:
+      - ${STUDIO_ADAPTERS_DIR:-./adapters}:/adapters                 # trainer writes here → vLLM loads by path
+      - ${HF_CACHE_DIR:-hf-cache}:/root/.cache/huggingface
+    ports:
+      - "8000:8000"
+    ipc: host                               # vLLM needs a large /dev/shm
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: ["gpu"]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  gateway-gpu:
+    profiles: ["gpu"]
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    image: studio/serving-gateway:latest
+    environment:
+      STUDIO_BACKEND_URL: http://vllm:8000/v1
+      STUDIO_BACKEND_KIND: vllm
+      STUDIO_BASE_MODEL_NAME: bitnet
+      STUDIO_GATEWAY_PORT: "9000"
+      STUDIO_GATEWAY_ADAPTER_PRIORITY: "user_style,tool_call"
+      STUDIO_GATEWAY_API_KEY: ${STUDIO_GATEWAY_API_KEY:-}
+    ports:
+      - "9000:9000"                         # Studio: STUDIO_LLM_BASE_URL=http://<host>:9000/v1
+    depends_on:
+      vllm:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── CPU PROFILE ─────────────────────────────────────────────────────────
+  # llama.cpp llama-server: BitNet GGUF over the OpenAI /v1 endpoint. LoRA is
+  # mounted at startup (--lora); runtime only adjusts its SCALE via POST
+  # /lora-adapters (no runtime FILE load — see README CPU caveat). Serves the
+  # GLOBAL tool_call adapter only; per-user style needs the GPU/vLLM path.
+  #   -m         BitNet GGUF (download per README)
+  #   --lora     the tool_call adapter as GGUF (convert_lora_to_gguf.py; README)
+  #   --alias    the model id clients send (= STUDIO_BASE_MODEL_NAME)
+  llama:
+    profiles: ["cpu"]
+    image: ghcr.io/ggml-org/llama.cpp:server   # pin a build tag in prod, e.g. :server--b6000
+    command: >
+      -m /models/${STUDIO_BITNET_GGUF:-ggml-model-i2_s.gguf}
+      --alias bitnet
+      --lora /adapters/${STUDIO_TOOLCALL_GGUF:-tool_call.gguf}
+      --lora-init-without-apply
+      --host 0.0.0.0
+      --port 8080
+      --ctx-size 4096
+      --threads ${LLAMA_THREADS:-8}
+    volumes:
+      - ${STUDIO_MODELS_DIR:-./models}:/models
+      - ${STUDIO_ADAPTERS_DIR:-./adapters}:/adapters
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  gateway-cpu:
+    profiles: ["cpu"]
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    image: studio/serving-gateway:latest
+    environment:
+      STUDIO_BACKEND_URL: http://llama:8080/v1
+      STUDIO_BACKEND_KIND: llama
+      STUDIO_BASE_MODEL_NAME: bitnet
+      STUDIO_GATEWAY_PORT: "9000"
+      STUDIO_GATEWAY_ADAPTER_PRIORITY: "tool_call"   # CPU path: global adapter only
+      STUDIO_GATEWAY_API_KEY: ${STUDIO_GATEWAY_API_KEY:-}
+    ports:
+      - "9000:9000"
+    depends_on:
+      llama:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  hf-cache:

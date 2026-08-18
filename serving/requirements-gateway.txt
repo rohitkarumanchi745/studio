@@ -1,0 +1,13 @@
+# Studio adapter-aware gateway — deliberately dependency-FREE.
+#
+# gateway.py uses only the Python standard library (http.server, urllib, json,
+# threading), so there is nothing to install. This file exists so the Docker
+# build has a stable, auditable "no third-party deps" contract and so a future
+# addition (metrics, tracing) has an obvious home.
+#
+# If you later want a production ASGI stack instead of the stdlib server, the
+# drop-in set would be:
+#   fastapi==0.115.*
+#   uvicorn[standard]==0.32.*
+#   httpx==0.27.*
+# — but the stdlib gateway needs none of these.

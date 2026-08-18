@@ -34,6 +34,10 @@ CONFIG (env, all optional except credentials):
   STUDIO_TRAIN_POLL_SECONDS loop sleep between polls      (default 60)
   STUDIO_TRAIN_EPOCHS       SFT epochs per round          (default 1)
   STUDIO_TRAIN_ADAPTER_BASE_URI   uri prefix serving loads adapters from (default = output dir)
+  STUDIO_SERVE_URL          serving side to prime after publish (the gateway, or vLLM);
+                            unset = push disabled (serving still picks it up next call)
+  STUDIO_SERVE_KIND         'gateway' (default, POST /admin/load_adapter) | 'vllm'
+  STUDIO_SERVE_TOKEN        optional bearer token if the serving side requires auth
 
 USAGE
   python train_online.py --once        # one round then exit
@@ -106,6 +110,61 @@ def publish_adapter(token, scope, kind, uri, base_model, metrics):
 
 def get_status(token):
     return _req("GET", "/api/training/online", token=token)
+
+
+# ── Serving push: tell the serving side to load the new adapter ──────────
+# After publishing to the registry, optionally poke the serving box so the NEXT
+# call serves the fresh adapter without waiting for a natural cache miss. Gated on
+# STUDIO_SERVE_URL and fully FAIL-SAFE: a serving box that's down (or any error)
+# is logged and ignored — it must NEVER break training. Pure stdlib.
+#
+#   STUDIO_SERVE_URL   base of the serving side (the gateway, or vLLM directly).
+#                      unset → push disabled (registry publish alone is enough;
+#                      serving picks the adapter up on its next call).
+#   STUDIO_SERVE_KIND  'gateway' (default) → POST {URL}/admin/load_adapter
+#                      'vllm'              → POST {URL}/v1/load_lora_adapter
+#   STUDIO_SERVE_TOKEN optional bearer token if the serving side requires auth.
+SERVE_URL = os.getenv("STUDIO_SERVE_URL", "").strip().rstrip("/")
+SERVE_KIND = os.getenv("STUDIO_SERVE_KIND", "gateway").strip().lower()
+SERVE_TOKEN = os.getenv("STUDIO_SERVE_TOKEN", "").strip()
+
+
+def _serve_post(path, body):
+    """Best-effort POST to the serving side. Returns True on 2xx, else False —
+    never raises, never SystemExits (unlike _req), so training is never blocked."""
+    url = SERVE_URL + path
+    data = json.dumps(body).encode()
+    headers = {"Content-Type": "application/json"}
+    if SERVE_TOKEN:
+        headers["Authorization"] = "Bearer " + SERVE_TOKEN
+    req = urllib.request.Request(url, data=data, method="POST", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return 200 <= r.status < 300
+    except Exception as e:
+        print(f"[trainer] serving push to {url} failed (ignored): {e}")
+        return False
+
+
+def push_to_serving(uri, kind, base_model, name=None):
+    """Ask the serving side to load the adapter at `uri` NOW. No-op (returns
+    None) when STUDIO_SERVE_URL is unset. Fail-safe."""
+    if not SERVE_URL:
+        return None
+    if SERVE_KIND == "vllm":
+        # Talk straight to vLLM's runtime-LoRA endpoint. lora_path == the uri the
+        # server sees (shared adapter volume); lora_name derived from the uri.
+        lora_name = name or os.path.basename(uri.rstrip("/"))  # already like tool_call-<ts>
+        ok = _serve_post("/v1/load_lora_adapter",
+                         {"lora_name": lora_name, "lora_path": uri})
+    else:
+        # Default: the gateway's admin hook — it maps uri → backend LoRA name and
+        # loads (vLLM) or enables (llama). Idempotent.
+        ok = _serve_post("/admin/load_adapter",
+                         {"uri": uri, "kind": kind, "base_model": base_model})
+    print(f"[trainer] serving push ({SERVE_KIND}) for {kind} {uri}: "
+          f"{'ok' if ok else 'failed (adapter still served on next call)'}")
+    return ok
 
 
 # ── Cursor persistence (train only on new experience) ────────────────────
@@ -247,6 +306,10 @@ def run_once(token, dry_run=False):
     uri = os.path.join(base_uri, os.path.basename(adapter_dir))
     pub = publish_adapter(token, "global", "tool_call", uri, BASE_MODEL, metrics)
     print(f"[trainer] published global/tool_call v{pub['version']} <- {uri}  metrics={metrics}")
+    # Optional, fail-safe: prime the serving side with the new adapter so the next
+    # call serves it immediately (registry publish alone already makes serving pick
+    # it up on its next call; this just avoids the first-call load latency).
+    push_to_serving(uri, "tool_call", BASE_MODEL)
     save_cursor(cursor)
     return {"trained": True, "adapter": uri, "version": pub["version"],
             "metrics": metrics, "cursor": cursor}
