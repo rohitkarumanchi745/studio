@@ -19,9 +19,11 @@ DESIGN NOTES
   `--dry-run` runs with zero ML deps and is fully testable against a live API.
   The TRAINING step imports torch/transformers/peft/trl lazily and prints a
   clear install hint if they're absent — so the loop degrades, never crashes.
-- Reward-filtered SFT for v1 (train on successful, well-scored trajectories —
-  a standard, safe policy-improvement baseline). DPO/GRPO from the paired /
-  advantage signal are natural extensions on the same stream.
+- Two objectives (STUDIO_TRAIN_MODE): 'sft' = reward-FILTERED supervised fine-
+  tuning (the reward selects which trajectories to imitate — a safe baseline,
+  not RL); 'dpo' = Direct Preference Optimization = genuine preference-based RL —
+  same-prompt outcomes are turned into (chosen > rejected) pairs by the reward,
+  and DPO puts that preference in the objective. GRPO/PPO are the next step.
 
 CONFIG (env, all optional except credentials):
   STUDIO_API_URL            base URL of the Studio API      (default http://localhost:8000)
@@ -30,9 +32,13 @@ CONFIG (env, all optional except credentials):
   STUDIO_TRAIN_BASE_MODEL   HF id of the base            (default microsoft/bitnet-b1.58-2B-4T)
   STUDIO_TRAIN_OUTPUT_DIR   where adapters + cursor live (default ./adapters)
   STUDIO_TRAIN_MIN_REWARD   keep rollouts with reward >= (default 0.6 — the "learned" band)
-  STUDIO_TRAIN_MIN_NEW      min new usable samples before a training round (default 32)
+  STUDIO_TRAIN_MIN_NEW      min new usable samples before an SFT round (default 32)
   STUDIO_TRAIN_POLL_SECONDS loop sleep between polls      (default 60)
-  STUDIO_TRAIN_EPOCHS       SFT epochs per round          (default 1)
+  STUDIO_TRAIN_EPOCHS       epochs per round              (default 1)
+  STUDIO_TRAIN_MODE         'sft' (default) | 'dpo' (preference-based RL)
+  STUDIO_TRAIN_PAIR_MARGIN  DPO: min reward gap for a chosen/rejected pair (default 0.15)
+  STUDIO_TRAIN_MIN_PAIRS    DPO: min preference pairs before a round (default 16)
+  STUDIO_TRAIN_DPO_BETA     DPO: KL strength toward the reference (default 0.1)
   STUDIO_TRAIN_ADAPTER_BASE_URI   uri prefix serving loads adapters from (default = output dir)
   STUDIO_SERVE_URL          serving side to prime after publish (the gateway, or vLLM);
                             unset = push disabled (serving still picks it up next call)
@@ -42,11 +48,13 @@ CONFIG (env, all optional except credentials):
 USAGE
   python train_online.py --once        # one round then exit
   python train_online.py --dry-run     # pull + format only (no ML deps, no publish)
-  python train_online.py               # continuous online loop
+  python train_online.py               # continuous online loop (SFT)
+  STUDIO_TRAIN_MODE=dpo python train_online.py --dry-run   # mine preference pairs, no ML deps
 """
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -59,6 +67,14 @@ MIN_REWARD = float(os.getenv("STUDIO_TRAIN_MIN_REWARD", "0.6"))
 MIN_NEW = int(os.getenv("STUDIO_TRAIN_MIN_NEW", "32"))
 POLL_SECONDS = int(os.getenv("STUDIO_TRAIN_POLL_SECONDS", "60"))
 EPOCHS = int(os.getenv("STUDIO_TRAIN_EPOCHS", "1"))
+# Objective: 'sft' = reward-FILTERED supervised fine-tuning (train on the good
+# trajectories); 'dpo' = Direct Preference Optimization = genuine preference-based
+# RL (the reward decides chosen>rejected and shapes the objective, not just the
+# data filter). DPO needs same-prompt pairs with a reward gap >= PAIR_MARGIN.
+MODE = os.getenv("STUDIO_TRAIN_MODE", "sft").strip().lower()
+PAIR_MARGIN = float(os.getenv("STUDIO_TRAIN_PAIR_MARGIN", "0.15"))
+MIN_PAIRS = int(os.getenv("STUDIO_TRAIN_MIN_PAIRS", "16"))
+DPO_BETA = float(os.getenv("STUDIO_TRAIN_DPO_BETA", "0.1"))
 CURSOR_FILE = os.path.join(OUT_DIR, ".train_cursor.json")
 
 
@@ -185,31 +201,79 @@ def save_cursor(cursor):
 
 # ── Rollouts -> tool-calling SFT samples ─────────────────────────────────
 
+def _completion_for(action):
+    """The tool-call target for a rollout's action (run_sql [+ render_chart]) as
+    compact JSON — the label a tool-calling policy learns. None if no SQL."""
+    sql = (action or {}).get("sql")
+    sql = (sql or "").strip()
+    if not sql:
+        return None
+    target = {"tool": "run_sql", "sql": sql}
+    if action.get("chart_type"):
+        target = [target, {"tool": "render_chart", "chart_type": action["chart_type"]}]
+    return json.dumps(target, separators=(",", ":"))
+
+
+def _norm_prompt(p):
+    """Group key so the SAME question asked twice pairs up, regardless of casing
+    or whitespace — DPO wants same-prompt / different-outcome pairs."""
+    return re.sub(r"\s+", " ", (p or "").strip().lower())
+
+
 def to_samples(rollouts):
-    """Keep successful, well-scored trajectories that took a real action, and
-    format each as a (prompt -> tool-call) example the adapter learns. The
-    target is the action the decision-maker actually took (its run_sql +
-    render_chart), as compact JSON — a faithful tool-calling label."""
+    """SFT: keep successful, well-scored trajectories that took a real action,
+    formatted as (prompt -> tool-call) examples. The reward FILTERS the data."""
     samples = []
     for r in rollouts:
         reward = r.get("reward")
-        action = r.get("action") or {}
-        sql = (action.get("sql") or "").strip()
         prompt = (r.get("prompt") or "").strip()
-        # Only successful trajectories with a concrete tool call train the policy.
-        if reward is None or reward < MIN_REWARD or not sql or not prompt:
+        if reward is None or reward < MIN_REWARD or not prompt:
             continue
         if (r.get("mode") or "").startswith(("fallback", "error")):
             continue  # deterministic fallback / errors aren't policy to imitate
-        target = {"tool": "run_sql", "sql": sql}
-        if action.get("chart_type"):
-            target = [target, {"tool": "render_chart", "chart_type": action["chart_type"]}]
-        samples.append({
-            "prompt": prompt,
-            "completion": json.dumps(target, separators=(",", ":")),
-            "reward": float(reward),
-        })
+        completion = _completion_for(r.get("action"))
+        if completion is None:
+            continue
+        samples.append({"prompt": prompt, "completion": completion, "reward": float(reward)})
     return samples
+
+
+def mine_preference_pairs(rollouts):
+    """DPO: reward-labeled rollouts -> preference pairs. For each prompt seen with
+    MORE THAN ONE distinct completion, pair its highest-reward completion (chosen)
+    with each lower-reward one (rejected) when the reward gap clears PAIR_MARGIN.
+
+    This is the genuine RL step: the heuristic reward now decides a PREFERENCE
+    (chosen > rejected) that DPO puts in the objective — no human labels, and the
+    reward is no longer just a data filter. Same-prompt pairs are the clean signal;
+    a prompt that only ever had one outcome yields no pair (nothing to prefer)."""
+    from collections import defaultdict
+    groups = defaultdict(dict)   # norm-prompt -> {completion: (best_reward, raw_prompt)}
+    for r in rollouts:
+        prompt = (r.get("prompt") or "").strip()
+        reward = r.get("reward")
+        if not prompt or reward is None:
+            continue
+        if (r.get("mode") or "").startswith(("fallback", "error")):
+            continue
+        completion = _completion_for(r.get("action"))
+        if completion is None:
+            continue
+        g = groups[_norm_prompt(prompt)]
+        if completion not in g or float(reward) > g[completion][0]:
+            g[completion] = (float(reward), prompt)   # best reward per distinct completion
+    pairs = []
+    for by_comp in groups.values():
+        if len(by_comp) < 2:
+            continue
+        ranked = sorted(((rw, pr, comp) for comp, (rw, pr) in by_comp.items()),
+                        key=lambda x: x[0], reverse=True)
+        best_rw, best_prompt, best_comp = ranked[0]
+        for rej_rw, _, rej_comp in ranked[1:]:
+            if best_rw - rej_rw >= PAIR_MARGIN:
+                pairs.append({"prompt": best_prompt, "chosen": best_comp,
+                              "rejected": rej_comp, "margin": round(best_rw - rej_rw, 3)})
+    return pairs
 
 
 def write_samples_jsonl(samples, path):
@@ -276,42 +340,121 @@ def train_lora(samples, base_model, out_dir, epochs):
     return adapter_dir, metrics
 
 
+def train_dpo(pairs, base_model, out_dir, epochs):
+    """Direct Preference Optimization of a LoRA adapter — genuine preference-based
+    RL. Optimizes the policy so the chosen (higher-reward) completion is preferred
+    over the rejected one, relative to a frozen reference (the base with the LoRA
+    disabled — no second model copy). CPU-feasible for a 1-bit base + small LoRA.
+    Raises a clear, actionable error if the ML stack isn't installed."""
+    try:
+        import torch
+        from datasets import Dataset
+        from peft import LoraConfig
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from trl import DPOConfig, DPOTrainer
+    except ImportError as e:
+        raise SystemExit(
+            "[trainer] DPO needs the ML stack — install it (CPU is fine):\n"
+            "    pip install -r scripts/requirements-trainer.txt\n"
+            f"  (missing: {e.name}). Use --dry-run to mine pairs without it.")
+
+    tok = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+
+    def _prompt(p):
+        msgs = [{"role": "user", "content": p}]
+        try:
+            return tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        except Exception:
+            return f"<|user|>\n{p}\n<|assistant|>\n"
+
+    ds = Dataset.from_dict({
+        "prompt": [_prompt(p["prompt"]) for p in pairs],
+        "chosen": [p["chosen"] for p in pairs],
+        "rejected": [p["rejected"] for p in pairs]})
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model, trust_remote_code=True, torch_dtype=torch.float32)
+    lora = LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05, bias="none",
+                      task_type="CAUSAL_LM",
+                      target_modules=["q_proj", "k_proj", "v_proj", "o_proj"])
+    adapter_dir = os.path.join(out_dir, f"tool_call-dpo-{int(time.time())}")
+    cfg = DPOConfig(output_dir=adapter_dir, num_train_epochs=epochs,
+                    per_device_train_batch_size=1, gradient_accumulation_steps=8,
+                    learning_rate=5e-5, beta=DPO_BETA, logging_steps=10,
+                    save_strategy="no", report_to=[], max_length=1024, max_prompt_length=512)
+    # ref_model=None + peft_config: the reference is the base with adapters
+    # disabled, so DPO needs no second full-model copy.
+    trainer = DPOTrainer(model=model, ref_model=None, args=cfg, train_dataset=ds,
+                         processing_class=tok, peft_config=lora)
+    result = trainer.train()
+    trainer.save_model(adapter_dir)
+    tok.save_pretrained(adapter_dir)
+    metrics = {
+        "method": "dpo", "beta": DPO_BETA,
+        "loss": float(getattr(result, "training_loss", 0.0) or 0.0),
+        "steps": int(getattr(result, "global_step", 0) or 0),
+        "n_pairs": len(pairs),
+        "avg_margin": round(sum(p["margin"] for p in pairs) / max(1, len(pairs)), 4),
+        "epochs": epochs,
+    }
+    return adapter_dir, metrics
+
+
 # ── One training round + the online loop ─────────────────────────────────
 
 def run_once(token, dry_run=False):
     since = load_cursor()
     pulled = pull_rollouts(token, since)
     rollouts, cursor = pulled["rollouts"], pulled["cursor"]
-    samples = to_samples(rollouts)
-    print(f"[trainer] pulled {len(rollouts)} rollouts since {since:.3f} -> "
-          f"{len(samples)} usable samples (reward>={MIN_REWARD})")
 
-    if len(samples) < MIN_NEW:
-        print(f"[trainer] {len(samples)} < MIN_NEW={MIN_NEW} — not enough new experience; "
-              f"advancing cursor, will accumulate.")
-        save_cursor(cursor)
-        return {"trained": False, "samples": len(samples), "cursor": cursor}
+    # Prepare the objective's training data: SFT filters, DPO mines pairs.
+    if MODE == "dpo":
+        pairs = mine_preference_pairs(rollouts)
+        print(f"[trainer] DPO: pulled {len(rollouts)} rollouts since {since:.3f} -> "
+              f"{len(pairs)} preference pairs (reward gap >= {PAIR_MARGIN})")
+        if len(pairs) < MIN_PAIRS:
+            print(f"[trainer] {len(pairs)} < MIN_PAIRS={MIN_PAIRS} — not enough preference "
+                  f"signal yet (needs same-prompt, reward-differing outcomes); accumulating.")
+            save_cursor(cursor)
+            return {"trained": False, "mode": "dpo", "pairs": len(pairs), "cursor": cursor}
+        data_path = write_samples_jsonl(pairs, os.path.join(OUT_DIR, "last_pairs.jsonl"))
+        if dry_run:
+            print(f"[trainer] --dry-run: wrote {len(pairs)} preference pairs to {data_path}; "
+                  f"skipping training + publish.")
+            save_cursor(cursor)
+            return {"trained": False, "mode": "dpo", "dry_run": True, "pairs": len(pairs),
+                    "pairs_path": data_path, "cursor": cursor}
+        print(f"[trainer] DPO-training LoRA on {len(pairs)} preference pairs (base={BASE_MODEL}) …")
+        adapter_dir, metrics = train_dpo(pairs, BASE_MODEL, OUT_DIR, EPOCHS)
+    else:
+        samples = to_samples(rollouts)
+        print(f"[trainer] SFT: pulled {len(rollouts)} rollouts since {since:.3f} -> "
+              f"{len(samples)} usable samples (reward >= {MIN_REWARD})")
+        if len(samples) < MIN_NEW:
+            print(f"[trainer] {len(samples)} < MIN_NEW={MIN_NEW} — not enough new experience; "
+                  f"advancing cursor, will accumulate.")
+            save_cursor(cursor)
+            return {"trained": False, "mode": "sft", "samples": len(samples), "cursor": cursor}
+        data_path = write_samples_jsonl(samples, os.path.join(OUT_DIR, "last_samples.jsonl"))
+        if dry_run:
+            print(f"[trainer] --dry-run: wrote {len(samples)} samples to {data_path}; "
+                  f"skipping training + publish.")
+            save_cursor(cursor)
+            return {"trained": False, "mode": "sft", "dry_run": True, "samples": len(samples),
+                    "samples_path": data_path, "cursor": cursor}
+        print(f"[trainer] SFT-training LoRA on {len(samples)} samples (base={BASE_MODEL}) …")
+        adapter_dir, metrics = train_lora(samples, BASE_MODEL, OUT_DIR, EPOCHS)
 
-    samples_path = write_samples_jsonl(samples, os.path.join(OUT_DIR, "last_samples.jsonl"))
-    if dry_run:
-        print(f"[trainer] --dry-run: wrote {len(samples)} samples to {samples_path}; "
-              f"skipping training + publish.")
-        save_cursor(cursor)
-        return {"trained": False, "dry_run": True, "samples": len(samples),
-                "samples_path": samples_path, "cursor": cursor}
-
-    print(f"[trainer] training LoRA on {len(samples)} samples (base={BASE_MODEL}) …")
-    adapter_dir, metrics = train_lora(samples, BASE_MODEL, OUT_DIR, EPOCHS)
+    # Shared publish + serving-push tail (same registry contract for either objective).
     base_uri = os.getenv("STUDIO_TRAIN_ADAPTER_BASE_URI", os.path.abspath(OUT_DIR))
     uri = os.path.join(base_uri, os.path.basename(adapter_dir))
     pub = publish_adapter(token, "global", "tool_call", uri, BASE_MODEL, metrics)
     print(f"[trainer] published global/tool_call v{pub['version']} <- {uri}  metrics={metrics}")
-    # Optional, fail-safe: prime the serving side with the new adapter so the next
-    # call serves it immediately (registry publish alone already makes serving pick
-    # it up on its next call; this just avoids the first-call load latency).
+    # Optional, fail-safe: prime the serving side so the next call serves it now.
     push_to_serving(uri, "tool_call", BASE_MODEL)
     save_cursor(cursor)
-    return {"trained": True, "adapter": uri, "version": pub["version"],
+    return {"trained": True, "mode": MODE, "adapter": uri, "version": pub["version"],
             "metrics": metrics, "cursor": cursor}
 
 
