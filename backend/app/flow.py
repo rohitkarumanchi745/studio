@@ -119,6 +119,63 @@ def _trace(user, stage, agent_name, request, source, artifact, ok, reward,
         return None
 
 
+# ── Lakehouse output contract (spark_job write→read loop) ────────────────
+#
+# A spark_job flow may DECLARE an S3 parquet sink. That declaration threads —
+# unchanged — through request_approval into the job script, so on genuine job
+# SUCCESS the supervisor's write→read bridge can auto-register it as a queryable
+# dataset. The contract mirrors objectstore's DatasetIn ({source,name,uri,
+# format}) plus `from_dataset`, the registered SOURCE dataset the job read, from
+# which objectstore derives the allowed output prefix.
+
+def _source_dataset(spec):
+    """The registered objectstore dataset the job reads — the first matched
+    table that resolves to a real dataset on the spec's source. Lazily imports
+    objectstore so nothing here depends on it being configured."""
+    try:
+        from .connectors import objectstore
+        want = set(spec.matched_tables or [])
+        for d in objectstore.datasets(spec.source):
+            if d["name"] in want:
+                return d
+    except Exception:
+        return None
+    return None
+
+
+def _dir_of(uri):
+    """Directory a parquet read-glob points into: cut at the first glob char,
+    then keep up to the last '/'. s3://b/orders/*.parquet -> s3://b/orders/ .
+    The Spark job writes to this dir; the read-glob registers it back."""
+    cut = min((uri.find(c) for c in "*?[" if c in uri), default=len(uri))
+    base = uri[:cut]
+    slash = base.rfind("/")
+    return base[:slash + 1] if slash > len("s3://") else base
+
+
+def _resolve_output(spec, output):
+    """Resolve a spark_job flow's declared S3 parquet sink into the full output
+    contract, or None when the loop can't be closed (no matched source
+    dataset). A caller-declared `output` is honoured and back-filled; otherwise
+    a safe default sink is derived UNDER the source dataset's own prefix, so it
+    passes objectstore's prefix confinement without any extra caller input."""
+    from_ds = next(iter(spec.matched_tables or []), None)
+    if isinstance(output, dict) and output.get("uri"):
+        out = dict(output)
+        out.setdefault("source", spec.source)
+        out.setdefault("format", "parquet")
+        out.setdefault("from_dataset", from_ds)
+        out.setdefault("name", f"{from_ds}_out" if from_ds else "spark_out")
+        return out
+    src = _source_dataset(spec)
+    if not src or not from_ds:
+        return None
+    name = f"{from_ds}_out"
+    uri = f"{_dir_of(src['uri'])}{name}/*.parquet"   # stays under the source prefix
+    return {"source": spec.source, "name": name, "uri": uri,
+            "format": "parquet", "from_dataset": from_ds}
+
+
 # ── Stages ───────────────────────────────────────────────────────────────
 
 def plan(user, request):
@@ -147,13 +204,30 @@ def plan(user, request):
     return spec, tid, None if ok else "Planner drafted no steps"
 
 
-def generate(user, spec):
+def generate(user, spec, kind="sql_script", output=None):
     """Code generator → GeneratedArtifact. Reuses pybuild (existing scripts via
-    MCP as context); the planned SQL steps are handed over as reference."""
+    MCP as context); the planned SQL steps are handed over as reference.
+
+    For a spark_job with a declared S3 output, the prompt is steered to emit a
+    PySpark job that READS the registered S3 source dataset, applies the steps
+    as DataFrame transforms, and WRITES parquet to the declared sink dir — so
+    the generated code closes the lakehouse loop. This only shapes the prompt;
+    nothing runs here, so it stays dormant-safe without any credentials."""
     t0 = time.time()
     context = "\n\n".join(f"-- {s.name}\n{s.sql}" for s in spec.steps if s.sql)
     prompt = (f"Build a deployable pipeline for: {spec.request}. Source: {spec.source}. "
               f"Implement these steps as one runnable job.")
+    if kind == "spark_job" and isinstance(output, dict) and output.get("uri"):
+        src = _source_dataset(spec)
+        src_uri = (src or {}).get("uri")
+        out_dir = _dir_of(output["uri"])
+        if src_uri:
+            prompt += (
+                f"\n\nEmit a PySpark job: read parquet from '{src_uri}' (the registered "
+                f"'{output.get('from_dataset')}' dataset on {spec.source}), apply the SQL "
+                f"steps above as DataFrame transforms, and write the result as parquet to "
+                f"'{out_dir}' with mode='overwrite'. Read the source by its S3 URI and take "
+                f"credentials from the Spark environment — never hardcode them.")
     try:
         out = pybuild.build(pybuild.BuildIn(prompt=prompt, context=context or None), user)
     except Exception as e:
@@ -242,14 +316,22 @@ def validate(user, spec, artifact):
     return result, tid
 
 
-def request_approval(user, spec, validation, target, kind):
+def request_approval(user, spec, validation, target, kind, output=None):
     """Approval agent → DeploymentRequest. The supervisor classifies risk and
-    decides approve / needs_human; an invalid pipeline is rejected outright."""
+    decides approve / needs_human; an invalid pipeline is rejected outright.
+
+    A declared spark_job `output` (the S3 parquet sink) is embedded as a sibling
+    key in the job script here; it threads immutably through supervisor.submit
+    into supervised_jobs.script, so the write→read bridge can read it back on
+    SUCCESS and register the output as a queryable dataset."""
     t0 = time.time()
     # What actually gets deployed: the verified read-only steps as a script, or
     # (for a Spark target) a job payload the executor submits.
     if kind == "spark_job":
-        script = json.dumps({"tasks": [{"name": s.name, "sql": s.sql} for s in spec.steps]})
+        payload = {"tasks": [{"name": s.name, "sql": s.sql} for s in spec.steps]}
+        if isinstance(output, dict) and output.get("uri"):
+            payload["output"] = output
+        script = json.dumps(payload)
     else:
         script = ";\n".join(s.sql for s in spec.steps if s.sql)
 
@@ -402,7 +484,7 @@ def init_tables():
     c.close()
 
 
-def run_flow(user, request, target=None, kind="sql_script"):
+def run_flow(user, request, target=None, kind="sql_script", output=None):
     """Drive one business request through the safe-production flow:
 
         generate → validate ─(fail)→ repair ×N ─(still failing)→ human review
@@ -421,7 +503,11 @@ def run_flow(user, request, target=None, kind="sql_script"):
                        spec, None, None, None, None, traces)
 
     target = target or spec.source
-    artifact, traces["codegen"] = generate(user, spec)
+    # For a spark_job, resolve the declared (or defaulted) S3 parquet sink once,
+    # then steer codegen with it and carry it through approval into the job so
+    # the write→read bridge can register it on SUCCESS.
+    declared_output = _resolve_output(spec, output) if kind == "spark_job" else None
+    artifact, traces["codegen"] = generate(user, spec, kind, declared_output)
 
     # Validate, and on failure repair up to N times before re-validating. If it
     # still won't pass, STOP before approval and send it to human review.
@@ -438,7 +524,8 @@ def run_flow(user, request, target=None, kind="sql_script"):
         return _finish(user, request, target, kind, "human_review", spec, artifact,
                        validation, None, None, traces)
 
-    deployment, traces["approve"] = request_approval(user, spec, validation, target, kind)
+    deployment, traces["approve"] = request_approval(user, spec, validation, target, kind,
+                                                      declared_output)
     if deployment.decision == "reject":
         return _finish(user, request, target, kind, "rejected", spec, artifact,
                        validation, deployment, None, traces)
@@ -506,13 +593,17 @@ class RunIn(BaseModel):
     request: str
     target: str | None = None       # deploy target; defaults to the planned source
     kind: str = "sql_script"        # "sql_script" | "spark_job"
+    # Optional S3 parquet sink for a spark_job: {name, uri, format?, source?,
+    # from_dataset?}. Omit and a safe default under the source dataset's prefix
+    # is derived. Used only for kind="spark_job".
+    output: dict | None = None
 
 
 @router.post("/run")
 def run(body: RunIn, user=Depends(current_user)):
     if body.kind not in ("sql_script", "spark_job"):
         raise HTTPException(400, "kind must be 'sql_script' or 'spark_job'")
-    return run_flow(user, body.request, body.target, body.kind)
+    return run_flow(user, body.request, body.target, body.kind, body.output)
 
 
 def _row(r):
@@ -595,6 +686,19 @@ def _pipeline_view(d):
             status, detail = ("ok" if c.get("ok") else "failed"), c.get("detail")
         steps.append({"name": st.get("name"), "table": st.get("table"),
                       "sql": st.get("sql"), "status": status, "detail": detail})
+    # Lakehouse loop: the declared S3 parquet sink (from the immutable job
+    # script) and, once the job succeeds, the dataset the bridge registered it
+    # as — or the refused-and-surfaced error. Together these let the Flow graph
+    # draw S3 source -> Spark -> S3 parquet -> dataset -> visualize.
+    out = None
+    try:
+        sc = dep.get("script")
+        out = (json.loads(sc) or {}).get("output") if sc else None
+    except Exception:
+        out = None
+    res = ex.get("result")
+    reg = res.get("registered_dataset") if isinstance(res, dict) else None
+    reg = reg if isinstance(reg, dict) else {}
     return {
         "source": spec.get("source"),
         "steps": steps,
@@ -607,6 +711,9 @@ def _pipeline_view(d):
         "deploy_ok": (ex.get("deploy") or {}).get("ok") if ex.get("deploy") else None,
         "run_ok": (ex.get("run") or {}).get("ok") if ex.get("run") else None,
         "job_id": ex.get("job_id"),
+        "output": out,                              # declared S3 parquet sink, or None
+        "registered_dataset": reg.get("registered"),  # queryable dataset name, or None
+        "register_error": reg.get("error"),        # set when registration was refused
     }
 
 

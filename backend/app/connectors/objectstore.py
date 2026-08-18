@@ -437,6 +437,28 @@ def list_datasets(user=Depends(current_user)):
             "formats": sorted(_FORMATS)}
 
 
+def _upsert_dataset(source, name, uri, fmt):
+    """Register (source, name) idempotently: DELETE then INSERT under the
+    unique index, so a re-register updates the row in place instead of
+    duplicating it. Shared by the admin add_dataset endpoint and the Spark
+    write→read bridge (register_output); the connector picks the change up via
+    its registry fingerprint on the next query. Returns the stored row.
+
+    Validation and any authority/confinement check are the CALLER's job — this
+    is the write primitive, deliberately unguarded so both call sites can layer
+    their own gate (admin role here, admin-approval + prefix confinement in the
+    bridge) without one path silently inheriting the other's."""
+    row_id, created = str(uuid.uuid4()), time.time()
+    c = db._conn()
+    c.execute("DELETE FROM objectstore_datasets WHERE source=? AND name=?", (source, name))
+    c.execute("INSERT INTO objectstore_datasets (id, source, name, uri, format, created_at) "
+              "VALUES (?,?,?,?,?,?)", (row_id, source, name, uri, fmt, created))
+    c.commit()
+    c.close()
+    return {"id": row_id, "source": source, "name": name, "uri": uri,
+            "format": fmt, "created_at": created}
+
+
 @router.post("", status_code=201)
 def add_dataset(body: DatasetIn, user=Depends(current_user)):
     _admin(user)
@@ -452,15 +474,9 @@ def add_dataset(body: DatasetIn, user=Depends(current_user)):
     if not _valid(source, name, uri, fmt):
         raise HTTPException(400, f"uri must start with {' or '.join(_SOURCES[source]['schemes'])} "
                                  "and contain no query string, quotes or whitespace")
-    c = db._conn()
-    c.execute("DELETE FROM objectstore_datasets WHERE source=? AND name=?", (source, name))
-    c.execute("INSERT INTO objectstore_datasets (id, source, name, uri, format, created_at) "
-              "VALUES (?,?,?,?,?,?)",
-              (str(uuid.uuid4()), source, name, uri, fmt, time.time()))
-    c.commit()
-    c.close()
     # The connector notices via its registry fingerprint and rebuilds its views
     # on the next query — nothing to invalidate here.
+    _upsert_dataset(source, name, uri, fmt)
     db.log_activity(user, "objectstore_register", prompt=f"{source}.{name}")
     return {"datasets": _rows()}
 
@@ -473,3 +489,162 @@ def remove_dataset(source: str, name: str, user=Depends(current_user)):
     c.commit()
     c.close()
     return {"datasets": _rows()}
+
+
+# ── Lakehouse write→read bridge (Spark output → queryable dataset) ────────
+#
+# The agent-built loop is: read a registered S3 source, run Spark, write
+# Parquet back to S3, and then *query that output in chat*. The last hop needs
+# the fresh Parquet to become an objectstore dataset — but a Spark job that
+# gets to name its own output URI is an exfiltration/priv surface: left
+# unchecked it could register s3://someone-elses-bucket/* or a URI that smuggles
+# credentials, and it would do so with an admin's authority. So registration
+# from a job success runs through the SAME shape as a manual register, plus one
+# additive control: the output URI must sit under an ALLOWED PREFIX. Nothing
+# here fires until a real Databricks/K8s Spark run reports terminal SUCCESS, so
+# it stays dormant exactly like the read connectors until infra is configured.
+
+
+class RegistrationError(Exception):
+    """An output URI could not be safely registered — it failed _valid() or
+    fell outside the allowed prefix. Raised (never swallowed) so a job-success
+    caller surfaces the refusal instead of silently registering a bad URI or
+    silently dropping a good one. register_spark_output() below turns it into a
+    fail-safe {"error": ...} for callers that would rather branch than catch."""
+
+
+def _prefix_of(uri):
+    """The bucket/prefix a dataset URI lives under: everything up to the first
+    glob char, trimmed back to the last real path separator. So
+    s3://b/orders/*.parquet -> s3://b/orders/ and s3://b/x/y/z.parquet ->
+    s3://b/x/y/. Used only as a confinement anchor, never as a reader path."""
+    cut = min((uri.find(c) for c in "*?[" if c in uri), default=len(uri))
+    base = uri[:cut]
+    scheme = base.find("//")
+    slash = base.rfind("/")
+    # Keep the scheme's '//' intact — only trim a genuine path separator so a
+    # bare bucket root (s3://b) is never mangled into an empty/partial prefix.
+    return base[:slash + 1] if scheme != -1 and slash > scheme + 1 else base
+
+
+def dataset_prefix(source, name):
+    """Confinement prefix of a REGISTERED source dataset, or None if no such
+    dataset exists. Exposed so a caller can default a Spark output's allowed
+    prefix to wherever the job's own SOURCE lives — a job may write back only
+    into its input's bucket/prefix. Reads the vetted registry (datasets()),
+    so it never returns a prefix derived from an unvalidated URI."""
+    src = next((d for d in datasets(source) if d["name"] == name), None)
+    return _prefix_of(src["uri"]) if src else None
+
+
+def _allowed_prefixes(source, allowed_prefix, from_dataset):
+    """Resolve the prefixes an output URI may live under, most-explicit first:
+    the caller's allowed_prefix, else the STUDIO_SPARK_OUTPUT_PREFIX allowlist
+    (comma-separated), else the source dataset's own prefix. An empty result
+    means 'nothing is permitted' — the confinement check then refuses every
+    URI, which is the safe default when no boundary has been configured."""
+    if allowed_prefix:
+        pfx = allowed_prefix if isinstance(allowed_prefix, (list, tuple)) else [allowed_prefix]
+        return [str(p) for p in pfx if p]
+    env = [p.strip() for p in os.getenv("STUDIO_SPARK_OUTPUT_PREFIX", "").split(",") if p.strip()]
+    if env:
+        return env
+    pfx = dataset_prefix(source, from_dataset) if from_dataset else None
+    return [pfx] if pfx else []
+
+
+def _confine(source, name, uri, fmt, allowed_prefix, from_dataset):
+    """Validate + confine an output URI, or raise RegistrationError. Returns
+    the cleaned (source, name, uri, fmt). Two checks, both required:
+    _valid() (right scheme for the source, identifier name, no credential-
+    smuggling query string / quotes / whitespace) AND prefix confinement (the
+    additive control that stops s3://someone-elses-bucket/*)."""
+    source = (source or "").strip()
+    name = (name or "").strip()
+    uri = (uri or "").strip()
+    fmt = (fmt or "parquet").strip().lower()
+    if not _valid(source, name, uri, fmt):
+        raise RegistrationError(
+            "output URI failed objectstore validation "
+            f"(source={source!r}, name={name!r}, format={fmt!r}, uri={uri!r})")
+    prefixes = _allowed_prefixes(source, allowed_prefix, from_dataset)
+    # Separator-aware confinement: normalize every boundary to end with "/" so a
+    # prefix matches only on a whole path segment. A bare startswith lets a
+    # SIBLING directory slip through — "s3://b/orders-EVIL/x".startswith(
+    # "s3://b/orders") is True — which would exfiltrate from a look-alike dir.
+    # With the trailing "/", "s3://b/orders/" matches "s3://b/orders/enriched/*"
+    # but NOT "s3://b/orders-EVIL/...".
+    bounded = [p if p.endswith("/") else p + "/" for p in prefixes]
+    if not bounded or not any(uri.startswith(p) for p in bounded):
+        raise RegistrationError(
+            f"output URI {uri!r} is outside the allowed prefix {bounded}")
+    return source, name, uri, fmt
+
+
+def register_output(user, source, name, uri, fmt="parquet", allowed_prefix=None,
+                    from_dataset=None):
+    """Register (or idempotently update) a Spark job's declared object-store
+    output as a queryable dataset — the write→read half of the lakehouse loop.
+    Safe to call from another module when a supervised Spark job reaches
+    genuine SUCCESS.
+
+    Gate: admin-only, the SAME authority as the manual add_dataset endpoint
+    (_admin on the passed-in user) — no broadening. The new row is an ordinary
+    objectstore_datasets row, RBAC-scoped by rbac._OBJECT_STORES identically to
+    every other dataset: a role without the object store still cannot see it.
+
+    Confinement: the URI must pass _valid() AND sit under an allowed prefix
+    (allowed_prefix, else STUDIO_SPARK_OUTPUT_PREFIX, else the from_dataset
+    source's own prefix); anything else raises RegistrationError and writes
+    NOTHING — fail-safe. Idempotent: re-registering the same (source, name)
+    updates in place via _upsert_dataset, never duplicates. Returns the stored
+    dataset row."""
+    _admin(user)
+    source, name, uri, fmt = _confine(source, name, uri, fmt, allowed_prefix, from_dataset)
+    row = _upsert_dataset(source, name, uri, fmt)
+    db.log_activity(user, "objectstore_spark_register", prompt=f"{source}.{name}",
+                    source=source, table=name)
+    return row
+
+
+def register_spark_output(output, job, user):
+    """Fail-safe wrapper for the /live terminal-SUCCESS hook: register a
+    succeeded Spark job's declared output. `output` is the DatasetIn-shaped
+    contract carried in the job script — {source, name, uri, format,
+    from_dataset} — and `job` is the supervised-job row.
+
+    Authority comes from the run itself: a platform_run reaches SUCCESS only
+    because a human admin approved it, stamping job['human_by']. So this gates
+    on job.get('human_by') (that admin authorized the write-back) rather than
+    on whoever happens to poll /live — exactly the manual admin authority,
+    without letting a non-admin poller trigger a registration.
+
+    Never raises and never leaves a half-state: returns {'registered': name,
+    'dataset': row} on success, or {'error': reason} on any refusal (bad shape,
+    not admin-approved, invalid/out-of-prefix URI). The bridge writes that dict
+    into the job result so /live and the Flow graph surface either the closed
+    loop or the visible refusal."""
+    if not isinstance(output, dict):
+        return {"error": "no output contract declared on this job"}
+    if not (job or {}).get("human_by"):
+        return {"error": "job was not admin-approved; refusing to register output"}
+    try:
+        # SECURITY: the confinement boundary must NEVER come from the
+        # (attacker-influenceable) job payload. Pass allowed_prefix=None so a
+        # payload-supplied "allowed_prefix" is IGNORED; the boundary is resolved
+        # server-side only — STUDIO_SPARK_OUTPUT_PREFIX, else the source
+        # dataset's own prefix. from_dataset is a NAME looked up in
+        # objectstore_datasets (dataset_prefix), so its boundary is that
+        # registry row's URI, never a value the payload can forge. No
+        # server-side boundary → _confine refuses (fail-safe).
+        row = _confine(output.get("source", "s3"), output.get("name", ""),
+                       output.get("uri", ""), output.get("format", "parquet"),
+                       None, output.get("from_dataset"))
+    except RegistrationError as e:
+        return {"error": str(e)}
+    source, name, uri, fmt = row
+    stored = _upsert_dataset(source, name, uri, fmt)
+    if user:
+        db.log_activity(user, "objectstore_spark_register", prompt=f"{source}.{name}",
+                        source=source, table=name)
+    return {"registered": name, "dataset": stored}

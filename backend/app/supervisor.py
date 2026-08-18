@@ -181,6 +181,64 @@ def _record_platform_rollout(user, target, run_ref):
         pass  # learning must never break execution
 
 
+def _register_output(output, job, user):
+    """Call the objectstore write→read bridge for a spark job's DECLARED S3
+    parquet output. Lazily imported so the whole feature stays dormant without
+    objectstore / AWS creds, and so this module never hard-depends on the
+    bridge's presence. Fail-safe: never raises — a bad or out-of-prefix output
+    URI comes back as {"error": ...} and is surfaced in the job result, never
+    crashes the run. Confinement (_valid + allowed-prefix) and the admin
+    authority gate (job["human_by"]) live in objectstore, which receives the
+    job so no policy is broadened here."""
+    try:
+        from .connectors import objectstore
+        # Call the 3-arg wrapper register_spark_output(output, job, user). The
+        # module also exposes a generic register_output(user, source, name, uri,
+        # ...) for the manual admin endpoint — invoking THAT with (output, job,
+        # user) silently binds user=output / source=job / name=user (garbage →
+        # _confine raises → the bridge NEVER registers). Bind to the wrapper by
+        # name; the getattr keeps the whole feature dormant if it is absent.
+        fn = getattr(objectstore, "register_spark_output", None)
+        if fn is None:
+            return {"error": "objectstore auto-registration is unavailable"}
+        reg = fn(output, job, user)
+        return reg if isinstance(reg, dict) else {"registered": str(reg)}
+    except Exception as e:
+        return {"error": f"auto-registration failed: {str(e)[:200]}"}
+
+
+def _bridge_output(job, user):
+    """Close the lakehouse loop for a SUCCEEDED spark job that declared an S3
+    parquet sink: read the declared `output` block out of the (immutable) job
+    script and auto-register it as a queryable objectstore dataset, recording
+    the outcome under result["registered_dataset"] so /live and the Flow graph
+    show `S3 parquet -> dataset`. Idempotent: a job re-polled after success
+    (or a re-approved run) is not re-registered or re-logged. Returns the
+    registration dict, or None when the job declared no output."""
+    try:
+        script = json.loads(job["script"]) if job.get("script") else {}
+    except Exception:
+        script = {}
+    output = script.get("output") if isinstance(script, dict) else None
+    if not isinstance(output, dict):
+        return None
+    try:
+        result = json.loads(job["result"]) if job.get("result") else {}
+    except Exception:
+        result = {}
+    if not isinstance(result, dict):
+        result = {"result": result}
+    prev = result.get("registered_dataset")
+    if isinstance(prev, dict) and prev.get("registered") == output.get("name"):
+        return prev   # already registered this exact output — don't re-log
+    reg = _register_output(output, job, user)
+    if reg is None:
+        return None
+    result["registered_dataset"] = reg
+    _save(job, result=json.dumps(result, default=str))
+    return reg
+
+
 def _execute(job):
     """Run the job against its environment. Raises on any failure."""
     user = _requester(job)
@@ -222,6 +280,14 @@ def _run(job):
         try:
             result = _execute(job)
             _save(job, status="succeeded", result=json.dumps(result, default=str), last_error=None)
+            # Write→read bridge. A supervised spark_job that DECLARED an S3
+            # parquet output has now produced it (this path runs only after an
+            # admin approved the job — spark jobs are always human-gated), so
+            # register that output as a queryable dataset. A platform_run's
+            # success here is only trigger-success; its GENUINE terminal state
+            # is discovered by /live, which is where that path registers.
+            if job["kind"] == "spark_job":
+                _bridge_output(job, _requester(job))
             return job
         except Exception as e:
             job["attempts"] += 1
@@ -430,6 +496,13 @@ def live_job(jid: str, user=Depends(current_user)):
         fields["status"] = "failed"
         fields["last_error"] = (st.get("detail") or "platform reported failure")[:500]
     _save(row, **fields)
+    # Write→read bridge. On a platform_run's GENUINE terminal success (the
+    # platform itself reports succeeded — not the trigger-success _run saw when
+    # it submitted), register the job's declared S3 parquet output as a
+    # queryable dataset. Idempotent, so repeated /live polls after success do
+    # not duplicate or re-log the registration.
+    if st["state"] == "succeeded":
+        _bridge_output(row, user)
     # Deliberately NO second Agent Lightning trace when a poll discovers the
     # terminal state — _execute already recorded this run's rollout.
 
