@@ -729,26 +729,55 @@ one-line uncomment in `requirements.txt`.
 
 ## Roadmap
 
-**In progress** (building + adversarially verifying now, not yet on `main`):
-- **Object storage + BigQuery connectors** — S3 / Azure Blob / GCS as
-  DuckDB-backed **named views**: admins register datasets (name → URI + format),
-  agents query ordinary table names under the same RBAC + guard and never see a
-  raw bucket URI; a BigQuery connector with a `maximum_bytes_billed` cost cap;
-  and a hardened query guard that closes path-literal (`FROM 's3://…'`) and
-  `read_*`/`*_scan` table-function escapes while fixing existing false
-  positives (`;` in string literals, identifiers like `created_at`). A
-  supervised Spark job's declared output (Parquet on S3) will auto-register as
-  a dataset on success — the write→read loop closed.
-- **Pipeline Control Service** — one adapter contract (trigger / status / logs /
-  data-quality) for **Airflow, Databricks Jobs, dbt Cloud, Kubernetes/Spark**
-  behind the supervisor's human-approval gate, with run status, logs, metrics,
-  and data-quality results (dbt test outcomes, Airflow task states) fed back
-  into the Jobs UI. Every trigger is an Agent Lightning rollout.
+**Shipped this cycle** (on `main`): object-storage (S3 / Azure / GCS) + BigQuery
+connectors with the hardened guard; the **Pipeline Control Service** (Airflow /
+Databricks Jobs / dbt Cloud / K8s-Spark behind the supervisor); the **semantic
+layer** (one definition of truth per metric); a light **Microsoft-Fluent /
+Data-Formulator** reskin with an encoding-shelf chart builder; the **pipeline-flow
+visualization** (source → transforms → target, per-step pass/fail + email digest);
+the **lakehouse write→read bridge** (S3 → Spark → S3 Parquet → auto-registered
+dataset → viz); **Autopilot agents** (schedule / threshold / event / manual, act-
+with-approval); and the self-hosted **BitNet** pipeline — the CPU **trainer**
+(reward-filtered SFT + DPO), **source-conditioned** training (per-source
+schema/dialect), and the **serving unit** (adapter-aware gateway + vLLM/BitNet.cpp).
 
-Planned:
-- Streaming agent steps to the UI (LangGraph `stream`)
-- Decision-level (per-tool-call) rollouts, so tool-calling training data is at
-  the granularity of the model's decisions
-- DPO / GRPO passes on the BitNet adapters (SFT is wired today)
-- Drill-through from a dashboard tile back into chat
-- Scheduled dashboard email digests
+### Future rollouts
+
+**Scale-out with Ray** (a scale-out upgrade — the single-node CPU path stays the
+default; not needed at today's volume, adopt when data/QPS justify a cluster):
+- **Ray Data** — distributed, streaming data feed for training: pull rollouts,
+  condition, tokenize, mine DPO pairs in parallel across workers (our per-rollout
+  transforms are already pure, so they map cleanly). The answer to "feed lots of
+  ever-changing data to BitNet."
+- **Ray Train** — data-parallel LoRA training that wraps the existing `trl`
+  SFT/DPO trainers across GPUs/nodes for throughput.
+- **Ray Serve** — autoscaling vLLM replicas behind the serving gateway (the
+  30k-seat serving path); pairs with the durable-queue lift below.
+- **Ray Core** — parallel **best-of-N** on-policy sampling (below) and the
+  parallel eval-gate.
+
+**BitNet / RL learning loop:**
+- **On-policy best-of-N preference generation** — sample N completions per prompt
+  from the current policy, score + pair them, so DPO/GRPO have real preference
+  data (the passive rollout log yields ~0 pairs today; verified against prod).
+- **Eval-gate / shadow promotion** — promote a freshly trained adapter to
+  `active` only if it beats the current one on a holdout, instead of publish=live.
+- **Full train≈serve fidelity** — condition each sample on the rollout's own role
+  and reproduce the complete serving system-prompt wrapper (today: skill sub-block
+  only, guard-covered).
+- Decision-level (per-tool-call) rollouts for finer-grained training data.
+
+**Platform / scale:**
+- **Durable-queue lift** — move background agent-runs + the autopilot ticker onto
+  a Redis/RQ queue so they scale past a single instance (task state is already in
+  Postgres; only the executor is per-pod today).
+- Route the pipeline flow's `deploy_execute` through the real platform adapters
+  per target (currently via `supervisor.submit`).
+
+**Product:**
+- **Blend into chat** — the cross-source blend engine is built + tested; wire the
+  Fields/encoding picker into the chat UI.
+- **Data Threads** — the branching exploration history to complete the Data
+  Formulator reshell.
+- CPU adapter hot-swap (auto PEFT→GGUF convert), streaming agent steps to the UI,
+  dashboard drill-through, scheduled dashboard email digests.
