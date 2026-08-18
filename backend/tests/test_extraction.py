@@ -541,6 +541,16 @@ def test_anonymous_link_does_not_widen(env):
 # rbac / kag threading — additive, existing behaviour byte-identical
 # =========================================================================
 
+def test_scope_sql_has_no_percent_literal_postgres_safe(env):
+    # _pg_sql rewrites ? -> %s for psycopg, so a literal % in the SQL breaks
+    # parameter binding on Postgres (but not sqlite). Guard against reintroducing
+    # a LIKE 'u:%' style predicate that only fails in prod.
+    for role, uid in [("admin", "u9"), ("admin", None), ("analyst", "u9"),
+                      ("viewer", None), ("admin", "adm")]:
+        pred, params = env.kag._scope_sql(role, uid)
+        assert "%" not in pred, f"scope SQL for {role}/{uid} contains a literal %: {pred}"
+
+
 def test_kag_scopes_for_no_user_id_is_unchanged(env):
     assert env.rbac.kag_scopes_for("viewer") == {"viewer"}
     assert env.rbac.kag_scopes_for("analyst") == {"analyst"}

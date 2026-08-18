@@ -160,9 +160,11 @@ def _scope_sql(role, user_id, col="access_scope"):
     scopes = rbac.kag_scopes_for(role, user_id)
     self_scope = ("u:" + user_id) if user_id else None
     if scopes == "*":
+        # substr(...,1,2) <> 'u:' instead of NOT LIKE 'u:%' so no literal % reaches
+        # psycopg on Postgres (db._pg_sql turns ? into %s; a stray % breaks binding).
         if self_scope:
-            return f"({col} NOT LIKE 'u:%' OR {col}=?)", [self_scope]
-        return f"{col} NOT LIKE 'u:%'", []
+            return f"(substr({col},1,2) <> 'u:' OR {col}=?)", [self_scope]
+        return f"substr({col},1,2) <> 'u:'", []
     if not scopes:
         return "1=0", []
     ph = ",".join("?" for _ in scopes)
