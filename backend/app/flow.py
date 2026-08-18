@@ -470,13 +470,18 @@ def _finish(user, request, target, kind, status, spec, artifact, validation,
     c.close()
     db.log_activity(user, "flow_run", prompt=request[:200], source=target,
                     ok=status in ("succeeded", "awaiting_approval"))
-    return {
+    resp = {
         "id": fid, "status": status, "request": request, "target": target, "kind": kind,
         "spec": _obj(spec), "artifact": _obj(artifact), "validation": _obj(validation),
         "deployment": _obj(deployment), "execution": _obj(execution),
         "trace_ids": traces, "job_id": job_id,
         "stages": _stage_view(spec, artifact, validation, deployment, execution, traces),
     }
+    resp["pipeline"] = _pipeline_view(resp)
+    # Every run emails a per-step digest (source -> transformations -> target),
+    # on both success and failure.
+    _pipeline_email(user, request, resp["pipeline"], status)
+    return resp
 
 
 def _stage_view(spec, artifact, validation, deployment, execution, traces):
@@ -550,6 +555,7 @@ def get(fid: str, user=Depends(current_user)):
                                             job["status"], d["execution"]["status"])
             d["execution"]["result"] = supervisor._public(supervisor._row(job)).get("result")
     d["stages"] = _stage_view_from_dict(d)
+    d["pipeline"] = _pipeline_view(d)
     return d
 
 
@@ -564,6 +570,73 @@ def remove(fid: str, user=Depends(current_user)):
     c.commit()
     c.close()
     return {"deleted": True}
+
+
+def _pipeline_view(d):
+    """The DATA pipeline (not the agent chain): source -> each transformation
+    step -> where it runs, with per-step pass/fail. This is what the Flow view
+    draws and what the per-step email reports. Step status comes from the
+    Validator's per-step checks (RBAC + guard + real execution)."""
+    spec = d.get("spec") or {}
+    val = d.get("validation") or {}
+    dep = d.get("deployment") or {}
+    ex = d.get("execution") or {}
+    check_by = {}
+    for c in (val.get("checks") or []):
+        nm = c.get("name", "")
+        if nm.startswith("step: "):
+            check_by[nm[len("step: "):]] = c
+    steps = []
+    for st in (spec.get("steps") or []):
+        c = check_by.get(st.get("name"))
+        if c is None:
+            status, detail = "pending", None
+        else:
+            status, detail = ("ok" if c.get("ok") else "failed"), c.get("detail")
+        steps.append({"name": st.get("name"), "table": st.get("table"),
+                      "sql": st.get("sql"), "status": status, "detail": detail})
+    return {
+        "source": spec.get("source"),
+        "steps": steps,
+        "target": dep.get("target") or spec.get("source"),
+        "kind": dep.get("kind"),
+        "risk": dep.get("risk"),
+        "decision": dep.get("decision"),
+        "executor": ex.get("executor"),
+        "run_status": ex.get("status"),
+        "deploy_ok": (ex.get("deploy") or {}).get("ok") if ex.get("deploy") else None,
+        "run_ok": (ex.get("run") or {}).get("ok") if ex.get("run") else None,
+        "job_id": ex.get("job_id"),
+    }
+
+
+def _pipeline_email(user, request, pv, overall):
+    """One digest per run reporting EACH step's success/failure (not 5 separate
+    emails). Sent on both success and failure, so every run's per-step outcome
+    lands in the inbox; _alert still fires for the urgent 'action required' cases."""
+    ok = overall in ("succeeded", "awaiting_approval")
+    color = {"ok": "#0e7a4d", "failed": "#c5221f", "pending": "#79766f"}
+    label = {"ok": "PASS", "failed": "FAIL", "pending": "pending"}
+    rows = "".join(
+        f"<tr><td>{i + 1}. {s['name']}</td><td>{s.get('table') or ''}</td>"
+        f"<td style='color:{color.get(s['status'], '#79766f')};font-weight:700'>{label.get(s['status'], s['status'])}</td>"
+        f"<td>{(s.get('detail') or '')[:140]}</td></tr>"
+        for i, s in enumerate(pv.get("steps") or []))
+    runs_on = pv.get("executor") or pv.get("target") or "?"
+    html = (
+        f"<p>Pipeline <b>{'succeeded' if ok else 'failed'}</b> for your request:</p>"
+        f"<p><i>{request}</i></p>"
+        f"<p>Source <b>{pv.get('source')}</b> &rarr; runs on <b>{runs_on}</b> "
+        f"({pv.get('kind') or 'sql_script'}) &rarr; status <b>{pv.get('run_status') or overall}</b></p>"
+        f"<table cellpadding='6' style='border-collapse:collapse;border:1px solid #e3e1de'>"
+        f"<tr style='background:#f5f4f2'><th align='left'>Step (transformation)</th>"
+        f"<th align='left'>Table</th><th align='left'>Result</th><th align='left'>Detail</th></tr>"
+        f"{rows}</table>")
+    try:
+        email_service.send(user["email"],
+                           f"Studio pipeline {'succeeded' if ok else 'failed'}: {request[:60]}", html)
+    except Exception:
+        pass
 
 
 def _stage_view_from_dict(d):

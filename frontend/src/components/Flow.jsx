@@ -29,6 +29,55 @@ const STATUS_TONE = {
 
 const RUN_MARK = { true: "✓", false: "✗", null: "⏸" };
 
+const RUN_BAD = ["deploy_failed", "rejected", "rolled_back", "failed", "execute_failed"];
+
+// The visual DATA pipeline: source -> each transformation (with pass/fail) ->
+// where the scripts run. Generated from the NLP prompt via the planner; step
+// status is the Validator's real RBAC+guard+execution check per step.
+function PipelineGraph({ pv }) {
+  const [open, setOpen] = useState(null);
+  if (!pv || !pv.steps) return null;
+  const runTone = pv.run_status === "succeeded" ? "ok"
+    : RUN_BAD.includes(pv.run_status) ? "bad" : "warn";
+  const mark = { ok: "\u2713", failed: "\u2715", pending: "\u23f8" };
+  const dotTone = { ok: "ok", failed: "bad", pending: "warn" };
+  return (
+    <div className="pl-graph-wrap">
+      <div className="pl-graph">
+        <div className="pl-gnode pl-src">
+          <div className="pl-gnode-kind">source</div>
+          <div className="pl-gnode-title">\u25c6 {pv.source}</div>
+        </div>
+        {pv.steps.map((s, i) => (
+          <div key={i} style={{ display: "contents" }}>
+            <div className="pl-garrow">\u2192</div>
+            <div className={"pl-gnode pl-step-" + s.status}
+              onClick={() => s.sql && setOpen(open === i ? null : i)} title={s.detail || ""}>
+              <div className="pl-gnode-kind">
+                <span className={"pl-gdot pl-" + dotTone[s.status]}>{mark[s.status]}</span>
+                transform {i + 1}
+              </div>
+              <div className="pl-gnode-title">{s.name}</div>
+              {s.table && <div className="pl-gnode-sub">\u25a6 {s.table}</div>}
+              {open === i && s.sql && <pre className="pl-gsql">{s.sql}</pre>}
+              {s.status === "failed" && s.detail && <div className="pl-gerr">{s.detail}</div>}
+            </div>
+          </div>
+        ))}
+        <div className="pl-garrow">\u2192</div>
+        <div className={"pl-gnode pl-tgt"}>
+          <div className="pl-gnode-kind">runs on</div>
+          <div className="pl-gnode-title">\u25b7 {pv.executor || pv.target}</div>
+          <div className="pl-gnode-sub">{pv.kind}{pv.risk ? " \u00b7 " + pv.risk : ""}</div>
+          <div className={"pl-gstatus flow-status-" + runTone}>
+            {(pv.run_status || "").replace(/_/g, " ") || "\u2014"}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function StageCard({ stage, flow, expanded, onToggle }) {
   const artifact = flow[ARTIFACT_OF[stage.stage]];
   const tone = stage.ok ? "ok" : "bad";
@@ -194,6 +243,9 @@ export default function Flow({ onClose, onOpenJobs }) {
           {flow.status === "rolled_back" && (
             <div className="meta flow-note">The run kept failing after retries — it was stopped, you were alerted, and it was rolled back.</div>
           )}
+          <div className="pl-graph-title">Pipeline</div>
+          <PipelineGraph pv={flow.pipeline} />
+          <div className="pl-graph-title">Agent chain</div>
           <div className="flow-chain">
             {flow.stages.map((s) => (
               <StageCard key={s.stage} stage={s} flow={flow} expanded={!!expanded[s.stage]}
