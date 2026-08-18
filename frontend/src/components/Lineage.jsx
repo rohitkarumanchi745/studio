@@ -43,14 +43,14 @@ function Node({ p, kind }) {
   const n = p.node;
   const failed = kind === "step" && n.failed;
   const stroke = failed ? FAIL : kind === "source" ? AVOCADO : GOLD;
-  const fill = failed ? "rgba(192,90,68,0.16)" : kind === "source" ? "rgba(107,142,61,0.14)" : "#232322";
+  const fill = failed ? "rgba(192,90,68,0.16)" : kind === "source" ? "rgba(107,142,61,0.14)" : "#f5f4f2";
   const label = kind === "step" && typeof n.index === "number" ? `${n.index + 1}. ${n.label}` : n.label;
   const clip = label.length > 22 ? label.slice(0, 21) + "…" : label;
   return (
     <g>
       <rect x={p.x} y={p.y} width={p.w} height={p.h} rx={7}
         fill={fill} stroke={stroke} strokeWidth={failed ? 1.8 : 1} />
-      <text x={p.x + 10} y={p.cy + 4} fontSize={12} fill="#e9e8df" fontWeight={kind === "source" ? 600 : 400}>
+      <text x={p.x + 10} y={p.cy + 4} fontSize={12} fill="#1b1a19" fontWeight={kind === "source" ? 600 : 400}>
         {clip}
       </text>
       {kind === "step" && failed && (

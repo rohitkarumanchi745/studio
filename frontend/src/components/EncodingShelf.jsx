@@ -3,7 +3,7 @@
 // data already on screen — no round-trip to the agent — which is exactly the
 // Data Formulator interaction. Deriving a NEW field (an aggregate, a computed
 // column) still goes through the agent via the "+ new field" box.
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { LABELS, computeFit } from "./ChartView";
 
 const TYPE_ICON = { num: "#", cat: "A", time: "T" };
@@ -36,12 +36,24 @@ export function deriveRenderData(columns, rows, spec) {
     if (!xseen.has(String(xv))) { xseen.add(String(xv)); xs.push(xv); }
     if (!cseen.has(cv) && colorVals.length < MAX_SERIES) { cseen.add(cv); colorVals.push(cv); }
     if (!cseen.has(cv)) continue; // beyond the cap
-    const k = String(xv) + "" + cv;
+    const k = String(xv) + "\u0000" + cv;
     acc.set(k, (acc.get(k) || 0) + (typeof r[mi] === "number" ? r[mi] : 0));
   }
   const cols = [spec.x, ...colorVals];
-  const outRows = xs.map((xv) => [xv, ...colorVals.map((cv) => acc.get(String(xv) + "" + cv) ?? 0)]);
+  const outRows = xs.map((xv) => [xv, ...colorVals.map((cv) => acc.get(String(xv) + "\u0000" + cv) ?? 0)]);
   return { columns: cols, rows: outRows, spec: { ...spec, x: spec.x, y: colorVals } };
+}
+
+// Close a popover when the user clicks anywhere outside the well.
+function useOutsideClose(open, setOpen) {
+  const ref = useRef(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [open, setOpen]);
+  return ref;
 }
 
 function Field({ name, kind }) {
@@ -59,10 +71,11 @@ function Field({ name, kind }) {
 function Well({ label, value, eligible, onSet, onClear }) {
   const [open, setOpen] = useState(false);
   const [over, setOver] = useState(false);
+  const wrapRef = useOutsideClose(open, setOpen);
   return (
     <div className="df-channel">
       <span className="df-channel-label">{label}</span>
-      <div style={{ position: "relative" }}>
+      <div style={{ position: "relative" }} ref={wrapRef}>
         <div
           className={"df-well" + (value ? " df-filled" : "") + (over ? " df-over" : "")}
           onClick={() => setOpen((o) => !o)}
@@ -95,12 +108,13 @@ function Well({ label, value, eligible, onSet, onClear }) {
 function MultiWell({ label, values, eligible, onChange }) {
   const [open, setOpen] = useState(false);
   const [over, setOver] = useState(false);
+  const wrapRef = useOutsideClose(open, setOpen);
   const add = (f) => { if (f && !values.includes(f)) onChange([...values, f]); };
   const remaining = eligible.filter((c) => !values.includes(c));
   return (
     <div className="df-channel">
       <span className="df-channel-label">{label}</span>
-      <div style={{ position: "relative" }}>
+      <div style={{ position: "relative" }} ref={wrapRef}>
         <div
           className={"df-well df-well-multi" + (values.length ? " df-filled" : "") + (over ? " df-over" : "")}
           onDragOver={(e) => { e.preventDefault(); setOver(true); }}

@@ -487,7 +487,7 @@ function buildOption(columns, rows, spec) {
             type: "heatmap",
             data: rows.map((r) => [String(r[xi]), String(r[ryi]), Number(r[vi]) || 0]),
             itemStyle: { borderColor: SURFACE, borderWidth: 2 },
-            label: { show: xCats.length * yCats.length <= 60, color: "#fff" },
+            label: { show: xCats.length * yCats.length <= 60, color: INK.primary, textBorderColor: SURFACE, textBorderWidth: 2 },
           }],
         };
       }
