@@ -5,6 +5,7 @@
 import { useMemo, useState } from "react";
 import { api } from "../api";
 import ChartView, { LABELS, computeFit } from "./ChartView";
+import EncodingShelf, { deriveRenderData } from "./EncodingShelf";
 
 export default function Canvas({ state, setState, onClose, chatOpen, onToggleChat, conversationId, tableLabel, onNewVersion, onOpenDashboard }) {
   const { panels, selected, note, original } = state;
@@ -36,9 +37,9 @@ export default function Canvas({ state, setState, onClose, chatOpen, onToggleCha
     setState({ ...state, panels: next });
   }
 
-  async function applyEdit(e) {
+  async function applyEdit(e, explicit) {
     e?.preventDefault();
-    const q = instruction.trim();
+    const q = (explicit ?? instruction).trim();
     if (!q || busy || !cur) return;
     setBusy(true);
     try {
@@ -184,26 +185,33 @@ export default function Canvas({ state, setState, onClose, chatOpen, onToggleCha
             )}
           </div>
         ) : (
-        <div className={panels.length > 1 ? "canvas-grid" : ""}>
-          {panels.map((p, i) => (
-            <div
-              key={i}
-              className={
-                panels.length > 1
-                  ? "panel" + (i === selected ? " panel-selected" : "")
-                  : ""
-              }
-              onClick={() => panels.length > 1 && setState({ ...state, selected: i })}
-            >
-              <ChartView
-                columns={p.columns}
-                rows={p.rows}
-                chart={p.chart}
-                tall={panels.length === 1}
-              />
-            </div>
-          ))}
-        </div>
+        panels.length === 1 && cur ? (
+          <EncodingShelf
+            columns={cur.columns}
+            rows={cur.rows}
+            spec={spec}
+            onSpec={(ns) => patchPanel(selected, { chart: ns })}
+            onDeriveField={(p) => applyEdit(null, p)}
+            busy={busy}
+          >
+            {(() => {
+              const rd = deriveRenderData(cur.columns, cur.rows, spec);
+              return <ChartView columns={rd.columns} rows={rd.rows} chart={rd.spec} tall />;
+            })()}
+          </EncodingShelf>
+        ) : (
+          <div className="canvas-grid">
+            {panels.map((p, i) => (
+              <div
+                key={i}
+                className={"panel" + (i === selected ? " panel-selected" : "")}
+                onClick={() => setState({ ...state, selected: i })}
+              >
+                <ChartView columns={p.columns} rows={p.rows} chart={p.chart} />
+              </div>
+            ))}
+          </div>
+        )
         )}
 
         {showData && cur && !gallery && (

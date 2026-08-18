@@ -1,14 +1,14 @@
 // Shared chart theme — the single validated palette every render engine
 // (ECharts, Plotly, Vega-Lite) draws from, so charts read as one system
-// regardless of which engine painted them. Validated against the dark
+// regardless of which engine painted them. Validated against the light
 // surface; don't tweak values here without re-running the palette validator.
 export const SERIES = ["#3987e5", "#199e70", "#c98500", "#008300", "#9085e9", "#e66767", "#d55181", "#d95926"];
 export const SEQ = ["#cde2fb", "#86b6ef", "#3987e5", "#1c5cab", "#0d366b"]; // blue ramp (magnitude)
 export const GOOD = "#008300", BAD = "#e66767", TOTAL = "#3987e5";
-export const INK = { primary: "#ffffff", secondary: "#c3c2b7", muted: "#898781" };
-export const GRID_LINE = "#2c2c2a";
-export const AXIS_LINE = "#383835";
-export const SURFACE = "#1a1a19";
+export const INK = { primary: "#1b1a19", secondary: "#4a4844", muted: "#79766f" };
+export const GRID_LINE = "#eceae7";
+export const AXIS_LINE = "#d9d6d2";
+export const SURFACE = "#ffffff";
 
 export function firstNumericIndex(columns, rows, ...exclude) {
   const first = rows[0] || [];
