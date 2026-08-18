@@ -9,6 +9,7 @@ agent MCP loading, so a "build Python from our existing scripts" request has
 the scripts available as tools.
 """
 import json
+import re
 import time
 import uuid
 
@@ -33,19 +34,38 @@ def init_tables():
             command TEXT,
             args TEXT,
             enabled INTEGER NOT NULL DEFAULT 1,
+            owner_id TEXT,
             created_at REAL NOT NULL
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_mcp_name ON mcp_servers(name);
         """
     )
+    # owner_id scopes a server to its owner: NULL = an admin-registered GLOBAL
+    # server (loads into every agent); set = a toolbuilder-built tool (loads
+    # ONLY for its owner). Guarded ALTER migrates databases created before the
+    # column existed. Postgres gets IF NOT EXISTS (a failed statement there
+    # aborts the whole transaction); SQLite swallows the duplicate-column error.
+    if db.IS_PG:
+        c.execute("ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS owner_id TEXT")
+    else:
+        try:
+            c.execute("ALTER TABLE mcp_servers ADD COLUMN owner_id TEXT")
+        except Exception:
+            pass
     c.commit()
     c.close()
 
 
-def registered():
-    """Enabled registered servers, in the shape MultiServerMCPClient wants."""
+def registered(user=None):
+    """Enabled registered servers, in the shape MultiServerMCPClient wants,
+    SCOPED to the caller: admin-registered globals (owner_id IS NULL) plus this
+    user's own built tools (owner_id = user id). With no user, only globals —
+    the safe default, so a built tool never leaks into another user's agent."""
+    uid = (user or {}).get("id")
     c = db._conn()
-    rows = c.execute("SELECT * FROM mcp_servers WHERE enabled=1").fetchall()
+    rows = c.execute(
+        "SELECT * FROM mcp_servers WHERE enabled=1 "
+        "AND (owner_id IS NULL OR owner_id = ?)", (uid,)).fetchall()
     c.close()
     out = {}
     for r in rows:
@@ -62,6 +82,44 @@ def registered():
                 entry["args"] = []
         out[d["name"]] = entry
     return out
+
+
+# Non-HTTP registration for an approved, supervised build (toolbuilder.py). The
+# authority is an admin-approved supervised job established by the caller, not
+# the current request, so there is no HTTP/admin gate here — but the name is
+# validated to a safe identifier (it becomes a unique-indexed row) and the
+# command/args are passed by the caller as a fixed interpreter + argv list (no
+# shell). See toolbuilder.py for the confinement of the path in args.
+_SAFE_SERVER = re.compile(r"[a-z][a-z0-9_]{0,63}")
+
+
+def register_stdio(name, command, args, owner_id=None):
+    """Register (idempotently) an approved stdio MCP server. Raises ValueError
+    on an unsafe name. `command` must be a real interpreter path and `args` a
+    list — both are stored verbatim and later handed to the stdio transport as
+    argv, never through a shell."""
+    if not (isinstance(name, str) and _SAFE_SERVER.fullmatch(name)):
+        raise ValueError("unsafe server name")
+    if not command or not isinstance(args, list):
+        raise ValueError("stdio server needs a command and an args list")
+    c = db._conn()
+    c.execute("DELETE FROM mcp_servers WHERE name=?", (name,))
+    c.execute(
+        "INSERT INTO mcp_servers (id, name, transport, url, command, args, enabled, owner_id, created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (str(uuid.uuid4()), name, "stdio", None, command,
+         json.dumps(args), 1, owner_id, time.time()),
+    )
+    c.commit()
+    c.close()
+
+
+def unregister(name):
+    """Remove a registered server by name (used when a built tool is deleted)."""
+    c = db._conn()
+    c.execute("DELETE FROM mcp_servers WHERE name=?", (name,))
+    c.commit()
+    c.close()
 
 
 def _list(user):

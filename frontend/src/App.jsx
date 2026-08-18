@@ -11,11 +11,13 @@ import Login from "./components/Login";
 import Governance from "./components/Governance";
 import Semantic from "./components/Semantic";
 import Jobs from "./components/Jobs";
+import Kag from "./components/Kag";
 import PyBuild from "./components/PyBuild";
 import Pipelines from "./components/Pipelines";
 import QueryLibrary from "./components/QueryLibrary";
 import Sessions from "./components/Sessions";
 import Skills from "./components/Skills";
+import ToolBuilder from "./components/ToolBuilder";
 import Sidebar from "./components/Sidebar";
 
 // Complete an Entra SSO redirect: /?sso_token=…&sso_user=… → store session.
@@ -81,6 +83,8 @@ export default function App() {
   const [showFlow, setShowFlow] = useState(false);
   const [showSkills, setShowSkills] = useState(false);
   const [showAutopilot, setShowAutopilot] = useState(false);
+  const [showToolBuilder, setShowToolBuilder] = useState(false);
+  const [showKag, setShowKag] = useState(false);
   // Bumped when a user connects/removes a key so the model menu refetches.
   const [modelsEpoch, setModelsEpoch] = useState(0);
 
@@ -139,6 +143,8 @@ export default function App() {
         onFlow={() => setShowFlow(true)}
         onSkills={() => setShowSkills(true)}
         onAutopilot={() => setShowAutopilot(true)}
+        onToolBuilder={() => setShowToolBuilder(true)}
+        onKag={() => setShowKag(true)}
         onKeysChanged={() => setModelsEpoch((n) => n + 1)}
         onRename={async (id, title) => {
           await api(`/conversations/${id}`, {
@@ -157,6 +163,13 @@ export default function App() {
           user={user}
           onClose={() => setShowAutopilot(false)}
           onOpenJobs={() => { setShowAutopilot(false); setShowJobs(true); }}
+        />
+      ) : showKag ? (
+        <Kag user={user} onClose={() => setShowKag(false)} />
+      ) : showToolBuilder ? (
+        <ToolBuilder
+          onClose={() => setShowToolBuilder(false)}
+          onOpenJobs={() => { setShowToolBuilder(false); setShowJobs(true); }}
         />
       ) : showFlow ? (
         <Flow onClose={() => setShowFlow(false)} onOpenJobs={() => { setShowFlow(false); setShowJobs(true); }} />

@@ -41,7 +41,7 @@ def build(body: BuildIn, user=Depends(current_user)):
         raise HTTPException(400, "Describe what the Python should do")
 
     spec = agent.llm_spec()
-    used_mcp = list(agent.mcp_servers().keys())
+    used_mcp = list(agent.mcp_servers(user).keys())
 
     if not agent.llm_available(spec, user):
         code = _scaffold(prompt, body.context)
@@ -68,7 +68,7 @@ def _generate(prompt, context, user, spec, used_mcp):
         messages.append(("user", f"Existing script for reference:\n{context[:6000]}"))
     messages.append(("user", f"Build Python for: {prompt}"))
 
-    mcp_cfg = agent.mcp_servers()
+    mcp_cfg = agent.mcp_servers(user)
     if mcp_cfg:
         # MCP tools (e.g. a filesystem/git server exposing existing scripts) let
         # the agent read them before writing. Run the graph on an event loop.

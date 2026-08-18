@@ -25,3 +25,8 @@ psycopg[binary]>=3.1
 # Tile-result cache when REDIS_URL is set; the app runs without it.
 redis>=5.0
 # agentlightning  # optional — Agent Lightning (trace/RL/APO) integration; loop works without it
+
+# KAG (Knowledge-Augmented Generation) document parsers — pure-Python, no
+# torch/pandas: cosine lives in embed.py, csv+email are stdlib.
+openpyxl>=3.1                    # .xlsx ingestion
+pypdf>=4.0                      # PDF text + page metadata

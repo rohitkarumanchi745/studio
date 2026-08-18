@@ -77,6 +77,23 @@ def allowed_tables(role, source, all_tables):
     return [t for t in all_tables if t.lower() in {p.lower() for p in policy}]
 
 
+def kag_scopes_for(role):
+    """Which KAG collection access_scopes a role may retrieve from.
+
+    Mirrors allowed_sources()'s fail-closed shape: a role whose whole policy is
+    "*" (admin) reaches every scope, so this returns the "*" sentinel; any other
+    role reaches only its own scope. KAG collections are governed exactly like
+    data sources — a role's agent (and /kag/search) can only ever surface chunks
+    from a collection whose scope is in this set, enforced server-side in SQL, so
+    grounding text can never widen data access. Additive: it reads _policies()
+    but never touches POLICIES, and adds no new authority a role didn't have.
+    """
+    pol = _policies().get(role, {})
+    if pol == "*" or role == "admin":
+        return "*"                       # sentinel: every scope
+    return {role}                        # v1: a role reaches its own scope
+
+
 def can_access(role, source, table):
     policy = _role_policy(role, source)
     if policy is None:

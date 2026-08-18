@@ -11,8 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from . import (auth, autopilot, catalog, chat, dashboards, db, flow, freshness,
-               governance, keys, mcp, pipelines, pybuild, qcache, queries, repos,
-               semantic, sessions, supervisor, trainer)
+               governance, kag, keys, mcp, pipelines, pybuild, qcache, queries, repos,
+               semantic, sessions, supervisor, toolbuilder, trainer)
 from .agent import llm_available, llm_spec
 from .connectors import objectstore
 from .connectors.demo import seed
@@ -41,6 +41,8 @@ app.include_router(governance.router)
 app.include_router(supervisor.router)
 app.include_router(mcp.router)
 app.include_router(pybuild.router)
+app.include_router(toolbuilder.router)
+app.include_router(kag.router)
 app.include_router(repos.router)
 app.include_router(repos._settings)
 app.include_router(sessions.router)
@@ -55,7 +57,8 @@ app.include_router(autopilot.router)
 # server proxies and strips that prefix, so dev keeps the unprefixed routes).
 for _router in (auth.router, catalog.router, chat.router, dashboards.router,
                 queries.router, pipelines.router, governance.router,
-                supervisor.router, mcp.router, pybuild.router,
+                supervisor.router, mcp.router, pybuild.router, toolbuilder.router,
+                kag.router,
                 repos.router, repos._settings, sessions.router, flow.router,
                 trainer.router, freshness.router, objectstore.router,
                 semantic.router, autopilot.router):
@@ -76,6 +79,8 @@ def startup():
     semantic.load()
     supervisor.init_tables()
     mcp.init_tables()
+    toolbuilder.init_tables()
+    kag.init_tables()
     repos.init_tables()
     sessions.init_tables()
     flow.init_tables()

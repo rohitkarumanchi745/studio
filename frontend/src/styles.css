@@ -841,3 +841,31 @@ input:focus, select:focus, .composer-pill:focus-within { box-shadow: 0 0 0 1px v
 .ap-run-gate { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
 .ap-run-body { margin-top: 6px; }
 .ap-run-text { color: var(--ink-2); font-size: 12.5px; white-space: pre-wrap; }
+
+/* ── Build tool / MCP (self-authored tools + MCP servers) ── */
+.query-item {
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: 9px; overflow: hidden;
+}
+.tb-ground {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  margin: 8px 0 2px; padding: 8px 10px;
+  background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px;
+}
+.tb-kind { display: inline-flex; gap: 6px; }
+.tb-result-head {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+}
+
+/* ── Knowledge (KAG) panel ── */
+.kag-doc-del { margin-left: auto; }
+.kag-passages { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+.kag-passage {
+  background: var(--surface); border: 1px solid var(--line);
+  border-left: 3px solid var(--accent); border-radius: 8px; padding: 8px 12px;
+}
+.kag-cite { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 4px; }
+.kag-quote {
+  color: var(--ink-2); font-size: 13px; white-space: pre-wrap;
+  max-height: 180px; overflow-y: auto;
+}
