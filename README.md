@@ -19,71 +19,79 @@ handle only what's genuinely new.
 
 ```mermaid
 flowchart TB
-    subgraph client["Browser — React + Vite"]
-        chat["Chat + Canvas<br/>ask · charts · pin · cross-filter"]
-        views["Pipelines · Flow · Jobs · Governance<br/>Agents · Skills · Sessions · Dashboards"]
+    subgraph client["Browser — React + Vite · light Fluent / Data-Formulator UI"]
+        chat["Chat + Canvas + encoding shelf<br/>ask · fields→channels · pin · cross-filter"]
+        views["Semantic layer · Autopilot · Pipelines · Flow<br/>Jobs · Governance · Agents · Dashboards"]
     end
 
     subgraph api["FastAPI — one origin, API at /api/*"]
-        routers["Routers · auth · chat · pipelines · flow<br/>queries · governance · supervisor · sessions<br/>mcp · repos · dashboards · catalog · freshness"]
-
+        subgraph tiers["Answer tiers, in order"]
+            sem["semantic.py<br/>metric layer · one definition of truth"]
+            qc["qcache.py · semantic cache"]
+            route["router.py · learned-scope cascade"]
+        end
         subgraph agents["Agent layer"]
-            orch["orchestrator.py<br/>fan-out + aggregator"]
-            agent["agent.py<br/>LangGraph ReAct"]
-            roster["roster.py<br/>named agents"]
-            flowm["flow.py<br/>staged typed pipeline"]
-            sup["supervisor.py<br/>risk + human-in-loop"]
+            orch["orchestrator.py · fan-out"]
+            agent["agent.py · LangGraph ReAct"]
+            flowm["flow.py · staged typed pipeline"]
+            auto["autopilot.py · proactive agents + ticker"]
+            sup["supervisor.py · risk + human-in-loop"]
         end
-
-        subgraph gate["Governance + guard"]
-            rbacm["rbac.py"]
-            guard["queryguard.py"]
-            gov["governance.py<br/>YAML policy + compliance"]
-            verify["verify_sql · the execution gate"]
-        end
-
-        subgraph learn["Agent Lightning · caching · routing"]
-            light["lightning.py<br/>rollouts + per-agent reward"]
-            qc["qcache.py<br/>semantic cache"]
-            route["router.py<br/>learned-scope cascade"]
-            emb2["embed.py<br/>Harrier similarity"]
-            tr["trainer.py<br/>online adapters"]
-            sess["sessions.py<br/>serialize + prompt cache"]
+        gate["verify_sql — the ONE data gate<br/>rbac · queryguard · governance"]
+        subgraph learn["Agent Lightning · learning"]
+            light["lightning.py · rollouts + reward"]
+            tr["trainer.py · rollout stream + adapter registry"]
+            emb2["embed.py · Harrier"]
+            sess["sessions.py · serialize + prompt cache"]
         end
     end
 
     subgraph state["State + cache"]
         pg[("PostgreSQL")]
-        redis[("Redis<br/>tile cache")]
+        redis[("Redis · tile cache")]
+    end
+
+    subgraph data["Data connectors — every path via verify_sql"]
+        src[("demo · Snowflake · Databricks<br/>Neo4j · marketing")]
+        obj[("Object store · S3 / Azure / GCS<br/>DuckDB views")]
+        bq[("BigQuery · cost-capped")]
+    end
+
+    subgraph selfh["Self-hosted BitNet loop (CPU, self-hosted)"]
+        trn{{"trainer worker · scripts/train_online.py<br/>reward-filtered SFT / DPO LoRA"}}
+        srv{{"serving unit · gateway + vLLM / BitNet.cpp"}}
     end
 
     subgraph ext["External"]
         llm{{"Frontier LLM · Claude / GPT (BYOK)"}}
-        bit{{"BitNet · self-hosted (learned scope)"}}
         harr{{"Harrier · embeddings"}}
         mcp{{"MCP servers"}}
-        gh{{"GitHub repos"}}
-        src[("Connectors · demo · Snowflake<br/>Databricks · Neo4j · marketing APIs")]
+        plat{{"Platforms · Airflow / Databricks Jobs<br/>dbt Cloud / K8s-Spark"}}
     end
 
-    client -->|JWT| routers
-    routers --> agents
-    agents --> learn
-    route <--> llm
-    route <--> bit
-    emb2 <--> harr
-    tr -.adapters.-> bit
+    client -->|JWT| tiers
+    tiers --> agents
+    sem --> gate
     agents --> gate
-    gate --> src
-    agent -.tools.-> mcp
-    flowm -.scripts.-> gh
-    routers --> pg
-    routers --> redis
+    auto --> sup
+    route <--> llm
+    route <--> srv
+    gate --> data
+    obj -. spark output auto-registers .-> data
+    agents --> learn
+    light --> tr
+    tr -->|rollouts| trn
+    trn -. LoRA adapters .-> srv
+    emb2 <--> harr
+    agent -. tools .-> mcp
+    sup -. governed run .-> plat
+    api --> pg
+    api --> redis
 
     classDef store fill:#1f6f4a,stroke:#2e9e6b,color:#fff
     classDef extc fill:#2b4a7d,stroke:#3d6bb3,color:#fff
-    class pg,redis store
-    class llm,bit,harr,mcp,gh,src extc
+    class pg,redis,src,obj,bq store
+    class llm,srv,trn,harr,mcp,plat extc
 ```
 
 **One gate for data.** Every path that returns rows — the agent's `run_sql`
@@ -99,21 +107,26 @@ sequenceDiagram
     autonumber
     participant U as User
     participant API as FastAPI
+    participant S as Semantic layer
+    participant R as Router · cache/BitNet/frontier
     participant A as Agent (LangGraph)
-    participant G as queryguard
+    participant G as verify_sql · RBAC+guard+gov
     participant W as Warehouse
     participant L as Agent Lightning
 
-    U->>API: "top 5 products by revenue in 2025"
-    API->>API: RBAC — role may see this source/table?
-    API->>API: semantic cache — seen a like question?
-    API->>A: prompt + skill file (RBAC-scoped schemas)
-    A->>G: run_sql(SELECT …)
-    G->>G: single stmt · SELECT-only · allowlist · LIMIT
-    G->>W: execute
-    W-->>A: columns + rows
-    A->>A: render_chart(type, x, y)
-    A-->>API: text · sql · rows · chart · usage
+    U->>API: "revenue by region"
+    API->>S: resolves to a defined metric?
+    alt in the semantic layer
+        S->>G: compiled canonical SQL (no model)
+    else novel prompt
+        API->>R: cache hit? BitNet learned it? else frontier
+        R->>A: prompt + source skill file (RBAC-scoped)
+        A->>G: run_sql(SELECT …)
+    end
+    G->>G: RBAC · SELECT-only · allowlist · LIMIT · governance mask
+    G->>W: execute (live — data changes every time)
+    W-->>G: columns + rows
+    G-->>API: rows + chart
     API->>L: record rollout (prompt, sql, reward)
     API-->>U: answer + chart on the canvas
 ```
