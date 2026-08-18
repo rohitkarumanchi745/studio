@@ -289,18 +289,26 @@ def _run_turn(ctx, user):
     connector = ctx["connector"]
     skill_md = skills.get_skill(connector, user["role"], ctx["allowed"], ctx["schemas"])
 
-    def _run(spec):
+    def _run(spec, kag_first=False):
         return agent.run_agent(
             prompt=prompt, connector=connector, table=ctx["table_param"],
             allowed_tables=ctx["allowed"], schemas=ctx["schemas"], history=ctx["history"],
-            user=user, model=spec, skill_md=skill_md)
+            user=user, model=spec, skill_md=skill_md, kag_first=kag_first)
 
+    # Explicit engine chosen in the model selector: honor it directly, ahead of the
+    # automatic tiers. 'bitnet' forces the self-hosted engine; 'kag' forces a
+    # documents-first turn grounded in the user's own knowledge collections.
+    if model == "bitnet":
+        result = _run(model_router.bitnet_spec())
+        result.setdefault("served_by", "bitnet")
+    elif model == "kag":
+        result = _run(None, kag_first=True)
+        result.setdefault("served_by", "kag")
     # Tier -1 — semantic layer: if the prompt resolves to admin-defined metrics,
     # answer from the ONE canonical definition. Deterministic, needs no model,
     # and guarantees every phrasing of the same question returns the same number.
     # Anything it can't resolve returns None and falls through to the agent.
-    result = semantic.answer(user, ctx["source"], prompt, ctx["table_param"])
-    if result is not None:
+    elif (result := semantic.answer(user, ctx["source"], prompt, ctx["table_param"])) is not None:
         pass
     # Tier 0 — semantic cache: an equivalent prompt reuses its plan (SQL+chart),
     # re-executed fresh, with no model at all.

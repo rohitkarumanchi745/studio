@@ -117,17 +117,39 @@ def available_models(user=None):
     specs = [s.strip() for s in os.getenv("STUDIO_MODELS", _DEFAULT_MODELS).split(",") if s.strip()]
     if llm_spec() not in specs:
         specs.insert(0, llm_spec())
-    return [
+    out = [
         {
             "spec": s,
             "provider": s.split(":", 1)[0],
             "name": s.split(":", 1)[-1],
+            "label": s.split(":", 1)[-1],
             "available": llm_available(s, user),
             "byok": bool(user_key(user, s)),
             "default": s == llm_spec(),
         }
         for s in specs
     ]
+    # Self-hosted BitNet: a selectable engine only once a tool-calling adapter is
+    # trained and the serving endpoint is configured. Dormant (absent) until then.
+    try:
+        from . import router as model_router
+        if model_router.bitnet_ready(user):
+            out.append({"spec": "bitnet", "provider": "bitnet", "name": "bitnet",
+                        "label": "\U0001f9e0 BitNet \u2014 self-hosted (learned)",
+                        "available": True, "byok": False, "default": False})
+    except Exception:
+        pass
+    # KAG: offered only when this user's role can reach a knowledge collection that
+    # actually has content \u2014 selecting it grounds the turn in documents first.
+    try:
+        from . import kag
+        if user and kag.reachable_collections(user.get("role")):
+            out.append({"spec": "kag", "provider": "kag", "name": "kag",
+                        "label": "\U0001f4c4 KAG \u2014 your documents",
+                        "available": True, "byok": False, "default": False})
+    except Exception:
+        pass
+    return out
 
 
 def user_key(user, spec=None):
@@ -292,7 +314,7 @@ def _final_text(result):
 
 
 def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, model=None,
-              skill_md=None):
+              skill_md=None, kag_first=False):
     """One analytics turn.
 
     schemas: {table_name: [{"name","type"}, ...]} — one entry for single-table
@@ -461,6 +483,13 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
 
     memory_notes = db.list_memory(user["id"])
     system = _system_prompt(connector, table, allowed_tables, schemas, memory_notes, skill_md)
+    if kag_first:
+        # User explicitly chose the KAG engine: ground the answer in their own
+        # documents first, and only touch the warehouse if the docs can't answer.
+        system += ("\n\nDOCUMENTS-FIRST: The user selected the knowledge engine. "
+                   "Call knowledge_search FIRST and ground your answer in the cited "
+                   "passages, quoting the source. Only fall back to querying the "
+                   "warehouse if the documents cannot answer the question.")
 
     try:
         llm = make_llm(spec, user)

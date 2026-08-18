@@ -409,7 +409,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
           >
             {models.map((m) => (
               <option key={m.spec} value={m.spec} disabled={!m.available}>
-                {m.name}{!m.available ? " — no key" : ""}
+                {m.label || m.name}{!m.available ? " — no key" : ""}
               </option>
             ))}
           </select>
