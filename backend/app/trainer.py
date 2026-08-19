@@ -96,6 +96,7 @@ def stream(since=0.0, limit=500):
             # versa. Additive: prior keys are unchanged.
             "source": r["source"], "tbl": r["tbl"],
             "mode": r["mode"], "agents": meta.get("agents") or [],
+            "history": meta.get("history") or [],
         })
     cursor = out[-1]["created_at"] if out else since
     return {"rollouts": out, "cursor": cursor, "count": len(out)}

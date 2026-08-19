@@ -271,7 +271,8 @@ def _run_turn(ctx, user):
         result["table"] = "all sources"
         result["matched_tables"] = []
         result["inputs"] = _query_inputs(result)
-        tid = lightning.record_chat_trace(user, cid, prompt, result, int((time.time() - t0) * 1000))
+        tid = lightning.record_chat_trace(user, cid, prompt, result, int((time.time() - t0) * 1000),
+                                          history=ctx["history"])
         if tid:
             result["trace_id"] = tid
         result["author_role"] = user["role"]
@@ -311,8 +312,11 @@ def _run_turn(ctx, user):
     elif (result := semantic.answer(user, ctx["source"], prompt, ctx["table_param"])) is not None:
         pass
     # Tier 0 — semantic cache: an equivalent prompt reuses its plan (SQL+chart),
-    # re-executed fresh, with no model at all.
-    elif (cached := qcache.lookup(user, ctx["source"], ctx["table_label"], prompt)) is not None:
+    # re-executed fresh, with no model at all. FIRST TURNS ONLY: the cache keys on
+    # the prompt alone, and a follow-up ("and by region?") means something different
+    # in every conversation — matching one against another replays the wrong plan.
+    elif not ctx["history"] and (cached := qcache.lookup(
+            user, ctx["source"], ctx["table_label"], prompt)) is not None:
         result = cached
     else:
         # Tier 1/2 — route learned, repeated work to the self-hosted BitNet;
@@ -337,8 +341,9 @@ def _run_turn(ctx, user):
         if result is None:
             result = _run(model)   # frontier LLM (default, or BitNet escalation)
             result.setdefault("served_by", "frontier")
-        qcache.store(user, ctx["source"], ctx["table_label"], prompt, result,
-                     reward=lightning.heuristic_reward(result))
+        if not ctx["history"]:   # same reason: a follow-up's plan is context-bound
+            qcache.store(user, ctx["source"], ctx["table_label"], prompt, result,
+                         reward=lightning.heuristic_reward(result))
     result["source"] = ctx["source"]
     result["table"] = ctx["table_label"]
     try:
@@ -350,7 +355,8 @@ def _run_turn(ctx, user):
     except Exception:
         result["matched_tables"] = []
     result["inputs"] = _query_inputs(result)
-    tid = lightning.record_chat_trace(user, cid, prompt, result, int((time.time() - t0) * 1000))
+    tid = lightning.record_chat_trace(user, cid, prompt, result, int((time.time() - t0) * 1000),
+                                      history=ctx["history"])
     if tid:
         result["trace_id"] = tid
     result["author_role"] = user["role"]
@@ -776,7 +782,7 @@ def _conversation(cid, user, prompt):
             {"role": m["role"], "text": m["content"].get("text", "")}
             for m in _visible_messages(cid, user, access)
             if m["content"].get("text")
-        ][-8:]
+        ][-int(os.getenv("STUDIO_HISTORY_TURNS", "8")):]
         return cid, history
     return db.create_conversation(user["id"], prompt), []
 

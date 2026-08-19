@@ -113,9 +113,15 @@ def record_agent_rollout(user, conversation_id, prompt, agent_name, role, sub,
         return None
 
 
-def record_chat_trace(user, conversation_id, prompt, result, duration_ms):
+def record_chat_trace(user, conversation_id, prompt, result, duration_ms, history=None):
     """Persist one rollout. Returns the trace id (also stored in the message,
-    so the UI's 👍/👎 can target it later)."""
+    so the UI's 👍/👎 can target it later).
+
+    history: the conversation turns the model actually saw this turn (role/text).
+    Stored on the rollout so the trainer can reproduce the SAME multi-turn
+    conditioning at training time — BitNet serves with history, so it must train
+    with history (train == serve), and a follow-up like "and by region?" is only
+    learnable WITH the turns that give it meaning."""
     errors = result.get("errors") or []
     chart = result.get("chart") or {}
     try:
@@ -140,7 +146,10 @@ def record_chat_trace(user, conversation_id, prompt, result, duration_ms):
             # learning store shows which agents were called (single worker, or
             # the fan-out crew + Aggregator).
             meta={"errors": errors[:5],
-                  "agents": [a.get("name") for a in (result.get("agents") or [])]},
+                  "agents": [a.get("name") for a in (result.get("agents") or [])],
+                  # trimmed to keep the trace row lean; same order the model saw
+                  "history": [{"role": h["role"], "text": (h.get("text") or "")[:600]}
+                              for h in (history or [])][-8:]},
         )
     except Exception:
         return None  # learning must never break answering

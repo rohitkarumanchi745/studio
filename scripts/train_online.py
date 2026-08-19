@@ -318,6 +318,19 @@ def _norm_prompt(p):
     return re.sub(r"\s+", " ", (p or "").strip().lower())
 
 
+def _ctx_key(history):
+    """Stable digest of the conversation turns a rollout was conditioned on.
+    Folded into the DPO group key so pairs never mix contexts: "and by region?"
+    after a revenue question and after a downtime question are DIFFERENT prompts
+    to the policy, and pairing them would teach nonsense preferences."""
+    import hashlib
+    if not history:
+        return ""
+    joined = "\x1e".join(f"{h.get('role','')}:{_norm_prompt(h.get('text',''))}"
+                          for h in history)
+    return hashlib.sha1(joined.encode()).hexdigest()[:12]
+
+
 def to_samples(rollouts, skills=None):
     """SFT: keep successful, well-scored trajectories that took a real action,
     formatted as (source-context -> prompt -> tool-call) examples. The reward
@@ -348,7 +361,10 @@ def to_samples(rollouts, skills=None):
         if src is None:
             continue  # no current source context / stale schema -> not trainable
         samples.append({"system": ctx, "prompt": prompt, "completion": completion,
-                        "reward": float(reward), "source": src})
+                        "reward": float(reward), "source": src,
+                        # the turns the model actually saw — trained in the same
+                        # positions serving puts them (train == serve, multi-turn)
+                        "history": r.get("history") or []})
     return samples, stale
 
 
@@ -384,21 +400,22 @@ def mine_preference_pairs(rollouts, skills=None):
         src, ctx = _condition(r, skills, stale)
         if src is None:
             continue  # no current source context / stale schema -> unpaired
-        g = groups[(src, _norm_prompt(prompt))]
+        hist = r.get("history") or []
+        g = groups[(src, _ctx_key(hist), _norm_prompt(prompt))]
         if completion not in g or float(reward) > g[completion][0]:
-            g[completion] = (float(reward), prompt, ctx)  # best reward per distinct completion
+            g[completion] = (float(reward), prompt, ctx, hist)  # best reward per distinct completion
     pairs = []
-    for (src, _norm), by_comp in groups.items():
+    for (src, _ck, _norm), by_comp in groups.items():
         if len(by_comp) < 2:
             continue
-        ranked = sorted(((rw, pr, ctx, comp) for comp, (rw, pr, ctx) in by_comp.items()),
+        ranked = sorted(((rw, pr, ctx, hist, comp) for comp, (rw, pr, ctx, hist) in by_comp.items()),
                         key=lambda x: x[0], reverse=True)
-        best_rw, best_prompt, best_ctx, best_comp = ranked[0]
-        for rej_rw, _, _, rej_comp in ranked[1:]:
+        best_rw, best_prompt, best_ctx, best_hist, best_comp = ranked[0]
+        for rej_rw, _, _, _, rej_comp in ranked[1:]:
             if best_rw - rej_rw >= PAIR_MARGIN:
                 pairs.append({"system": best_ctx, "prompt": best_prompt, "chosen": best_comp,
                               "rejected": rej_comp, "margin": round(best_rw - rej_rw, 3),
-                              "source": src})
+                              "source": src, "history": best_hist})
     return pairs, stale
 
 
@@ -439,13 +456,19 @@ def train_lora(samples, base_model, out_dir, epochs):
         msgs = []
         if s.get("system"):
             msgs.append({"role": "system", "content": s["system"]})
+        for h in (s.get("history") or []):   # conversation turns, exactly as served
+            msgs.append({"role": "user" if h.get("role") == "user" else "assistant",
+                         "content": h.get("text") or ""})
         msgs += [{"role": "user", "content": s["prompt"]},
                  {"role": "assistant", "content": s["completion"]}]
         try:
             return tok.apply_chat_template(msgs, tokenize=False)
         except Exception:
             sys_prefix = f"<|system|>\n{s['system']}\n" if s.get("system") else ""
-            return f"{sys_prefix}<|user|>\n{s['prompt']}\n<|assistant|>\n{s['completion']}{tok.eos_token}"
+            hist = "".join(
+                f"<|{'user' if h.get('role') == 'user' else 'assistant'}|>\n{h.get('text') or ''}\n"
+                for h in (s.get("history") or []))
+            return f"{sys_prefix}{hist}<|user|>\n{s['prompt']}\n<|assistant|>\n{s['completion']}{tok.eos_token}"
 
     ds = Dataset.from_dict({"text": [_fmt(s) for s in samples]})
     model = AutoModelForCausalLM.from_pretrained(
@@ -500,12 +523,18 @@ def train_dpo(pairs, base_model, out_dir, epochs):
         msgs = []
         if p.get("system"):
             msgs.append({"role": "system", "content": p["system"]})
+        for h in (p.get("history") or []):   # conversation turns, exactly as served
+            msgs.append({"role": "user" if h.get("role") == "user" else "assistant",
+                         "content": h.get("text") or ""})
         msgs.append({"role": "user", "content": p["prompt"]})
         try:
             return tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
         except Exception:
             sys_prefix = f"<|system|>\n{p['system']}\n" if p.get("system") else ""
-            return f"{sys_prefix}<|user|>\n{p['prompt']}\n<|assistant|>\n"
+            hist = "".join(
+                f"<|{'user' if h.get('role') == 'user' else 'assistant'}|>\n{h.get('text') or ''}\n"
+                for h in (p.get("history") or []))
+            return f"{sys_prefix}{hist}<|user|>\n{p['prompt']}\n<|assistant|>\n"
 
     ds = Dataset.from_dict({
         "prompt": [_prompt(p) for p in pairs],
