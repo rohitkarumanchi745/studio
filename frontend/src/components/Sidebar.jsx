@@ -29,6 +29,18 @@ export default function Sidebar({
     catch { return {}; }
   });
 
+  // The tool buttons are a tall stack; collapsed by default they stop
+  // swallowing the sidebar, so the chat history always has room to render.
+  const [toolsOpen, setToolsOpen] = useState(
+    () => localStorage.getItem("studio_tools_open") === "1");
+  function toggleTools() {
+    setToolsOpen((o) => {
+      try { localStorage.setItem("studio_tools_open", o ? "0" : "1"); }
+      catch { /* private mode */ }
+      return !o;
+    });
+  }
+
   const loadFolders = () =>
     api("/folders").then((d) => setFolders(d.folders || [])).catch(() => {});
   // Same cadence as the conversations poll in App.jsx, so a folder created,
@@ -224,6 +236,7 @@ export default function Sidebar({
           «
         </button>
       </div>
+      <div className="conv-label">Chats</div>
       <div className="conv-list">
         {creatingFolder && (
           <div className="folder-row">
@@ -416,6 +429,11 @@ export default function Sidebar({
       )}
 
       <div className="sidebar-footer">
+        <button className="tools-toggle" onClick={toggleTools}>
+          {toolsOpen ? "▾" : "▸"} Tools & settings
+        </button>
+        {toolsOpen && (
+        <div className="tools-list">
         <button className="logout" onClick={onDashboards} style={{ marginBottom: 8 }}>
           ▦ Dashboards
         </button>
@@ -469,6 +487,8 @@ export default function Sidebar({
         <button className="logout" onClick={onActivity} style={{ marginBottom: 8 }}>
           ⏱ Activity{user?.role === "admin" ? " (all users)" : ""}
         </button>
+        </div>
+        )}
         <div className="userline">
           <span className="avatar">{(user?.name || "?")[0].toUpperCase()}</span>
           <div>

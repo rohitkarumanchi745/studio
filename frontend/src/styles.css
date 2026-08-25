@@ -80,7 +80,18 @@ input:focus, select:focus { border-color: var(--accent); }
   margin-bottom: 12px;
 }
 .new-chat:hover { background: var(--surface-2); }
-.conv-list { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
+.conv-list { flex: 1; min-height: 140px; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
+.conv-label {
+  color: var(--ink-3); font-size: 11px; text-transform: uppercase;
+  letter-spacing: 0.05em; padding: 10px 10px 4px;
+}
+/* Tools group: collapsed by default so the footer can't swallow the chat list. */
+.tools-toggle {
+  display: block; width: 100%; text-align: left; color: var(--ink-2);
+  padding: 8px 10px; border-radius: 8px; margin-bottom: 8px; cursor: pointer;
+}
+.tools-toggle:hover { background: var(--surface-2); color: var(--ink); }
+.tools-list { max-height: 45vh; overflow-y: auto; margin-bottom: 4px; }
 .conv {
   display: flex; align-items: center; border-radius: 8px; padding: 8px 10px;
   color: var(--ink-2); cursor: pointer;
