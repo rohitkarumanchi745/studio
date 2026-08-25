@@ -168,7 +168,10 @@ export default function Sidebar({
         />
       ) : (
         <>
-          <span className="conv-title">
+          <span
+            className="conv-title"
+            onDoubleClick={() => c.can_edit !== false && startRename(c)}
+          >
             {c.running > 0 ? (
               <span className="conv-run" title="A task is running here">◌ </span>
             ) : c.unseen > 0 ? (
@@ -177,6 +180,17 @@ export default function Sidebar({
             {c.shared && <span className="conv-shared" title="Shared with you">◈ </span>}
             {c.title}
           </span>
+          <button
+            className="conv-edit"
+            title={c.can_edit === false ? "You have view-only access" : "Rename"}
+            disabled={c.can_edit === false}
+            onClick={(e) => {
+              e.stopPropagation();
+              startRename(c);
+            }}
+          >
+            ✎
+          </button>
           <button
             className="conv-del"
             title={c.shared ? "Only the owner can delete this" : "Delete"}
@@ -263,15 +277,34 @@ export default function Sidebar({
                     autoFocus
                   />
                 ) : (
-                  <span className="folder-name">
-                    <span className="folder-caret">{collapsed[f.id] ? "▸" : "▾"}</span>
-                    {" "}▣ {f.name}
-                    <span className="folder-count">
-                      {collapsed[f.id] && running > 0 ? " ◌" : ""}
-                      {collapsed[f.id] && !running && unseen > 0 ? " ●" : ""}
-                      {" "}{convs.length}
+                  <>
+                    <span
+                      className="folder-name"
+                      onDoubleClick={() => {
+                        setRenamingFolder(f.id);
+                        setFolderDraft(f.name);
+                      }}
+                    >
+                      <span className="folder-caret">{collapsed[f.id] ? "▸" : "▾"}</span>
+                      {" "}▣ {f.name}
+                      <span className="folder-count">
+                        {collapsed[f.id] && running > 0 ? " ◌" : ""}
+                        {collapsed[f.id] && !running && unseen > 0 ? " ●" : ""}
+                        {" "}{convs.length}
+                      </span>
                     </span>
-                  </span>
+                    <button
+                      className="conv-edit"
+                      title="Rename folder"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setRenamingFolder(f.id);
+                        setFolderDraft(f.name);
+                      }}
+                    >
+                      ✎
+                    </button>
+                  </>
                 )}
               </div>
               {!collapsed[f.id] && convs.map((c) => renderConv(c, true))}

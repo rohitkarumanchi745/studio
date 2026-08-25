@@ -89,6 +89,10 @@ input:focus, select:focus { border-color: var(--accent); }
 .conv-title { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .conv-del { color: var(--ink-3); visibility: hidden; padding: 0 4px; }
 .conv:hover .conv-del { visibility: visible; }
+/* Rename pencil: same hover-reveal pattern as the delete ×, on chats and folders. */
+.conv-edit { color: var(--ink-3); visibility: hidden; padding: 0 4px; }
+.conv:hover .conv-edit, .folder-row:hover .conv-edit { visibility: visible; }
+.conv-edit:hover, .conv-del:hover:not(:disabled) { color: var(--ink); }
 .conv-empty { color: var(--ink-3); font-size: 13px; padding: 8px; }
 /* Chat folders: collapsible groups above the unfiled chats. */
 .folder-row {
