@@ -153,7 +153,8 @@ def _wrap_tool(code):
         "# Register every top-level function this module defines as a tool.\n"
         "import inspect as _inspect, sys as _sys\n"
         "for _n, _f in list(vars(_sys.modules[__name__]).items()):\n"
-        "    if _inspect.isfunction(_f) and not _n.startswith('_'):\n"
+        "    if (_inspect.isfunction(_f) and not _n.startswith('_')\n"
+        "            and getattr(_f, '__module__', None) == __name__):\n"
         "        mcp.tool()(_f)\n\n"
         'if __name__ == "__main__":\n'
         '    mcp.run(transport="stdio")\n'
@@ -259,7 +260,7 @@ def _register(a):
     supervised job shows human_by (an admin approved it). Idempotent."""
     os.makedirs(SANDBOX, exist_ok=True)
     path = os.path.realpath(os.path.join(SANDBOX, f"srv_{a['id']}.py"))
-    if not path.startswith(SANDBOX + os.sep):        # path confinement
+    if os.path.commonpath([path, SANDBOX]) != SANDBOX:   # path confinement
         raise HTTPException(400, "path escapes sandbox")
     name = a.get("server_name") or _server_name(a, a.get("name"))
     code = a["code"] if a["kind"] == "mcp" else _wrap_tool(a["code"])
@@ -413,7 +414,7 @@ def delete_artifact(id: str, user=Depends(current_user)):
         except Exception:
             pass
     path = os.path.realpath(os.path.join(SANDBOX, f"srv_{a['id']}.py"))
-    if path.startswith(SANDBOX + os.sep) and os.path.exists(path):
+    if os.path.commonpath([path, SANDBOX]) == SANDBOX and os.path.exists(path):
         try:
             os.remove(path)
         except Exception:

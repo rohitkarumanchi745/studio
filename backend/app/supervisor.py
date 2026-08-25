@@ -22,9 +22,10 @@ it advises, but policy — not the model — decides whether a write runs.
 platform_run jobs (kind "platform_run", target = an orchestration platform from
 platforms.PLATFORMS) trigger external pipelines. Platforms aren't data sources,
 so RBAC table policy doesn't apply — instead only admins and analysts may
-submit, and every run waits for a human admin. The platform's {run_ref, url}
-lands in the result JSON column (schema unchanged); GET /jobs/{id}/live then
-feeds status / logs / quality back from the platform.
+submit, and every run waits for a human admin. A successful trigger leaves the
+job "running" with the platform's {run_ref, url} in the result JSON column
+(schema unchanged); GET /jobs/{id}/live then feeds status / logs / quality back
+from the platform and flips the job on a terminal state.
 """
 import json
 import time
@@ -279,13 +280,20 @@ def _run(job):
     while True:
         try:
             result = _execute(job)
+            if job["kind"] == "platform_run":
+                # Trigger-success only — the pipeline is now running on the
+                # platform, so the job stays "running". /live owns the terminal
+                # state: it flips the job to succeeded/failed when the platform
+                # reports one, and registers the declared output on GENUINE
+                # success. "succeeded" here would show a finished job in the
+                # list while the pipeline is still in flight.
+                _save(job, status="running", result=json.dumps(result, default=str), last_error=None)
+                return job
             _save(job, status="succeeded", result=json.dumps(result, default=str), last_error=None)
             # Write→read bridge. A supervised spark_job that DECLARED an S3
             # parquet output has now produced it (this path runs only after an
             # admin approved the job — spark jobs are always human-gated), so
-            # register that output as a queryable dataset. A platform_run's
-            # success here is only trigger-success; its GENUINE terminal state
-            # is discovered by /live, which is where that path registers.
+            # register that output as a queryable dataset.
             if job["kind"] == "spark_job":
                 _bridge_output(job, _requester(job))
             return job
@@ -408,11 +416,13 @@ def submit_job(body: SubmitIn, user=Depends(current_user)):
         raise HTTPException(400, "kind must be 'sql_script', 'spark_job' or 'platform_run'")
     if not (body.script or "").strip():
         raise HTTPException(400, "script is required")
-    if body.kind == "platform_run":
+    if body.kind in ("spark_job", "platform_run"):
+        # Both are executed via json.loads(script) — fail at submit time with a
+        # clear 400 instead of at run time inside the retry/escalation loop.
         try:
             json.loads(body.script)
         except Exception:
-            raise HTTPException(400, "platform_run script must be a JSON payload")
+            raise HTTPException(400, f"{body.kind} script must be a JSON payload")
     return _public(submit(body.kind, body.target, body.script, user))
 
 

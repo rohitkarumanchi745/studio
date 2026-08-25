@@ -167,7 +167,7 @@ def test_admin_approval_triggers_and_stores_run_ref(airflow_env):
     before = len(_platform_traces())
 
     out = approve(job["id"], user=ADMIN)
-    assert out["status"] == "succeeded"
+    assert out["status"] == "running"   # trigger-success; /live owns the terminal state
     assert out["human_by"] == "admin@studio.test"
     res = out["result"]
     assert res["run_ref"].startswith("etl_daily:studio__")
@@ -228,7 +228,7 @@ def test_live_polls_persists_and_flips_failed(airflow_env):
     res = out["job"]["result"]
     assert res["state"] == "running"          # persisted merge...
     assert res["run_ref"].startswith("etl_daily:")  # ...kept the run_ref
-    assert out["job"]["status"] == "succeeded"  # non-terminal poll: no flip
+    assert out["job"]["status"] == "running"  # non-terminal poll: no flip
 
     before = len(_platform_traces())
     SCRIPT["state"] = "failed"
