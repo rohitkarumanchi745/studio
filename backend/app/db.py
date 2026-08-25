@@ -76,6 +76,13 @@ def init_db():
             id TEXT PRIMARY KEY,
             user_id TEXT NOT NULL,
             title TEXT NOT NULL,
+            folder_id TEXT,
+            created_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS conversation_folders (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            name TEXT NOT NULL,
             created_at REAL NOT NULL
         );
         CREATE TABLE IF NOT EXISTS conversation_shares (
@@ -156,6 +163,14 @@ def init_db():
     else:
         try:
             c.execute("ALTER TABLE users ADD COLUMN verified INTEGER NOT NULL DEFAULT 1")
+        except sqlite3.OperationalError:
+            pass
+    # Sidebar folders (guarded ALTER for databases created before folder_id).
+    if IS_PG:
+        c.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS folder_id TEXT")
+    else:
+        try:
+            c.execute("ALTER TABLE conversations ADD COLUMN folder_id TEXT")
         except sqlite3.OperationalError:
             pass
     c.commit()
@@ -431,7 +446,8 @@ def list_conversations(user_id):
     """Own conversations plus any shared with this user, newest first."""
     c = _conn()
     rows = c.execute(
-        "SELECT c.id, c.title, c.created_at, c.user_id AS owner_id, u.email AS owner_email, "
+        "SELECT c.id, c.title, c.created_at, c.folder_id, c.user_id AS owner_id, "
+        "       u.email AS owner_email, "
         "       s.permission AS shared_permission "
         "FROM conversations c "
         "LEFT JOIN users u ON u.id = c.user_id "
@@ -450,6 +466,9 @@ def list_conversations(user_id):
         out.append({
             "id": d["id"], "title": d["title"], "created_at": d["created_at"],
             "permission": perm, "shared": not owned,
+            # Folders are personal organization: a recipient never sees (or
+            # inherits) the owner's filing, so shared rows stay unfiled.
+            "folder_id": d.get("folder_id") if owned else None,
             "owner_email": d.get("owner_email"),
             "can_edit": perm in ("owner", "edit"),
         })

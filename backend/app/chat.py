@@ -10,9 +10,9 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from . import (agent, db, email_service, keys, lightning, orchestrator, qcache,
-               queryguard, rbac, roster, router as model_router, semantic,
-               sessions, skills)
+from . import (agent, db, email_service, keys, lightning, orchestrator,
+               progress, qcache, queryguard, rbac, roster,
+               router as model_router, semantic, sessions, skills)
 from .auth import current_user
 from .catalog import _connector_or_400, match_tables
 
@@ -36,6 +36,7 @@ def init_tables():
             status TEXT NOT NULL DEFAULT 'running',
             error TEXT,
             seen INTEGER NOT NULL DEFAULT 0,
+            steps TEXT,
             created_at REAL NOT NULL,
             finished_at REAL
         );
@@ -43,6 +44,15 @@ def init_tables():
             ON chat_tasks(user_id, conversation_id);
         """
     )
+    # steps holds the live activity feed (progress.py). Guarded ALTER migrates
+    # databases created before the column existed — same pattern as mcp.py.
+    if db.IS_PG:
+        c.execute("ALTER TABLE chat_tasks ADD COLUMN IF NOT EXISTS steps TEXT")
+    else:
+        try:
+            c.execute("ALTER TABLE chat_tasks ADD COLUMN steps TEXT")
+        except Exception:
+            pass
     c.commit()
     c.close()
 
@@ -150,6 +160,104 @@ def rename(cid: str, body: Rename, user=Depends(current_user)):
         raise HTTPException(400, "Title cannot be empty")
     db.rename_conversation(cid, title)
     return {"id": cid, "title": title[:80]}
+
+
+# ── Folders: personal sidebar organization for a user's own chats ────────
+
+class FolderIn(BaseModel):
+    name: str
+
+
+class MoveIn(BaseModel):
+    folder_id: Optional[str] = None   # None → back to the root (unfiled)
+
+
+def _folder_or_404(fid, user):
+    c = db._conn()
+    r = c.execute("SELECT * FROM conversation_folders WHERE id=?", (fid,)).fetchone()
+    c.close()
+    if r is None or dict(r)["user_id"] != user["id"]:
+        raise HTTPException(404, "Folder not found")   # 404, not 403 — no oracle
+    return dict(r)
+
+
+def _reject_duplicate_folder(name, user, ignore_id=None):
+    """Two same-named folders would be indistinguishable in the sidebar and in
+    the Move-to menu, so names are unique per user (case-insensitive)."""
+    c = db._conn()
+    rows = c.execute("SELECT id, name FROM conversation_folders WHERE user_id=?",
+                     (user["id"],)).fetchall()
+    c.close()
+    for r in rows:
+        d = dict(r)
+        if d["id"] != ignore_id and d["name"].strip().lower() == name.lower():
+            raise HTTPException(400, f"You already have a folder named '{d['name']}'")
+
+
+@router.get("/folders")
+def folders(user=Depends(current_user)):
+    c = db._conn()
+    rows = c.execute("SELECT id, name, created_at FROM conversation_folders "
+                     "WHERE user_id=? ORDER BY name", (user["id"],)).fetchall()
+    c.close()
+    return {"folders": [dict(r) for r in rows]}
+
+
+@router.post("/folders", status_code=201)
+def create_folder(body: FolderIn, user=Depends(current_user)):
+    name = (body.name or "").strip()[:60]
+    if not name:
+        raise HTTPException(400, "Folder name cannot be empty")
+    _reject_duplicate_folder(name, user)
+    fid = str(uuid.uuid4())
+    c = db._conn()
+    c.execute("INSERT INTO conversation_folders (id, user_id, name, created_at) "
+              "VALUES (?,?,?,?)", (fid, user["id"], name, time.time()))
+    c.commit()
+    c.close()
+    return {"id": fid, "name": name}
+
+
+@router.patch("/folders/{fid}")
+def rename_folder(fid: str, body: FolderIn, user=Depends(current_user)):
+    _folder_or_404(fid, user)
+    name = (body.name or "").strip()[:60]
+    if not name:
+        raise HTTPException(400, "Folder name cannot be empty")
+    _reject_duplicate_folder(name, user, ignore_id=fid)
+    c = db._conn()
+    c.execute("UPDATE conversation_folders SET name=? WHERE id=?", (name, fid))
+    c.commit()
+    c.close()
+    return {"id": fid, "name": name}
+
+
+@router.delete("/folders/{fid}")
+def delete_folder(fid: str, user=Depends(current_user)):
+    """Delete a folder. Its chats are unfiled back to the root, never deleted."""
+    _folder_or_404(fid, user)
+    c = db._conn()
+    c.execute("UPDATE conversations SET folder_id=NULL WHERE folder_id=? AND user_id=?",
+              (fid, user["id"]))
+    c.execute("DELETE FROM conversation_folders WHERE id=?", (fid,))
+    c.commit()
+    c.close()
+    return {"deleted": True}
+
+
+@router.post("/conversations/{cid}/folder")
+def move_conversation(cid: str, body: MoveIn, user=Depends(current_user)):
+    """File a conversation into one of YOUR folders (or None to unfile).
+    Owner only: filing is personal — a collaborator organizing their sidebar
+    must not reshuffle the owner's."""
+    _own_or_404(cid, user, need="owner")
+    if body.folder_id is not None:
+        _folder_or_404(body.folder_id, user)   # must be the caller's folder
+    c = db._conn()
+    c.execute("UPDATE conversations SET folder_id=? WHERE id=?", (body.folder_id, cid))
+    c.commit()
+    c.close()
+    return {"id": cid, "folder_id": body.folder_id}
 
 
 class ShareIn(BaseModel):
@@ -300,9 +408,11 @@ def _run_turn(ctx, user):
     # automatic tiers. 'bitnet' forces the self-hosted engine; 'kag' forces a
     # documents-first turn grounded in the user's own knowledge collections.
     if model == "bitnet" and model_router.bitnet_ready(user):
+        progress.emit("routing to the self-hosted BitNet engine")
         result = _run(model_router.bitnet_spec())
         result.setdefault("served_by", "bitnet")
     elif model == "kag":
+        progress.emit("searching your knowledge collections")
         result = _run(None, kag_first=True)
         result.setdefault("served_by", "kag")
     # Tier -1 — semantic layer: if the prompt resolves to admin-defined metrics,
@@ -310,13 +420,14 @@ def _run_turn(ctx, user):
     # and guarantees every phrasing of the same question returns the same number.
     # Anything it can't resolve returns None and falls through to the agent.
     elif (result := semantic.answer(user, ctx["source"], prompt, ctx["table_param"])) is not None:
-        pass
+        progress.emit("answered from the semantic layer (canonical metric)")
     # Tier 0 — semantic cache: an equivalent prompt reuses its plan (SQL+chart),
     # re-executed fresh, with no model at all. FIRST TURNS ONLY: the cache keys on
     # the prompt alone, and a follow-up ("and by region?") means something different
     # in every conversation — matching one against another replays the wrong plan.
     elif not ctx["history"] and (cached := qcache.lookup(
             user, ctx["source"], ctx["table_label"], prompt)) is not None:
+        progress.emit("reusing a cached plan for an equivalent question")
         result = cached
     else:
         # Tier 1/2 — route learned, repeated work to the self-hosted BitNet;
@@ -326,6 +437,7 @@ def _run_turn(ctx, user):
         result = None
         if route == "bitnet":
             try:
+                progress.emit("trying the self-hosted BitNet engine first")
                 r = _run(model_router.bitnet_spec())
                 if r.get("sql") and not r.get("errors"):
                     r["served_by"] = "bitnet"
@@ -339,11 +451,14 @@ def _run_turn(ctx, user):
             except Exception:
                 result = None   # escalate below
         if result is None:
+            if route == "bitnet":
+                progress.emit("BitNet couldn't answer — escalating to the frontier model")
             result = _run(model)   # frontier LLM (default, or BitNet escalation)
             result.setdefault("served_by", "frontier")
         if not ctx["history"]:   # same reason: a follow-up's plan is context-bound
             qcache.store(user, ctx["source"], ctx["table_label"], prompt, result,
                          reward=lightning.heuristic_reward(result))
+    progress.emit("finalizing the answer")
     result["source"] = ctx["source"]
     result["table"] = ctx["table_label"]
     try:
@@ -401,6 +516,7 @@ def ask_background(body: Ask, user=Depends(current_user)):
 def _bg_run(ctx, user, tid):
     """Runs in a worker thread: execute the turn, then record task outcome."""
     status, error = "done", None
+    progress.bind(tid)   # this thread's emits feed the task's live activity
     try:
         _run_turn(ctx, user)
     except Exception as e:
@@ -418,13 +534,18 @@ def _bg_run(ctx, user, tid):
 @router.get("/tasks/{tid}")
 def task_status(tid: str, user=Depends(current_user)):
     c = db._conn()
-    r = c.execute("SELECT id, conversation_id, user_id, status, error FROM chat_tasks WHERE id=?",
-                  (tid,)).fetchone()
+    r = c.execute("SELECT id, conversation_id, user_id, status, error, steps "
+                  "FROM chat_tasks WHERE id=?", (tid,)).fetchone()
     c.close()
     if r is None or dict(r)["user_id"] != user["id"]:
         raise HTTPException(404, "Task not found")
     d = dict(r)
     d.pop("user_id", None)
+    # The live activity feed the agent emitted so far (progress.py).
+    try:
+        d["steps"] = json.loads(d.get("steps") or "[]")
+    except (TypeError, ValueError):
+        d["steps"] = []
     return d
 
 

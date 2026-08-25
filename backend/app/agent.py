@@ -25,7 +25,7 @@ import os
 import re
 from typing import List
 
-from . import db, email_service, queryguard
+from . import db, email_service, progress, queryguard
 from .queryguard import QueryRejected
 
 # Full Power BI / Tableau-style catalog (rendered with ECharts client-side)
@@ -331,6 +331,11 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
     """
     from . import roster
     me = roster.worker(connector.name)  # this run's named worker agent
+    # Live-activity feed: capture the bound task id ONCE and emit through it
+    # from the tool closures — tools may run on other threads/event loops where
+    # the contextvar isn't set, so the closure-captured id is the reliable path.
+    _tid = progress.current()
+    _me = me.get("name") or connector.name
 
     spec = model or llm_spec()
     if not llm_available(spec, user):
@@ -351,6 +356,7 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         Args:
             sql: A single SELECT (or WITH...SELECT) statement. No DML/DDL.
         """
+        progress.emit_for(_tid, f"{_me}: running SQL on {connector.name} — {sql[:80]}")
         try:
             cleaned = queryguard.validate(sql, allowed_tables)
             cleaned = queryguard.enforce_limit(cleaned, MAX_ROWS)
@@ -383,6 +389,7 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
             x: Column for the x axis / category / label / source dimension.
             y: Numeric column(s) to plot; special shapes noted per type above.
         """
+        progress.emit_for(_tid, f"{_me}: rendering a {chart_type} chart — {title[:60]}")
         if chart_type not in CHART_TYPES:
             return f"Unsupported chart_type. Use one of: {', '.join(CHART_TYPES)}"
         if ctx["sql"] is None:
@@ -509,8 +516,11 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
             pass
         # Cache the system prompt + prior-turn prefix (KV reuse across turns).
         messages = _cache_history(history, spec) + [("user", prompt)]
+        progress.emit_for(_tid, f"{_me}: reading the question and the schema")
         mcp_cfg = mcp_servers(user)
         if mcp_cfg:
+            progress.emit_for(_tid, f"{_me}: loading tools from {len(mcp_cfg)} MCP "
+                                    f"server{'s' if len(mcp_cfg) != 1 else ''}")
             # MCP tools are async — load them and run the graph on an event loop.
             import asyncio
 

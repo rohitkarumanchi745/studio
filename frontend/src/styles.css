@@ -90,6 +90,21 @@ input:focus, select:focus { border-color: var(--accent); }
 .conv-del { color: var(--ink-3); visibility: hidden; padding: 0 4px; }
 .conv:hover .conv-del { visibility: visible; }
 .conv-empty { color: var(--ink-3); font-size: 13px; padding: 8px; }
+/* Chat folders: collapsible groups above the unfiled chats. */
+.folder-row {
+  display: flex; align-items: center; border-radius: 8px; padding: 7px 10px;
+  color: var(--ink-2); cursor: pointer; font-size: 13px; user-select: none;
+}
+.folder-row:hover { background: var(--surface-2); color: var(--ink); }
+.folder-name { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.folder-caret { display: inline-block; width: 12px; color: var(--ink-3); }
+.folder-count { color: var(--ink-3); font-size: 11px; margin-left: 4px; }
+.conv-filed { margin-left: 14px; }
+.ctx-label {
+  color: var(--ink-3); font-size: 11px; text-transform: uppercase;
+  letter-spacing: 0.04em; padding: 6px 10px 2px; border-top: 1px solid var(--line);
+  margin-top: 4px;
+}
 .sidebar-footer { border-top: 1px solid var(--line); padding-top: 10px; }
 .userline { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; }
 .avatar {
@@ -162,6 +177,9 @@ td { color: var(--ink-2); }
 }
 .suggestion:hover { background: var(--surface-2); }
 .thinking { display: flex; gap: 6px; align-items: center; color: var(--ink-3); font-size: 13px; }
+/* Live agent activity above the thinking dots: completed steps, newest last. */
+.agent-activity { margin-bottom: 6px; }
+.activity-step { color: var(--ink-3); font-size: 12px; line-height: 1.7; opacity: 0.8; }
 .dot {
   width: 6px; height: 6px; border-radius: 50%; background: var(--ink-3);
   animation: pulse 1.2s infinite ease-in-out;

@@ -66,6 +66,9 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
   const [prompt, setPrompt] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  // Live activity: the steps the agent has emitted so far this turn, refreshed
+  // by the task poll — so the "thinking" bubble shows what is actually happening.
+  const [liveSteps, setLiveSteps] = useState([]);
   const endRef = useRef(null);
   // Background-task polling lives in refs, NOT state/effects: creating a new
   // conversation changes conversationId, and an effect keyed on it used to
@@ -150,6 +153,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
     // start a different task without waiting.
     setMessages((m) => [...m, { role: "user", text: q, source, table: tableLabel }]);
     setBusy(true);
+    setLiveSteps([]);
     try {
       const data = await api("/chat/background", {
         method: "POST",
@@ -209,6 +213,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
         return;
       }
       if (st.status === "running") {
+        if (activeConvRef.current === cid) setLiveSteps(st.steps || []);
         // Watchdog: a task that never reaches a terminal state must not hang the
         // UI silently — surface it so the failure is diagnosable, not invisible.
         if (Date.now() - started > 5 * 60 * 1000) {
@@ -217,13 +222,14 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
           setError("The agent is taking unusually long. It's still running server-side — reopen this chat shortly to see the answer.");
           return;
         }
-        setTimeout(tick, 2500);
+        setTimeout(tick, 1500);
         return;
       }
       pollingRef.current = null;                        // done or failed
       // Clear the spinner even if the user switched chats — leaving busy set
       // is what made the composer look permanently stuck.
       setBusy(false);
+      setLiveSteps([]);
       if (activeConvRef.current === cid) {
         try {
           handleModelError(loadMessages(await api(`/conversations/${cid}/messages`)));
@@ -376,11 +382,20 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
 
         {busy && (
           <div className="msg">
+            {liveSteps.length > 1 && (
+              <div className="agent-activity">
+                {liveSteps.slice(-6, -1).map((s, i) => (
+                  <div key={i} className="activity-step">✓ {s.label}</div>
+                ))}
+              </div>
+            )}
             <div className="thinking">
               <span className="dot" />
               <span className="dot" />
               <span className="dot" />
-              agent is querying…
+              {liveSteps.length
+                ? liveSteps[liveSteps.length - 1].label
+                : "agent is querying…"}
             </div>
           </div>
         )}

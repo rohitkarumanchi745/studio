@@ -88,10 +88,16 @@ export default function App() {
   // Bumped when a user connects/removes a key so the model menu refetches.
   const [modelsEpoch, setModelsEpoch] = useState(0);
 
+  // Epoch guard: the 6s poll and a post-action refresh can be in flight at
+  // once, and the slower (staler) response must not clobber the newer one —
+  // without this a just-moved chat visibly jumps back to its old folder.
+  const refreshEpochRef = useRef(0);
   const refresh = useCallback(() => {
     if (!getToken()) return;
+    const epoch = ++refreshEpochRef.current;
     api("/conversations")
       .then((c) => {
+        if (epoch !== refreshEpochRef.current) return; // superseded — drop it
         setConversations(c);
         setConvsLoaded(true);
       })
@@ -124,6 +130,7 @@ export default function App() {
         activeId={activeId}
         onSelect={setActiveId}
         onNew={() => setActiveId(null)}
+        onRefresh={refresh}
         onCollapse={() => setSidebarOpen(false)}
         onDelete={async (id) => {
           await api(`/conversations/${id}`, { method: "DELETE" });

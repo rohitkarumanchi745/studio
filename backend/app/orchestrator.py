@@ -19,7 +19,7 @@ deterministic fallback, and the aggregator falls back to a per-source summary.
 import concurrent.futures
 import json
 
-from . import agent, lightning, rbac, roster, skills, util
+from . import agent, lightning, progress, rbac, roster, skills, util
 from .connectors import all_sources, get_connector
 
 MAX_PARALLEL = 6
@@ -75,6 +75,8 @@ def run_orchestrated(prompt, user, history, model=None, conversation_id=None):
         result.setdefault("agents", [roster.worker(s["connector"].name)])
         return result
 
+    progress.emit("fanning out to " + ", ".join(
+        roster.name_for(s["connector"].name) for s in sources))
     spec = model or agent.llm_spec()
     subs = _fanout(prompt, sources, user, model)
 
@@ -86,6 +88,8 @@ def run_orchestrated(prompt, user, history, model=None, conversation_id=None):
                            "agent": roster.name_for(sub["_source"])})
         errors.extend(sub.get("errors") or [])
 
+    progress.emit("Aggregator: synthesizing one answer from "
+                  f"{len(subs)} agents' results")
     text = _aggregate(prompt, subs, user, spec)
     last = next((r for r in subs if r.get("sql")), None)
 
@@ -121,12 +125,20 @@ def _fanout(prompt, sources, user, model):
     """Scatter: run every source's agent concurrently and independently. One
     thread per source (each has its own connector), so the agents never touch
     each other's state. Returns each agent's result tagged with its source."""
+    # Pool threads don't inherit the live-activity contextvar — capture the
+    # task id here and rebind inside each worker so its emits still land.
+    tid = progress.current()
+
     def _ask(s):
         conn = s["connector"]
+        progress.bind(tid)
         try:
             sub = agent.run_agent(prompt, conn, "*", s["allowed"], s["schemas"],
                                   [], user, model, skill_md=s["skill"])
+            progress.emit_for(tid, f"{roster.name_for(conn.name)}: finished "
+                                   f"({len(sub.get('rows') or [])} rows)")
         except Exception as e:
+            progress.emit_for(tid, f"{roster.name_for(conn.name)}: failed ({str(e)[:80]})")
             sub = {"text": f"(agent error: {e})", "sql": None, "columns": [],
                    "rows": [], "chart": None, "panels": [], "errors": [str(e)]}
         sub["_source"] = conn.name
