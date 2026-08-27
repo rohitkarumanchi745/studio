@@ -221,25 +221,40 @@ def _build_graph(llm, tools, system):
             return create_react_agent(llm, tools, state_modifier=system)
 
 
-def _apply_prompt_cache(system, spec):
-    """Mark the large, stable system/skill prefix for Anthropic prompt caching.
+def _apply_prompt_cache(system, spec, volatile=None):
+    """Mark the large, stable system/skill prefix for Anthropic prompt caching,
+    and append the VOLATILE tail (per-user memory, recent failures) as a second
+    block AFTER the breakpoint.
 
     This is the real hosted-API analog of a KV-cache snapshot: with a
     cache_control breakpoint the provider keeps the prefix's KV cache warm
     server-side, so the next turn (or a resumed session replaying the same
-    prefix) is billed at ~10% and skips re-processing it. Returns a
-    SystemMessage carrying the breakpoint for Anthropic; the plain string for
-    other providers or when STUDIO_PROMPT_CACHE is disabled. Never raises."""
+    prefix) is billed at ~10% and skips re-processing it. Caching depends on an
+    exact prefix match, so content that changes between turns must sit below
+    the breakpoint — "stable content first, volatile content last" — or every
+    remembered note or failed query anywhere on the source would invalidate
+    the whole cached skill file. Returns a SystemMessage for Anthropic; None
+    for other providers or when STUDIO_PROMPT_CACHE is disabled (the caller
+    then uses the plain concatenated string). Never raises."""
     if os.getenv("STUDIO_PROMPT_CACHE", "1").lower() not in ("1", "true", "yes"):
-        return system
+        return None
     if (spec or "").split(":", 1)[0] != "anthropic":
-        return system
+        return None
     try:
         from langchain_core.messages import SystemMessage
-        return SystemMessage(content=[{"type": "text", "text": system,
-                                       "cache_control": {"type": "ephemeral"}}])
+        return SystemMessage(content=_cache_blocks(system, volatile))
     except Exception:
-        return system
+        return None
+
+
+def _cache_blocks(system, volatile=None):
+    """Content blocks for a cache-marked system message: the stable prefix
+    carries the breakpoint; the volatile tail (if any) follows it unmarked."""
+    blocks = [{"type": "text", "text": system,
+               "cache_control": {"type": "ephemeral"}}]
+    if volatile:
+        blocks.append({"type": "text", "text": volatile})   # after the breakpoint
+    return blocks
 
 
 def _cache_history(history, spec):
@@ -264,17 +279,19 @@ def _cache_history(history, spec):
         return msgs
 
 
-def _graph(llm, tools, system, spec):
-    """Build the agent graph, preferring a cache-marked system prompt. Falls
-    back to the plain string if this LangChain build won't take a SystemMessage,
-    so caching is strictly best-effort and never blocks the agent."""
-    cached = _apply_prompt_cache(system, spec)
-    if cached is not system:
+def _graph(llm, tools, system, spec, volatile=None):
+    """Build the agent graph, preferring a cache-marked system prompt (stable
+    prefix cached, volatile tail after the breakpoint). Falls back to the plain
+    concatenated string if this LangChain build won't take a SystemMessage, so
+    caching is strictly best-effort and never blocks the agent."""
+    plain = f"{system}\n\n{volatile}" if volatile else system
+    cached = _apply_prompt_cache(system, spec, volatile)
+    if cached is not None:
         try:
             return _build_graph(llm, tools, cached)
         except Exception:
             pass
-    return _build_graph(llm, tools, system)
+    return _build_graph(llm, tools, plain)
 
 
 def _extract_usage(result):
@@ -493,7 +510,9 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         return json.dumps({"reference_passages": hits}, default=str)
 
     memory_notes = db.list_memory(user["id"])
-    system = _system_prompt(connector, table, allowed_tables, schemas, memory_notes, skill_md)
+    # Stable half (cached prefix) + volatile half (below the breakpoint).
+    system, volatile = _system_blocks(connector, table, allowed_tables, schemas,
+                                      memory_notes, skill_md)
     if kag_first:
         # User explicitly chose the KAG engine: ground the answer in their own
         # documents first, and only touch the warehouse if the docs can't answer.
@@ -526,12 +545,12 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
 
             async def _arun():
                 tools = base_tools + list(await _load_mcp_tools(mcp_cfg))
-                graph = _graph(llm, tools, system, spec)
+                graph = _graph(llm, tools, system, spec, volatile)
                 return await graph.ainvoke({"messages": messages}, config={"recursion_limit": 16})
 
             result = asyncio.run(_arun())
         else:
-            graph = _graph(llm, base_tools, system, spec)
+            graph = _graph(llm, base_tools, system, spec, volatile)
             result = graph.invoke({"messages": messages}, config={"recursion_limit": 16})
         text = _final_text(result) or "Done."
         usage = _extract_usage(result)
@@ -593,7 +612,15 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
     }
 
 
-def _system_prompt(connector, table, allowed_tables, schemas, memory_notes, skill_md=None):
+def _system_blocks(connector, table, allowed_tables, schemas, memory_notes, skill_md=None):
+    """(stable, volatile) halves of the system prompt.
+
+    stable: role, scope, the skill file, learned rules, platform notes, rules —
+    identical across turns (and across users of a source), so it is the
+    prompt-cache prefix. volatile: this user's memory notes and the source's
+    recent failures — they change between turns (a `remember` call, any
+    failed query on the source) and must sit BELOW the cache breakpoint, or
+    each change would invalidate the whole cached skill file."""
     scope = f"Selected table: {table}" if table != "*" else "Scope: the whole source (all tables listed below)"
     memory = "\n".join(f"  - {n}" for n in memory_notes) or "  (none)"
     if skill_md:
@@ -610,16 +637,13 @@ def _system_prompt(connector, table, allowed_tables, schemas, memory_notes, skil
 Accessible tables and schemas:
 {schema_text}
 All tables you may reference: {', '.join(allowed_tables)}"""
-    return f"""You are Studio, a senior data analyst agent. Answer the user's question about their data by writing SQL, running it, and (when a visualization helps) proposing a chart.
+    stable = f"""You are Studio, a senior data analyst agent. Answer the user's question about their data by writing SQL, running it, and (when a visualization helps) proposing a chart.
 
 {scope}
 {source_block}
 
-What you remember about this user (from earlier sessions):
-{memory}
-
 Learned guidance (distilled from past runs and mistakes — follow it):
-{_learned_lessons(connector.name)}
+{_learned_rules()}
 
 The wider Studio platform (mention these when asked what you/Studio can do, and
 point the user at the page — they run outside this chat, gated by human approval):
@@ -658,27 +682,50 @@ Rules:
 - If a query fails, read the error and fix your SQL — do not give up on the first error.
 - Final answer: a short, direct insight (2-4 sentences) with concrete numbers.
   Do not paste raw result tables into the text — the UI renders them."""
+    failures = "\n".join(_recent_failure_notes(connector.name)) or "  (none)"
+    volatile = f"""What you remember about this user (from earlier sessions):
+{memory}
+
+Recent failures on this source (avoid repeating them):
+{failures}"""
+    return stable, volatile
 
 
-def _learned_lessons(source):
-    """The agent's accumulated lessons: the distilled prompt from training runs
-    (prompts/system_learned.txt, written by scripts/train_apo.py) plus recent
-    failure messages for this source, so known bugs aren't repeated."""
-    parts = []
+def _system_prompt(connector, table, allowed_tables, schemas, memory_notes, skill_md=None):
+    """The whole prompt as ONE string (stable + volatile) for non-caching callers."""
+    stable, volatile = _system_blocks(connector, table, allowed_tables, schemas,
+                                      memory_notes, skill_md)
+    return f"{stable}\n\n{volatile}"
+
+
+def _learned_rules():
+    """STABLE: the distilled prompt from training runs (prompts/system_learned.txt,
+    written by scripts/train_apo.py). Changes only when APO runs, so it belongs
+    in the cached prefix."""
     path = os.path.join(os.path.dirname(__file__), "..", "prompts", "system_learned.txt")
     try:
         with open(path) as f:
-            learned = f.read().strip()
-        if learned:
-            parts.append(learned)
+            return f.read().strip() or "  (none yet)"
     except OSError:
-        pass
+        return "  (none yet)"
+
+
+def _recent_failure_notes(source):
+    """VOLATILE: recent failure messages for this source, so known bugs aren't
+    repeated. Changes whenever any query on the source fails — keep it below the
+    cache breakpoint."""
     try:
         from . import db
-        for err in db.recent_failures(source, limit=5):
-            parts.append(f"- A previous query here failed with: {err[:180]} — avoid this mistake.")
+        return [f"- A previous query here failed with: {err[:180]} — avoid this mistake."
+                for err in db.recent_failures(source, limit=5)]
     except Exception:
-        pass
+        return []
+
+
+def _learned_lessons(source):
+    """The agent's accumulated lessons as one block (rules + recent failures)."""
+    rules = _learned_rules()
+    parts = ([rules] if rules != "  (none yet)" else []) + _recent_failure_notes(source)
     return "\n".join(parts) or "  (none yet)"
 
 
