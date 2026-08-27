@@ -131,6 +131,11 @@ sequenceDiagram
     API-->>U: answer + chart on the canvas
 ```
 
+While a turn runs, the chat shows a **live activity feed** — the routing
+tier taken, which named agent is running which SQL, charts being rendered,
+fan-out and aggregation across sources — streamed through the background-task
+row the UI already polls (`progress.py`), so nothing new to deploy or open.
+
 Without an API key the agent degrades to a deterministic preview
 (`SELECT * … LIMIT` + auto chart), so the whole flow stays demoable. An
 *invalid* key is a different case and is called out as one — "the server's key
@@ -301,7 +306,11 @@ statements auto-approve; writes, DDL, and jobs require a human (admin) to
 approve before anything runs. Execution failures retry, then escalate — the
 requester is emailed and an admin approves a retry or aborts. Studio *generates*
 Python but never executes arbitrary code itself; running always goes through
-this gate.
+this gate. A triggered **platform run** stays `running` until the live poll
+(`GET /jobs/{id}/live`) sees the platform's genuine terminal state — trigger
+success is not job success — and Spark / platform payloads are validated as
+JSON at submit, so a malformed script is a clear 400 rather than a run-time
+retry loop.
 
 ### Governance-as-code
 
@@ -512,7 +521,11 @@ flowchart TB
   fans agents out in parallel instead.)
 - **Prompt caching** marks the large stable system/skill prefix with an
   Anthropic cache breakpoint — the provider keeps its KV cache warm and bills
-  reads at ~10%.
+  reads at ~10%. The prompt is laid out *stable content first, volatile content
+  last*: role, skill file, learned rules, and rules form the cached prefix;
+  the user's memory notes and the source's recent failures ride in a second
+  block **after** the breakpoint, so a `remember` call or someone else's failed
+  query on the same source can't invalidate everyone's cached prefix.
 - **KV reuse across conversation turns** marks the last prior-turn message with
   a second breakpoint, so each turn reuses the whole system + history prefix.
 - **Semantic query cache** (`qcache.py`) caches a successful run's plan under a
@@ -543,6 +556,19 @@ measurable.
   its charts, and a still-running task's live state) and any unsent composer
   draft, both kept per user. History itself always lives server-side in
   Postgres — the refresh only ever risked the *view*, and now not even that.
+- **Live agent activity** — while a background turn runs, the thinking bubble
+  narrates it: routing tier, `snowflake agent: running SQL — SELECT …`,
+  chart rendering, fan-out / aggregation. Steps are appended to the task row
+  (`chat_tasks.steps`, capped) by `progress.py` and returned by the same
+  `GET /tasks/{id}` poll; reopening a chat mid-run picks the feed back up.
+- **Chat folders** — personal, per-user organization of the sidebar: create /
+  rename / delete folders, file a chat via its right-click menu, collapsible
+  groups with running / unseen indicators. Filing is owner-only and never
+  visible to share recipients; deleting a folder unfiles its chats, never
+  deletes them; names are unique per user (case-insensitive).
+- **Discoverable renaming** — chats and folders show a ✎ on hover and rename on
+  double-click (IME-safe inputs); the tool pages collapse into one
+  "Tools & settings" group so the chat list always has room.
 
 ---
 
@@ -794,6 +820,7 @@ alone; FastAPI serves the built frontend on one origin.
 | `STUDIO_DB_PATH` | SQLite path — point at a mounted volume, or deploys wipe it |
 | `REDIS_URL` | Tile cache; unset falls back to in-process |
 | `STUDIO_PROMPT_CACHE` | Toggle Anthropic prompt/KV caching (default on) |
+| `STUDIO_HISTORY_TURNS` | Prior turns replayed to the model each turn (default 8); sessions keep the full transcript |
 | `STUDIO_QCACHE_THRESHOLD` | Cache-band similarity threshold (default 0.9) |
 | `HARRIER_EMBED_URL` | Harrier embedding endpoint (OpenAI-compatible `/embeddings`); unset → lexical matching |
 | `HARRIER_EMBED_MODEL` / `HARRIER_EMBED_INSTRUCT` / `HARRIER_EMBED_KEY` | Harrier model id (default `microsoft/harrier-oss-v1-0.6b`), query instruction, optional auth |
@@ -830,7 +857,11 @@ the **Knowledge (KAG)** layer — RBAC-scoped RAG over Excel / PDF / Word / Powe
 / email with cited grounding — and its **Microsoft 365 extraction layer** (app-level
 + delegated Graph auth, auto-onboard on signup, delta + webhook sync, ACL→scope
 fail-closed, encrypted tokens, dormant until Azure is configured); plus **BitNet and
-KAG as directly selectable engines** in the composer's model menu.
+KAG as directly selectable engines** in the composer's model menu. Latest:
+**live agent-activity streaming** in chat, **sidebar chat folders** with
+discoverable renaming, platform runs that stay `running` until the platform
+reports a terminal state, and the **cache-safe prompt layout** (volatile memory
+and failure notes below the breakpoint).
 
 ### Future rollouts
 
@@ -870,5 +901,12 @@ default; not needed at today's volume, adopt when data/QPS justify a cluster):
   Fields/encoding picker into the chat UI.
 - **Data Threads** — the branching exploration history to complete the Data
   Formulator reshell.
-- CPU adapter hot-swap (auto PEFT→GGUF convert), streaming agent steps to the UI,
-  dashboard drill-through, scheduled dashboard email digests.
+- CPU adapter hot-swap (auto PEFT→GGUF convert), dashboard drill-through,
+  scheduled dashboard email digests.
+- **Cost per successful outcome** — price each rollout's tokens per model and
+  aggregate over rewarded runs, so BitNet's ROI and cache savings are visible
+  in dollars; a standing **evaluation set** gating APO rules and adapter
+  promotion (propose → evaluate → apply).
+- **RAPTOR-style tree retrieval for KAG** — per-collection opt-in: cluster
+  chunks, LLM-summarize each cluster recursively, store summaries as scoped
+  chunk rows, search all levels; flat retrieval stays the dormant-safe default.
