@@ -18,6 +18,7 @@ deterministic fallback, and the aggregator falls back to a per-source summary.
 """
 import concurrent.futures
 import json
+import re
 
 from . import agent, lightning, progress, rbac, roster, skills, util
 from .connectors import all_sources, get_connector
@@ -53,12 +54,45 @@ def accessible_sources(user, max_schema_tables=10):
     return [e for e in util.pmap(build, all_sources(), workers=MAX_PARALLEL) if e]
 
 
-def run_orchestrated(prompt, user, history, model=None, conversation_id=None):
+def _norm(name):
+    """Lowercase, every non-alphanumeric run → one space (same rule for prompt
+    and table names, so `web-traffic`, `analytics.events`, `ecommerce_orders`
+    all compare as plain words)."""
+    return re.sub(r"[^a-z0-9]+", " ", (name or "").lower()).strip()
+
+
+def ambiguous_tables(prompt, sources):
+    """Tables the prompt NAMES that exist in MORE THAN ONE accessible source →
+    [{table, sources}], sorted by table. Studio never guesses which database a
+    same-named table means; the caller asks the user instead.
+
+    A table counts as named only when its normalized name appears as a whole
+    phrase in the normalized prompt ("sales", "ecommerce orders", "web traffic").
+    Deliberately no stemming: "in order of region" must not trip `orders`, nor
+    "the status of the migration" trip `status` — if the user didn't name the
+    table, the safe default is the ordinary fan-out (every source answers and
+    the Aggregator cites each)."""
+    text = " " + _norm(prompt) + " "
+    owners = {}
+    for s in sources:
+        for t in s.get("allowed") or []:
+            owners.setdefault(t.lower(), set()).add(s["connector"].name)
+    out = []
+    for t, names in sorted(owners.items()):
+        phrase = _norm(t)
+        if len(names) >= 2 and phrase and f" {phrase} " in text:
+            out.append({"table": t, "sources": sorted(names)})
+    return out
+
+
+def run_orchestrated(prompt, user, history, model=None, conversation_id=None,
+                     sources=None):
     """One multi-database turn. Same result shape as agent.run_agent, plus
     agents_used; mode is "orchestrated". Each worker and the aggregator is
     scored as its own rollout (per-agent reward shaping), so their policies
-    improve independently."""
-    sources = accessible_sources(user)
+    improve independently. `sources`: an already-built roster (the caller
+    probed it for the ambiguity check) — else built here."""
+    sources = sources if sources is not None else accessible_sources(user)
     if not sources:
         return {"text": "No accessible data sources.", "sql": None, "columns": [],
                 "rows": [], "chart": None, "panels": [], "email": None,

@@ -64,6 +64,9 @@ class Ask(BaseModel):
     tables: Optional[List[str]] = None  # multi-select: restrict to these tables
     conversation_id: Optional[str] = None
     model: Optional[str] = None  # user-selected model spec from GET /models
+    # "All sources" only: run even if the prompt names a table that exists in
+    # several sources (the user chose "both, side by side" on a clarification).
+    allow_ambiguous: bool = False
 
 
 @router.get("/agents")
@@ -315,8 +318,10 @@ def _prepare(body, user):
     if body.source == "*":
         cid, history = _conversation(body.conversation_id, user, prompt)
         db.add_message(cid, "user", {"text": prompt, "source": "*", "table": "all sources",
-                                     "author_role": user["role"]})
-        return {"mode": "*", "cid": cid, "history": history, "model": model, "prompt": prompt}
+                                     "author_role": user["role"],
+                                     "allow_ambiguous": bool(getattr(body, "allow_ambiguous", False))})
+        return {"mode": "*", "cid": cid, "history": history, "model": model, "prompt": prompt,
+                "allow_ambiguous": bool(getattr(body, "allow_ambiguous", False))}
 
     if not rbac.can_access(user["role"], body.source, body.table):
         raise HTTPException(403, "Your role has no access to this table")
@@ -366,6 +371,61 @@ def _prepare(body, user):
             "table_label": table_label}
 
 
+def _and(names):
+    names = list(names)
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def _resolved_tables(cid):
+    """Shared tables this conversation already chose to query across ALL sources
+    ("both / all, side by side"). Remembered on the assistant result of that
+    turn, so a later prompt naming the same table isn't asked again — while a
+    different shared table still is."""
+    out = set()
+    try:
+        for m in db.list_messages(cid):
+            if m["role"] == "assistant":
+                out.update(m["content"].get("resolved_tables") or [])
+    except Exception:
+        pass
+    return out
+
+
+def _clarify_turn(ctx, user, clash, t0):
+    """A table the question names exists in several sources: record an
+    assistant message that ASKS which one, carrying the choices the UI renders
+    as chips (one per source, plus all of them side by side). No agent runs,
+    nothing is queried, no rollout is recorded and no session turn is counted —
+    this turn is a question, not an answer. _conversation() also keeps the
+    exchange out of the model's history, since the re-ask repeats the question."""
+    cid, prompt = ctx["cid"], ctx["prompt"]
+    progress.emit("asking which source to use")
+    by_source = {}
+    for c in clash:
+        for s in c["sources"]:
+            by_source.setdefault(s, []).append(c["table"])
+    srcs = sorted(by_source)
+    where = "; ".join(f"`{c['table']}` is in {_and(c['sources'])}" for c in clash)
+    text = (f"{where}. Which source should I use? Pick one, or ask "
+            f"{'both' if len(srcs) == 2 else f'all {len(srcs)}'} side by side.")
+    result = {
+        "text": text, "sql": None, "columns": [], "rows": [], "chart": None,
+        "panels": [], "email": None, "errors": [], "mode": "clarify", "model": None,
+        "source": "*", "table": "all sources", "matched_tables": [], "agents_used": [],
+        "clarify": {
+            "prompt": prompt, "table": clash[0]["table"], "conflicts": clash,
+            "options": [{"source": s, "tables": by_source[s]} for s in srcs]
+                       + [{"source": "*", "tables": [c["table"] for c in clash]}],
+        },
+        "author_role": user["role"],
+    }
+    result["inputs"] = _query_inputs(result)
+    db.add_message(cid, "assistant", result)
+    db.log_activity(user, "chat", prompt=prompt, source="*", table=clash[0]["table"],
+                    mode="clarify", ok=True, duration_ms=int((time.time() - t0) * 1000))
+    return result
+
+
 def _run_turn(ctx, user):
     """Heavy half of a turn: run the agent, append the assistant message, trace,
     and checkpoint. Pure work off the prepared context — safe in a thread."""
@@ -373,8 +433,21 @@ def _run_turn(ctx, user):
     t0 = time.time()
 
     if ctx["mode"] == "*":
+        # Same-named table in several sources? Don't guess — ask, unless the
+        # user already chose "both, side by side" (allow_ambiguous).
+        sources = orchestrator.accessible_sources(user)
+        clash = orchestrator.ambiguous_tables(prompt, sources)
+        if clash and not ctx.get("allow_ambiguous"):
+            # Tables this conversation already chose to query across all sources
+            # are settled; only a NEW shared table asks again.
+            resolved = _resolved_tables(cid)
+            clash = [c for c in clash if c["table"] not in resolved]
+            if clash:
+                return _clarify_turn(ctx, user, clash, t0)
         result = orchestrator.run_orchestrated(prompt, user, ctx["history"], model,
-                                               conversation_id=cid)
+                                               conversation_id=cid, sources=sources)
+        if clash and ctx.get("allow_ambiguous"):
+            result["resolved_tables"] = [c["table"] for c in clash]   # sticky for this chat
         result.setdefault("source", "*")
         result["table"] = "all sources"
         result["matched_tables"] = []
@@ -899,10 +972,24 @@ def _conversation(cid, user, prompt):
     """Resolve/create the conversation and return (cid, recent history)."""
     if cid:
         access = _own_or_404(cid, user, need="edit")
+        msgs = _visible_messages(cid, user, access)
+        # A clarification ("which source?") and the question that triggered it
+        # are not conversation for the model: the re-ask repeats the question,
+        # so replaying the pair would show the model its own unanswered question
+        # twice — and make a clarified FIRST question look like a follow-up
+        # (skipping the semantic cache). Drop the pair.
+        keep = []
+        for i, m in enumerate(msgs):
+            nxt = msgs[i + 1] if i + 1 < len(msgs) else None
+            if m["role"] == "assistant" and m["content"].get("mode") == "clarify":
+                continue
+            if (m["role"] == "user" and nxt and nxt["role"] == "assistant"
+                    and nxt["content"].get("mode") == "clarify"):
+                continue
+            keep.append(m)
         history = [
             {"role": m["role"], "text": m["content"].get("text", "")}
-            for m in _visible_messages(cid, user, access)
-            if m["content"].get("text")
+            for m in keep if m["content"].get("text")
         ][-int(os.getenv("STUDIO_HISTORY_TURNS", "8")):]
         return cid, history
     return db.create_conversation(user["id"], prompt), []

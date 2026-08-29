@@ -174,6 +174,41 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
     }
   }
 
+  // A clarification chip re-asks the same question scoped the way the user
+  // chose: ONE source (the picker follows, so follow-ups stay there) or all
+  // sources side by side (allow_ambiguous skips the check for this ask).
+  async function resend(q, opt) {
+    if (busy) return;
+    setError("");
+    const both = opt.source === "*";
+    // The picker follows the choice both ways, so the toolbar always shows
+    // where the question went and where the next typed one will go.
+    setSource(both ? "*" : opt.source);
+    setSel([]);
+    setMessages((m) => [...m, { role: "user", text: q, source: opt.source,
+                                table: both ? "all sources" : opt.source }]);
+    setBusy(true);
+    setLiveSteps([]);
+    try {
+      const data = await api("/chat/background", {
+        method: "POST",
+        body: JSON.stringify({
+          prompt: q,
+          source: opt.source,
+          table: "*",
+          conversation_id: conversationId,
+          model: model || undefined,
+          allow_ambiguous: both,
+        }),
+      });
+      if (!conversationId) onConversationCreated(data.conversation_id);
+      pollFor(data.task_id, data.conversation_id);
+    } catch (err) {
+      setError(err.message);
+      setBusy(false);
+    }
+  }
+
   function loadMessages(ms) {
     const loaded = ms.map((m) => ({ role: m.role, ...m.content }));
     setMessages(loaded);
@@ -376,6 +411,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
               m={m}
               requirement={messages[i - 1]?.role === "user" ? messages[i - 1].text : ""}
               onOpenCanvas={() => setCanvas(buildCanvas(m))}
+              onClarify={resend}
             />
           )
         )}
@@ -438,7 +474,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
   );
 }
 
-function AssistantMessage({ m, requirement, onOpenCanvas }) {
+function AssistantMessage({ m, requirement, onOpenCanvas, onClarify }) {
   const [showSql, setShowSql] = useState(false);
   const [columns, setColumns] = useState(m.columns);
   const [rows, setRows] = useState(m.rows);
@@ -539,6 +575,26 @@ function AssistantMessage({ m, requirement, onOpenCanvas }) {
           </span>
         </div>
         {m.text && <p className="answer">{m.text}</p>}
+        {m.clarify && onClarify && (
+          <div className="clarify-chips">
+            {m.clarify.options.map((o) => (
+              <button
+                key={o.source}
+                className="chip"
+                onClick={() => onClarify(m.clarify.prompt, o)}
+                title={o.source === "*"
+                  ? "Query every source that has this table and compare the answers — remembered for this chat"
+                  : `Answer from ${o.source} only (has ${(o.tables || []).join(", ")}) — follow-ups stay there`}
+              >
+                {o.source === "*"
+                  ? (m.clarify.options.length > 3
+                      ? `⧉ All ${m.clarify.options.length - 1}, side by side`
+                      : "⧉ Both, side by side")
+                  : `▣ Use ${o.source}`}
+              </button>
+            ))}
+          </div>
+        )}
         {/* What the answer was computed from — read off the executed SQL, so it
             reflects the tables actually queried, not the ones picked up top. */}
         {m.inputs?.tables?.length > 0 && (

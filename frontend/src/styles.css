@@ -192,6 +192,8 @@ td { color: var(--ink-2); }
 }
 .suggestion:hover { background: var(--surface-2); }
 .thinking { display: flex; gap: 6px; align-items: center; color: var(--ink-3); font-size: 13px; }
+/* Clarification chips: which source's same-named table did you mean? */
+.clarify-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 10px; }
 /* Live agent activity above the thinking dots: completed steps, newest last. */
 .agent-activity { margin-bottom: 6px; }
 .activity-step { color: var(--ink-3); font-size: 12px; line-height: 1.7; opacity: 0.8; }
