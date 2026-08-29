@@ -731,7 +731,21 @@ def _learned_lessons(source):
 
 # ── Deterministic fallback (no LLM key) ─────────────────────────────────
 
+def _tables_named(prompt, tables):
+    """Allowed tables the prompt names outright — normalized whole-phrase match
+    on both sides (`ecommerce_orders` ↔ "ecommerce orders"), no stemming."""
+    norm = lambda v: re.sub(r"[^a-z0-9]+", " ", (v or "").lower()).strip()
+    text = " " + norm(prompt) + " "
+    return [t for t in tables if norm(t) and f" {norm(t)} " in text]
+
+
 def _fallback(prompt, connector, table, allowed_tables):
+    # Whole-source ask that NAMES a table ("show sales by region") → preview
+    # that table, not the first one alphabetically or a wall of previews.
+    if table == "*":
+        named = _tables_named(prompt, allowed_tables)
+        if named:
+            table = named[0]
     target = table if table != "*" else (allowed_tables[0] if allowed_tables else None)
     if not target:
         return {"text": "No accessible tables.", "sql": None, "columns": [], "rows": [],

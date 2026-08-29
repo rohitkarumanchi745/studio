@@ -8,11 +8,13 @@ from .marketing import MARKETING_CONNECTORS
 # connector) — keep auth.py free of module-level connector imports or this
 # becomes a cycle.
 from .objectstore import OBJECT_STORE_CONNECTORS
+from .postgres_conn import PostgresConnector
 from .snowflake_conn import SnowflakeConnector
 
 _REGISTRY = {
     "demo": DemoConnector(),
     "snowflake": SnowflakeConnector(),
+    "postgres": PostgresConnector(),
     "databricks": DatabricksConnector(),
     "bigquery": BigQueryConnector(),
     "neo4j": GraphConnector(),

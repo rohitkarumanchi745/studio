@@ -16,14 +16,14 @@ _OBJECT_STORES = ["s3", "azure_blob", "gcs"]
 
 POLICIES = {
     "admin": {
-        "demo": "*", "snowflake": "*", "databricks": "*", "bigquery": "*",
-        "neo4j": "*",
+        "demo": "*", "snowflake": "*", "postgres": "*", "databricks": "*",
+        "bigquery": "*", "neo4j": "*",
         **{o: "*" for o in _OBJECT_STORES},
         **{m: "*" for m in _MARKETING},
     },
     "analyst": {
-        "demo": "*", "snowflake": "*", "databricks": "*", "bigquery": "*",
-        "neo4j": "*",
+        "demo": "*", "snowflake": "*", "postgres": "*", "databricks": "*",
+        "bigquery": "*", "neo4j": "*",
         **{o: "*" for o in _OBJECT_STORES},
         **{m: "*" for m in _MARKETING},
     },
