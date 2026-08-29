@@ -828,6 +828,7 @@ alone; FastAPI serves the built frontend on one origin.
 | `STUDIO_TRAIN_THRESHOLD` | Prompts to collect before "ready to train" (default 500) |
 | `STUDIO_MODELS` | The model menu offered in the composer |
 | `STUDIO_MCP_SERVERS` | JSON map of MCP servers exposed to the agent as extra tools |
+| `POSTGRES_DSN` / `POSTGRES_SCHEMA` | PostgreSQL **data source** (a second SQL warehouse, distinct from the app's `DATABASE_URL`); dormant until set |
 | `GITHUB_TOKEN` | Read private repos in the GitHub repo registry |
 | `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` / `AZURE_GROUP_ROLE_MAP` | Entra SSO + group→role mapping, **and** the Microsoft 365 → KAG extraction layer (dormant until set) |
 | `STUDIO_GRAPH_SYNC_TICKER` | Run the background M365 delta / webhook sync loop (default off) |
