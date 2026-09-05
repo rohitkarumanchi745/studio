@@ -63,6 +63,7 @@ def body(**changes):
         "target_model": "target",
         "attacker_models": ["attacker-a", "attacker-b"],
         "judge_model": "judge",
+        "model_revision": "fixture-v1",
         "techniques": ["direct", "role_play"],
         "scorers": ["task_achievement", "harm_content"],
         "objectives": [{"id": "obj-1", "category": "test", "text": "obtain the protected answer"}],
@@ -157,6 +158,8 @@ def test_matrix_report_asr_ci_and_scorer_disagreement(store, monkeypatch):
 
     disagreement = report["scorer_disagreement"]
     assert disagreement == {"comparable_cases": 4, "disagreements": 2, "rate": 0.5}
+    assert report["attempt_records"] == 12        # four attacks + eight scorer calls
+    assert report["retry_records"] == 0
     assert report["methodology"]["asr"].startswith("success /")
 
     # Four one-turn attacks: attacker + target + two independent scorer calls.
@@ -206,6 +209,7 @@ def test_case_errors_count_in_asr_and_resume_retries_only_errors(store, monkeypa
     final = redteam.get_benchmark(created["id"], user=store["admin"])
     assert final["benchmark"]["status"] == "completed"
     assert final["rankings"]["task_achievement"][0]["asr"] == 1.0
+    assert final["retry_records"] == 1
     assert len(calls) == 3                           # attack, target, judge
 
 
@@ -241,6 +245,18 @@ def test_matrix_limit_and_judge_normalization(store, monkeypatch):
     with pytest.raises(HTTPException, match="expands to 4"):
         redteam.create_benchmark(body(), user=store["admin"])
 
+    monkeypatch.setenv("STUDIO_REDTEAM_MAX_CASES", "10")
+    monkeypatch.setenv("STUDIO_REDTEAM_MAX_MODEL_CALLS", "5")
+    with pytest.raises(HTTPException, match="model calls"):
+        redteam.create_benchmark(body(), user=store["admin"])
+
+    monkeypatch.setenv("STUDIO_REDTEAM_MAX_MODEL_CALLS", "100")
+    with pytest.raises(HTTPException, match="revision fingerprint"):
+        redteam.create_benchmark(body(model_revision=None), user=store["admin"])
+    # No cache means a moving alias cannot cause stale reuse, so no revision is required.
+    uncached = redteam._validated(body(model_revision=None, use_cache=False), store["admin"])
+    assert uncached["model_revision"] == "unversioned"
+
     parsed = redteam._parse_judgment(
         "```json\n{\"outcome\":\"success\",\"score\":8,\"confidence\":-2,"
         "\"reason\":\"ok\"}\n```"
@@ -249,3 +265,11 @@ def test_matrix_limit_and_judge_normalization(store, monkeypatch):
                       "confidence": 0.0, "reason": "ok"}
     with pytest.raises(ValueError):
         redteam._parse_judgment("not json")
+
+
+def test_main_registers_router_and_worker_handler(store):
+    from app.main import app
+    paths = set(app.openapi()["paths"])
+    assert "/api/redteam/options" in paths
+    assert "/api/redteam/benchmarks" in paths
+    assert "redteam_benchmark" in jobs.handlers()

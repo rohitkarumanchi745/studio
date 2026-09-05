@@ -89,6 +89,20 @@ def _max_cases():
         return 500
 
 
+def _max_model_calls():
+    try:
+        return max(1, int(os.getenv("STUDIO_REDTEAM_MAX_MODEL_CALLS", "3000")))
+    except (TypeError, ValueError):
+        return 3000
+
+
+def _model_timeout_s():
+    try:
+        return max(5.0, min(300.0, float(os.getenv("STUDIO_REDTEAM_MODEL_TIMEOUT_S", "60"))))
+    except (TypeError, ValueError):
+        return 60.0
+
+
 def init_tables():
     with db.connect() as c:
         c.executescript(
@@ -101,6 +115,7 @@ def init_tables():
                 status TEXT NOT NULL,
                 target_model TEXT NOT NULL,
                 judge_model TEXT NOT NULL,
+                model_revision TEXT NOT NULL,
                 target_system_prompt TEXT NOT NULL,
                 attacker_models TEXT NOT NULL,
                 techniques TEXT NOT NULL,
@@ -180,6 +195,21 @@ def init_tables():
                 ON redteam_scores(owner_id, score_key, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_redteam_score_benchmark
                 ON redteam_scores(benchmark_id, case_id);
+
+            CREATE TABLE IF NOT EXISTS redteam_attempts (
+                id TEXT PRIMARY KEY,
+                benchmark_id TEXT NOT NULL,
+                case_id TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                scorer TEXT,
+                outcome TEXT NOT NULL,
+                latency_ms INTEGER,
+                error TEXT,
+                created_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_redteam_attempt_case
+                ON redteam_attempts(benchmark_id, case_id, stage, scorer, created_at);
             """
         )
         c.commit()
@@ -197,6 +227,9 @@ class BenchmarkIn(BaseModel):
     target_model: str
     attacker_models: list[str]
     judge_model: str
+    # Provider model aliases can move. Exact cache reuse therefore requires an
+    # operator-supplied deployment/version fingerprint, not only the alias.
+    model_revision: str | None = Field(default=None, max_length=160)
     techniques: list[str] = Field(default_factory=lambda: ["direct", "role_play", "crescendo"])
     scorers: list[str] = Field(default_factory=lambda: ["task_achievement", "harm_content"])
     objectives: list[ObjectiveIn]
@@ -280,6 +313,7 @@ def _validated(body, user):
     name = body.name.strip()
     dataset_name = body.dataset_name.strip()
     target_system_prompt = body.target_system_prompt.strip()
+    model_revision = (body.model_revision or "").strip()
     if not name or not dataset_name or not target_system_prompt:
         raise HTTPException(400, "Name, dataset name and target system prompt cannot be blank")
     attackers = _unique(body.attacker_models)
@@ -310,11 +344,29 @@ def _validated(body, user):
             400,
             f"Benchmark expands to {total} attack cases; the configured limit is {_max_cases()}",
         )
+    estimated_calls = (
+        len(attackers) * len(objectives) * body.trials *
+        sum(2 * (body.max_turns if technique == "crescendo" else 1)
+            for technique in techniques)
+        + total * len(scorers)
+    )
+    if estimated_calls > _max_model_calls():
+        raise HTTPException(
+            400,
+            f"Benchmark can make {estimated_calls} model calls; the configured limit is "
+            f"{_max_model_calls()}",
+        )
+    if body.use_cache and not model_revision:
+        raise HTTPException(
+            400,
+            "Exact cache reuse requires a model/deployment revision fingerprint",
+        )
     return {
         "name": name,
         "dataset_name": dataset_name,
         "target_model": target_model,
         "judge_model": judge_model,
+        "model_revision": model_revision or "unversioned",
         "target_system_prompt": target_system_prompt,
         "attacker_models": attackers,
         "techniques": techniques,
@@ -326,6 +378,7 @@ def _validated(body, user):
         "seed": body.seed,
         "use_cache": body.use_cache,
         "total_cases": total,
+        "estimated_model_calls": estimated_calls,
     }
 
 
@@ -404,6 +457,7 @@ def _case_key(b, objective, attacker_model, technique, trial):
     return _digest(
         PROTOCOL_VERSION,
         b["target_model"],
+        b["model_revision"],
         _digest(b["target_system_prompt"]),
         attacker_model,
         technique,
@@ -418,6 +472,7 @@ def _score_key(b, case, scorer):
         PROTOCOL_VERSION,
         scorer,
         b["judge_model"],
+        b["model_revision"],
         case["objective"],
         _digest(case.get("transcript") or []),
     )
@@ -462,7 +517,13 @@ def _invoke_model(spec, user, system, messages, *, temperature, max_tokens, cach
     key = (spec, float(temperature), int(max_tokens))
     llm = cache.get(key)
     if llm is None:
-        llm = agent.make_llm(spec, user, temperature=temperature, max_tokens=max_tokens)
+        # One provider-level retry and a bounded request timeout keep failure
+        # tolerance comparable across candidates instead of letting a provider's
+        # SDK defaults silently determine the benchmark result.
+        llm = agent.make_llm(
+            spec, user, temperature=temperature, max_tokens=max_tokens,
+            timeout=_model_timeout_s(), max_retries=1,
+        )
         cache[key] = llm
     t0 = time.perf_counter()
     reply = llm.invoke([("system", system), *messages])
@@ -746,6 +807,25 @@ def _save_score(b, case, scorer, result, *, cached_from=None):
         c.commit()
 
 
+def _record_attempt(b, case, stage, outcome, *, scorer=None, latency_ms=None,
+                    error=None):
+    """Append an application-level attempt; final result rows stay one-per-cell.
+
+    A manual resume can replace an error with a success without erasing the
+    failed observation. Reports count every record beyond the newest result for
+    a case/stage/scorer tuple as retry_records, matching the benchmark's final
+    ASR denominator without inflating it with superseded attempts.
+    """
+    with db.connect() as c:
+        c.execute(
+            "INSERT INTO redteam_attempts (id, benchmark_id, case_id, owner_id, stage, "
+            "scorer, outcome, latency_ms, error, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (str(uuid.uuid4()), b["id"], case["id"], b["owner_id"], stage, scorer,
+             outcome, latency_ms, (error or "")[:1000] or None, time.time()),
+        )
+        c.commit()
+
+
 class _Canceled(Exception):
     pass
 
@@ -767,12 +847,16 @@ def _run_cell(b, objective, attacker_model, technique, trial, user, model_cache)
         else:
             try:
                 result = _run_attack(b, objective, attacker_model, technique, user, model_cache)
-                _continue(b["id"])
-                _save_case(case["id"], result)
             except (jobs.ClaimLost, _Canceled):
                 raise
             except Exception as exc:
+                _record_attempt(b, case, "attack", "error", error=str(exc))
                 _save_case(case["id"], {"transcript": []}, status="error", error=str(exc))
+            else:
+                _continue(b["id"])
+                _record_attempt(b, case, "attack", "success",
+                                latency_ms=result.get("latency_ms"))
+                _save_case(case["id"], result)
     case = _reload_case(case["id"])
 
     for scorer in b["scorers"]:
@@ -803,6 +887,8 @@ def _run_cell(b, objective, attacker_model, technique, trial, user, model_cache)
                 "input_tokens": 0, "output_tokens": 0, "error": str(exc),
             }
         _continue(b["id"])
+        _record_attempt(b, case, "score", result["outcome"], scorer=scorer,
+                        latency_ms=result.get("latency_ms"), error=result.get("error"))
         _save_score(b, case, scorer, result)
 
 
@@ -935,6 +1021,14 @@ def _report(b):
         by_case[row["case_id"]][row["scorer"]] = row["outcome"]
     comparable = [outcomes for outcomes in by_case.values() if len(outcomes) > 1]
     disagreements = [o for o in comparable if len(set(o.values())) > 1]
+    with db.connect() as c:
+        attempt_groups = c.execute(
+            "SELECT case_id, stage, COALESCE(scorer, '') AS scorer, COUNT(*) AS n "
+            "FROM redteam_attempts WHERE benchmark_id=? GROUP BY case_id, stage, scorer",
+            (b["id"],),
+        ).fetchall()
+    attempt_records = sum(int(r["n"] or 0) for r in attempt_groups)
+    retry_records = sum(max(0, int(r["n"] or 0) - 1) for r in attempt_groups)
 
     cases = {}
     for row in rows:
@@ -962,6 +1056,8 @@ def _report(b):
             "disagreements": len(disagreements),
             "rate": round(len(disagreements) / len(comparable), 4) if comparable else 0.0,
         },
+        "attempt_records": attempt_records,
+        "retry_records": retry_records,
         "cases": list(cases.values()),
         "methodology": {
             "asr": "success / (success + failure + error + undetermined)",
@@ -983,9 +1079,12 @@ def options(user=Depends(current_user)):
         "techniques": [{"id": k, **v} for k, v in TECHNIQUES.items()],
         "scorers": [{"id": k, **v} for k, v in SCORERS.items()],
         "default_objectives": DEFAULT_OBJECTIVES,
-        "limits": {"max_cases": _max_cases(), "max_objectives": 100,
-                   "max_attackers": 10, "max_trials": 5, "max_turns": 8},
+        "limits": {"max_cases": _max_cases(), "max_model_calls": _max_model_calls(),
+                   "max_objectives": 100, "max_attackers": 10,
+                   "max_trials": 5, "max_turns": 8},
         "protocol_version": PROTOCOL_VERSION,
+        "failure_tolerance": {"provider_retries": 1,
+                              "model_timeout_seconds": _model_timeout_s()},
     }
 
 
@@ -996,13 +1095,15 @@ def create_benchmark(body: BenchmarkIn, user=Depends(current_user)):
     with db.connect() as c:
         c.execute(
             "INSERT INTO redteam_benchmarks (id, owner_id, name, dataset_name, status, "
-            "target_model, judge_model, target_system_prompt, attacker_models, techniques, "
+            "target_model, judge_model, model_revision, target_system_prompt, "
+            "attacker_models, techniques, "
             "scorers, objectives, objective_set_hash, trials, max_turns, seed, use_cache, "
             "protocol_version, total_cases, job_id, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 bid, user["id"], cfg["name"], cfg["dataset_name"], "queued",
-                cfg["target_model"], cfg["judge_model"], cfg["target_system_prompt"],
+                cfg["target_model"], cfg["judge_model"], cfg["model_revision"],
+                cfg["target_system_prompt"],
                 json.dumps(cfg["attacker_models"]), json.dumps(cfg["techniques"]),
                 json.dumps(cfg["scorers"]), json.dumps(cfg["objectives"]),
                 cfg["objective_set_hash"], cfg["trials"], cfg["max_turns"], cfg["seed"],
@@ -1047,10 +1148,16 @@ def get_case(bid: str, case_id: str, user=Depends(current_user)):
             "FROM redteam_scores WHERE case_id=? ORDER BY scorer",
             (case_id,),
         ).fetchall()
+        attempts = c.execute(
+            "SELECT stage, scorer, outcome, latency_ms, error, created_at "
+            "FROM redteam_attempts WHERE case_id=? ORDER BY created_at",
+            (case_id,),
+        ).fetchall()
     if row is None:
         raise HTTPException(404, "Benchmark case not found")
     case = _case_row(row)
     case["scores"] = [dict(s) for s in scores]
+    case["attempts"] = [dict(a) for a in attempts]
     return case
 
 
@@ -1102,6 +1209,7 @@ def delete_benchmark(bid: str, user=Depends(current_user)):
     if b["status"] not in TERMINAL:
         raise HTTPException(409, "Cancel the benchmark and wait for it to stop before deleting")
     with db.connect() as c:
+        c.execute("DELETE FROM redteam_attempts WHERE benchmark_id=?", (bid,))
         c.execute("DELETE FROM redteam_scores WHERE benchmark_id=?", (bid,))
         c.execute("DELETE FROM redteam_cases WHERE benchmark_id=?", (bid,))
         c.execute("DELETE FROM redteam_benchmarks WHERE id=?", (bid,))

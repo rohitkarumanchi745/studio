@@ -350,3 +350,50 @@ def test_register_requires_ten_char_password(fresh):
     with pytest.raises(HTTPException) as ei:
         auth.register(auth.Register(email="new@example.com", password="nine-char", name="N"))
     assert ei.value.status_code == 400
+
+
+def test_demo_mode_restores_passwords_a_production_boot_revoked(fresh, monkeypatch):
+    """The Railway case: a deployment booted in production (revoking the seed
+    passwords), then switched to STUDIO_DEMO_MODE=1 to get its demo logins
+    back. init_db() only INSERTS a missing account, so without
+    restore_seed_passwords() the rows kept their unrecoverable random hash and
+    every documented login answered "Invalid email or password" forever."""
+    from app import bootstrap, db
+
+    # A deployment that already has the seed rows, then boots in production.
+    monkeypatch.delenv("STUDIO_DEMO_MODE", raising=False)
+    monkeypatch.setenv("STUDIO_SECRET", "x" * 40)
+    monkeypatch.setenv("STUDIO_TOOLBUILDER", "0")
+    db.init_db()
+    for email, pw, name, role in bootstrap.SEED_USERS:
+        if not db.get_user_by_email(email):
+            db.create_user(email, pw, name, role=role, verified=1)
+    bootstrap.enforce()
+    for email, pw, _n, _r in bootstrap.SEED_USERS:
+        assert not db.verify_password(pw, db.get_user_by_email(email)["password_hash"])
+
+    # Switching to demo mode must hand them back.
+    monkeypatch.setenv("STUDIO_DEMO_MODE", "1")
+    bootstrap.enforce()
+    for email, pw, _n, role in bootstrap.SEED_USERS:
+        user = db.get_user_by_email(email)
+        assert db.verify_password(pw, user["password_hash"]), email
+        assert user["role"] == role
+        assert user["verified"]
+
+
+def test_production_still_revokes_after_a_demo_boot(fresh, monkeypatch):
+    """The restore must not leak into production: the same database flipped
+    back to production mode revokes the demo passwords again."""
+    from app import bootstrap, db
+
+    monkeypatch.setenv("STUDIO_DEMO_MODE", "1")
+    db.init_db()
+    bootstrap.enforce()
+    assert db.verify_password("admin123", db.get_user_by_email("admin@studio.local")["password_hash"])
+
+    monkeypatch.delenv("STUDIO_DEMO_MODE", raising=False)
+    monkeypatch.setenv("STUDIO_SECRET", "y" * 40)
+    monkeypatch.setenv("STUDIO_TOOLBUILDER", "0")
+    bootstrap.enforce()
+    assert not db.verify_password("admin123", db.get_user_by_email("admin@studio.local")["password_hash"])

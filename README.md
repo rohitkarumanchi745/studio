@@ -777,6 +777,56 @@ flowchart LR
 
 ---
 
+## Adversarial model benchmark — choose attackers with evidence
+
+The admin-only **Red team benchmark** turns attacker-model selection into a
+controlled experiment, following the core design of Microsoft's
+[PyRIT AdversarialBenchmark](https://microsoft.github.io/PyRIT/latest/scanner/benchmark/)
+without adding PyRIT's separate global registry, memory, or credential system.
+Studio uses its existing provider-neutral model menu and encrypted BYOK keys.
+
+One run pins the objective target, target system prompt, exact objective set,
+attack techniques, scorer rubrics, judge model, turn limit, seed, and trial
+numbers. It varies only the selected attacker models. The matrix is ordered in
+paired blocks, with a deterministic attacker rotation, so one model does not
+always receive the first request in every block.
+
+- **Techniques:** direct red team, role play, and adaptive multi-turn Crescendo.
+- **Independent scoring:** task achievement and harmful-content rubrics score
+  the **same stored target transcript**. The report shows their separate
+  rankings and their case-level disagreement rate.
+- **Honest ASR:** `success / (success + failure + error + undetermined)`, shown
+  overall and per technique with Wilson 95% intervals. Errors never disappear
+  from the denominator; a resumed run keeps superseded attempts as
+  `retry_records` while only its newest final result counts.
+- **Evidence beyond ASR:** target/judge token counts, latency, confidence,
+  category, objective-set hash, full owner-visible transcript, cache provenance,
+  and model/deployment revision.
+- **Durable and resumable:** `POST /api/redteam/benchmarks` atomically creates
+  the benchmark and its `redteam_benchmark` queue job. A worker resumes at the
+  missing matrix cell after a restart. Stop is cooperative between model calls;
+  failed cells can be resumed without rerunning successful ones.
+- **Exact cache only:** cache lookup is owner-scoped and hashes the full attack
+  configuration; scorer cache additionally hashes the exact transcript and
+  rubric. Because a provider alias can move to new weights, cache reuse is
+  refused until the operator supplies a model/deployment revision fingerprint.
+- **Contained execution:** only admins can run it and must affirm authorization.
+  Attacker, target, and judge are bare chat-model calls—no SQL, KAG, memory,
+  email, MCP, Studio tools, or arbitrary target URL is exposed. Matrix size and
+  estimated model calls are hard-capped server-side.
+
+This is a Studio-native benchmark, not a wrapper around the `pyrit` package, and
+its scope is intentionally narrower: text-only Studio-offered model targets,
+three techniques, and two built-in LLM-judge rubrics. It does not yet import
+HarmBench datasets, target external applications, calibrate scorers against
+human labels, price calls, support multimodal attacks, or prove a model is
+generally “best.” LLM judges are themselves fallible and prompt-injectable;
+treat rankings as evidence for a specific target/objective/technique/scorer
+configuration. Transcripts may contain unsafe or sensitive text and remain in
+the state store until an admin deletes the run.
+
+---
+
 ## Agent Lightning — the learning loop
 
 Modeled on Microsoft's [Agent Lightning](https://github.com/microsoft/agent-lightning):
@@ -1644,6 +1694,9 @@ you in: the account is created unverified and the emailed 6-digit code
 | `STUDIO_PROMPT_CACHE` | Toggle Anthropic prompt/KV caching (default on) |
 | `STUDIO_QCACHE_THRESHOLD` | Cache-band similarity threshold (default 0.9) |
 | `STUDIO_TRAIN_THRESHOLD` | Prompts to collect before "ready to train" (default 500) |
+| `STUDIO_REDTEAM_MAX_CASES` | Maximum attack cases in one adversarial benchmark after expanding attacker × technique × objective × trial (default 500) |
+| `STUDIO_REDTEAM_MAX_MODEL_CALLS` | Maximum estimated attacker + target + judge calls in one benchmark (default 3000) |
+| `STUDIO_REDTEAM_MODEL_TIMEOUT_S` | Per-call timeout used uniformly for attacker, target, and judge models (default 60; clamped to 5–300 seconds). Each model object also gets one provider-level retry |
 
 **Data gate & results**
 

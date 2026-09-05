@@ -155,6 +155,7 @@ def enforce():
     """Startup gate. Call once, after db.init_db()."""
     if demo_mode():
         log.info("bootstrap: demo mode: seed accounts enabled, ephemeral JWT secret")
+        restore_seed_passwords()
         ensure_bootstrap_admin()
         ensure_shared_login()
         return
@@ -226,6 +227,37 @@ def revoke_default_passwords():
         log.warning(
             "bootstrap: %s still had its default password — revoked. Reset it via "
             "STUDIO_ADMIN_EMAIL/STUDIO_ADMIN_PASSWORD or sign in through SSO.", email)
+
+
+def restore_seed_passwords():
+    """Demo mode: put the documented seed passwords back.
+
+    The mirror of revoke_default_passwords(), and the reason it must exist:
+    db.init_db() only INSERTS a seed account that is missing, so once a
+    production boot has revoked these passwords the rows survive with an
+    unrecoverable random hash. Turning STUDIO_DEMO_MODE back on then seeded
+    nothing, revoked nothing, and left every documented login answering
+    "Invalid email or password" — a deployment that could never get its demo
+    credentials back. A demo account's password is configuration, not a
+    person's secret (the same reasoning as ensure_shared_login), so demo mode
+    re-asserts it on every boot: the role and verified flag too, in case an
+    admin changed them while the deployment was in production mode.
+
+    Only ever runs under demo_mode(); production still revokes.
+    """
+    from . import db
+    for email, default_pw, name, role in SEED_USERS:
+        user = db.get_user_by_email(email)
+        if not user:
+            continue                     # init_db seeds a missing one already
+        if not db.verify_password(default_pw, user["password_hash"]):
+            db.set_user_password(user["id"], db.hash_password(default_pw))
+            log.info("bootstrap: restored the demo password for %s", email)
+        if user["role"] != role:
+            db.set_user_role(email, role)
+            log.info("bootstrap: restored the demo role for %s (%s)", email, role)
+        if not user.get("verified"):
+            db.mark_verified(email)
 
 
 def ensure_bootstrap_admin():
