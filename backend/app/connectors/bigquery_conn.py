@@ -67,11 +67,20 @@ class BigQueryConnector(Connector):
         dataset, so `other_dataset.customers` (or another project's) is outside
         what the catalog was built from and the query guard refuses it. Env and
         the inline key only — never a network call, since this runs per query.
+
+        ARITY carries the meaning, and BigQuery's rule is:
+          one part  `x.sales`   -> x is a DATASET in the default project
+          two parts `a.b.sales` -> a is the PROJECT, b the DATASET
+        which is exactly how the two spellings are declared here. The dataset
+        keeps its CONFIGURED CASE: BigQuery dataset and table ids are
+        case-SENSITIVE (unlike Snowflake/Postgres, nothing is folded), so
+        lower-casing it would have declared a namespace that does not exist and
+        refused the one that does. Project ids are lower-case by GCP rule.
         """
-        dataset = (self._cfg()["dataset"] or "").strip().lower()
+        dataset = (self._cfg()["dataset"] or "").strip()
         if not dataset:
             return frozenset()
-        project = (self._project() or "").strip().lower()
+        project = (self._project() or "").strip()
         out = {dataset}
         if project:
             out.add(f"{project}.{dataset}")

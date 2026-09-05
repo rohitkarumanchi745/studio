@@ -74,21 +74,20 @@ DEFAULT_REFRESH_S = 5.0
 
 
 def init_tables():
-    c = db._conn()
-    c.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS governance_docs (
-            id TEXT PRIMARY KEY,
-            yaml TEXT NOT NULL,
-            applied_by TEXT,
-            applied_at REAL NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS governance_docs_applied_at
-            ON governance_docs (applied_at DESC, id DESC);
-        """
-    )
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS governance_docs (
+                id TEXT PRIMARY KEY,
+                yaml TEXT NOT NULL,
+                applied_by TEXT,
+                applied_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS governance_docs_applied_at
+                ON governance_docs (applied_at DESC, id DESC);
+            """
+        )
+        c.commit()
 
 
 def _refresh_ttl():
@@ -106,13 +105,10 @@ def _newest_ident():
     empty; _UNKNOWN when the store cannot be read at all, which must NEVER be
     read as "no document" (that would fall open to built-in RBAC on a blip)."""
     try:
-        c = db._conn()
-        try:
+        with db.connect() as c:
             row = c.execute(
                 "SELECT id, applied_at FROM governance_docs "
                 "ORDER BY applied_at DESC, id DESC LIMIT 1").fetchone()
-        finally:
-            c.close()
     except Exception:
         return _UNKNOWN
     return (row["id"], row["applied_at"]) if row else None
@@ -157,10 +153,9 @@ def load():
     file, else none (Studio uses built-in RBAC). Cached in _STATE; accessors
     re-check the store every STUDIO_GOVERNANCE_REFRESH_S (_refresh_if_stale),
     and reload() forces it now."""
-    c = db._conn()
-    row = c.execute("SELECT id, yaml, applied_at FROM governance_docs "
-                    "ORDER BY applied_at DESC, id DESC LIMIT 1").fetchone()
-    c.close()
+    with db.connect() as c:
+        row = c.execute("SELECT id, yaml, applied_at FROM governance_docs "
+                        "ORDER BY applied_at DESC, id DESC LIMIT 1").fetchone()
     # Record the identity even when the row's YAML is unusable: otherwise every
     # refresh would see a "change" and reload the same broken document forever.
     _FRESH.update(at=time.monotonic(),
@@ -579,11 +574,10 @@ def apply_yaml(text, user):
     ok, errors, doc = validate(text)
     if not ok:
         return False, errors
-    c = db._conn()
-    c.execute("INSERT INTO governance_docs (id, yaml, applied_by, applied_at) VALUES (?,?,?,?)",
-              (__import__("uuid").uuid4().hex, text, (user or {}).get("email"), time.time()))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("INSERT INTO governance_docs (id, yaml, applied_by, applied_at) VALUES (?,?,?,?)",
+                  (__import__("uuid").uuid4().hex, text, (user or {}).get("email"), time.time()))
+        c.commit()
     reload()
     db.log_activity(user, "governance_apply", prompt=f"roles={list(doc['roles'])}")
     return True, []
@@ -683,10 +677,9 @@ def apply_config(body: YamlIn, user=Depends(current_user)):
 def clear_config(user=Depends(current_user)):
     """Revert to built-in RBAC (removes the applied document)."""
     _admin(user)
-    c = db._conn()
-    c.execute("DELETE FROM governance_docs")
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("DELETE FROM governance_docs")
+        c.commit()
     reload()
     db.log_activity(user, "governance_clear")
     return {"cleared": True, "loaded": loaded()}

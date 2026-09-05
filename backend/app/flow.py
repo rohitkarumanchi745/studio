@@ -38,6 +38,7 @@ from pydantic import BaseModel
 from . import (db, email_service, pipelines, pybuild, queries, queryguard, roster,
                supervisor)
 from .auth import current_user
+from .connectors import databricks_conn
 from .sources import connector_or_400
 
 router = APIRouter(prefix="/flow", tags=["flow"])
@@ -366,13 +367,35 @@ def request_approval(user, spec, validation, target, kind, output=None):
     A declared spark_job `output` (the S3 parquet sink) is embedded as a sibling
     key in the job script here; it threads immutably through supervisor.submit
     into supervised_jobs.script, so the write→read bridge can read it back on
-    SUCCESS and register the output as a queryable dataset."""
+    SUCCESS and register the output as a queryable dataset.
+
+    The Spark payload is built by databricks_conn.build_submission — a real
+    Jobs 2.1 run-submit body (one sql_task per verified step, each with a
+    unique task_key and the configured warehouse), not a hand-rolled dict the
+    endpoint would 400 on. If the body CANNOT be built (no
+    DATABRICKS_WAREHOUSE_ID, no statements) the request is REFUSED here with
+    that reason: a submission the API would reject is worse than an honest
+    "not configured", and nothing is posted. The human-approval gate below is
+    untouched — this is about the body, not the policy."""
     t0 = time.time()
     # What actually gets deployed: the verified read-only steps as a script, or
     # (for a Spark target) a job payload the executor submits.
     if kind == "spark_job":
-        payload = {"tasks": [{"name": s.name, "sql": s.sql} for s in spec.steps]}
+        try:
+            payload = databricks_conn.build_submission(
+                [(s.name, s.sql) for s in spec.steps if (s.sql or "").strip()],
+                run_name=f"studio: {spec.request}")
+        except ValueError as e:
+            req = DeploymentRequest(target=target, kind=kind, risk="job",
+                                    decision="reject", reasons=[str(e)], script="",
+                                    deploys="spark_job", artifact_deployed=False)
+            tid = _trace(user, "approve", "Approval agent", spec.request, target,
+                         req.model_dump(), ok=False, reward=0.0, error=str(e),
+                         duration_ms=int((time.time() - t0) * 1000))
+            return req, tid
         if isinstance(output, dict) and output.get("uri"):
+            # Studio-private sibling key: stripped from the posted body by the
+            # connector, read back off the stored script by the bridge.
             payload["output"] = output
         script = json.dumps(payload)
     else:
@@ -533,27 +556,26 @@ def _alert(user, request, phase, details):
 # ── Persistence + driver ─────────────────────────────────────────────────
 
 def init_tables():
-    c = db._conn()
-    c.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS flow_runs (
-            id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            request TEXT NOT NULL,
-            target TEXT,
-            kind TEXT,
-            status TEXT NOT NULL,
-            spec TEXT, artifact TEXT, validation TEXT, deployment TEXT, execution TEXT,
-            trace_ids TEXT,
-            job_id TEXT,
-            created_at REAL NOT NULL,
-            updated_at REAL NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_flow_user ON flow_runs(user_id, updated_at DESC);
-        """
-    )
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS flow_runs (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                request TEXT NOT NULL,
+                target TEXT,
+                kind TEXT,
+                status TEXT NOT NULL,
+                spec TEXT, artifact TEXT, validation TEXT, deployment TEXT, execution TEXT,
+                trace_ids TEXT,
+                job_id TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_flow_user ON flow_runs(user_id, updated_at DESC);
+            """
+        )
+        c.commit()
 
 
 def run_flow(user, request, target=None, kind="sql_script", output=None):
@@ -622,17 +644,16 @@ def _finish(user, request, target, kind, status, spec, artifact, validation,
     fid = str(uuid.uuid4())
     now = time.time()
     job_id = execution.job_id if execution else None
-    c = db._conn()
-    c.execute(
-        "INSERT INTO flow_runs (id, user_id, request, target, kind, status, spec, "
-        "artifact, validation, deployment, execution, trace_ids, job_id, created_at, "
-        "updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (fid, user["id"], request, target, kind, status,
-         _dump(spec), _dump(artifact), _dump(validation), _dump(deployment),
-         _dump(execution), json.dumps(traces), job_id, now, now),
-    )
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute(
+            "INSERT INTO flow_runs (id, user_id, request, target, kind, status, spec, "
+            "artifact, validation, deployment, execution, trace_ids, job_id, created_at, "
+            "updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (fid, user["id"], request, target, kind, status,
+             _dump(spec), _dump(artifact), _dump(validation), _dump(deployment),
+             _dump(execution), json.dumps(traces), job_id, now, now),
+        )
+        c.commit()
     db.log_activity(user, "flow_run", prompt=request[:200], source=target,
                     ok=status in OK_STATUSES)
     resp = {
@@ -697,20 +718,18 @@ def _row(r):
 
 @router.get("")
 def listing(user=Depends(current_user)):
-    c = db._conn()
-    rows = c.execute(
-        "SELECT id, request, target, kind, status, job_id, created_at, updated_at "
-        "FROM flow_runs WHERE user_id=? ORDER BY updated_at DESC LIMIT 100",
-        (user["id"],)).fetchall()
-    c.close()
+    with db.connect() as c:
+        rows = c.execute(
+            "SELECT id, request, target, kind, status, job_id, created_at, updated_at "
+            "FROM flow_runs WHERE user_id=? ORDER BY updated_at DESC LIMIT 100",
+            (user["id"],)).fetchall()
     return {"flows": [dict(r) for r in rows]}
 
 
 @router.get("/{fid}")
 def get(fid: str, user=Depends(current_user)):
-    c = db._conn()
-    r = c.execute("SELECT * FROM flow_runs WHERE id=?", (fid,)).fetchone()
-    c.close()
+    with db.connect() as c:
+        r = c.execute("SELECT * FROM flow_runs WHERE id=?", (fid,)).fetchone()
     if r is None or dict(r)["user_id"] != user["id"]:
         raise HTTPException(404, "Flow not found")  # 404, not 403 — no oracle
     d = _row(r)
@@ -730,14 +749,12 @@ def get(fid: str, user=Depends(current_user)):
 
 @router.delete("/{fid}")
 def remove(fid: str, user=Depends(current_user)):
-    c = db._conn()
-    r = c.execute("SELECT user_id FROM flow_runs WHERE id=?", (fid,)).fetchone()
-    if r is None or dict(r)["user_id"] != user["id"]:
-        c.close()
-        raise HTTPException(404, "Flow not found")  # 404, not 403 — no oracle
-    c.execute("DELETE FROM flow_runs WHERE id=?", (fid,))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        r = c.execute("SELECT user_id FROM flow_runs WHERE id=?", (fid,)).fetchone()
+        if r is None or dict(r)["user_id"] != user["id"]:
+            raise HTTPException(404, "Flow not found")  # 404, not 403 — no oracle
+        c.execute("DELETE FROM flow_runs WHERE id=?", (fid,))
+        c.commit()
     return {"deleted": True}
 
 

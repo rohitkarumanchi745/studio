@@ -1,6 +1,7 @@
 """Chat: conversations, the ask endpoint driving the agent, fresh-data rerun,
 email reports, and the per-user activity audit log."""
 import json
+import logging
 import os
 import time
 import uuid
@@ -16,6 +17,8 @@ from .auth import current_user
 from .matching import match_tables
 from .sources import connector_or_400
 
+log = logging.getLogger("studio.chat")
+
 router = APIRouter(tags=["chat"])
 
 # Background tasks let a user start a question in one chat, move to another, and
@@ -26,32 +29,37 @@ router = APIRouter(tags=["chat"])
 
 
 def init_tables():
-    c = db._conn()
-    c.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS chat_tasks (
-            id TEXT PRIMARY KEY,
-            conversation_id TEXT NOT NULL,
-            user_id TEXT NOT NULL,
-            prompt TEXT,
-            status TEXT NOT NULL DEFAULT 'running',
-            error TEXT,
-            seen INTEGER NOT NULL DEFAULT 0,
-            steps TEXT,
-            user_message_id TEXT,
-            created_at REAL NOT NULL,
-            finished_at REAL
-        );
-        CREATE INDEX IF NOT EXISTS idx_chat_tasks_user
-            ON chat_tasks(user_id, conversation_id);
-        """
-    )
-    # steps holds the live activity feed (progress.py); user_message_id is the
-    # turn this task answers (_already_answered). Databases created before
-    # either column existed get them from migrations 3 and 6
-    # (app/migrations.py).
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS chat_tasks (
+                id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                prompt TEXT,
+                status TEXT NOT NULL DEFAULT 'running',
+                error TEXT,
+                seen INTEGER NOT NULL DEFAULT 0,
+                steps TEXT,
+                user_message_id TEXT,
+                created_at REAL NOT NULL,
+                finished_at REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_tasks_user
+                ON chat_tasks(user_id, conversation_id);
+            CREATE INDEX IF NOT EXISTS idx_chat_tasks_status
+                ON chat_tasks(status, created_at);
+            """
+        )
+        # steps holds the live activity feed (progress.py); user_message_id is
+        # the turn this task answers (_already_answered). Databases created
+        # before either column existed get them from migrations 3 and 6
+        # (app/migrations.py). idx_chat_tasks_status serves the orphan sweep
+        # (_fail_orphan_tasks), which runs on every reclaim pass and looks up
+        # old rows still marked 'running'; it needs no migration because
+        # CREATE INDEX IF NOT EXISTS runs here on every boot, new database or
+        # old — only the schema a CREATE TABLE owns has to be migrated.
+        c.commit()
 
 
 class Ask(BaseModel):
@@ -140,10 +148,9 @@ def remove(cid: str, user=Depends(current_user)):
     # Deleting destroys it for everyone it is shared with — owner only.
     _own_or_404(cid, user, need="owner")
     db.delete_conversation(cid)
-    c = db._conn()   # drop this chat's background-task rows too (no orphans)
-    c.execute("DELETE FROM chat_tasks WHERE conversation_id=?", (cid,))
-    c.commit()
-    c.close()
+    with db.connect() as c:   # drop this chat's background-task rows too (no orphans)
+        c.execute("DELETE FROM chat_tasks WHERE conversation_id=?", (cid,))
+        c.commit()
     return {"deleted": True}
 
 
@@ -173,9 +180,8 @@ class MoveIn(BaseModel):
 
 
 def _folder_or_404(fid, user):
-    c = db._conn()
-    r = c.execute("SELECT * FROM conversation_folders WHERE id=?", (fid,)).fetchone()
-    c.close()
+    with db.connect() as c:
+        r = c.execute("SELECT * FROM conversation_folders WHERE id=?", (fid,)).fetchone()
     if r is None or dict(r)["user_id"] != user["id"]:
         raise HTTPException(404, "Folder not found")   # 404, not 403 — no oracle
     return dict(r)
@@ -184,10 +190,9 @@ def _folder_or_404(fid, user):
 def _reject_duplicate_folder(name, user, ignore_id=None):
     """Two same-named folders would be indistinguishable in the sidebar and in
     the Move-to menu, so names are unique per user (case-insensitive)."""
-    c = db._conn()
-    rows = c.execute("SELECT id, name FROM conversation_folders WHERE user_id=?",
-                     (user["id"],)).fetchall()
-    c.close()
+    with db.connect() as c:
+        rows = c.execute("SELECT id, name FROM conversation_folders WHERE user_id=?",
+                         (user["id"],)).fetchall()
     for r in rows:
         d = dict(r)
         if d["id"] != ignore_id and d["name"].strip().lower() == name.lower():
@@ -196,10 +201,9 @@ def _reject_duplicate_folder(name, user, ignore_id=None):
 
 @router.get("/folders")
 def folders(user=Depends(current_user)):
-    c = db._conn()
-    rows = c.execute("SELECT id, name, created_at FROM conversation_folders "
-                     "WHERE user_id=? ORDER BY name", (user["id"],)).fetchall()
-    c.close()
+    with db.connect() as c:
+        rows = c.execute("SELECT id, name, created_at FROM conversation_folders "
+                         "WHERE user_id=? ORDER BY name", (user["id"],)).fetchall()
     return {"folders": [dict(r) for r in rows]}
 
 
@@ -210,11 +214,10 @@ def create_folder(body: FolderIn, user=Depends(current_user)):
         raise HTTPException(400, "Folder name cannot be empty")
     _reject_duplicate_folder(name, user)
     fid = str(uuid.uuid4())
-    c = db._conn()
-    c.execute("INSERT INTO conversation_folders (id, user_id, name, created_at) "
-              "VALUES (?,?,?,?)", (fid, user["id"], name, time.time()))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("INSERT INTO conversation_folders (id, user_id, name, created_at) "
+                  "VALUES (?,?,?,?)", (fid, user["id"], name, time.time()))
+        c.commit()
     return {"id": fid, "name": name}
 
 
@@ -225,10 +228,9 @@ def rename_folder(fid: str, body: FolderIn, user=Depends(current_user)):
     if not name:
         raise HTTPException(400, "Folder name cannot be empty")
     _reject_duplicate_folder(name, user, ignore_id=fid)
-    c = db._conn()
-    c.execute("UPDATE conversation_folders SET name=? WHERE id=?", (name, fid))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("UPDATE conversation_folders SET name=? WHERE id=?", (name, fid))
+        c.commit()
     return {"id": fid, "name": name}
 
 
@@ -236,12 +238,11 @@ def rename_folder(fid: str, body: FolderIn, user=Depends(current_user)):
 def delete_folder(fid: str, user=Depends(current_user)):
     """Delete a folder. Its chats are unfiled back to the root, never deleted."""
     _folder_or_404(fid, user)
-    c = db._conn()
-    c.execute("UPDATE conversations SET folder_id=NULL WHERE folder_id=? AND user_id=?",
-              (fid, user["id"]))
-    c.execute("DELETE FROM conversation_folders WHERE id=?", (fid,))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("UPDATE conversations SET folder_id=NULL WHERE folder_id=? AND user_id=?",
+                  (fid, user["id"]))
+        c.execute("DELETE FROM conversation_folders WHERE id=?", (fid,))
+        c.commit()
     return {"deleted": True}
 
 
@@ -253,10 +254,9 @@ def move_conversation(cid: str, body: MoveIn, user=Depends(current_user)):
     _own_or_404(cid, user, need="owner")
     if body.folder_id is not None:
         _folder_or_404(body.folder_id, user)   # must be the caller's folder
-    c = db._conn()
-    c.execute("UPDATE conversations SET folder_id=? WHERE id=?", (body.folder_id, cid))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("UPDATE conversations SET folder_id=? WHERE id=?", (body.folder_id, cid))
+        c.commit()
     return {"id": cid, "folder_id": body.folder_id}
 
 
@@ -430,10 +430,32 @@ def _answer(ctx, result):
     """Append the turn's assistant message. A BACKGROUND turn stamps the id of
     the user message it answers (ctx["reply_to"]) so a retry can recognise its
     own answer among several concurrent turns' — see _already_answered. A
-    synchronous turn has no task and stamps nothing."""
-    if ctx.get("reply_to"):
-        result["reply_to"] = ctx["reply_to"]
-    return db.add_message(ctx["cid"], "assistant", result)
+    synchronous turn has no task and stamps nothing.
+
+    This is the last safe point before a turn becomes visible, so it is where
+    the two defences against a DOUBLE answer sit. Two attempts of the same
+    chat_turn job really can be running at once: reclaim_stale() gives the job
+    to a second worker when the first stops heartbeating, and the first may
+    merely have been slow.
+
+      1. COOPERATIVE — jobs.check_claim() raises ClaimLost if this thread's
+         claim is already gone, so we abandon before writing anything. It is
+         only a courtesy: nothing can preempt a thread that does not check.
+      2. ABSOLUTE — reply_to is a column with a UNIQUE index, so if the other
+         attempt got there first the INSERT is refused, add_message returns
+         None, and we discard our answer. This is the guarantee; (1) only
+         saves the wasted work.
+    """
+    reply_to = ctx.get("reply_to")
+    if not reply_to:
+        return db.add_message(ctx["cid"], "assistant", result)
+    result["reply_to"] = reply_to
+    jobs.check_claim()
+    mid = db.add_message(ctx["cid"], "assistant", result, reply_to=reply_to)
+    if mid is None:
+        raise jobs.ClaimLost(
+            f"user turn {reply_to} was answered by another attempt while this one ran")
+    return mid
 
 
 def _clarify_turn(ctx, user, clash, t0):
@@ -625,25 +647,103 @@ def ask_background(body: Ask, user=Depends(current_user)):
     cid, mid = _record_user_turn(body, user, scope=scope)
     tid = str(uuid.uuid4())
     now = time.time()
-    c = db._conn()
-    c.execute("INSERT INTO chat_tasks (id, conversation_id, user_id, prompt, status, "
-              "seen, user_message_id, created_at) VALUES (?,?,?,?,?,?,?,?)",
-              (tid, cid, user["id"], scope["prompt"][:500], "running", 0, mid, now))
-    c.commit()
-    c.close()
-    jobs.enqueue("chat_turn", {"body": body.model_dump(), "cid": cid, "tid": tid,
-                               "user_id": user["id"]},
-                 user_id=user["id"], max_attempts=2)
+    # The task row and its queue job go in ONE transaction, on one connection.
+    # They used to be two commits, and a failure between them (the enqueue
+    # raising, the process dying) left chat_tasks.status='running' with no job
+    # behind it: nothing would ever run that turn and nothing would ever fail
+    # it, so the UI spun on it forever. Both tables live in this database, so
+    # atomicity needs no outbox — either the user gets a task a worker will
+    # pick up, or the POST fails and there is no task at all.
+    #
+    # The user message above is deliberately NOT in this transaction: it is
+    # written by db.add_message on its own connection, and an orphan there is
+    # harmless — an unanswered question the user can simply ask again, not a
+    # row that pretends work is in flight.
+    with db.connect() as c:
+        c.execute("INSERT INTO chat_tasks (id, conversation_id, user_id, prompt, status, "
+                  "seen, user_message_id, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                  (tid, cid, user["id"], scope["prompt"][:500], "running", 0, mid, now))
+        # conn=c enlists the job row in the transaction above and leaves the
+        # commit to us. The id is derived from the task id, so the job and the
+        # task it drives can be joined (see _fail_orphan_tasks) and a repeated
+        # enqueue for one task can never queue the turn twice.
+        jobs.enqueue("chat_turn", {"body": body.model_dump(), "cid": cid, "tid": tid,
+                                   "user_id": user["id"]},
+                     user_id=user["id"], max_attempts=2, job_id=_task_job_id(tid), conn=c)
+        c.commit()
     return {"conversation_id": cid, "task_id": tid, "status": "running"}
+
+
+# A chat task and the job that runs it share an id, so either can be found
+# from the other with no extra column and no scan of the payload JSON.
+_JOB_ID_PREFIX = "chat_turn:"
+
+
+def _task_job_id(tid):
+    return _JOB_ID_PREFIX + tid
+
+
+def _orphan_task_after_s():
+    """How long a task may sit 'running' with no live job before the reclaim
+    pass gives up on it.
+
+    It must comfortably exceed the longest legitimate gap between a task
+    starting and its job existing in a live state, and the queue's own stale
+    window bounds that: a claimed job whose worker died is only re-queued
+    after STUDIO_JOB_STALE_S, and it may burn several attempts doing so. Three
+    stale windows (15 minutes by default) is generous on purpose — the cost of
+    waiting is a spinner, the cost of being early is failing a turn that was
+    about to answer."""
+    override = os.getenv("STUDIO_CHAT_TASK_ORPHAN_S")
+    if override:
+        return float(override)
+    return max(3 * jobs.stale_after_s(), 900.0)
+
+
+@jobs.reconciler
+def _fail_orphan_tasks():
+    """Fail every chat task left 'running' with no job behind it.
+
+    Enqueue is atomic now, so no NEW orphan can be created; this heals the
+    ones an older build already left in the database, and any future way a job
+    row can vanish from under a task (an operator clearing the queue, a job
+    finishing without writing the answer because its claim was reclaimed and
+    the winner then died). Registered as a jobs reconciler, so it runs on the
+    worker's existing reclaim pass rather than on a timer of its own.
+
+    Returns the number of tasks failed."""
+    cutoff = time.time() - _orphan_task_after_s()
+    failed = 0
+    with db.connect() as c:
+        # A task is an orphan when its job is missing, or finished while the
+        # task never left 'running'. '||' is the SQL-standard concatenation
+        # both SQLite and Postgres speak.
+        rows = c.execute(
+            "SELECT t.id FROM chat_tasks t "
+            f"LEFT JOIN background_jobs j ON j.id = '{_JOB_ID_PREFIX}' || t.id "
+            "WHERE t.status='running' AND t.created_at < ? "
+            "AND (j.id IS NULL OR j.status IN ('done','failed'))",
+            (cutoff,)).fetchall()
+        for r in rows:
+            c.execute(
+                "UPDATE chat_tasks SET status='failed', error=?, finished_at=? "
+                "WHERE id=? AND status='running'",
+                ("this turn was lost: no background job is running it any more",
+                 time.time(), r["id"]))
+            failed += 1
+        c.commit()
+    if failed:
+        log.warning("chat: failed %s orphaned background task(s) with no job behind them",
+                    failed)
+    return failed
 
 
 def _task_turn(tid):
     """(created_at, user_message_id) for a task, or None. user_message_id is
     NULL only for a task recorded before the column existed (migration 6)."""
-    c = db._conn()
-    r = c.execute("SELECT created_at, user_message_id FROM chat_tasks WHERE id=?",
-                  (tid,)).fetchone()
-    c.close()
+    with db.connect() as c:
+        r = c.execute("SELECT created_at, user_message_id FROM chat_tasks WHERE id=?",
+                      (tid,)).fetchone()
     return (float(r["created_at"]), r["user_message_id"]) if r else None
 
 
@@ -671,28 +771,26 @@ def _already_answered(cid, tid):
     if mid:
         return any(m["role"] == "assistant" and (m.get("content") or {}).get("reply_to") == mid
                    for m in db.list_messages(cid))
-    c = db._conn()
-    # The user message was written just before the task row, in the same
-    # request; the newest user message at or before that moment is this turn's.
-    user_turn = c.execute(
-        "SELECT created_at FROM messages WHERE conversation_id=? AND role='user' "
-        "AND created_at <= ? ORDER BY created_at DESC LIMIT 1",
-        (cid, created_at + 1.0)).fetchone()
-    since = float(user_turn["created_at"]) if user_turn else created_at
-    answered = c.execute(
-        "SELECT 1 FROM messages WHERE conversation_id=? AND role='assistant' "
-        "AND created_at > ? LIMIT 1", (cid, since)).fetchone()
-    c.close()
+    with db.connect() as c:
+        # The user message was written just before the task row, in the same
+        # request; the newest user message at or before that moment is this turn's.
+        user_turn = c.execute(
+            "SELECT created_at FROM messages WHERE conversation_id=? AND role='user' "
+            "AND created_at <= ? ORDER BY created_at DESC LIMIT 1",
+            (cid, created_at + 1.0)).fetchone()
+        since = float(user_turn["created_at"]) if user_turn else created_at
+        answered = c.execute(
+            "SELECT 1 FROM messages WHERE conversation_id=? AND role='assistant' "
+            "AND created_at > ? LIMIT 1", (cid, since)).fetchone()
     return answered is not None
 
 
 def _finish_task(tid, status, error=None):
     try:
-        c = db._conn()
-        c.execute("UPDATE chat_tasks SET status=?, error=?, finished_at=? WHERE id=?",
-                  (status, error, time.time(), tid))
-        c.commit()
-        c.close()
+        with db.connect() as c:
+            c.execute("UPDATE chat_tasks SET status=?, error=?, finished_at=? WHERE id=?",
+                      (status, error, time.time(), tid))
+            c.commit()
     except Exception:
         pass
 
@@ -705,7 +803,12 @@ def _chat_turn_job(payload, job):
     An exception always propagates so the queue records it: with attempts
     left the job is retried and the task stays 'running'; on the last attempt
     the task is marked failed first (exactly as the old thread pool did) and
-    the job fails alongside it, so both rows carry the error."""
+    the job fails alongside it, so both rows carry the error.
+
+    jobs.ClaimLost is the exception to that: it means reclaim_stale() gave
+    this job to another worker while we ran, so the attempt executing NOW owns
+    the task row. We touch nothing — not the task, not the queue — and let
+    jobs._execute abandon us silently."""
     tid, cid = payload["tid"], payload["cid"]
     user = db.get_user(payload["user_id"])
     if user is None:
@@ -723,7 +826,19 @@ def _chat_turn_job(payload, job):
         # Stamp the answer with the user message this task answers, so the
         # guard above recognises it on a retry (and never another turn's).
         ctx["reply_to"] = turn[1] if turn else None
+        # First safe point: the expensive part has not started yet. _answer()
+        # checks again immediately before it writes, which is the one that
+        # actually has to hold.
+        jobs.check_claim()
         _run_turn(ctx, user)
+    except jobs.ClaimLost:
+        # Another worker owns this job — and therefore this task — now. Leave
+        # chat_tasks exactly as it is: the owner will finish it, and marking
+        # it failed here would overwrite an answer that is on its way.
+        progress.emit("this attempt lost its claim and was abandoned")
+        log.warning("chat: task %s abandoned by a reclaimed attempt; the current "
+                    "owner of job %s finishes it", tid, job.get("id"))
+        raise
     except Exception as e:
         if last_attempt:
             _finish_task(tid, "failed", str(e)[:500])
@@ -738,10 +853,9 @@ def _chat_turn_job(payload, job):
 
 @router.get("/tasks/{tid}")
 def task_status(tid: str, user=Depends(current_user)):
-    c = db._conn()
-    r = c.execute("SELECT id, conversation_id, user_id, status, error, steps "
-                  "FROM chat_tasks WHERE id=?", (tid,)).fetchone()
-    c.close()
+    with db.connect() as c:
+        r = c.execute("SELECT id, conversation_id, user_id, status, error, steps "
+                      "FROM chat_tasks WHERE id=?", (tid,)).fetchone()
     if r is None or dict(r)["user_id"] != user["id"]:
         raise HTTPException(404, "Task not found")
     d = dict(r)
@@ -759,20 +873,18 @@ def latest_task(cid: str, user=Depends(current_user)):
     """The most recent background task for a conversation — so reopening a chat
     whose task is still running resumes the live 'working…' state."""
     _own_or_404(cid, user)
-    c = db._conn()
-    r = c.execute("SELECT id, status, error FROM chat_tasks WHERE conversation_id=? AND user_id=? "
-                  "ORDER BY created_at DESC LIMIT 1", (cid, user["id"])).fetchone()
-    c.close()
+    with db.connect() as c:
+        r = c.execute("SELECT id, status, error FROM chat_tasks WHERE conversation_id=? AND user_id=? "
+                      "ORDER BY created_at DESC LIMIT 1", (cid, user["id"])).fetchone()
     return dict(r) if r else {"status": "none"}
 
 
 def _task_states(user_id):
     """Per-conversation task counts for the sidebar: how many are still running,
     and how many finished but haven't been seen (the blue dot)."""
-    c = db._conn()
-    rows = c.execute("SELECT conversation_id, status, seen FROM chat_tasks WHERE user_id=?",
-                     (user_id,)).fetchall()
-    c.close()
+    with db.connect() as c:
+        rows = c.execute("SELECT conversation_id, status, seen FROM chat_tasks WHERE user_id=?",
+                         (user_id,)).fetchall()
     out = {}
     for r in rows:
         d = out.setdefault(r["conversation_id"], {"running": 0, "unseen": 0})
@@ -784,11 +896,10 @@ def _task_states(user_id):
 
 
 def _mark_seen(cid, user_id):
-    c = db._conn()
-    c.execute("UPDATE chat_tasks SET seen=1 WHERE conversation_id=? AND user_id=? AND status!='running'",
-              (cid, user_id))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("UPDATE chat_tasks SET seen=1 WHERE conversation_id=? AND user_id=? AND status!='running'",
+                  (cid, user_id))
+        c.commit()
 
 
 class Rerun(BaseModel):
@@ -1023,15 +1134,14 @@ def skills_catalog(user=Depends(current_user)):
 
 
 def _training_stats():
-    c = db._conn()
-    n = lambda q: c.execute(q).fetchone()["n"]
-    stats = {
-        "total_rollouts": n("SELECT COUNT(*) n FROM agent_traces"),
-        "usable": n("SELECT COUNT(*) n FROM agent_traces WHERE reward IS NOT NULL"),
-        "distinct_prompts": n("SELECT COUNT(DISTINCT prompt) n FROM agent_traces WHERE prompt IS NOT NULL"),
-        "human_labeled": n("SELECT COUNT(*) n FROM agent_traces WHERE reward_source='user'"),
-    }
-    c.close()
+    with db.connect() as c:
+        n = lambda q: c.execute(q).fetchone()["n"]
+        stats = {
+            "total_rollouts": n("SELECT COUNT(*) n FROM agent_traces"),
+            "usable": n("SELECT COUNT(*) n FROM agent_traces WHERE reward IS NOT NULL"),
+            "distinct_prompts": n("SELECT COUNT(DISTINCT prompt) n FROM agent_traces WHERE prompt IS NOT NULL"),
+            "human_labeled": n("SELECT COUNT(*) n FROM agent_traces WHERE reward_source='user'"),
+        }
     return stats
 
 
@@ -1359,39 +1469,38 @@ def purge_message_rows(max_age_days=None, batch=500):
     cutoff = time.time() - days * 86400
     purged, last_id = 0, ""
     try:
-        c = db._conn()
-        while True:
-            rows = c.execute(
-                "SELECT id, content FROM messages WHERE role='assistant' AND created_at < ? "
-                "AND id > ? AND content NOT LIKE ? ORDER BY id LIMIT ?",
-                (cutoff, last_id, "%" + _PURGED_MARK + "%", batch)).fetchall()
-            if not rows:
-                break
-            for r in rows:
-                last_id = r["id"]
-                try:
-                    content = json.loads(r["content"])
-                except Exception:
-                    continue
-                if not isinstance(content, dict):
-                    continue
-                panels = content.get("panels")
-                has_rows = bool(content.get("rows")) or any(
-                    isinstance(p, dict) and p.get("rows") for p in (panels or []))
-                if not has_rows:
-                    continue
-                content["rows"] = []
-                if isinstance(panels, list):
-                    content["panels"] = [
-                        {**p, "rows": []} if isinstance(p, dict) else p for p in panels]
-                content["rows_purged"] = True
-                c.execute("UPDATE messages SET content=? WHERE id=?",
-                          (json.dumps(content), r["id"]))
-                purged += 1
-            c.commit()
-            if len(rows) < batch:
-                break
-        c.close()
+        with db.connect() as c:
+            while True:
+                rows = c.execute(
+                    "SELECT id, content FROM messages WHERE role='assistant' AND created_at < ? "
+                    "AND id > ? AND content NOT LIKE ? ORDER BY id LIMIT ?",
+                    (cutoff, last_id, "%" + _PURGED_MARK + "%", batch)).fetchall()
+                if not rows:
+                    break
+                for r in rows:
+                    last_id = r["id"]
+                    try:
+                        content = json.loads(r["content"])
+                    except Exception:
+                        continue
+                    if not isinstance(content, dict):
+                        continue
+                    panels = content.get("panels")
+                    has_rows = bool(content.get("rows")) or any(
+                        isinstance(p, dict) and p.get("rows") for p in (panels or []))
+                    if not has_rows:
+                        continue
+                    content["rows"] = []
+                    if isinstance(panels, list):
+                        content["panels"] = [
+                            {**p, "rows": []} if isinstance(p, dict) else p for p in panels]
+                    content["rows_purged"] = True
+                    c.execute("UPDATE messages SET content=? WHERE id=?",
+                              (json.dumps(content), r["id"]))
+                    purged += 1
+                c.commit()
+                if len(rows) < batch:
+                    break
     except Exception:
         pass
     return purged

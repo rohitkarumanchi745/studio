@@ -41,29 +41,28 @@ router = APIRouter(prefix="/settings/mcp", tags=["mcp"])
 
 
 def init_tables():
-    c = db._conn()
-    c.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS mcp_servers (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            transport TEXT NOT NULL,
-            url TEXT,
-            command TEXT,
-            args TEXT,
-            enabled INTEGER NOT NULL DEFAULT 1,
-            owner_id TEXT,
-            created_at REAL NOT NULL
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_mcp_name ON mcp_servers(name);
-        """
-    )
-    # owner_id scopes a server to its owner: NULL = an admin-registered GLOBAL
-    # server (loads into every agent); set = a toolbuilder-built tool (loads
-    # ONLY for its owner). Databases created before the column existed get it
-    # from migration 4 (app/migrations.py).
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS mcp_servers (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                transport TEXT NOT NULL,
+                url TEXT,
+                command TEXT,
+                args TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                owner_id TEXT,
+                created_at REAL NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_mcp_name ON mcp_servers(name);
+            """
+        )
+        # owner_id scopes a server to its owner: NULL = an admin-registered GLOBAL
+        # server (loads into every agent); set = a toolbuilder-built tool (loads
+        # ONLY for its owner). Databases created before the column existed get it
+        # from migration 4 (app/migrations.py).
+        c.commit()
 
 
 def registered(user=None):
@@ -72,11 +71,10 @@ def registered(user=None):
     user's own built tools (owner_id = user id). With no user, only globals —
     the safe default, so a built tool never leaks into another user's agent."""
     uid = (user or {}).get("id")
-    c = db._conn()
-    rows = c.execute(
-        "SELECT * FROM mcp_servers WHERE enabled=1 "
-        "AND (owner_id IS NULL OR owner_id = ?)", (uid,)).fetchall()
-    c.close()
+    with db.connect() as c:
+        rows = c.execute(
+            "SELECT * FROM mcp_servers WHERE enabled=1 "
+            "AND (owner_id IS NULL OR owner_id = ?)", (uid,)).fetchall()
     out = {}
     for r in rows:
         d = dict(r)
@@ -148,30 +146,27 @@ def register_stdio(name, command, args, owner_id=None):
         raise ValueError("the tool builder is disabled (STUDIO_TOOLBUILDER)")
     if not command or not isinstance(args, list):
         raise ValueError("stdio server needs a command and an args list")
-    c = db._conn()
-    c.execute("DELETE FROM mcp_servers WHERE name=?", (name,))
-    c.execute(
-        "INSERT INTO mcp_servers (id, name, transport, url, command, args, enabled, owner_id, created_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?)",
-        (str(uuid.uuid4()), name, "stdio", None, command,
-         json.dumps(args), 1, owner_id, time.time()),
-    )
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("DELETE FROM mcp_servers WHERE name=?", (name,))
+        c.execute(
+            "INSERT INTO mcp_servers (id, name, transport, url, command, args, enabled, owner_id, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (str(uuid.uuid4()), name, "stdio", None, command,
+             json.dumps(args), 1, owner_id, time.time()),
+        )
+        c.commit()
 
 
 def unregister(name):
     """Remove a registered server by name (used when a built tool is deleted)."""
-    c = db._conn()
-    c.execute("DELETE FROM mcp_servers WHERE name=?", (name,))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("DELETE FROM mcp_servers WHERE name=?", (name,))
+        c.commit()
 
 
 def _list(user):
-    c = db._conn()
-    rows = c.execute("SELECT * FROM mcp_servers ORDER BY created_at").fetchall()
-    c.close()
+    with db.connect() as c:
+        rows = c.execute("SELECT * FROM mcp_servers ORDER BY created_at").fetchall()
     out = []
     for r in rows:
         d = dict(r)
@@ -215,16 +210,15 @@ def add_server(body: ServerIn, user=Depends(current_user)):
         raise HTTPException(400, "stdio transport needs a command")
     if body.transport in ("streamable_http", "sse") and not body.url:
         raise HTTPException(400, "http/sse transport needs a url")
-    c = db._conn()
-    c.execute("DELETE FROM mcp_servers WHERE name=?", (name,))
-    c.execute(
-        "INSERT INTO mcp_servers (id, name, transport, url, command, args, enabled, created_at) "
-        "VALUES (?,?,?,?,?,?,?,?)",
-        (str(uuid.uuid4()), name, body.transport, body.url, body.command,
-         json.dumps(body.args or []), 1 if body.enabled else 0, time.time()),
-    )
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("DELETE FROM mcp_servers WHERE name=?", (name,))
+        c.execute(
+            "INSERT INTO mcp_servers (id, name, transport, url, command, args, enabled, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (str(uuid.uuid4()), name, body.transport, body.url, body.command,
+             json.dumps(body.args or []), 1 if body.enabled else 0, time.time()),
+        )
+        c.commit()
     db.log_activity(user, "mcp_register", prompt=name)
     return {"servers": _list(user)}
 
@@ -232,10 +226,9 @@ def add_server(body: ServerIn, user=Depends(current_user)):
 @router.delete("/{name}")
 def remove_server(name: str, user=Depends(current_user)):
     _admin(user)
-    c = db._conn()
-    c.execute("DELETE FROM mcp_servers WHERE name=?", (name,))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("DELETE FROM mcp_servers WHERE name=?", (name,))
+        c.commit()
     return {"servers": _list(user)}
 
 

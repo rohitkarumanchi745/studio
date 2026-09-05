@@ -86,35 +86,34 @@ _SOURCE_TYPES = ("xlsx", "csv", "pdf", "eml")
 # ── Store ────────────────────────────────────────────────────────────────
 
 def init_tables():
-    c = db._conn()
-    c.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS kag_collections (
-            id TEXT PRIMARY KEY,
-            name TEXT UNIQUE NOT NULL,
-            access_scope TEXT NOT NULL,
-            description TEXT,
-            created_by TEXT NOT NULL,
-            created_at REAL NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS kag_chunks (
-            id TEXT PRIMARY KEY,
-            collection TEXT NOT NULL,
-            source_type TEXT NOT NULL,
-            source_name TEXT NOT NULL,
-            chunk_text TEXT NOT NULL,
-            embedding TEXT,
-            metadata TEXT NOT NULL,
-            access_scope TEXT NOT NULL,
-            content_hash TEXT NOT NULL,
-            created_at REAL NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_kag_coll ON kag_chunks(collection);
-        CREATE INDEX IF NOT EXISTS idx_kag_hash ON kag_chunks(content_hash);
-        """
-    )
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS kag_collections (
+                id TEXT PRIMARY KEY,
+                name TEXT UNIQUE NOT NULL,
+                access_scope TEXT NOT NULL,
+                description TEXT,
+                created_by TEXT NOT NULL,
+                created_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS kag_chunks (
+                id TEXT PRIMARY KEY,
+                collection TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                source_name TEXT NOT NULL,
+                chunk_text TEXT NOT NULL,
+                embedding TEXT,
+                metadata TEXT NOT NULL,
+                access_scope TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                created_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_kag_coll ON kag_chunks(collection);
+            CREATE INDEX IF NOT EXISTS idx_kag_hash ON kag_chunks(content_hash);
+            """
+        )
+        c.commit()
     # Teach kag about the Word/.docx and PowerPoint/.pptx parsers the M365/Graph
     # connector adds. Idempotent, lazy, and dormancy-safe: a missing optional
     # wheel (python-docx / python-pptx) surfaces only if such a file is actually
@@ -130,12 +129,11 @@ def delete_source(collection, source_name):
     """Remove every chunk of one source from a collection — the wholesale DELETE
     keyed on (collection, source_name) that re-ingest already uses, exposed so a
     tombstoned Graph item's chunks are dropped on delta. Returns the row count."""
-    c = db._conn()
-    cur = c.execute("DELETE FROM kag_chunks WHERE collection=? AND source_name=?",
-                    (collection, source_name))
-    n = getattr(cur, "rowcount", 0) or 0
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        cur = c.execute("DELETE FROM kag_chunks WHERE collection=? AND source_name=?",
+                        (collection, source_name))
+        n = getattr(cur, "rowcount", 0) or 0
+        c.commit()
     return n
 
 
@@ -144,9 +142,8 @@ def _valid_name(name):
 
 
 def _collection(name):
-    c = db._conn()
-    r = c.execute("SELECT * FROM kag_collections WHERE name=?", (name,)).fetchone()
-    c.close()
+    with db.connect() as c:
+        r = c.execute("SELECT * FROM kag_collections WHERE name=?", (name,)).fetchone()
     return dict(r) if r else None
 
 
@@ -188,12 +185,11 @@ def reachable_collections(role, user_id=None):
     if not rbac.kag_scopes_for(role, user_id):
         return []
     pred, sp = _scope_sql(role, user_id)           # admin excludes others' private 'u:' scopes
-    c = db._conn()
-    rows = c.execute(
-        f"SELECT * FROM kag_collections WHERE {pred} "
-        f"AND name IN (SELECT DISTINCT collection FROM kag_chunks) ORDER BY name",
-        tuple(sp)).fetchall()
-    c.close()
+    with db.connect() as c:
+        rows = c.execute(
+            f"SELECT * FROM kag_collections WHERE {pred} "
+            f"AND name IN (SELECT DISTINCT collection FROM kag_chunks) ORDER BY name",
+            tuple(sp)).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -443,16 +439,15 @@ def ingest_bytes(user, collection, name, data, access_scope=None):
                      json.dumps(vec) if vec else None, json.dumps(meta, default=str),
                      scope, h, now))
 
-    c = db._conn()
-    c.execute("DELETE FROM kag_chunks WHERE collection=? AND source_name=?",
-              (collection, name))
-    for r in rows:
-        c.execute(
-            "INSERT INTO kag_chunks (id, collection, source_type, source_name, "
-            "chunk_text, embedding, metadata, access_scope, content_hash, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)", r)
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("DELETE FROM kag_chunks WHERE collection=? AND source_name=?",
+                  (collection, name))
+        for r in rows:
+            c.execute(
+                "INSERT INTO kag_chunks (id, collection, source_type, source_name, "
+                "chunk_text, embedding, metadata, access_scope, content_hash, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)", r)
+        c.commit()
     db.log_activity(user, "kag_ingest", prompt=name, source=collection,
                     row_count=len(rows))
     return {"collection": collection, "source_name": name, "chunks": len(rows),
@@ -463,12 +458,11 @@ def _create_collection(name, scope, description, user):
     row = {"id": str(uuid.uuid4()), "name": name, "access_scope": scope,
            "description": description, "created_by": user["id"],
            "created_at": time.time()}
-    c = db._conn()
-    c.execute("INSERT INTO kag_collections (id, name, access_scope, description, "
-              "created_by, created_at) VALUES (?,?,?,?,?,?)",
-              (row["id"], name, scope, description, user["id"], row["created_at"]))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("INSERT INTO kag_collections (id, name, access_scope, description, "
+                  "created_by, created_at) VALUES (?,?,?,?,?,?)",
+                  (row["id"], name, scope, description, user["id"], row["created_at"]))
+        c.commit()
     return row
 
 
@@ -520,9 +514,8 @@ def search(query, role, k=None, collection=None, user_id=None):
         params.append(collection)
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
 
-    c = db._conn()
-    rows = c.execute(f"SELECT * FROM kag_chunks{where}", tuple(params)).fetchall()
-    c.close()
+    with db.connect() as c:
+        rows = c.execute(f"SELECT * FROM kag_chunks{where}", tuple(params)).fetchall()
 
     qvec = embed.embed(query, kind="query")
     scored = []
@@ -673,16 +666,15 @@ def _read_uri(uri, user):
 def list_collections(user=Depends(current_user)):
     """Collections this role may reach, with doc/chunk counts. RBAC-filtered."""
     colls = reachable_collections(user["role"])
-    c = db._conn()
-    out = []
-    for coll in colls:
-        stats = c.execute(
-            "SELECT COUNT(*) n, COUNT(DISTINCT source_name) d FROM kag_chunks "
-            "WHERE collection=?", (coll["name"],)).fetchone()
-        out.append({"name": coll["name"], "access_scope": coll["access_scope"],
-                    "description": coll["description"],
-                    "doc_count": stats["d"], "chunk_count": stats["n"]})
-    c.close()
+    with db.connect() as c:
+        out = []
+        for coll in colls:
+            stats = c.execute(
+                "SELECT COUNT(*) n, COUNT(DISTINCT source_name) d FROM kag_chunks "
+                "WHERE collection=?", (coll["name"],)).fetchone()
+            out.append({"name": coll["name"], "access_scope": coll["access_scope"],
+                        "description": coll["description"],
+                        "doc_count": stats["d"], "chunk_count": stats["n"]})
     return {"collections": out, "role": user["role"]}
 
 
@@ -704,12 +696,11 @@ def create_collection(body: CollectionIn, user=Depends(current_user)):
 @router.get("/collections/{name}/docs")
 def list_docs(name: str, user=Depends(current_user)):
     _reach_or_404(name, user)
-    c = db._conn()
-    rows = c.execute(
-        "SELECT source_name, source_type, COUNT(*) chunks, MIN(metadata) meta, "
-        "MAX(created_at) created_at FROM kag_chunks WHERE collection=? "
-        "GROUP BY source_name, source_type ORDER BY source_name", (name,)).fetchall()
-    c.close()
+    with db.connect() as c:
+        rows = c.execute(
+            "SELECT source_name, source_type, COUNT(*) chunks, MIN(metadata) meta, "
+            "MAX(created_at) created_at FROM kag_chunks WHERE collection=? "
+            "GROUP BY source_name, source_type ORDER BY source_name", (name,)).fetchall()
     docs = []
     for r in rows:
         try:
@@ -740,12 +731,11 @@ def delete_doc(name: str, source_name: str, user=Depends(current_user)):
     # Deleting content requires admin, or a role that can ingest into the scope.
     if user["role"] != "admin" and not _reachable(coll["access_scope"], user["role"]):
         raise HTTPException(403, "not permitted")
-    c = db._conn()
-    cur = c.execute("DELETE FROM kag_chunks WHERE collection=? AND source_name=?",
-                    (name, _basename(source_name)))
-    n = cur.rowcount if cur.rowcount is not None else 0
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        cur = c.execute("DELETE FROM kag_chunks WHERE collection=? AND source_name=?",
+                        (name, _basename(source_name)))
+        n = cur.rowcount if cur.rowcount is not None else 0
+        c.commit()
     return {"deleted": n}
 
 
@@ -754,11 +744,10 @@ def delete_collection(name: str, user=Depends(current_user)):
     _admin(user)
     if not _collection(name):
         raise HTTPException(404, "Not found")
-    c = db._conn()
-    cur = c.execute("DELETE FROM kag_chunks WHERE collection=?", (name,))
-    n = cur.rowcount if cur.rowcount is not None else 0
-    c.execute("DELETE FROM kag_collections WHERE name=?", (name,))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        cur = c.execute("DELETE FROM kag_chunks WHERE collection=?", (name,))
+        n = cur.rowcount if cur.rowcount is not None else 0
+        c.execute("DELETE FROM kag_collections WHERE name=?", (name,))
+        c.commit()
     db.log_activity(user, "kag_collection_delete", prompt=name)
     return {"deleted": n}

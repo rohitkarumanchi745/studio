@@ -48,34 +48,33 @@ _STOP = {"the", "a", "an", "of", "for", "and", "to", "in", "on", "by", "with",
 
 
 def init_tables():
-    c = db._conn()
-    c.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS query_cache (
-            id TEXT PRIMARY KEY,
-            role TEXT NOT NULL,
-            source TEXT NOT NULL,
-            table_scope TEXT NOT NULL,
-            prompt TEXT NOT NULL,
-            signature TEXT NOT NULL,
-            sql TEXT NOT NULL,
-            chart TEXT,
-            text TEXT,
-            hits INTEGER NOT NULL DEFAULT 0,
-            seen INTEGER NOT NULL DEFAULT 0,
-            avg_reward REAL,
-            embedding TEXT,
-            created_at REAL NOT NULL,
-            updated_at REAL NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_qcache_scope
-            ON query_cache(role, source, table_scope);
-        """
-    )
-    # seen / avg_reward / embedding arrived with routing and embeddings; a
-    # table created before them gets them from migration 5 (app/migrations.py).
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS query_cache (
+                id TEXT PRIMARY KEY,
+                role TEXT NOT NULL,
+                source TEXT NOT NULL,
+                table_scope TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                signature TEXT NOT NULL,
+                sql TEXT NOT NULL,
+                chart TEXT,
+                text TEXT,
+                hits INTEGER NOT NULL DEFAULT 0,
+                seen INTEGER NOT NULL DEFAULT 0,
+                avg_reward REAL,
+                embedding TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_qcache_scope
+                ON query_cache(role, source, table_scope);
+            """
+        )
+        # seen / avg_reward / embedding arrived with routing and embeddings; a
+        # table created before them gets them from migration 5 (app/migrations.py).
+        c.commit()
 
 
 def _stem(t):
@@ -144,11 +143,10 @@ def lookup(user, source, table_scope, prompt):
     if not sig:
         return None
     q_vec = _query_vec(sig)
-    c = db._conn()
-    rows = c.execute(
-        "SELECT * FROM query_cache WHERE role=? AND source=? AND table_scope=?",
-        (user["role"], source, table_scope)).fetchall()
-    c.close()
+    with db.connect() as c:
+        rows = c.execute(
+            "SELECT * FROM query_cache WHERE role=? AND source=? AND table_scope=?",
+            (user["role"], source, table_scope)).fetchall()
     best, best_score = None, 0.0
     for r in rows:
         e_vec = json.loads(r["embedding"]) if r["embedding"] else None
@@ -164,11 +162,10 @@ def lookup(user, source, table_scope, prompt):
     cols, data = executed
     chart = json.loads(best["chart"]) if best["chart"] else None
     panel = {"sql": best["sql"], "columns": cols, "rows": data, "chart": chart}
-    c = db._conn()
-    c.execute("UPDATE query_cache SET hits=hits+1, updated_at=? WHERE id=?",
-              (time.time(), best["id"]))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("UPDATE query_cache SET hits=hits+1, updated_at=? WHERE id=?",
+                  (time.time(), best["id"]))
+        c.commit()
     return {
         "text": best["text"] or "Reused a cached query plan.",
         "sql": best["sql"], "columns": cols, "rows": data, "chart": chart,
@@ -184,12 +181,11 @@ def scope_stats():
     """BitNet's scope: how many use cases it covers (patterns that have crossed
     'repeated + successful'), plus how many are still being learned (handled by
     the frontier until they cross over). Centralized across roles."""
-    c = db._conn()
-    total = c.execute("SELECT COUNT(DISTINCT signature) n FROM query_cache").fetchone()["n"]
-    row = c.execute(
-        "SELECT COUNT(*) n FROM (SELECT signature FROM query_cache GROUP BY signature "
-        "HAVING SUM(seen) >= ? AND AVG(avg_reward) >= ?) sub", (MIN_SEEN, MIN_REWARD)).fetchone()
-    c.close()
+    with db.connect() as c:
+        total = c.execute("SELECT COUNT(DISTINCT signature) n FROM query_cache").fetchone()["n"]
+        row = c.execute(
+            "SELECT COUNT(*) n FROM (SELECT signature FROM query_cache GROUP BY signature "
+            "HAVING SUM(seen) >= ? AND AVG(avg_reward) >= ?) sub", (MIN_SEEN, MIN_REWARD)).fetchone()
     in_scope = row["n"]
     return {"in_scope": in_scope, "total_patterns": total, "learning": max(0, total - in_scope)}
 
@@ -212,27 +208,26 @@ def store(user, source, table_scope, prompt, result, reward=None):
     emb = _doc_vec(sig)                            # stored pattern = document side
     emb_json = json.dumps(emb) if emb else None
     now = time.time()
-    c = db._conn()
-    row = c.execute("SELECT id, seen, avg_reward, embedding FROM query_cache WHERE role=? "
-                    "AND source=? AND table_scope=? AND signature=?",
-                    (user["role"], source, table_scope, json.dumps(sig))).fetchone()
-    if row:
-        seen = (row["seen"] or 0) + 1
-        prev = row["avg_reward"] if row["avg_reward"] is not None else reward
-        avg = (prev * (seen - 1) + reward) / seen        # running average
-        c.execute("UPDATE query_cache SET sql=?, chart=?, text=?, seen=?, avg_reward=?, "
-                  "embedding=?, updated_at=? WHERE id=?",
-                  (sql, chart, text[:2000], seen, avg,
-                   emb_json or row["embedding"], now, row["id"]))
-    else:
-        c.execute(
-            "INSERT INTO query_cache (id, role, source, table_scope, prompt, signature, sql, "
-            "chart, text, hits, seen, avg_reward, embedding, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (str(uuid.uuid4()), user["role"], source, table_scope, prompt[:500],
-             json.dumps(sig), sql, chart, text[:2000], 0, 1, reward, emb_json, now, now))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        row = c.execute("SELECT id, seen, avg_reward, embedding FROM query_cache WHERE role=? "
+                        "AND source=? AND table_scope=? AND signature=?",
+                        (user["role"], source, table_scope, json.dumps(sig))).fetchone()
+        if row:
+            seen = (row["seen"] or 0) + 1
+            prev = row["avg_reward"] if row["avg_reward"] is not None else reward
+            avg = (prev * (seen - 1) + reward) / seen        # running average
+            c.execute("UPDATE query_cache SET sql=?, chart=?, text=?, seen=?, avg_reward=?, "
+                      "embedding=?, updated_at=? WHERE id=?",
+                      (sql, chart, text[:2000], seen, avg,
+                       emb_json or row["embedding"], now, row["id"]))
+        else:
+            c.execute(
+                "INSERT INTO query_cache (id, role, source, table_scope, prompt, signature, sql, "
+                "chart, text, hits, seen, avg_reward, embedding, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (str(uuid.uuid4()), user["role"], source, table_scope, prompt[:500],
+                 json.dumps(sig), sql, chart, text[:2000], 0, 1, reward, emb_json, now, now))
+        c.commit()
 
 
 def learned(source, table_scope, prompt):
@@ -246,14 +241,13 @@ def learned(source, table_scope, prompt):
     if not sig:
         return None
     q_vec = _query_vec(sig)
-    c = db._conn()
-    rows = c.execute(
-        "SELECT signature, SUM(seen) seen, AVG(avg_reward) avg_reward, MAX(sql) sql, "
-        "MAX(prompt) prompt, MAX(embedding) embedding FROM query_cache "
-        "WHERE source=? AND table_scope=? GROUP BY signature "
-        "HAVING SUM(seen) >= ? AND AVG(avg_reward) >= ?",
-        (source, table_scope, MIN_SEEN, MIN_REWARD)).fetchall()
-    c.close()
+    with db.connect() as c:
+        rows = c.execute(
+            "SELECT signature, SUM(seen) seen, AVG(avg_reward) avg_reward, MAX(sql) sql, "
+            "MAX(prompt) prompt, MAX(embedding) embedding FROM query_cache "
+            "WHERE source=? AND table_scope=? GROUP BY signature "
+            "HAVING SUM(seen) >= ? AND AVG(avg_reward) >= ?",
+            (source, table_scope, MIN_SEEN, MIN_REWARD)).fetchall()
     best, score = None, 0.0
     for r in rows:
         e_vec = json.loads(r["embedding"]) if r["embedding"] else None

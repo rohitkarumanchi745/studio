@@ -113,13 +113,22 @@ def check(user, source, sql, *, table_label="*", max_rows=None):
     dashboards and pipelines. Returns (connector, allowed_tables, cleaned_sql);
     cleaned_sql is what execute() would run.
 
-    The guard is handed the connector's own namespace (Connector.qualifiers()):
-    the allowlist is keyed on BARE table names, so without it `secret_schema.
-    sales` rode in on an entry for `sales` and reached a schema the catalog
-    never described."""
+    The guard is handed the connector's own namespace (Connector.qualifiers())
+    and its DIALECT: the allowlist is keyed on BARE table names, so without the
+    namespace `secret_schema.sales` rode in on an entry for `sales` and reached
+    a schema the catalog never described, and without the dialect a quoted
+    `"CUSTOMERS"` CTE stood in for the denied base table `customers`."""
     connector, allowed = scope(user, source, table_label=table_label)
     guard = _guard(connector)
-    cleaned = guard.validate(sql, allowed, qualifiers=connector.qualifiers())
+    kw = {"qualifiers": connector.qualifiers()}
+    if guard is queryguard:
+        # WHICH ENGINE will read this text decides what an identifier MEANS:
+        # `"CUSTOMERS"` is a different table from `customers` on Postgres and
+        # Snowflake, and the guard cannot judge a CTE or an allowlist entry
+        # without knowing that. Cypher has no such folding question, and
+        # cypherguard.validate takes no dialect, so only the SQL guard is told.
+        kw["dialect"] = getattr(connector, "dialect", None)
+    cleaned = guard.validate(sql, allowed, **kw)
     cleaned = guard.enforce_limit(cleaned, _cap(max_rows))
     return connector, allowed, cleaned
 

@@ -28,33 +28,32 @@ PREVIEW_ROWS = 20
 
 
 def init_tables():
-    c = db._conn()
-    c.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS saved_queries (
-            id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            title TEXT NOT NULL,
-            prompt TEXT NOT NULL,
-            sql TEXT NOT NULL,
-            source TEXT NOT NULL,
-            table_label TEXT,
-            columns TEXT,
-            row_count INTEGER,
-            verified INTEGER NOT NULL DEFAULT 0,
-            verified_at REAL,
-            edited INTEGER NOT NULL DEFAULT 0,
-            visibility TEXT NOT NULL DEFAULT 'private',
-            author_role TEXT,
-            created_at REAL NOT NULL,
-            updated_at REAL NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_saved_queries_user
-            ON saved_queries(user_id, updated_at DESC);
-        """
-    )
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS saved_queries (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                sql TEXT NOT NULL,
+                source TEXT NOT NULL,
+                table_label TEXT,
+                columns TEXT,
+                row_count INTEGER,
+                verified INTEGER NOT NULL DEFAULT 0,
+                verified_at REAL,
+                edited INTEGER NOT NULL DEFAULT 0,
+                visibility TEXT NOT NULL DEFAULT 'private',
+                author_role TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_saved_queries_user
+                ON saved_queries(user_id, updated_at DESC);
+            """
+        )
+        c.commit()
 
 
 # ── Verification: the gate everything passes through ────────────────────
@@ -158,9 +157,8 @@ def _row(r):
 
 
 def _own_or_404(qid, user, *, edit=False):
-    c = db._conn()
-    row = c.execute("SELECT * FROM saved_queries WHERE id=?", (qid,)).fetchone()
-    c.close()
+    with db.connect() as c:
+        row = c.execute("SELECT * FROM saved_queries WHERE id=?", (qid,)).fetchone()
     if row is None:
         raise HTTPException(404, "Query not found")
     d = _row(row)
@@ -217,17 +215,16 @@ def create(body: SaveIn, user=Depends(current_user)):
     visibility = body.visibility if body.visibility in ("private", "org") else "private"
     now = time.time()
     qid = str(uuid.uuid4())
-    c = db._conn()
-    c.execute(
-        "INSERT INTO saved_queries (id, user_id, title, prompt, sql, source, table_label, "
-        "columns, row_count, verified, verified_at, edited, visibility, author_role, "
-        "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        (qid, user["id"], title, prompt, result["sql"], body.source, body.table,
-         json.dumps(result["columns"]), result["row_count"], 1, now,
-         1 if body.edited else 0, visibility, user["role"], now, now),
-    )
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute(
+            "INSERT INTO saved_queries (id, user_id, title, prompt, sql, source, table_label, "
+            "columns, row_count, verified, verified_at, edited, visibility, author_role, "
+            "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (qid, user["id"], title, prompt, result["sql"], body.source, body.table,
+             json.dumps(result["columns"]), result["row_count"], 1, now,
+             1 if body.edited else 0, visibility, user["role"], now, now),
+        )
+        c.commit()
     db.log_activity(user, "query_save", prompt=title, source=body.source,
                     sql=result["sql"], row_count=result["row_count"])
     return get(qid, user)
@@ -236,13 +233,12 @@ def create(body: SaveIn, user=Depends(current_user)):
 @router.get("")
 def listing(user=Depends(current_user)):
     """The verified repository: this user's saved queries plus org-shared."""
-    c = db._conn()
-    rows = c.execute(
-        "SELECT * FROM saved_queries WHERE user_id=? OR visibility='org' "
-        "ORDER BY updated_at DESC",
-        (user["id"],),
-    ).fetchall()
-    c.close()
+    with db.connect() as c:
+        rows = c.execute(
+            "SELECT * FROM saved_queries WHERE user_id=? OR visibility='org' "
+            "ORDER BY updated_at DESC",
+            (user["id"],),
+        ).fetchall()
     out = []
     for r in rows:
         d = _row(r)
@@ -301,20 +297,18 @@ def update(qid: str, body: UpdateIn, user=Depends(current_user)):
         fields["updated_at"] = time.time()
         sets = ", ".join(f"{k}=?" for k in fields)
         params = list(fields.values()) + [qid]
-        c = db._conn()
-        c.execute(f"UPDATE saved_queries SET {sets} WHERE id=?", params)
-        c.commit()
-        c.close()
+        with db.connect() as c:
+            c.execute(f"UPDATE saved_queries SET {sets} WHERE id=?", params)
+            c.commit()
     return get(qid, user)
 
 
 @router.delete("/{qid}")
 def remove(qid: str, user=Depends(current_user)):
     _own_or_404(qid, user, edit=True)
-    c = db._conn()
-    c.execute("DELETE FROM saved_queries WHERE id=?", (qid,))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("DELETE FROM saved_queries WHERE id=?", (qid,))
+        c.commit()
     return {"deleted": True}
 
 

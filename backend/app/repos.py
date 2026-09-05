@@ -24,29 +24,27 @@ _settings = APIRouter(prefix="/settings/repos", tags=["repos"])
 
 
 def init_tables():
-    c = db._conn()
-    c.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS github_repos (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            url TEXT NOT NULL,
-            description TEXT,
-            default_branch TEXT DEFAULT 'main',
-            enabled INTEGER NOT NULL DEFAULT 1,
-            created_at REAL NOT NULL
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_repo_name ON github_repos(name);
-        """
-    )
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS github_repos (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                url TEXT NOT NULL,
+                description TEXT,
+                default_branch TEXT DEFAULT 'main',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at REAL NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_repo_name ON github_repos(name);
+            """
+        )
+        c.commit()
 
 
 def _all():
-    c = db._conn()
-    rows = c.execute("SELECT * FROM github_repos WHERE enabled=1 ORDER BY created_at").fetchall()
-    c.close()
+    with db.connect() as c:
+        rows = c.execute("SELECT * FROM github_repos WHERE enabled=1 ORDER BY created_at").fetchall()
     return [dict(r) for r in rows]
 
 
@@ -121,14 +119,13 @@ def add_repo(body: RepoIn, user=Depends(current_user)):
     name = body.name.strip()
     if not name or "github.com" not in body.url:
         raise HTTPException(400, "name and a github.com url are required")
-    c = db._conn()
-    c.execute("DELETE FROM github_repos WHERE name=?", (name,))
-    c.execute("INSERT INTO github_repos (id, name, url, description, default_branch, enabled, created_at) "
-              "VALUES (?,?,?,?,?,?,?)",
-              (str(uuid.uuid4()), name, body.url.strip(), body.description,
-               body.default_branch or "main", 1, time.time()))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("DELETE FROM github_repos WHERE name=?", (name,))
+        c.execute("INSERT INTO github_repos (id, name, url, description, default_branch, enabled, created_at) "
+                  "VALUES (?,?,?,?,?,?,?)",
+                  (str(uuid.uuid4()), name, body.url.strip(), body.description,
+                   body.default_branch or "main", 1, time.time()))
+        c.commit()
     db.log_activity(user, "repo_register", prompt=name)
     return {"repos": _all()}
 
@@ -136,10 +133,9 @@ def add_repo(body: RepoIn, user=Depends(current_user)):
 @_settings.delete("/{name}")
 def remove_repo(name: str, user=Depends(current_user)):
     _admin(user)
-    c = db._conn()
-    c.execute("DELETE FROM github_repos WHERE name=?", (name,))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("DELETE FROM github_repos WHERE name=?", (name,))
+        c.commit()
     return {"repos": _all()}
 
 

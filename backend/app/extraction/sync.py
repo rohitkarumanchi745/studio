@@ -339,15 +339,13 @@ def disconnect(user_id, purge=False):
 def _purge_collection(user_id):
     from .. import db
     name = f"m365-{user_id}"
-    c = db._conn()
-    c.execute("DELETE FROM kag_chunks WHERE collection=?", (name,))
-    c.execute("DELETE FROM kag_collections WHERE name=?", (name,))
-    c.commit()
-    c.close()
-    cc = db._conn()
-    cc.execute("DELETE FROM graph_items WHERE user_id=?", (user_id,))
-    cc.commit()
-    cc.close()
+    with db.connect() as c:
+        c.execute("DELETE FROM kag_chunks WHERE collection=?", (name,))
+        c.execute("DELETE FROM kag_collections WHERE name=?", (name,))
+        c.commit()
+    with db.connect() as cc:
+        cc.execute("DELETE FROM graph_items WHERE user_id=?", (user_id,))
+        cc.commit()
 
 
 # ── The ticker (autopilot clone) ─────────────────────────────────────────

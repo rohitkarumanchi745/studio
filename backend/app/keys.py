@@ -38,45 +38,42 @@ def _fernet():
 
 
 def init_tables():
-    c = db._conn()
-    c.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS user_api_keys (
-            id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            provider TEXT NOT NULL,
-            ciphertext TEXT NOT NULL,
-            last4 TEXT NOT NULL,
-            created_at REAL NOT NULL
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_user_api_keys_one
-            ON user_api_keys(user_id, provider);
-        """
-    )
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS user_api_keys (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                ciphertext TEXT NOT NULL,
+                last4 TEXT NOT NULL,
+                created_at REAL NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_user_api_keys_one
+                ON user_api_keys(user_id, provider);
+            """
+        )
+        c.commit()
 
 
 def set_key(user_id, provider, api_key):
     token = _fernet().encrypt(api_key.encode()).decode()
-    c = db._conn()
-    c.execute("DELETE FROM user_api_keys WHERE user_id=? AND provider=?", (user_id, provider))
-    c.execute(
-        "INSERT INTO user_api_keys (id, user_id, provider, ciphertext, last4, created_at) "
-        "VALUES (?,?,?,?,?,?)",
-        (str(uuid.uuid4()), user_id, provider, token, api_key[-4:], time.time()),
-    )
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("DELETE FROM user_api_keys WHERE user_id=? AND provider=?", (user_id, provider))
+        c.execute(
+            "INSERT INTO user_api_keys (id, user_id, provider, ciphertext, last4, created_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (str(uuid.uuid4()), user_id, provider, token, api_key[-4:], time.time()),
+        )
+        c.commit()
 
 
 def get_key(user_id, provider):
     """Decrypted key, or None. Never log or return this to a client."""
-    c = db._conn()
-    row = c.execute(
-        "SELECT ciphertext FROM user_api_keys WHERE user_id=? AND provider=?",
-        (user_id, provider)).fetchone()
-    c.close()
+    with db.connect() as c:
+        row = c.execute(
+            "SELECT ciphertext FROM user_api_keys WHERE user_id=? AND provider=?",
+            (user_id, provider)).fetchone()
     if not row:
         return None
     try:
@@ -86,19 +83,17 @@ def get_key(user_id, provider):
 
 
 def list_keys(user_id):
-    c = db._conn()
-    rows = c.execute(
-        "SELECT provider, last4, created_at FROM user_api_keys WHERE user_id=? ORDER BY provider",
-        (user_id,)).fetchall()
-    c.close()
+    with db.connect() as c:
+        rows = c.execute(
+            "SELECT provider, last4, created_at FROM user_api_keys WHERE user_id=? ORDER BY provider",
+            (user_id,)).fetchall()
     return [dict(r) for r in rows]
 
 
 def delete_key(user_id, provider):
-    c = db._conn()
-    c.execute("DELETE FROM user_api_keys WHERE user_id=? AND provider=?", (user_id, provider))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("DELETE FROM user_api_keys WHERE user_id=? AND provider=?", (user_id, provider))
+        c.commit()
 
 
 def verify(provider, api_key):

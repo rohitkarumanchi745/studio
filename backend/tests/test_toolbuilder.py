@@ -17,9 +17,13 @@ import sys
 import tempfile
 
 # Throwaway SQLite + sandbox dir BEFORE app modules compute their paths.
+# setdefault for the sandbox: toolbuilder.SANDBOX is frozen at IMPORT time while
+# mcp/sandbox re-read the env per call, so the whole test session must agree on
+# one directory — the first module to claim it (this one or
+# test_artifact_approval) wins and every other reads it back out of the env.
 _TMP = tempfile.mkdtemp(prefix="studio-toolbuilder-test-")
 os.environ["STUDIO_DB_PATH"] = os.path.join(_TMP, "studio.db")
-os.environ["STUDIO_TOOLBUILDER_DIR"] = os.path.join(_TMP, "sandbox")
+os.environ.setdefault("STUDIO_TOOLBUILDER_DIR", os.path.join(_TMP, "sandbox"))
 
 import pytest
 from fastapi import HTTPException

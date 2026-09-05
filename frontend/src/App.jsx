@@ -16,6 +16,7 @@ import Kag from "./components/Kag";
 import PyBuild from "./components/PyBuild";
 import Pipelines from "./components/Pipelines";
 import QueryLibrary from "./components/QueryLibrary";
+import RedTeam from "./components/RedTeam";
 import Sessions from "./components/Sessions";
 import Skills from "./components/Skills";
 import ToolBuilder from "./components/ToolBuilder";
@@ -202,6 +203,7 @@ export default function App() {
         onAutopilot={go("/autopilot")}
         onToolBuilder={go("/toolbuilder")}
         onKag={go("/kag")}
+        onRedTeam={go("/redteam")}
         onKeysChanged={() => setModelsEpoch((n) => n + 1)}
         onRename={async (id, title) => {
           await api(`/conversations/${id}`, {
@@ -220,6 +222,7 @@ export default function App() {
         <Route path="/toolbuilder" element={<ToolBuilder onClose={home} onOpenJobs={go("/jobs")} />} />
         <Route path="/flow" element={<Flow onClose={home} onOpenJobs={go("/jobs")} />} />
         <Route path="/agents" element={<Agents onClose={home} />} />
+        <Route path="/redteam" element={<RedTeam user={user} onClose={home} />} />
         <Route
           path="/sessions"
           element={

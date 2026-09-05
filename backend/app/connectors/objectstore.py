@@ -53,23 +53,22 @@ _FORMATS = {"parquet": "read_parquet", "csv": "read_csv_auto", "json": "read_jso
 
 
 def init_tables():
-    c = db._conn()
-    c.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS objectstore_datasets (
-            id TEXT PRIMARY KEY,
-            source TEXT NOT NULL,
-            name TEXT NOT NULL,
-            uri TEXT NOT NULL,
-            format TEXT NOT NULL,
-            created_at REAL NOT NULL
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_objectstore_dataset
-            ON objectstore_datasets(source, name);
-        """
-    )
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS objectstore_datasets (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                name TEXT NOT NULL,
+                uri TEXT NOT NULL,
+                format TEXT NOT NULL,
+                created_at REAL NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_objectstore_dataset
+                ON objectstore_datasets(source, name);
+            """
+        )
+        c.commit()
 
 
 # ── Dataset registry (env bootstrap + DB) ───────────────────────────────
@@ -124,13 +123,12 @@ def datasets(source):
 
 
 def _rows(source=None):
-    c = db._conn()
-    if source:
-        rows = c.execute("SELECT * FROM objectstore_datasets WHERE source=? ORDER BY created_at",
-                         (source,)).fetchall()
-    else:
-        rows = c.execute("SELECT * FROM objectstore_datasets ORDER BY created_at").fetchall()
-    c.close()
+    with db.connect() as c:
+        if source:
+            rows = c.execute("SELECT * FROM objectstore_datasets WHERE source=? ORDER BY created_at",
+                             (source,)).fetchall()
+        else:
+            rows = c.execute("SELECT * FROM objectstore_datasets ORDER BY created_at").fetchall()
     return [dict(r) for r in rows]
 
 
@@ -453,12 +451,11 @@ def _upsert_dataset(source, name, uri, fmt):
     their own gate (admin role here, admin-approval + prefix confinement in the
     bridge) without one path silently inheriting the other's."""
     row_id, created = str(uuid.uuid4()), time.time()
-    c = db._conn()
-    c.execute("DELETE FROM objectstore_datasets WHERE source=? AND name=?", (source, name))
-    c.execute("INSERT INTO objectstore_datasets (id, source, name, uri, format, created_at) "
-              "VALUES (?,?,?,?,?,?)", (row_id, source, name, uri, fmt, created))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("DELETE FROM objectstore_datasets WHERE source=? AND name=?", (source, name))
+        c.execute("INSERT INTO objectstore_datasets (id, source, name, uri, format, created_at) "
+                  "VALUES (?,?,?,?,?,?)", (row_id, source, name, uri, fmt, created))
+        c.commit()
     return {"id": row_id, "source": source, "name": name, "uri": uri,
             "format": fmt, "created_at": created}
 
@@ -488,10 +485,9 @@ def add_dataset(body: DatasetIn, user=Depends(current_user)):
 @router.delete("/{source}/{name}")
 def remove_dataset(source: str, name: str, user=Depends(current_user)):
     _admin(user)
-    c = db._conn()
-    c.execute("DELETE FROM objectstore_datasets WHERE source=? AND name=?", (source, name))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("DELETE FROM objectstore_datasets WHERE source=? AND name=?", (source, name))
+        c.commit()
     return {"datasets": _rows()}
 
 

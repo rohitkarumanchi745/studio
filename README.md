@@ -128,31 +128,74 @@ ceiling for any result.
 **The allowlist is a namespace, not just a name.** RBAC keys on *bare* table
 names, so an allowlist entry for `sales` also admitted `secret_schema.sales` —
 and a warehouse credential almost always sees more schemas than the catalog
-ever described. Every connector now declares `qualifiers()`: the lowercase
-prefixes a table reference may carry, built from the same environment it
-connects with and never from a network call (`{schema, database.schema}` for
-PostgreSQL, `{schema, database, database.schema}` for Snowflake, `{schema,
-catalog, catalog.schema}` for Databricks, `{dataset, project.dataset}` for
-BigQuery, and **empty** for the demo, object-store and marketing sources — a
-source that cannot vouch for a namespace accepts no qualifier at all).
-`gateway.check()` hands that set to the guard, so `check()` and `execute()`
-both refuse a cross-schema reference: *"Table 'secret_schema.sales' is outside
-the configured namespace for this source"*. Matching is whole-string,
-quote- and case-insensitive, so `acme.public.sales` validates on a connector
+ever described. Every connector declares `qualifiers()`: the prefixes a table
+reference may carry, built from the same environment it connects with and never
+from a network call. `gateway.check()` hands that set to the guard, so
+`check()` and `execute()` both refuse a cross-schema reference: *"Table
+'secret_schema.sales' is outside the configured namespace for this source"*.
+Matching is whole-**prefix** — matching only the *last* part would re-open the
+same hole one database over, so `acme.public.sales` validates on a connector
 configured for the `acme` database's `public` schema while
-`other_db.public.sales` does not — matching only the *last* part would re-open
-the same hole one database over — and a same-named CTE can no longer launder a
-qualified reference, because the engine resolves it to the base table.
-Unqualified names are untouched: they are what RBAC keys on.
+`other_db.public.sales` does not — and a same-named CTE can no longer launder a
+qualified reference, because the engine resolves a qualified name to the base
+table. Unqualified names are untouched: they are what RBAC keys on.
+
+**Arity is part of the declaration.** One part and two parts are different
+questions, because the vendors answer them differently, and declaring a name at
+the wrong arity was itself a hole: with the database declared as a one-part
+prefix, Snowflake read `ANALYTICS.sales` as the *schema* `ANALYTICS` — a
+namespace the catalog had never described. Each connector declares each
+spelling at the arity its own engine gives it, and the guard matches a whole
+prefix at its own arity only:
+
+| Source | One part | Two parts | Case of the declared prefix |
+|---|---|---|---|
+| PostgreSQL | `POSTGRES_SCHEMA` (a schema) | `dbname.schema` from the DSN | verbatim — the stored name |
+| Snowflake | `SNOWFLAKE_SCHEMA` (a schema) | `database.schema` | folded **UP**, the name Snowflake stores |
+| Databricks | `DATABRICKS_SCHEMA` (a schema) | `catalog.schema` | folded **down** (Spark folds everything) |
+| BigQuery | `BIGQUERY_DATASET` | `project.dataset` | verbatim — BigQuery ids are case-**sensitive** |
+| demo · object store · marketing · Neo4j | — | — | **empty**: a source that cannot vouch for a namespace accepts no qualifier at all |
+
+**Identifiers are compared the way the engine resolves them.** `"CUSTOMERS"`
+and `customers` are two different tables on PostgreSQL and Snowflake, and a
+guard that lowercased both believed a quoted CTE was answering a bare
+reference: with only `sales` allowed, `WITH "CUSTOMERS" AS (SELECT * FROM
+sales) SELECT * FROM customers` bound a CTE named `CUSTOMERS` while the outer
+reference resolved to the **denied base relation** `customers`. So the guard
+keeps each identifier's *quotedness* and folds it per dialect — bare folds
+**down** on PostgreSQL, **up** on Snowflake, not at all on BigQuery, and a
+quoted name is exact on all three; every other engine we target (SQLite,
+DuckDB, Spark/Databricks) is case-insensitive for quoted names too and keeps
+the single case-insensitive reading. Allowlist entries and declared qualifiers
+are read as *catalog* spellings — the name the engine stores — so both sides of
+every comparison mean the same thing. Two consequences worth knowing: on
+PostgreSQL and Snowflake, SQL that quotes a name in a case the catalog does not
+use is now rejected (the engine would not have found that relation either), and
+`POSTGRES_SCHEMA` / `SNOWFLAKE_SCHEMA` are read as *identifiers*, not free text
+— see *Configuration*.
+
+**An unqualified name can only mean the configured schema.** The guard cannot
+check a bare name's namespace — there is nothing written to check — so the
+PostgreSQL connector pins it on the connection instead: every connection is
+opened with `options=-c search_path="<POSTGRES_SCHEMA>"` (a keyword argument,
+which beats anything the DSN carries; double-quoted so the server does not fold
+it). Without the pin, an allowlisted `sales` resolved to whichever schema came
+first on the server's default `search_path`, which can be one the catalog never
+listed. `POSTGRES_SCHEMA` must therefore be a plain identifier
+(`[A-Za-z0-9_$]+`); anything else raises at connect time rather than being
+pasted into libpq's option string.
 
 **One gate, two dialects.** Neo4j speaks Cypher, where `MATCH (n:Person)
 RETURN n` is the read shape and `SELECT` does not exist — so the SQL-only guard
 rejected every valid graph query and the source was unusable. The fork is in
 the **guard, never the execution path**: `gateway._guard()` picks
 `cypherguard.py` when `connector.dialect == "cypher"` and `queryguard.py`
-otherwise, and both expose the same `validate(text, allowed, qualifiers=…)` /
+otherwise, and both expose `validate(text, allowed, qualifiers=…)` /
 `enforce_limit(text, max_rows)`, raise the same `QueryRejected`, and return the
-comment-free text the caller must execute. RBAC, the row cap,
+comment-free text the caller must execute. The SQL guard takes one argument
+more — `dialect`, which decides how identifiers fold — because that question
+exists on a warehouse and not in Cypher; `gateway.check()` therefore passes it
+only to `queryguard`. RBAC, the row cap,
 `governance.filter_result` and the audit row therefore run in the same order
 for every source (see *Extending the agent* for what Cypher may say).
 
@@ -438,6 +481,26 @@ code; Studio hands it over, it does not launch it. Routing it into a real
 runtime is on the [roadmap](#future-rollouts), behind the same supervisor gate
 as every other write.
 
+**The Spark payload is a real Jobs submission, built by the connector.** The
+flow used to hand-roll `{"tasks": [{"name": …, "sql": …}]}` — a shape the
+Databricks API does not accept, so an approved `spark_job` deployment failed at
+submit time, after the human gate. `databricks_conn.build_submission()` now owns
+the Jobs 2.1 run-submit body: one `sql_task` per verified step, each with a
+unique, API-legal `task_key` slugged from the step name (duplicates get a
+numeric suffix — the API rejects a duplicate key, and silently merging two
+steps would drop a verified statement) and the warehouse from
+**`DATABRICKS_WAREHOUSE_ID`**. The statement rides inline as
+`sql_task.query.query_text`; a workspace restricted to *saved* queries would
+register the query first and substitute `query_id` in the same slot. With no
+warehouse configured the flow **refuses before the supervisor is called** —
+`decision: "reject"`, empty script, the reason naming the variable — rather than
+building a body the API would `400`. `validate_submission()` runs both inside
+the builder and again at the top of `submit_spark_job()`, before any HTTP call:
+unique task keys, exactly one recognized task type per task, compute present
+(`warehouse_id` inside a `sql_task`, `existing_cluster_id` / `new_cluster` /
+`job_cluster_key` otherwise). Studio's private `output` key is stripped from
+what is posted (`api_body()`) while the stored script keeps it for the bridge.
+
 ### Supervised execution + human-in-the-loop
 
 Studio is read-only by default. Running a script or Spark job against a real
@@ -456,6 +519,21 @@ pipeline. A triggered **platform run** stays `running` until the live poll
 success is not job success — and Spark / platform payloads are validated as
 JSON at submit, so a malformed script is a clear 400 rather than a run-time
 retry loop.
+
+**One job kind is an approval record, not an execution.** A tool-builder
+registration (`mcp_build`, `supervisor.ARTIFACT_KIND`) is Python, and it went
+through the same `_execute` that hands a script to `connector.run_script` — so
+an approved artifact job was one connector lookup away from running generated
+Python against a warehouse, and `classify` was reading Python as SQL to decide
+its risk. The kinds are named constants now (`SQL_KIND`, `SPARK_KIND`,
+`PLATFORM_KIND`, `ARTIFACT_KIND`), `classify` returns its own risk
+(`"artifact"`) without parsing the body as SQL, and `_execute` dispatches
+**exhaustively**: the artifact branch runs before any connector is resolved,
+records `{"executed": false, "approved_by": …}`, fails closed with no approver,
+and **never touches a warehouse**; an unknown kind now *raises* instead of
+falling through to `run_script`. The kind is not submittable over HTTP either —
+only the tool builder mints one — and registration additionally requires the
+linked job to *be* an artifact job.
 
 ### Governance-as-code
 
@@ -543,6 +621,41 @@ label is refused, because `MATCH (n) RETURN n` and the anonymous hop in
 pattern already bound is the one exemption. A top-level `RETURN` is required so
 the row cap has a well-defined place, and a `LIMIT` is appended when the final
 `RETURN` has none (a `LIMIT` on an intermediate `WITH` does not count).
+
+**That exemption is answered in Cypher's own scope, not a statement-global
+table.** Cypher throws names away, and a guard that did not throw them away too
+kept vouching for a `Person` the engine no longer had — so with only `Person`
+allowed, `MATCH (n:Person) WITH count(*) AS c MATCH (n) RETURN n` and
+`MATCH (n:Person) RETURN n UNION MATCH (n) RETURN n` both read the whole graph
+through a variable that was no longer pinned to anything. The guard now walks
+clauses in order threading the same scope Cypher does: **`WITH` replaces** the
+scope with exactly what it projects (`WITH *` carries it all through; an
+aliased item never pins its alias), **`UNION` starts a new query part** with an
+empty one, and a **`CALL {}` subquery starts empty** and sees only what its
+importing `WITH` hands it (what its `RETURN` projects becomes visible after
+it). `EXISTS {}` / `COUNT {}` / `COLLECT {}` import a copy and export nothing.
+Out of scope, a bare `(n)` is a **fresh** binding over the whole graph and is
+refused exactly like `MATCH (n)`.
+
+**Every label a pattern can match must be named.** `:A|B`, `:A&B`, `:A:B` and
+the parenthesised `:(A|B)` are each checked name by name. `:!A` and `:%` match
+by *exclusion* — `(n:!Person)` is the whole graph minus one label — so they
+name nothing an allowlist can approve and are refused outright. A **dynamic**
+label or relationship type (`(s:$(row.kind))`) names whatever the expression
+evaluates to at run time, which no check made before execution can bound, so it
+is refused unless it is a **static string literal**: `:$("Person")` is recorded
+as if written `:Person` and decided by the ordinary allowlist check, while
+`:$(x)`, `:$param` and `:$("Per" + "son")` all fail closed.
+
+**A pattern comprehension is a traversal, not a list.** `RETURN [ (a)-->(b) | b
+]` is a `MATCH` wearing list brackets, and its brackets hid it twice over: its
+node patterns were never visited (so it streamed the whole graph from a
+projection), and every `:Label` inside a `[…]` was classified as a relationship
+*type*, which this guard deliberately does not allowlist (so a denied label was
+reachable from any `RETURN`, `WITH`, `WHERE`, `UNWIND` or `ORDER BY`). Only a
+bracket that follows a `-` opens a relationship; every other one is a list, and
+a list holding a pattern is checked as the pattern it is. Ordinary lists,
+indexes, slices, list comprehensions and arithmetic are untouched.
 Governance needs no special case: `filter_result` keys on **column** names, so
 the returned aliases are denied or masked exactly as on a SQL source, and a
 statement whose lineage cannot be attributed falls back to every governed table
@@ -822,8 +935,10 @@ measurable.
   prefix, so a run can be paused, **resumed**, or **forked**; token + cache-read
   meters show the reuse.
 - **Background tasks + blue dot** — `POST /chat/background` records the user
-  turn and a `chat_tasks` row at request time, enqueues a `chat_turn` job in the
-  durable `background_jobs` table (`jobs.py`) and returns `202` immediately, so
+  turn, then writes the `chat_tasks` row **and** its `chat_turn` job in the
+  durable `background_jobs` table (`jobs.py`) in **one transaction on one
+  connection** (`jobs.enqueue(..., conn=c)` enlists in the caller's transaction
+  instead of committing its own), and returns `202` immediately, so
   you can start a question in one chat, switch to another and start a different
   one, and a **blue dot** lights up each conversation when its task finishes
   (cleared when opened). A worker claims the job with one atomic `UPDATE`
@@ -853,6 +968,37 @@ measurable.
   background turns run in the *same* conversation without either being mistaken
   for the other; task rows written before that column keep the old temporal
   test, so they stay retry-safe.
+- **A turn cannot be answered twice, and a task cannot be left running with no
+  job.** Both used to be possible, and neither was fixed by being careful.
+  *Atomicity:* the task row and its job were two commits, so a failure between
+  them left `chat_tasks.status='running'` with nothing behind it — the UI spun
+  forever. One transaction means either both rows exist or neither does, and
+  the job's id is derived from the task's (`chat_turn:<task id>`), so the two
+  can be joined and a repeated enqueue for one task cannot queue the turn
+  twice. The user message stays deliberately outside that transaction: an
+  orphan there is an unanswered question the user can ask again, not a row that
+  lies about work being in flight. *Uniqueness:* two attempts of the same
+  reclaimed job really can run at the same instant — Python threads are not
+  preemptible, so a cooperative abort is a courtesy, not a guarantee — and a
+  check-then-insert guard loses that race. The guarantee is a **column with a
+  unique index**: `messages.reply_to` (migration 7) with `CREATE UNIQUE INDEX …
+  ON messages(reply_to) WHERE reply_to IS NOT NULL`, so the second `INSERT`
+  simply cannot land. `db.add_message` recognises the violation structurally
+  (SQLite `IntegrityError`, Postgres `SQLSTATE 23505`), rolls back so a pooled
+  connection is never returned aborted, and returns `None`: *someone else
+  answered, discard mine* is a normal outcome, never a `500`. The partial
+  predicate keeps every other message — every user turn, every synchronous
+  answer — unconstrained. The cooperative half is still there and still worth
+  having: `jobs.check_claim()` raises `ClaimLost` the moment a heartbeat is
+  refused, and `jobs._execute` treats that as **silent abandonment** — no
+  complete, no fail, no retry, because the attempt now belongs to whoever owns
+  the row.
+- **Rows an older build stranded heal themselves.** `reclaim_stale()` runs
+  registered `jobs.reconciler` functions on its existing pass, and chat's marks
+  failed any task left `running` past `STUDIO_CHAT_TASK_ORPHAN_S` (default
+  `max(3 × STUDIO_JOB_STALE_S, 900 s)`) whose job is missing or already
+  finished. Generous on purpose: the cost of waiting is a spinner, the cost of
+  being early is failing a turn that was about to answer.
 - **One worker, N replicas** — the autopilot and Microsoft 365 tickers are no
   longer daemon threads. The worker's scheduler loop runs `autopilot.tick_once()`
   / `sync.tick_once()` on their cadence (`STUDIO_AUTOPILOT_TICK_SECONDS`,
@@ -865,8 +1011,19 @@ measurable.
   M365 pass, and a second tick of the *same* scheduler is refused rather than
   queued behind the first), and a side thread renews the lease for as long as
   the tick runs — a tick slower than its TTL used to lose the lease under
-  itself and let a second replica start the same pass alongside it. `stop()`
-  waits a bounded moment for an in-flight tick before releasing the leases.
+  itself and let a second replica start the same pass alongside it. A renewal
+  that does not come back holding the lease is treated as **loss**: renewing
+  stops at once (a later renewal would steal the name back from the new holder)
+  and the tick's abort event is set. The TTL is `max(4 × interval, 120 s)`, and
+  the bound that matters is failover: a live tick renews every 10 s, so the
+  lease only expires after twelve consecutive failed renewals. `stop()` waits
+  a bounded five seconds for an in-flight tick and then releases the leases of
+  the ticks that **finished** — a tick still running keeps its lease and is
+  logged, because releasing it under a live tick is precisely the overlap the
+  lease exists to prevent (we cannot kill a daemon thread, so handing the name
+  to another replica starts a second copy of the same pass alongside it).
+  Leaving it costs at most one TTL of no ticking; releasing it costs
+  correctness.
   `STUDIO_WORKER_MODE` picks where jobs run: `thread` (default) runs one
   worker inside the web process — the single-service behaviour, with chat jobs
   shared across replicas by atomic claims; `external` makes the web process
@@ -1105,14 +1262,39 @@ optional and falls back to the in-process cache silently.
   administrative clause, catalog procedures only, node labels allowlisted,
   unlabelled node patterns refused). The **guard** forks on
   `connector.dialect`; the execution path does not.
+- **An identifier means what the engine says it means** — quotedness is kept
+  and folding is per dialect (bare down on PostgreSQL, up on Snowflake, not at
+  all on BigQuery, quoted exact on all three; case-insensitive everywhere
+  else), and allowlist entries and declared qualifiers are read as the catalog
+  spellings they are. Collapsing both readings to lower case let a quoted CTE
+  stand in for a denied base table: `WITH "CUSTOMERS" AS (SELECT * FROM sales)
+  SELECT * FROM customers` resolved the outer reference to the real
+  `customers`.
 - **A qualified name must stay inside the source's namespace** — the allowlist
   keys on *bare* table names, so the guard also checks any qualifier against
   the connector's own `qualifiers()`, built from the environment it connects
-  with. `secret_schema.sales` is rejected — *"outside the configured namespace
+  with and declared **at the arity its engine gives it** (`schema`,
+  `database.schema`, …; a whole prefix matches at its own arity or nothing
+  does). `secret_schema.sales` is rejected — *"outside the configured namespace
   for this source"* — even though `sales` is allowed and the warehouse
-  credential can see that schema, and a same-named CTE cannot launder it.
+  credential can see that schema, and a same-named CTE cannot launder it. A
+  *bare* name carries no namespace to check, so the PostgreSQL connector pins
+  `search_path` to the configured schema on every connection instead.
+- **Cypher scope is Cypher's scope** — the "every node carries a label" test is
+  answered against the variables in scope *where the pattern is written*:
+  `WITH` replaces the scope, `UNION` starts an empty one, a `CALL {}` subquery
+  sees only its importing `WITH`. Every label a pattern can match must be
+  **named** — `:!A` and `:%` match by exclusion and are refused, a dynamic
+  `:$(…)` label or relationship type is refused unless it is a static string
+  literal — and a **pattern comprehension** in a projection is checked as the
+  traversal it is, not skipped as a list.
 - **Read-only by default** — writes / DDL / Spark jobs only run through the
   supervisor + human approval; Studio never executes generated code in-process.
+  The supervisor dispatches on a **closed set** of job kinds and raises on an
+  unknown one rather than falling through to `connector.run_script`, and the
+  tool-builder kind (`mcp_build`) is an approval *record*: it is handled before
+  any connector is resolved, records `executed: false`, and is not submittable
+  over HTTP at all.
 - **Generated Python is a deliverable, never a deployable** — the staged flow's
   Validator only *parses* the artifact (`python syntax (static only — not
   executed)`, `artifact_status = "syntax_checked_not_executed"`), and what the
@@ -1231,7 +1413,9 @@ optional and falls back to the in-process cache silently.
 | **LangGraph provider-neutral ReAct** | Swap Claude ↔ GPT without touching the graph or tools | Bound to LangChain's abstractions |
 | **Durable job queue on the app DB** (`background_jobs`), not a broker | No extra infra: SQLite or Postgres *is* the queue; jobs survive restarts (stale-heartbeat reclaim), claims are atomic (`FOR UPDATE SKIP LOCKED` on Postgres) and **fenced** by a per-claim token so a reclaimed job cannot be completed twice, and a separate worker service is optional | Polling (`STUDIO_JOB_POLL_S`) rather than push; throughput bounded by the DB — fine for chat turns and tickers, not a firehose |
 | **Governance converges on a short TTL, not pub/sub** | A policy has to reach every replica, and adding Redis pub/sub or sticky routing to do it is infrastructure the rest of the design avoids | One tiny indexed read per process per `STUDIO_GOVERNANCE_REFRESH_S` whether or not anything changed, and a bounded window (default 5 s) in which a replica may still apply the previous document — set it to `0` to check on every decision |
-| **A qualifier the connector did not declare is rejected** | The allowlist describes bare names in the namespace the catalog was built from; a credential almost always sees more | Legitimate fully-qualified SQL must use a spelling the connector declares (`schema`, `database.schema`, …), sources with no namespace (demo, object store, marketing) reject *any* qualifier, and BigQuery's backtick-quoted full path still has to be written bare or dataset-qualified |
+| **A qualifier the connector did not declare is rejected** | The allowlist describes bare names in the namespace the catalog was built from; a credential almost always sees more | Legitimate fully-qualified SQL must use a spelling the connector declares, **at the arity it declares it** (`schema`, `database.schema`, …), sources with no namespace (demo, object store, marketing) reject *any* qualifier, and BigQuery's backtick-quoted full path still has to be written bare or dataset-qualified |
+| **An identifier is folded the way its engine folds it** | `"CUSTOMERS"` and `customers` are different tables on PostgreSQL and Snowflake; treating them as one let a quoted CTE stand in for a denied base table | Hand-written SQL on those two sources that quotes a name in a case the catalog does not report is now refused (as the engine would have refused it), and `POSTGRES_SCHEMA` / `SNOWFLAKE_SCHEMA` must be spelled the way the catalog reports the namespace |
+| **A pattern comprehension is checked as a traversal** | `RETURN [ (a)-->(b) \| b ]` reads the graph from a projection, and its brackets also hid every label inside them behind the relationship-type exemption | The bracket heuristic is narrow on purpose (contents must start with a node group and contain a real arrow), so an exotic list expression that happens to look like a pattern would be judged as one |
 | **SSO hands the session over through a single-use code** | A token in a redirect URL survives in history, `Referer` and proxy logs | The code map is in-process (as `_SSO_STATES` already was), so a multi-replica deployment needs sticky sessions until both move into the app DB; the SPA pays one extra reload on the SSO path |
 | **Versioned migrations, auto-applied at boot** | Schema changes are numbered, idempotent, recorded, and serialized across replicas (advisory lock on Postgres, `BEGIN IMMEDIATE` on SQLite) so two booting services cannot collide; `STUDIO_AUTO_MIGRATE=0` hands control to a release step | A migration never creates a table, so the previous version must have booted once before `migrate up` has anything to do |
 | **Single Railway service** (API serves the built frontend; worker optional) | One origin, no CORS, one deploy, one healthcheck | Frontend and backend scale together; a second `python -m app.worker` service is needed to scale jobs independently |
@@ -1461,6 +1645,7 @@ you in: the account is created unverified and the emailed 6-digit code
 | `STUDIO_GRAPH_SYNC_TICKER` / `STUDIO_GRAPH_TICK_SECONDS` | M365 delta / webhook sync scheduler kill-switch (default on once Azure is configured) and cadence inside the worker (default 60) |
 | `STUDIO_JOB_POLL_S` | Queue poll interval in seconds (default 1.0) |
 | `STUDIO_JOB_STALE_S` | Seconds without a heartbeat before a running job is reclaimed (default 300) |
+| `STUDIO_CHAT_TASK_ORPHAN_S` | Seconds a `chat_tasks` row may sit `running` with no live job before the reclaim pass fails it (default `max(3 × STUDIO_JOB_STALE_S, 900)`). Enqueue is atomic, so this only heals rows an older build stranded — generous on purpose: being early fails a turn that was about to answer |
 | `STUDIO_JOB_WORKERS` | Handler threads per worker (default 4) |
 | `STUDIO_WORKER_MODE` | `thread` (default: one worker inside the web process), `external` (web enqueues only; run `python -m app.worker`), `off` (nothing runs — tests) |
 
@@ -1486,8 +1671,9 @@ you in: the account is created unverified and the emailed 6-digit code
 |---|---|
 | `AZURE_REDIRECT_URI` | Entra SSO redirect, default `http://localhost:8000/api/auth/azure/callback` — register that exact URI in the app registration |
 | `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` / `AZURE_GROUP_ROLE_MAP` | Entra SSO + group→role mapping, **and** the Microsoft 365 → KAG extraction layer (dormant until set) |
+| `DATABRICKS_WAREHOUSE_ID` | **Required for the Spark / Jobs flow.** The SQL warehouse that runs a submitted job's `sql_task`s. Unset, a `spark_job` deployment is *refused* before the supervisor is called (`decision: "reject"`, reason naming this variable) rather than posting a body the Jobs API would `400`. Not needed for reading through the Databricks source |
 | `GITHUB_TOKEN` | Read private repos in the GitHub repo registry |
-| `POSTGRES_DSN` / `POSTGRES_SCHEMA` | PostgreSQL **data source** (a second SQL warehouse, distinct from the app's `DATABASE_URL`); dormant until set. `POSTGRES_SCHEMA` (default `public`) is also the namespace the query guard accepts — with the DSN's database, `{schema, dbname.schema}` |
+| `POSTGRES_DSN` / `POSTGRES_SCHEMA` | PostgreSQL **data source** (a second SQL warehouse, distinct from the app's `DATABASE_URL`); dormant until set. `POSTGRES_SCHEMA` (default `public`) does three jobs: it is the schema `list_tables()` builds the catalog from, the namespace the query guard accepts (with the DSN's database, `{schema, dbname.schema}` — at those arities, spelled **exactly** as here), and the value every connection's `search_path` is pinned to, so an unqualified allowed name can only ever mean this schema. It must be a plain identifier (`[A-Za-z0-9_$]+`) or the connection is refused |
 | `STUDIO_GRAPH_REDIRECT_URI` | Microsoft 365 delegated-OAuth return, default `$STUDIO_PUBLIC_URL/api/m365/oauth/callback` or `http://localhost:8000/api/m365/oauth/callback` |
 | `STUDIO_MCP_SERVERS` | JSON map of MCP servers exposed to the agent as extra tools |
 | `STUDIO_PUBLIC_URL` | Public origin of the deployment; combined with `/api/m365/webhook` for Graph change notifications (webhooks are skipped when unset) |
@@ -1500,7 +1686,12 @@ that source — `POSTGRES_SCHEMA` (plus the database named in `POSTGRES_DSN`),
 `SNOWFLAKE_DATABASE` + `SNOWFLAKE_SCHEMA`, `DATABRICKS_CATALOG` +
 `DATABRICKS_SCHEMA`, `BIGQUERY_PROJECT` + `BIGQUERY_DATASET`. Set the one your
 agents should read; a reference into any other is rejected as *outside the
-configured namespace for this source*. The Databricks driver ships installed
+configured namespace for this source*. Each is read as an **identifier**, the
+way its own vendor reads one — Snowflake folds an unquoted name up (so
+`SNOWFLAKE_SCHEMA=public` names the schema `PUBLIC`), Spark folds everything
+down, and PostgreSQL and BigQuery store what was written — so set the spelling
+the catalog reports, and see the namespace table under *Architecture* for which
+arity each part is declared at. The Databricks driver ships installed
 (set the three `DATABRICKS_*` vars and the source appears); Snowflake's is a
 one-line uncomment in `requirements.txt`.
 

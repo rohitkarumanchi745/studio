@@ -16,7 +16,10 @@ Invariants:
   - apply_pending() runs AFTER the baseline (main.startup(), or the CLI on a
     database the app has already booted against at least once). A migration
     never creates a table: if its table does not exist yet, it is a no-op,
-    because the baseline will create the table complete.
+    because the baseline will create the table complete. It MAY create an
+    index on a column it just added (CREATE ... IF NOT EXISTS, so the fresh
+    baseline that already has it is untouched) — an index is not part of a
+    CREATE TABLE, so there is nowhere else for an old database to get one.
   - Versions are strictly increasing and unique (tests/test_migrations.py
     pins this); a new column gets a new version appended at the end.
   - One transaction per migration. Both SQLite and Postgres have
@@ -124,6 +127,28 @@ def _m6_chat_tasks_user_message_id(c, is_pg):
     _add_column(c, "chat_tasks", "user_message_id", "TEXT", is_pg)
 
 
+def _m7_messages_reply_to(c, is_pg):
+    # The id of the user message an assistant message answers, lifted out of
+    # the JSON content into a real column so it can carry a UNIQUE index.
+    #
+    # WHY a constraint and not a check: a background chat turn's
+    # "did someone already answer this?" guard is check-then-write, and two
+    # reclaimed attempts of the same chat_turn job can be running at the same
+    # instant — the queue's claim token fences the job ROW, but nothing can
+    # stop a Python thread mid-flight. The index makes the second answer
+    # impossible to store, which is the only guarantee that survives the race.
+    #
+    # The index is PARTIAL (reply_to IS NOT NULL) so user turns and
+    # synchronous answers, which have no reply_to, are unaffected — and it is
+    # safe to add to a live database for the same reason: every existing row
+    # gets NULL, so nothing can already violate it.
+    if not _table_exists(c, "messages", is_pg):
+        return
+    _add_column(c, "messages", "reply_to", "TEXT", is_pg)
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_reply_to "
+              "ON messages(reply_to) WHERE reply_to IS NOT NULL")
+
+
 MIGRATIONS = [
     (1, "users.verified", _m1_users_verified),
     (2, "conversations.folder_id", _m2_conversations_folder_id),
@@ -131,6 +156,7 @@ MIGRATIONS = [
     (4, "mcp_servers.owner_id", _m4_mcp_servers_owner_id),
     (5, "query_cache.seen+avg_reward+embedding", _m5_query_cache_routing_columns),
     (6, "chat_tasks.user_message_id", _m6_chat_tasks_user_message_id),
+    (7, "messages.reply_to + unique index", _m7_messages_reply_to),
 ]
 
 
@@ -213,23 +239,17 @@ def _is_applied(c, version):
 
 def pending():
     """[(version, name)] not yet recorded in schema_migrations, in order."""
-    c = db._conn()
-    try:
+    with db.connect() as c:
         _ensure_table(c)
         done = _applied_versions(c)
-    finally:
-        c.close()
     return [(v, n) for v, n, _fn in MIGRATIONS if v not in done]
 
 
 def status():
     """{"current": highest applied version (0 = none), "pending": [(v, name)]}."""
-    c = db._conn()
-    try:
+    with db.connect() as c:
         _ensure_table(c)
         done = _applied_versions(c)
-    finally:
-        c.close()
     return {
         "current": max(done) if done else 0,
         "pending": [(v, n) for v, n, _fn in MIGRATIONS if v not in done],
@@ -254,47 +274,48 @@ def apply_pending():
 def _apply_pending_locked():
     applied = []
     is_pg = db.IS_PG
-    c = db._conn()
-    holding_pg = False
-    try:
-        if is_pg:
-            _acquire_pg_lock(c)
-            holding_pg = True
-        else:
-            _sqlite_wait_for_lock(c)
-        _ensure_table(c)
-        # RE-READ under the lock. Another replica may have applied everything
-        # while we were waiting for it; a process that now finds nothing
-        # pending must exit cleanly rather than re-run anything.
-        done = _applied_versions(c)
-        for version, name, fn in MIGRATIONS:
-            if version in done:
-                continue
-            _begin(c, is_pg)
-            try:
-                fn(c, is_pg)
-                c.execute(
-                    "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?,?,?)",
-                    (version, name, time.time()))
-                c.commit()
-            except Exception:
-                c.rollback()
-                # Last line of defence for the one window the lock cannot
-                # cover on SQLite (another PROCESS committed this exact
-                # version between our re-read and our INSERT): the migration
-                # is applied, just not by us, so carry on instead of crashing
-                # a replica on boot. A genuine failure still raises.
-                if _is_applied(c, version):
-                    log.info("migrations: %d %s was applied concurrently by another "
-                             "process", version, name)
+    # ONE connection for the whole apply: the advisory lock is session-level,
+    # and SQLite's IMMEDIATE transaction lives on this connection too.
+    with db.connect() as c:
+        holding_pg = False
+        try:
+            if is_pg:
+                _acquire_pg_lock(c)
+                holding_pg = True
+            else:
+                _sqlite_wait_for_lock(c)
+            _ensure_table(c)
+            # RE-READ under the lock. Another replica may have applied everything
+            # while we were waiting for it; a process that now finds nothing
+            # pending must exit cleanly rather than re-run anything.
+            done = _applied_versions(c)
+            for version, name, fn in MIGRATIONS:
+                if version in done:
                     continue
-                raise
-            applied.append((version, name))
-            log.info("migrations: applied %d %s", version, name)
-    finally:
-        if holding_pg:
-            _release_pg_lock(c)
-        c.close()
+                _begin(c, is_pg)
+                try:
+                    fn(c, is_pg)
+                    c.execute(
+                        "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?,?,?)",
+                        (version, name, time.time()))
+                    c.commit()
+                except Exception:
+                    c.rollback()
+                    # Last line of defence for the one window the lock cannot
+                    # cover on SQLite (another PROCESS committed this exact
+                    # version between our re-read and our INSERT): the migration
+                    # is applied, just not by us, so carry on instead of crashing
+                    # a replica on boot. A genuine failure still raises.
+                    if _is_applied(c, version):
+                        log.info("migrations: %d %s was applied concurrently by another "
+                                 "process", version, name)
+                        continue
+                    raise
+                applied.append((version, name))
+                log.info("migrations: applied %d %s", version, name)
+        finally:
+            if holding_pg:
+                _release_pg_lock(c)
     return applied
 
 

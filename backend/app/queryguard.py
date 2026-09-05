@@ -14,7 +14,14 @@ Table names are matched on their BARE name (that is what RBAC and governance
 key on) but a qualifier is no longer discarded: `secret_schema.sales` is not
 `sales`, and the gateway passes the connector's own namespace so a reference
 outside it is refused rather than silently reduced to an allowed name.
+
+Identity is DIALECT-AWARE and preserves quotedness. `"CUSTOMERS"` and
+`customers` are two different tables on PostgreSQL and Snowflake, and folding
+both to `customers` let a quoted CTE stand in for a denied base table (see
+_canon). The gateway passes connector.dialect; dialect=None keeps the old
+case-insensitive reading for callers that have no connector in hand.
 """
+import collections
 import re
 
 # Write/DDL keywords, plus the extension/config statements a file-reading
@@ -165,21 +172,66 @@ def _skip_parens(toks, i):
     return i
 
 
-def _qualified_name(toks, i):
-    """`db.schema."Tbl"` -> ('tbl', 'db.schema', index after it).
+# ── Identifier identity ─────────────────────────────────────────────────
 
-    The bare name stays the RBAC key: every allowlist and every governance rule
-    is keyed on bare names. But the QUALIFIER is returned alongside it, because
-    dropping it was a hole: an allowlist containing `sales` also accepted
-    `secret_schema.sales`, so a service account whose warehouse credentials can
-    see a second schema/catalog read straight past the catalog/RBAC boundary
-    (rbac.allowed_tables only ever lists the connector's configured namespace).
-    validate() checks the qualifier against the connector's own namespace when
-    the caller passes one; see `qualifiers` there.
+# A reference part exactly as WRITTEN: its text plus whether it arrived quoted.
+# The tokenizer already knows — ("ident", …) for `"x"` / `x` / [x], ("word", …)
+# for a bare x — and discarding that collapsed two different tables into one
+# name. PostgreSQL folds a BARE identifier to lower case and keeps a QUOTED one
+# verbatim, so with only `sales` allowed
+#     WITH "CUSTOMERS" AS (SELECT * FROM sales) SELECT * FROM customers
+# binds a CTE named CUSTOMERS while the outer reference resolves to the DENIED
+# base relation customers — a guard that lowercased both believed the reference
+# was the CTE. Invariant: two identifiers denote the same object only when
+# their canonical forms (below) are equal.
+_Ident = collections.namedtuple("_Ident", "text quoted")
+
+# How an engine reads an identifier written BARE — listed only for the engines
+# that do NOT also fold a quoted one. Every other dialect we target (SQLite,
+# DuckDB, Databricks/Spark) is case-insensitive for quoted names as well, so
+# both readings fold to lower there; that is also the historical behaviour and
+# is what dialect=None keeps.
+_BARE_FOLD = {
+    "postgres": str.lower,      # bare folds DOWN, quoted is exact
+    "snowflake": str.upper,     # bare folds UP, quoted is exact
+    "bigquery": lambda t: t,    # dataset/table ids are case-sensitive as written
+}
+
+
+def _canon(ident, dialect=None):
+    """The identity the ENGINE would resolve this written identifier to."""
+    fold = _BARE_FOLD.get((dialect or "").lower())
+    if fold is None:
+        return ident.text.lower()               # case-insensitive engine (or unknown)
+    return ident.text if ident.quoted else fold(ident.text)
+
+
+def _catalog_canon(name, dialect=None):
+    """Identity of a name the CATALOG spelled — an RBAC allowlist entry, which
+    comes from connector.list_tables(). The catalog reports the STORED name, so
+    it is already exact: it gets the same reading as a quoted reference (a
+    Snowflake catalog says SALES, which a bare `sales` reaches and a quoted
+    `"sales"` does not)."""
+    return _canon(_Ident(str(name).strip('"').strip("`"), True), dialect)
+
+
+def _qualified_name(toks, i):
+    """`db.schema."Tbl"` -> ([_Ident(db), _Ident(schema), _Ident(Tbl)], index after).
+
+    Parts are returned as WRITTEN (text + quotedness); the caller canonicalizes
+    them for the connector's dialect. The last part is the RBAC key: every
+    allowlist and every governance rule is keyed on bare names. But the
+    QUALIFIER is returned alongside it, because dropping it was a hole: an
+    allowlist containing `sales` also accepted `secret_schema.sales`, so a
+    service account whose warehouse credentials can see a second schema/catalog
+    read straight past the catalog/RBAC boundary (rbac.allowed_tables only ever
+    lists the connector's configured namespace). validate() checks the
+    qualifier against the connector's own namespace when the caller passes one;
+    see `qualifiers` there.
     """
     parts, n = [], len(toks)
     while i < n and toks[i][0] in ("word", "ident"):
-        parts.append(toks[i][1])
+        parts.append(_Ident(toks[i][1], toks[i][0] == "ident"))
         i += 1
         if i < n and toks[i] == ("punct", "."):
             i += 1
@@ -187,13 +239,12 @@ def _qualified_name(toks, i):
         break
     if not parts:
         raise QueryRejected("Unreadable table reference after FROM/JOIN")
-    clean = [p.strip('"').lower() for p in parts]
-    if any(c in p for p in clean for c in "/:\\"):
+    if any(c in p.text for p in parts for c in "/:\\"):
         # `JOIN "s3://bucket/x.parquet"` — a path wearing an identifier's
         # quotes. Checked on every part, not just the last: the qualifier is a
         # path too in `"s3://bucket"."x.parquet"`.
         raise QueryRejected("A file or URI is not a permitted data source")
-    return clean[-1], ".".join(clean[:-1]), i
+    return parts, i
 
 
 def _read_ref(toks, i, depth, refs):
@@ -208,15 +259,16 @@ def _read_ref(toks, i, depth, refs):
         raise QueryRejected("A file or URI is not a permitted data source")
     if i < n and toks[i][0] == "word" and toks[i][1].lower() in _SUBQUERY_HEAD:
         return i, depth
-    name, qualifier, j = _qualified_name(toks, i)
-    refs.append((name, qualifier, i))
+    parts, j = _qualified_name(toks, i)
+    refs.append((parts, i))
     return j, depth
 
 
 def _table_refs(toks):
-    """[(name, qualifier, token index)] for every FROM/JOIN target, comma-joined
-    arms included — `FROM sales, customers` hid its second arm from the regex.
-    `qualifier` is "" for an unqualified name."""
+    """[(parts, token index)] for every FROM/JOIN target, comma-joined arms
+    included — `FROM sales, customers` hid its second arm from the regex.
+    `parts` is the dotted reference as written (see _qualified_name): one
+    _Ident for an unqualified name, more when it carries a qualifier."""
     refs, i, n, depth, from_depth = [], 0, len(toks), 0, None
     while i < n:
         kind, text = toks[i]
@@ -293,7 +345,7 @@ def _cte_bindings(toks):
         if recursive:
             i += 1
         while i < n and toks[i][0] in ("word", "ident"):
-            name, at = toks[i][1].strip('"').lower(), i
+            name, at = _Ident(toks[i][1], toks[i][0] == "ident"), i
             i = _skip_parens(toks, i + 1)          # optional (col, col) list
             if not (i < n and toks[i][0] == "word" and toks[i][1].lower() == "as"):
                 break
@@ -311,12 +363,17 @@ def _cte_bindings(toks):
     return out
 
 
-def _cte_legal(bindings, name, at):
-    """Is the ref at token index `at` resolved by a CTE the ENGINE would also
-    resolve it to? Bound earlier, still in scope, and not a non-recursive
-    self-reference (which the engine sends to the base table)."""
-    for bname, bat, scope_end, body_open, body_close, recursive in bindings:
-        if bname != name or not (bat < at < scope_end):
+def _cte_legal(bindings, canon, at, dialect=None):
+    """Is the ref whose canonical identity is `canon`, at token index `at`,
+    resolved by a CTE the ENGINE would also resolve it to? Bound earlier, still
+    in scope, and not a non-recursive self-reference (which the engine sends to
+    the base table).
+
+    Names are compared CANONICALLY, so a quoted CTE cannot shadow an unquoted
+    base table (or the reverse): on PostgreSQL the CTE `"CUSTOMERS"` does not
+    answer a bare `customers`, and the guard must not pretend it does."""
+    for bident, bat, scope_end, body_open, body_close, recursive in bindings:
+        if _canon(bident, dialect) != canon or not (bat < at < scope_end):
             continue
         if body_open < at < body_close and not recursive:
             continue
@@ -326,35 +383,78 @@ def _cte_legal(bindings, name, at):
 
 # ── Public API ──────────────────────────────────────────────────────────
 
-def _qualifier_ok(qualifier, qualifiers):
-    """Is `db.schema` one of the namespaces this connector was configured with?
+def _declared_qualifiers(qualifiers, dialect=None):
+    """Connector.qualifiers() grouped BY ARITY: {n_parts: {canonical prefix}}.
 
-    Whole-string comparison only, deliberately. Accepting a qualifier because
+    Arity is the question, not just the text. A one-part prefix and a two-part
+    prefix mean different things to the engine — Snowflake reads `x.sales` as
+    SCHEMA.object and `a.b.sales` as DATABASE.SCHEMA.object — so a connector
+    that accepts a database name only in the two-part position must not have it
+    matched in the one-part position. Grouping makes that impossible to get
+    wrong by accident and lets the refusal say which arities exist.
+
+    A declared prefix is read as a CATALOG spelling — the STORED name of the
+    namespace, canonicalized exactly like an allowlist entry (_catalog_canon).
+    That is what each connector reports: it is the spelling its own
+    list_tables() queries the catalog with, and (on PostgreSQL) the spelling
+    its search_path is pinned to. Each connector is responsible for applying
+    its vendor's folding to the raw env value before declaring it — Snowflake
+    stores an unquoted `public` as PUBLIC, so snowflake_conn declares PUBLIC.
+
+    Admitting BOTH readings (bare-folded and quoted-verbatim) instead was a
+    fail-open: with POSTGRES_SCHEMA=Analytics — a quote-created schema, which
+    is exactly how list_tables and the search_path pin read it — a folded
+    `analytics` was also admitted, so `analytics.sales` passed the namespace
+    check while PostgreSQL resolved it to a DIFFERENT schema the catalog had
+    never described. One spelling in, one identity out.
+    """
+    if qualifiers is None:
+        return None
+    by_arity = {}
+    for q in qualifiers:
+        parts = [p.strip('"').strip("`") for p in str(q).split(".")]
+        parts = [p for p in parts if p]
+        if not parts:
+            continue
+        by_arity.setdefault(len(parts), set()).add(
+            ".".join(_catalog_canon(p, dialect) for p in parts))
+    return by_arity
+
+
+def _qualifier_ok(canon_parts, by_arity):
+    """Is this canonicalized prefix one of the namespaces this connector was
+    configured with, AT THIS ARITY?
+
+    Whole-prefix comparison only, deliberately. Accepting a qualifier because
     its LAST part matches would re-open the hole this check exists to close:
     with a configured schema of `public`, `other_db.public.sales` would pass
     while reading another database's PUBLIC schema. Connectors therefore
     declare every spelling they accept (schema, database.schema, ...) in
     Connector.qualifiers(), built from the same env they connect with.
     """
-    return qualifier in qualifiers
+    return ".".join(canon_parts) in by_arity.get(len(canon_parts), ())
 
 
-def validate(sql, allowed_tables, qualifiers=None):
+def validate(sql, allowed_tables, qualifiers=None, dialect=None):
     """Raise QueryRejected unless `sql` is a single SELECT touching only
     allowed tables. Returns the comment-free SQL the caller must execute.
 
-    `qualifiers` is the connector's own namespace — the set of lowercase
-    prefixes a table reference may carry (Connector.qualifiers(); the gateway
-    passes it). When given, `secret_schema.sales` is refused even though the
+    `qualifiers` is the connector's own namespace — the prefixes a table
+    reference may carry, each declared at the ARITY the engine gives it
+    (Connector.qualifiers(); the gateway passes it), matched canonically. When given, `secret_schema.sales` is refused even though the
     bare name `sales` is allowed, because RBAC's allowlist only ever describes
     the CONFIGURED namespace and a warehouse credential usually sees more than
     that. An unqualified name is always fine, an empty set means "no qualifier
     at all" (sqlite/DuckDB/API sources), and None keeps the historical
     behaviour of not looking at qualifiers — the default so that callers
     without a connector in hand (blend, dashboards) are unaffected.
+
+    `dialect` is the connector's dialect (the gateway passes it) and decides
+    how identifiers FOLD: what `"CUSTOMERS"` and `customers` mean is a property
+    of the engine, not of the guard. None keeps the historical
+    case-insensitive-everything reading, so blend and dashboards are unaffected.
     """
-    quals = None if qualifiers is None else {
-        str(q).strip('"').strip("`").lower() for q in qualifiers}
+    quals = _declared_qualifiers(qualifiers, dialect)
     raw = (sql or "").strip().rstrip(";").strip()
     toks, cleaned = _tokens(raw)
     if not toks:
@@ -385,14 +485,20 @@ def validate(sql, allowed_tables, qualifiers=None):
         if FORBIDDEN.fullmatch(text):
             raise QueryRejected("Query contains a forbidden keyword (read-only access)")
 
-    allowed = {str(t).strip('"').lower() for t in allowed_tables}
+    # Allowlist entries are CATALOG spellings, so they are canonicalized the
+    # exact way a reference is — never a naive .lower(), which would let a
+    # quoted `"sales"` pass for a Snowflake table stored as SALES.
+    allowed = {_catalog_canon(t, dialect) for t in allowed_tables}
     ctes = _cte_bindings(toks)
     refs = _table_refs(toks)
-    for name, qualifier, at in refs:
-        if quals is not None and qualifier:
-            if not _qualifier_ok(qualifier, quals):
+    for parts, at in refs:
+        name = _canon(parts[-1], dialect)
+        qual_parts = [_canon(p, dialect) for p in parts[:-1]]
+        written = ".".join(p.text for p in parts)
+        if quals is not None and qual_parts:
+            if not _qualifier_ok(qual_parts, quals):
                 raise QueryRejected(
-                    f"Table '{qualifier}.{name}' is outside the configured "
+                    f"Table '{written}' is outside the configured "
                     f"namespace for this source")
             # A qualified reference names a real table in that namespace, never
             # a CTE (CTE names are bare), so it must be on the allowlist itself
@@ -400,15 +506,16 @@ def validate(sql, allowed_tables, qualifiers=None):
             # launder the CTE's permission onto the base table.
             if name not in allowed:
                 raise QueryRejected(
-                    f"Access to table '{name}' is not permitted for your role")
+                    f"Access to table '{parts[-1].text}' is not permitted for your role")
             continue
         # A CTE legalizes a ref only where the ENGINE would resolve it to that
         # CTE: bound earlier, within the binding's paren scope, and never a
         # non-recursive self-reference. Order-only tracking let an inner-scoped
         # binding launder an outer ref to a denied base table.
-        if name in allowed or _cte_legal(ctes, name, at):
+        if name in allowed or _cte_legal(ctes, name, at, dialect):
             continue
-        raise QueryRejected(f"Access to table '{name}' is not permitted for your role")
+        raise QueryRejected(
+            f"Access to table '{parts[-1].text}' is not permitted for your role")
     if not refs:
         # Fail closed: a query we cannot attribute to a permitted table is a
         # parser gap, and every gap so far has been a silent allow.
@@ -449,7 +556,9 @@ def base_tables(sql):
     try:
         toks, _ = _tokens((sql or "").strip().rstrip(";").strip())
         ctes = _cte_bindings(toks)
-        return {name for name, _qual, at in _table_refs(toks)
-                if not _cte_legal(ctes, name, at)}
+        # Dialect-free (case-insensitive) on purpose: governance and chat key
+        # their rules on lowercase bare names and have no connector in hand.
+        return {_canon(parts[-1]) for parts, at in _table_refs(toks)
+                if not _cte_legal(ctes, _canon(parts[-1]), at)}
     except QueryRejected:
         return set()

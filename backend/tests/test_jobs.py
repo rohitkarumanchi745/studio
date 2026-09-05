@@ -10,7 +10,13 @@ and its heartbeat thread stops as soon as a beat is refused; a lease cannot be t
 expires while its holder can renew; the Worker thread drains the queue and
 its scheduler loop ticks only under the lease; a SLOW tick runs off the poll
 loop (jobs keep flowing), never overlaps itself, renews its lease while it
-runs and is waited for by stop(); POST /api/chat/background enqueues a
+runs and is waited for by stop(); a tick still running when stop() gives up
+KEEPS its lease (it is left to expire rather than handed to a second worker
+mid-pass) while a normal tick releases promptly, and a failed renewal is read
+as loss of the lease and signals the tick to abandon; a reclaimed job signals
+its handler to abandon through an abort Event (and a handler that ignores it
+still runs to completion — the documented limitation); a reclaim pass runs
+the registered reconcilers and survives a broken one; POST /api/chat/background enqueues a
 chat_turn job that run_one() completes into a done task plus an assistant
 message, a re-run of the same payload does NOT answer twice, and two turns
 started in the SAME conversation both get answered; canvas composition is
@@ -523,6 +529,201 @@ def test_stop_waits_for_an_in_flight_tick_before_releasing_the_lease(env):
     w.stop()
     assert done == ["finished"]                    # stop() returned only after it
     assert jobs.acquire_lease("m365_sync", "other", ttl_s=5) is True   # lease released
+
+
+def test_stop_does_not_release_the_lease_of_a_tick_that_is_still_running(env, monkeypatch):
+    """stop() waits a bounded moment for an in-flight tick; when that runs out
+    it used to release the lease anyway, which is precisely the overlap the
+    lease exists to prevent — the tick is still executing and cannot be
+    killed, so another replica would start a second copy of the same pass.
+    A lease under a live tick is now LEFT to expire on its own."""
+    jobs = env
+    monkeypatch.setattr(jobs, "_SCHED_STOP_WAIT_S", 0.2)
+    started, release = threading.Event(), threading.Event()
+
+    def _stuck():
+        started.set()
+        release.wait(10)
+
+    w = jobs.Worker(worker_id="stuck", concurrency=1, poll_s=0.02,
+                    schedulers=[{"name": "autopilot", "fn": _stuck,
+                                 "enabled": lambda: True, "interval_s": 0.05}]).start()
+    try:
+        assert started.wait(5), "the scheduler never ticked"
+        w.stop()                       # gives up on the tick after the grace
+        assert not release.is_set()    # ... which is genuinely still running
+        # A second worker cannot take the scheduler while that pass is alive.
+        assert jobs.acquire_lease("autopilot", "other", ttl_s=5) is False
+        from app import db as _db
+        with _db.connect() as c:
+            row = c.execute("SELECT holder, expires_at FROM scheduler_leases WHERE name=?",
+                            ("autopilot",)).fetchone()
+        assert row["holder"] == "stuck"
+        # It is left to EXPIRE, not held forever: the TTL is the bound.
+        assert float(row["expires_at"]) - time.time() <= jobs._lease_ttl(
+            {"interval_s": 0.05}) + 1
+    finally:
+        release.set()
+
+
+def test_a_failed_renewal_marks_the_lease_lost_and_signals_the_tick(env, monkeypatch):
+    """A renewal that does not come back holding the lease means the lease is
+    GONE. It used to be logged and ignored, so the tick kept running (and kept
+    trying to renew) while another worker held the name."""
+    jobs = env
+    monkeypatch.setattr(jobs, "_SCHED_RENEW_S", 0.02)
+    finished = []
+
+    def _tick():
+        for _ in range(500):           # ~5s if it is never signalled
+            jobs.check_claim()         # the cooperative safe point
+            time.sleep(0.01)
+        finished.append("ran to completion")
+
+    s = {"name": "autopilot", "fn": _tick, "enabled": lambda: True, "interval_s": 0.05}
+    w = jobs.Worker(worker_id="A", schedulers=[])
+    assert jobs.acquire_lease("autopilot", "A", jobs._lease_ttl(s)) is True
+    # Every renewal from here on fails (a database blip, or another holder).
+    monkeypatch.setattr(jobs, "acquire_lease", lambda *a, **k: False)
+
+    t0 = time.time()
+    w._run_scheduled_tick(s)           # returns when the tick abandons itself
+    assert time.time() - t0 < 3, "the tick kept running after losing its lease"
+    assert finished == [], "the tick ran to completion without its lease"
+
+
+def test_a_tick_that_keeps_its_lease_is_never_signalled(env, monkeypatch):
+    """The mirror image: renewals that succeed must not abort anything."""
+    jobs = env
+    monkeypatch.setattr(jobs, "_SCHED_RENEW_S", 0.02)
+    finished = []
+
+    def _tick():
+        for _ in range(20):
+            jobs.check_claim()
+            time.sleep(0.01)
+        finished.append("done")
+
+    s = {"name": "autopilot", "fn": _tick, "enabled": lambda: True, "interval_s": 0.05}
+    w = jobs.Worker(worker_id="A", schedulers=[])
+    assert jobs.acquire_lease("autopilot", "A", jobs._lease_ttl(s)) is True
+    w._run_scheduled_tick(s)
+    assert finished == ["done"]
+    # A normal tick still gives the lease back promptly when the worker stops.
+    w.schedulers = [s]
+    w.stop()
+    assert jobs.acquire_lease("autopilot", "other", ttl_s=5) is True
+
+
+def test_lease_ttl_is_comfortably_longer_than_a_tick_and_than_stop(env):
+    """The TTL is the failover bound. It has to outlast many renewal periods
+    (so a blip never expires a live lease) and stop()'s grace (so a lease left
+    behind by a stuck tick expires rather than lingering by accident)."""
+    jobs = env
+    ttl = jobs._lease_ttl({"interval_s": 60})
+    assert ttl >= 4 * 60
+    for interval in (0.05, 1, 30, 60, 300):
+        ttl = jobs._lease_ttl({"interval_s": interval})
+        assert ttl >= jobs._SCHED_LEASE_FLOOR_S
+        assert ttl >= 12 * jobs._SCHED_RENEW_S     # 12 failed renewals to expire
+        assert ttl > jobs._SCHED_STOP_WAIT_S * 10
+        assert ttl >= 4 * interval
+
+
+# ── Cooperative abort: a lost claim reaches the HANDLER ──────────────────
+
+def test_a_reclaimed_job_signals_its_handler_to_abandon(env, monkeypatch):
+    """The claim token fences the job ROW, but a handler's side effects are
+    not fenced by anything. _execute now sets an abort Event the moment a
+    heartbeat is refused, so a handler that checks it stops before writing."""
+    jobs = env
+    monkeypatch.setattr(jobs, "_HEARTBEAT_S", 0.05)
+    effects, saw_event = [], []
+    running, reclaimed = threading.Event(), threading.Event()
+
+    @jobs.handler("t_abort")
+    def _slow(payload, job):
+        running.set()
+        saw_event.append(isinstance(job.get("abort"), threading.Event))
+        reclaimed.wait(5)
+        for _ in range(200):
+            jobs.check_claim()        # safe point, before the side effect
+            time.sleep(0.01)
+        effects.append("wrote the answer")
+        return {"ok": True}
+
+    jid = jobs.enqueue("t_abort", {})
+    t = threading.Thread(target=jobs.run_one, args=("w1",), daemon=True)
+    t.start()
+    assert running.wait(5)
+    # Another worker takes the job away while ours is still executing.
+    jobs.reclaim_stale(stale_after=-1)
+    reclaimed.set()
+    t.join(10)
+    assert saw_event == [True]        # the Event reached the handler
+    assert effects == [], "the handler kept working after losing its claim"
+    # Abandoned, not failed: the attempt belongs to whoever owns the row now.
+    row = jobs.get(jid)
+    assert row["status"] == "queued" and row["locked_by"] is None
+    assert row["error"] == "stale: worker stopped heartbeating"
+
+
+def test_a_handler_that_ignores_the_abort_event_still_runs(env, monkeypatch):
+    """Documented limitation, pinned so nobody mistakes the cooperative signal
+    for a guarantee: Python cannot preempt a thread, so a handler that never
+    checks runs to the end. This is exactly why an at-most-once effect needs a
+    database constraint (messages.reply_to) and not just this Event."""
+    jobs = env
+    monkeypatch.setattr(jobs, "_HEARTBEAT_S", 0.05)
+    effects = []
+    running, reclaimed = threading.Event(), threading.Event()
+
+    @jobs.handler("t_no_check")
+    def _oblivious(payload, job):
+        running.set()
+        reclaimed.wait(5)
+        time.sleep(0.2)
+        effects.append("wrote anyway")   # no check_claim() anywhere
+        return {"ok": True}
+
+    jobs.enqueue("t_no_check", {})
+    t = threading.Thread(target=jobs.run_one, args=("w1",), daemon=True)
+    t.start()
+    assert running.wait(5)
+    jobs.reclaim_stale(stale_after=-1)
+    reclaimed.set()
+    t.join(10)
+    assert effects == ["wrote anyway"]
+
+
+# ── Reconcilers run on the reclaim pass ──────────────────────────────────
+
+def test_reclaim_runs_registered_reconcilers_and_survives_a_broken_one(env):
+    jobs = env
+    calls = []
+
+    def good():
+        calls.append("good")
+
+    def bad():
+        calls.append("bad")
+        raise RuntimeError("reconciler exploded")
+
+    keys = [f"{f.__module__}.{f.__qualname__}" for f in (good, bad)]
+    jobs.reconciler(bad)
+    jobs.reconciler(good)
+    try:
+        # A broken reconciler must not stop the queue from healing.
+        assert jobs.reclaim_stale() == (0, 0)
+        assert sorted(calls) == ["bad", "good"]
+        # Registering the same function again replaces it — a module reload
+        # must not double every reconciler.
+        before = len(jobs._RECONCILERS)
+        jobs.reconciler(good)
+        assert len(jobs._RECONCILERS) == before
+    finally:
+        for k in keys:
+            jobs._RECONCILERS.pop(k, None)
 
 
 def test_worker_mode_env(monkeypatch):

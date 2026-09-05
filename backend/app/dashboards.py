@@ -47,39 +47,38 @@ VIEW_LOG_TTL = float(os.getenv("STUDIO_DASH_VIEW_LOG_TTL", "300"))
 
 def init_tables():
     """Idempotent; also called at import so a missed wiring cannot break the feature."""
-    c = db._conn()
-    c.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS dashboards (
-            id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            title TEXT NOT NULL,
-            description TEXT NOT NULL DEFAULT '',
-            visibility TEXT NOT NULL DEFAULT 'private',
-            layout TEXT NOT NULL DEFAULT '{}',
-            filters TEXT NOT NULL DEFAULT '[]',
-            created_at REAL NOT NULL,
-            updated_at REAL NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS dashboard_tiles (
-            id TEXT PRIMARY KEY,
-            dashboard_id TEXT NOT NULL,
-            position INTEGER NOT NULL DEFAULT 0,
-            title TEXT NOT NULL DEFAULT '',
-            source TEXT NOT NULL,
-            table_label TEXT,
-            sql TEXT NOT NULL,
-            spec TEXT NOT NULL,
-            layout TEXT NOT NULL DEFAULT '{}',
-            created_at REAL NOT NULL,
-            updated_at REAL NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_dash_user ON dashboards(user_id, updated_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_tile_dash ON dashboard_tiles(dashboard_id, position);
-        """
-    )
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS dashboards (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                visibility TEXT NOT NULL DEFAULT 'private',
+                layout TEXT NOT NULL DEFAULT '{}',
+                filters TEXT NOT NULL DEFAULT '[]',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS dashboard_tiles (
+                id TEXT PRIMARY KEY,
+                dashboard_id TEXT NOT NULL,
+                position INTEGER NOT NULL DEFAULT 0,
+                title TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL,
+                table_label TEXT,
+                sql TEXT NOT NULL,
+                spec TEXT NOT NULL,
+                layout TEXT NOT NULL DEFAULT '{}',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_dash_user ON dashboards(user_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_tile_dash ON dashboard_tiles(dashboard_id, position);
+            """
+        )
+        c.commit()
 
 
 init_tables()
@@ -208,53 +207,48 @@ def _visible_filters(dash, user):
 # ── Storage (no HTTP — importable by tests and by a future agent tool) ──
 
 def dashboard_owner(dashboard_id):
-    c = db._conn()
-    row = c.execute("SELECT user_id FROM dashboards WHERE id=?", (dashboard_id,)).fetchone()
-    c.close()
+    with db.connect() as c:
+        row = c.execute("SELECT user_id FROM dashboards WHERE id=?", (dashboard_id,)).fetchone()
     return row["user_id"] if row else None
 
 
 def create_dashboard(user, title, description="", visibility="private", layout=None):
     did, now = str(uuid.uuid4()), time.time()
-    c = db._conn()
-    c.execute(
-        "INSERT INTO dashboards (id, user_id, title, description, visibility, layout, "
-        "filters, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
-        (did, user["id"], (title or "Untitled dashboard")[:120], (description or "")[:500],
-         visibility if visibility in VISIBILITIES else "private",
-         json.dumps(_dict(layout) or DEFAULT_LAYOUT), "[]", now, now),
-    )
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute(
+            "INSERT INTO dashboards (id, user_id, title, description, visibility, layout, "
+            "filters, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (did, user["id"], (title or "Untitled dashboard")[:120], (description or "")[:500],
+             visibility if visibility in VISIBILITIES else "private",
+             json.dumps(_dict(layout) or DEFAULT_LAYOUT), "[]", now, now),
+        )
+        c.commit()
     return get_dashboard(did)
 
 
 def get_dashboard(dashboard_id, *, with_tiles=True):
-    c = db._conn()
-    row = c.execute("SELECT * FROM dashboards WHERE id=?", (dashboard_id,)).fetchone()
-    if not row:
-        c.close()
-        return None
-    dash = _row_to_dash(row)
-    if with_tiles:
-        rows = c.execute(
-            "SELECT * FROM dashboard_tiles WHERE dashboard_id=? ORDER BY position, created_at",
-            (dashboard_id,)).fetchall()
-        dash["tiles"] = [_row_to_tile(r) for r in rows]
-    c.close()
+    with db.connect() as c:
+        row = c.execute("SELECT * FROM dashboards WHERE id=?", (dashboard_id,)).fetchone()
+        if not row:
+            return None
+        dash = _row_to_dash(row)
+        if with_tiles:
+            rows = c.execute(
+                "SELECT * FROM dashboard_tiles WHERE dashboard_id=? ORDER BY position, created_at",
+                (dashboard_id,)).fetchall()
+            dash["tiles"] = [_row_to_tile(r) for r in rows]
     return dash
 
 
 def list_dashboards(user):
     """The user's own dashboards plus every org-visible one, newest first."""
-    c = db._conn()
-    rows = c.execute(
-        "SELECT d.*, u.email owner_email, "
-        "(SELECT COUNT(*) FROM dashboard_tiles t WHERE t.dashboard_id=d.id) tile_count "
-        "FROM dashboards d LEFT JOIN users u ON u.id=d.user_id "
-        "WHERE d.user_id=? OR d.visibility='org' ORDER BY d.updated_at DESC",
-        (user["id"],)).fetchall()
-    c.close()
+    with db.connect() as c:
+        rows = c.execute(
+            "SELECT d.*, u.email owner_email, "
+            "(SELECT COUNT(*) FROM dashboard_tiles t WHERE t.dashboard_id=d.id) tile_count "
+            "FROM dashboards d LEFT JOIN users u ON u.id=d.user_id "
+            "WHERE d.user_id=? OR d.visibility='org' ORDER BY d.updated_at DESC",
+            (user["id"],)).fetchall()
     out = []
     for r in rows:
         d = _row_to_dash(r)
@@ -289,27 +283,24 @@ def update_dashboard(dashboard_id, **fields):
         sets.append(f"{key}=?")
         args.append(val)
     if sets:
-        c = db._conn()
-        c.execute(f"UPDATE dashboards SET {', '.join(sets)}, updated_at=? WHERE id=?",
-                  (*args, time.time(), dashboard_id))
-        c.commit()
-        c.close()
+        with db.connect() as c:
+            c.execute(f"UPDATE dashboards SET {', '.join(sets)}, updated_at=? WHERE id=?",
+                      (*args, time.time(), dashboard_id))
+            c.commit()
     return get_dashboard(dashboard_id)
 
 
 def delete_dashboard(dashboard_id):
-    c = db._conn()
-    c.execute("DELETE FROM dashboard_tiles WHERE dashboard_id=?", (dashboard_id,))
-    c.execute("DELETE FROM dashboards WHERE id=?", (dashboard_id,))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("DELETE FROM dashboard_tiles WHERE dashboard_id=?", (dashboard_id,))
+        c.execute("DELETE FROM dashboards WHERE id=?", (dashboard_id,))
+        c.commit()
 
 
 def _touch(dashboard_id):
-    c = db._conn()
-    c.execute("UPDATE dashboards SET updated_at=? WHERE id=?", (time.time(), dashboard_id))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("UPDATE dashboards SET updated_at=? WHERE id=?", (time.time(), dashboard_id))
+        c.commit()
 
 
 def _auto_layout(tiles, chart_type, cols=12):
@@ -350,25 +341,23 @@ def add_tile(dashboard_id, tile):
     layout = _dict(tile.get("layout")) or _auto_layout(dash.get("tiles") or [], spec.get("type"))
     position = _int(tile.get("position"), len(dash.get("tiles") or []))
     tid, now = str(uuid.uuid4()), time.time()
-    c = db._conn()
-    c.execute(
-        "INSERT INTO dashboard_tiles (id, dashboard_id, position, title, source, table_label, "
-        "sql, spec, layout, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        (tid, dashboard_id, position, str(tile.get("title") or spec.get("title") or "")[:120],
-         str(tile.get("source") or ""), tile.get("table_label"), str(tile.get("sql") or ""),
-         json.dumps(spec), json.dumps(layout), now, now),
-    )
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute(
+            "INSERT INTO dashboard_tiles (id, dashboard_id, position, title, source, table_label, "
+            "sql, spec, layout, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (tid, dashboard_id, position, str(tile.get("title") or spec.get("title") or "")[:120],
+             str(tile.get("source") or ""), tile.get("table_label"), str(tile.get("sql") or ""),
+             json.dumps(spec), json.dumps(layout), now, now),
+        )
+        c.commit()
     _touch(dashboard_id)
     return get_tile(dashboard_id, tid), warnings
 
 
 def get_tile(dashboard_id, tile_id):
-    c = db._conn()
-    row = c.execute("SELECT * FROM dashboard_tiles WHERE id=? AND dashboard_id=?",
-                    (tile_id, dashboard_id)).fetchone()
-    c.close()
+    with db.connect() as c:
+        row = c.execute("SELECT * FROM dashboard_tiles WHERE id=? AND dashboard_id=?",
+                        (tile_id, dashboard_id)).fetchone()
     return _row_to_tile(row) if row else None
 
 
@@ -404,21 +393,19 @@ def update_tile(dashboard_id, tile_id, **fields):
         sets.append(f"{key}=?")
         args.append(val)
     if sets:
-        c = db._conn()
-        c.execute(f"UPDATE dashboard_tiles SET {', '.join(sets)}, updated_at=? "
-                  "WHERE id=? AND dashboard_id=?", (*args, time.time(), tile_id, dashboard_id))
-        c.commit()
-        c.close()
+        with db.connect() as c:
+            c.execute(f"UPDATE dashboard_tiles SET {', '.join(sets)}, updated_at=? "
+                      "WHERE id=? AND dashboard_id=?", (*args, time.time(), tile_id, dashboard_id))
+            c.commit()
         _touch(dashboard_id)
     return get_tile(dashboard_id, tile_id), warnings
 
 
 def delete_tile(dashboard_id, tile_id):
-    c = db._conn()
-    c.execute("DELETE FROM dashboard_tiles WHERE id=? AND dashboard_id=?",
-              (tile_id, dashboard_id))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("DELETE FROM dashboard_tiles WHERE id=? AND dashboard_id=?",
+                  (tile_id, dashboard_id))
+        c.commit()
     _touch(dashboard_id)
 
 
@@ -426,17 +413,16 @@ def set_layout(dashboard_id, layout):
     """Bulk drag/resize commit. Unknown tile ids are ignored, not an error."""
     known = {t["id"] for t in (get_dashboard(dashboard_id) or {}).get("tiles", [])}
     now, updated = time.time(), 0
-    c = db._conn()
-    for i, item in enumerate(_list(layout)):
-        if not isinstance(item, dict) or item.get("id") not in known:
-            continue
-        box = {"x": _int(item.get("x"), 0), "y": _int(item.get("y"), 0),
-               "w": max(1, _int(item.get("w"), 6)), "h": max(1, _int(item.get("h"), 4))}
-        c.execute("UPDATE dashboard_tiles SET layout=?, position=?, updated_at=? WHERE id=?",
-                  (json.dumps(box), i, now, item["id"]))
-        updated += 1
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        for i, item in enumerate(_list(layout)):
+            if not isinstance(item, dict) or item.get("id") not in known:
+                continue
+            box = {"x": _int(item.get("x"), 0), "y": _int(item.get("y"), 0),
+                   "w": max(1, _int(item.get("w"), 6)), "h": max(1, _int(item.get("h"), 4))}
+            c.execute("UPDATE dashboard_tiles SET layout=?, position=?, updated_at=? WHERE id=?",
+                      (json.dumps(box), i, now, item["id"]))
+            updated += 1
+        c.commit()
     if updated:
         _touch(dashboard_id)
     return updated

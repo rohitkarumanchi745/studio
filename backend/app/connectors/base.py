@@ -128,8 +128,8 @@ class Connector:
         raise NotImplementedError
 
     def qualifiers(self):
-        """Lowercase namespace prefixes a table reference may carry in this
-        source's SQL — {"public", "acme.public"} for a Postgres schema, say.
+        """Namespace prefixes a table reference may carry in this source's SQL
+        — {"public", "acme.public"} for a Postgres schema, say.
 
         The gateway hands this to queryguard, which refuses a FROM/JOIN target
         whose qualifier is not in the set: RBAC's allowlist only ever describes
@@ -137,6 +137,21 @@ class Connector:
         it connects with usually sees more, so `secret_schema.sales` must not
         ride in on an allowlist entry for `sales`. Unqualified names are always
         fine — they are what RBAC keys on.
+
+        ARITY is part of the declaration, not a detail: a one-part prefix and a
+        two-part prefix are DIFFERENT questions, because engines resolve them
+        differently (Snowflake reads `x.sales` as SCHEMA.object but `a.b.sales`
+        as DATABASE.SCHEMA.object). Declare each spelling at the arity the
+        vendor actually gives it, and state that rule in the override's
+        docstring — declaring a DATABASE name as a ONE-part prefix let
+        `<database>.sales` through as a schema reference the catalog had never
+        described. The guard matches a whole prefix at its own arity and never
+        on a suffix.
+
+        Case follows the ENGINE: the guard canonicalizes both sides for the
+        connector's dialect, so a prefix may be reported lower-cased where the
+        engine folds bare names (Postgres, Snowflake) but must keep its exact
+        spelling where it does not (BigQuery dataset ids).
 
         Default: EMPTY, i.e. no qualifier is accepted. A connector that has not
         declared its namespace cannot vouch for one, and sqlite / in-memory /

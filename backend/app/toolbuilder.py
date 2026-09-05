@@ -11,8 +11,8 @@ The safety spine (highest-risk feature in the app):
 
     build ──▶ code in a DB row (status=draft)          no file, no exec
       │
-    submit ─▶ supervisor.submit("mcp_build", <accessible source>, code)
-      │       code-as-not-read ⇒ needs_human ⇒ awaiting_approval
+    submit ─▶ supervisor.submit(ARTIFACT_KIND, <accessible source>, code)
+      │       an artifact is always needs_human ⇒ awaiting_approval
       │                                          (no mcp_servers row yet)
     a human ADMIN approves the supervised job (supervisor._need_approver)
       │
@@ -24,6 +24,10 @@ admin's approval of the supervised job. The app's only contact with the
 generated code is open(path,"w").write(code); it is never import/exec/eval'd
 in-process. It runs only when the MCP client spawns it as a separate OS process
 over stdio, and only for the approved, enabled=1 row.
+
+The supervised job is an APPROVAL RECORD, not an execution: supervisor's
+artifact kind runs nothing at all (no connector, no run_script), so the admin
+signature — and the audit row it leaves — is the whole of what that job does.
 
 HOW it runs is not decided here. The row stores only the confined path; at
 load time mcp.registered() replaces command/args with sandbox.launch_spec(path)
@@ -195,38 +199,36 @@ def _server_name(artifact, requested=None):
 # ── Persistence ─────────────────────────────────────────────────────────
 
 def init_tables():
-    c = db._conn()
-    c.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS toolbuilder_artifacts (
-            id TEXT PRIMARY KEY,
-            owner_id TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            prompt TEXT NOT NULL,
-            code TEXT NOT NULL,
-            status TEXT NOT NULL,
-            job_id TEXT,
-            server_name TEXT,
-            source TEXT,
-            name TEXT,
-            created_at REAL NOT NULL,
-            updated_at REAL NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_tb_owner ON toolbuilder_artifacts(owner_id, updated_at DESC);
-        """
-    )
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS toolbuilder_artifacts (
+                id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                code TEXT NOT NULL,
+                status TEXT NOT NULL,
+                job_id TEXT,
+                server_name TEXT,
+                source TEXT,
+                name TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_tb_owner ON toolbuilder_artifacts(owner_id, updated_at DESC);
+            """
+        )
+        c.commit()
 
 
 def _insert(a):
-    c = db._conn()
-    cols = ("id,owner_id,kind,prompt,code,status,job_id,server_name,source,name,"
-            "created_at,updated_at")
-    c.execute(f"INSERT INTO toolbuilder_artifacts ({cols}) VALUES ({','.join('?' * 12)})",
-              tuple(a[k] for k in cols.split(",")))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        cols = ("id,owner_id,kind,prompt,code,status,job_id,server_name,source,name,"
+                "created_at,updated_at")
+        c.execute(f"INSERT INTO toolbuilder_artifacts ({cols}) VALUES ({','.join('?' * 12)})",
+                  tuple(a[k] for k in cols.split(",")))
+        c.commit()
 
 
 def _save(a, **fields):
@@ -234,17 +236,15 @@ def _save(a, **fields):
     a["updated_at"] = time.time()
     fields["updated_at"] = a["updated_at"]
     sets = ", ".join(f"{k}=?" for k in fields)
-    c = db._conn()
-    c.execute(f"UPDATE toolbuilder_artifacts SET {sets} WHERE id=?",
-              list(fields.values()) + [a["id"]])
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute(f"UPDATE toolbuilder_artifacts SET {sets} WHERE id=?",
+                  list(fields.values()) + [a["id"]])
+        c.commit()
 
 
 def _row(id):
-    c = db._conn()
-    r = c.execute("SELECT * FROM toolbuilder_artifacts WHERE id=?", (id,)).fetchone()
-    c.close()
+    with db.connect() as c:
+        r = c.execute("SELECT * FROM toolbuilder_artifacts WHERE id=?", (id,)).fetchone()
     return dict(r) if r else None
 
 
@@ -283,12 +283,17 @@ def _resolve(a):
     """Poll the linked supervised job and reflect the human's decision onto the
     artifact. Supervisor has no post-approval callback, so this runs on every
     read. We key on human_by (an admin, enforced by supervisor._need_approver),
-    never on the job's run result (the SQL executor mis-handles Python text and
-    escalates — cosmetic; the app still never exec/imports the code)."""
+    never on the job's run result: the job's "execution" is the approval itself
+    (supervisor's artifact kind executes nothing), so its result can never be
+    what makes code runnable — only an admin's signature can.
+
+    The linked job must BE an artifact job. Registration is the one edge from
+    code to runnable, so it may not be reached through a job of some other kind
+    that happens to carry this id."""
     if a["status"] not in ("awaiting_approval",) or not a.get("job_id"):
         return a
     job = supervisor._get(a["job_id"])
-    if not job:
+    if not job or job["kind"] != supervisor.ARTIFACT_KIND:
         return a
     if job["status"] == "rejected":
         _save(a, status="rejected")
@@ -368,11 +373,10 @@ def build(body: BuildIn, user=Depends(current_user)):
 
 @router.get("")
 def list_artifacts(user=Depends(current_user)):
-    c = db._conn()
-    rows = c.execute(
-        "SELECT * FROM toolbuilder_artifacts WHERE owner_id=? ORDER BY updated_at DESC LIMIT 200",
-        (user["id"],)).fetchall()
-    c.close()
+    with db.connect() as c:
+        rows = c.execute(
+            "SELECT * FROM toolbuilder_artifacts WHERE owner_id=? ORDER BY updated_at DESC LIMIT 200",
+            (user["id"],)).fetchall()
     arts = [_resolve(dict(r)) for r in rows]
     return {"artifacts": [_card(a) for a in arts]}
 
@@ -404,7 +408,10 @@ def submit(id: str, body: SubmitIn = SubmitIn(), user=Depends(current_user)):
         # Can't scope a built tool to a source the owner's role cannot reach.
         raise HTTPException(400, f"You cannot scope this tool to '{anchor}'.")
 
-    job = supervisor.submit(kind="mcp_build", target=anchor, script=a["code"], user=user)
+    # ARTIFACT_KIND, never a SQL/Spark kind: the script is generated Python and
+    # the job exists for the admin gate + audit trail, not to run anything.
+    job = supervisor.submit(kind=supervisor.ARTIFACT_KIND, target=anchor,
+                            script=a["code"], user=user)
     _save(a, status="awaiting_approval", job_id=job["id"], source=anchor)
     db.log_activity(user, "toolbuilder_submit", prompt=a["prompt"][:200], source=anchor)
     return {"artifact": _public(_row(a["id"])),
@@ -426,8 +433,7 @@ def delete_artifact(id: str, user=Depends(current_user)):
             os.remove(path)
         except Exception:
             pass
-    c = db._conn()
-    c.execute("DELETE FROM toolbuilder_artifacts WHERE id=?", (id,))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("DELETE FROM toolbuilder_artifacts WHERE id=?", (id,))
+        c.commit()
     return {"ok": True}

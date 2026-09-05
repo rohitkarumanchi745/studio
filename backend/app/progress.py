@@ -45,11 +45,9 @@ def emit_for(tid, label):
     if not tid or not label:
         return
     try:
-        with _lock:
-            c = db._conn()
+        with _lock, db.connect() as c:
             r = c.execute("SELECT steps FROM chat_tasks WHERE id=?", (tid,)).fetchone()
             if r is None:
-                c.close()
                 return
             try:
                 steps = json.loads(dict(r)["steps"] or "[]")
@@ -59,6 +57,5 @@ def emit_for(tid, label):
             c.execute("UPDATE chat_tasks SET steps=? WHERE id=?",
                       (json.dumps(steps[-MAX_STEPS:]), tid))
             c.commit()
-            c.close()
     except Exception:
         pass

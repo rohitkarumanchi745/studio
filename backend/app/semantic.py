@@ -70,21 +70,20 @@ _TREND_WORDS = ("trend", "over time", "time series", "timeline", "trended", "tre
 # ── Store (mirrors governance) ──────────────────────────────────────────
 
 def init_tables():
-    c = db._conn()
-    c.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS semantic_models (
-            id TEXT PRIMARY KEY,
-            yaml TEXT NOT NULL,
-            applied_by TEXT,
-            applied_at REAL NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS semantic_models_applied_at
-            ON semantic_models (applied_at DESC, id DESC);
-        """
-    )
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS semantic_models (
+                id TEXT PRIMARY KEY,
+                yaml TEXT NOT NULL,
+                applied_by TEXT,
+                applied_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS semantic_models_applied_at
+                ON semantic_models (applied_at DESC, id DESC);
+            """
+        )
+        c.commit()
 
 
 def _refresh_ttl():
@@ -99,12 +98,9 @@ def _newest_ident():
     row is never edited in place. None when the table is empty, _UNKNOWN when
     the store cannot be read (which must not be read as "no model")."""
     try:
-        c = db._conn()
-        try:
+        with db.connect() as c:
             row = c.execute("SELECT id, applied_at FROM semantic_models "
                             "ORDER BY applied_at DESC, id DESC LIMIT 1").fetchone()
-        finally:
-            c.close()
     except Exception:
         return _UNKNOWN
     return (row["id"], row["applied_at"]) if row else None
@@ -135,10 +131,9 @@ def load():
     """Active document: DB (admin-applied) first, else the STUDIO_SEMANTIC file,
     else none (chat just uses the agent). Cached in _STATE; accessors re-check
     the store every STUDIO_SEMANTIC_REFRESH_S; reload() forces it now."""
-    c = db._conn()
-    row = c.execute("SELECT id, yaml, applied_at FROM semantic_models "
-                    "ORDER BY applied_at DESC, id DESC LIMIT 1").fetchone()
-    c.close()
+    with db.connect() as c:
+        row = c.execute("SELECT id, yaml, applied_at FROM semantic_models "
+                        "ORDER BY applied_at DESC, id DESC LIMIT 1").fetchone()
     # Record the identity even when the YAML is unusable, or every refresh
     # would see a "change" and reload the same broken document forever.
     _FRESH.update(at=time.monotonic(),
@@ -752,11 +747,10 @@ def apply_yaml(body: YamlIn, user=Depends(current_user)):
     ok, errors, _ = validate(body.yaml)
     if not ok:
         raise HTTPException(400, {"errors": errors})
-    c = db._conn()
-    c.execute("INSERT INTO semantic_models (id, yaml, applied_by, applied_at) VALUES (?,?,?,?)",
-              (uuid.uuid4().hex, body.yaml, user["email"], time.time()))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("INSERT INTO semantic_models (id, yaml, applied_by, applied_at) VALUES (?,?,?,?)",
+                  (uuid.uuid4().hex, body.yaml, user["email"], time.time()))
+        c.commit()
     reload()
     db.log_activity(user, "semantic_apply", ok=loaded())
     return get_config(user)
@@ -765,10 +759,9 @@ def apply_yaml(body: YamlIn, user=Depends(current_user)):
 @router.delete("")
 def clear(user=Depends(current_user)):
     _admin(user)
-    c = db._conn()
-    c.execute("DELETE FROM semantic_models")
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("DELETE FROM semantic_models")
+        c.commit()
     reload()
     return {"loaded": loaded()}
 

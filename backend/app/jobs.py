@@ -4,7 +4,7 @@ Before this module, background work lived in the web process: chat turns on
 a ThreadPoolExecutor, the autopilot and M365 tickers on daemon threads. A
 restart lost every in-flight turn, and N web replicas ran N tickers. This
 module moves that work onto the app database (SQLite or Postgres — the same
-db._conn() facade every other module uses, no broker, no new dependency):
+db facade every other module uses, no broker, no new dependency):
 
   * background_jobs is the queue. A web request ENQUEUES a JSON payload and
     returns; a Worker CLAIMS it with one atomic UPDATE and runs the handler
@@ -41,6 +41,20 @@ Invariants:
   - Handlers must be re-entrant: a retry (or a reclaim after a crash) runs
     the same payload again, so a handler checks for its own prior effects
     before repeating a side effect.
+  - The fence protects the queue ROW; it cannot protect a handler's EFFECTS,
+    because Python cannot preempt a running thread. So a lost claim is also
+    published COOPERATIVELY: _execute() hands the handler an abort Event (in
+    job["abort"], and via claim_lost()/check_claim() for code too deep to
+    thread it through) and sets it the moment a heartbeat is refused. A
+    handler that checks it at its safe points raises ClaimLost and is
+    abandoned silently. A handler that IGNORES it keeps running to the end —
+    nothing can stop it — so any effect that must happen at most once needs a
+    real database constraint behind it as well (chat's answers have a UNIQUE
+    index on messages.reply_to; see chat._answer).
+  - A reclaim pass also runs the registered reconciler() callbacks. reclaim
+    repairs the queue; a reconciler repairs the rows that POINT AT the queue
+    (a chat_tasks row left 'running' with no job behind it), which reclaim
+    itself cannot see.
   - STUDIO_WORKER_MODE decides WHERE jobs run: "thread" (default — the web
     process runs one Worker in-process, the pre-queue behaviour), "external"
     (the web process only enqueues; `python -m app.worker` runs them) or
@@ -61,6 +75,26 @@ log = logging.getLogger("studio.jobs")
 
 STATUSES = ("queued", "running", "done", "failed")
 _HANDLERS = {}
+# fn() callbacks run after every reclaim pass — see reconciler(). Keyed by
+# qualified name so re-importing a module replaces its callback instead of
+# registering a second copy.
+_RECONCILERS = {}
+
+# The abort Event for the job (or scheduler tick) running on THIS thread.
+# Thread-local because a handler's inner layers — chat._answer is four calls
+# deep — must be able to ask "do I still own this work?" without every
+# function in between growing a parameter for it.
+_LOCAL = threading.local()
+
+
+class ClaimLost(Exception):
+    """A handler noticed its claim (or its scheduler lease) was taken away
+    mid-run and abandoned the work before writing anything.
+
+    _execute() treats it as a SILENT abandonment: no completion, no failure,
+    no retry, one log line. The worker that reclaimed the job is the one whose
+    run counts, and a fail() from us would spend an attempt that is no longer
+    ours and could re-queue a payload that is already executing elsewhere."""
 
 # Cadence knobs. Heartbeats are much more frequent than the stale window so a
 # slow-but-alive handler is never mistaken for a dead worker.
@@ -69,6 +103,7 @@ _RECLAIM_EVERY_S = 30.0
 # An in-flight scheduler tick renews its lease this often (bounded below by a
 # third of the lease TTL, so a renewal always lands well before expiry), and
 # stop() waits at most this long for one to finish before giving up on it.
+# Giving up does NOT release the lease — see Worker.stop().
 _SCHED_RENEW_S = 10.0
 _SCHED_STOP_WAIT_S = 5.0
 
@@ -86,37 +121,36 @@ def stale_after_s():
 # ── Schema ───────────────────────────────────────────────────────────────
 
 def init_tables():
-    c = db._conn()
-    c.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS background_jobs (
-            id TEXT PRIMARY KEY,
-            kind TEXT NOT NULL,
-            payload TEXT NOT NULL,
-            status TEXT NOT NULL,
-            attempts INTEGER NOT NULL DEFAULT 0,
-            max_attempts INTEGER NOT NULL DEFAULT 2,
-            run_after REAL NOT NULL,
-            locked_by TEXT,
-            locked_at REAL,
-            heartbeat_at REAL,
-            result TEXT,
-            error TEXT,
-            user_id TEXT,
-            created_at REAL NOT NULL,
-            finished_at REAL
-        );
-        CREATE INDEX IF NOT EXISTS idx_background_jobs_due
-            ON background_jobs(status, run_after);
-        CREATE TABLE IF NOT EXISTS scheduler_leases (
-            name TEXT PRIMARY KEY,
-            holder TEXT NOT NULL,
-            expires_at REAL NOT NULL
-        );
-        """
-    )
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS background_jobs (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 2,
+                run_after REAL NOT NULL,
+                locked_by TEXT,
+                locked_at REAL,
+                heartbeat_at REAL,
+                result TEXT,
+                error TEXT,
+                user_id TEXT,
+                created_at REAL NOT NULL,
+                finished_at REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_background_jobs_due
+                ON background_jobs(status, run_after);
+            CREATE TABLE IF NOT EXISTS scheduler_leases (
+                name TEXT PRIMARY KEY,
+                holder TEXT NOT NULL,
+                expires_at REAL NOT NULL
+            );
+            """
+        )
+        c.commit()
 
 
 # ── Handlers ─────────────────────────────────────────────────────────────
@@ -135,6 +169,65 @@ def handlers():
     return dict(_HANDLERS)
 
 
+def reconciler(fn):
+    """Register fn() to run after every reclaim pass.
+
+    reclaim_stale() repairs the QUEUE — a running job whose worker died goes
+    back on it. A reconciler repairs the rows that POINT AT the queue, which
+    the queue cannot see: chat_tasks.status='running' with no job behind it is
+    a task nothing will ever run and nothing will ever fail, so the UI spins on
+    it forever. Enqueue is atomic now (chat.ask_background writes the task row
+    and its job in one transaction), so no NEW orphan can be created — this is
+    the net that heals the ones an older build already left behind, and any
+    other way a job can vanish from under a task.
+
+    Callbacks run OUTSIDE reclaim_stale's transaction and every exception is
+    swallowed: a broken reconciler must never stop the queue from healing."""
+    _RECONCILERS[f"{fn.__module__}.{fn.__qualname__}"] = fn
+    return fn
+
+
+def run_reconcilers():
+    """Run every registered reconciler, isolating failures. Returns the number
+    that raised."""
+    failed = 0
+    for key, fn in list(_RECONCILERS.items()):
+        try:
+            fn()
+        except Exception:
+            failed += 1
+            log.exception("jobs: reconciler %s failed", key)
+    return failed
+
+
+# ── Cooperative abort ────────────────────────────────────────────────────
+
+def abort_event():
+    """The Event that is SET when the work running on THIS thread has lost its
+    claim (a reclaimed job) or its scheduler lease. None outside a job/tick —
+    a synchronous request, a test calling a handler directly — which is why
+    every caller must treat None as 'still ours'."""
+    return getattr(_LOCAL, "abort", None)
+
+
+def claim_lost():
+    """True once this thread's claim/lease is gone. Cheap: poll it freely."""
+    ev = abort_event()
+    return ev is not None and ev.is_set()
+
+
+def check_claim():
+    """Raise ClaimLost when this thread no longer owns its work.
+
+    Call it at SAFE POINTS — immediately before any write that must not happen
+    twice — so the abandonment costs nothing but the wasted compute. It is a
+    cooperative check, not a guarantee: a handler that never calls it runs to
+    completion regardless (Python cannot preempt a thread), so a
+    must-happen-once effect still needs a database constraint."""
+    if claim_lost():
+        raise ClaimLost("the claim on this job was reclaimed while it was running")
+
+
 # ── Queue operations ─────────────────────────────────────────────────────
 
 def _row(r):
@@ -150,30 +243,40 @@ def _row(r):
 
 
 def enqueue(kind, payload, *, user_id=None, run_after=None, max_attempts=2,
-            job_id=None):
+            job_id=None, conn=None):
     """Append a job and return its id. run_after (epoch seconds) delays it;
-    job_id lets a caller make the enqueue idempotent with its own key."""
+    job_id lets a caller make the enqueue idempotent with its own key.
+
+    `conn` ENLISTS the insert in a transaction the caller already has open:
+    the row is written on that connection and NOT committed here, so it lands
+    (or rolls back) atomically with the caller's own rows. That is what makes
+    a queue job and the application row that tracks it all-or-nothing — see
+    chat.ask_background, where a separate commit per row could leave a task
+    marked 'running' with no job to run it. Omitting `conn` keeps the old
+    behaviour exactly: our own connection, our own commit."""
     if kind not in _HANDLERS:
         # Not fatal — the handler may live in the worker process — but worth
         # a log line, since a typo here would sit on the queue forever.
         log.info("jobs: enqueue kind=%s has no handler in this process", kind)
     jid = job_id or str(uuid.uuid4())
     now = time.time()
-    c = db._conn()
-    c.execute(
-        "INSERT INTO background_jobs (id, kind, payload, status, attempts, max_attempts, "
-        "run_after, user_id, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-        (jid, kind, json.dumps(payload or {}), "queued", 0, int(max_attempts),
-         float(run_after if run_after is not None else now), user_id, now))
-    c.commit()
-    c.close()
+    sql = ("INSERT INTO background_jobs (id, kind, payload, status, attempts, max_attempts, "
+           "run_after, user_id, created_at) VALUES (?,?,?,?,?,?,?,?,?)")
+    params = (jid, kind, json.dumps(payload or {}), "queued", 0, int(max_attempts),
+              float(run_after if run_after is not None else now), user_id, now)
+    if conn is not None:
+        # The caller owns the transaction: no commit, no rollback, no close.
+        conn.execute(sql, params)
+        return jid
+    with db.connect() as c:
+        c.execute(sql, params)
+        c.commit()
     return jid
 
 
 def get(job_id):
-    c = db._conn()
-    r = c.execute("SELECT * FROM background_jobs WHERE id=?", (job_id,)).fetchone()
-    c.close()
+    with db.connect() as c:
+        r = c.execute("SELECT * FROM background_jobs WHERE id=?", (job_id,)).fetchone()
     return _row(r)
 
 
@@ -195,8 +298,7 @@ def claim(worker_id, kinds=None):
         kind_sql = " AND kind IN (" + ",".join("?" for _ in kinds) + ")"
         params.extend(kinds)
     lock = " FOR UPDATE SKIP LOCKED" if db.IS_PG else ""
-    c = db._conn()
-    try:
+    with db.connect() as c:
         c.execute(
             "UPDATE background_jobs SET status='running', locked_by=?, locked_at=?, "
             "heartbeat_at=?, attempts=attempts+1 WHERE id = ("
@@ -206,8 +308,6 @@ def claim(worker_id, kinds=None):
             params)
         c.commit()
         r = c.execute("SELECT * FROM background_jobs WHERE locked_by=?", (token,)).fetchone()
-    finally:
-        c.close()
     return _row(r)
 
 
@@ -224,15 +324,12 @@ def heartbeat(job_id, token):
     claim is GONE — reclaimed (locked_by cleared or replaced) or already
     finished — and the caller must then stop working on the job: someone else
     owns it now, and every further write of ours would corrupt their run."""
-    c = db._conn()
-    try:
+    with db.connect() as c:
         cur = c.execute(
             "UPDATE background_jobs SET heartbeat_at=? "
             "WHERE id=? AND status='running' AND locked_by=?",
             (time.time(), job_id, token))
         c.commit()
-    finally:
-        c.close()
     return _matched(cur)
 
 
@@ -240,15 +337,12 @@ def complete(job_id, token, result=None):
     """Record success, fenced on the claim token. Returns False — writing
     nothing at all — when the job was reclaimed while we ran, so a stale
     worker can never finish a job another worker is executing."""
-    c = db._conn()
-    try:
+    with db.connect() as c:
         cur = c.execute(
             "UPDATE background_jobs SET status='done', result=?, error=NULL, finished_at=?, "
             "locked_by=NULL WHERE id=? AND locked_by=?",
             (json.dumps(result) if result is not None else None, time.time(), job_id, token))
         c.commit()
-    finally:
-        c.close()
     return _matched(cur)
 
 
@@ -269,8 +363,7 @@ def fail(job_id, token, error, retry=True):
     the attempt it burned is not ours to spend."""
     error = (str(error) if error is not None else "")[:2000]
     now = time.time()
-    c = db._conn()
-    try:
+    with db.connect() as c:
         # The token is on the SELECT too, so a stale worker reads nothing and
         # leaves attempts/status exactly as the new owner set them.
         r = c.execute("SELECT attempts, max_attempts FROM background_jobs "
@@ -292,8 +385,6 @@ def fail(job_id, token, error, retry=True):
                 "locked_by=NULL WHERE id=? AND locked_by=?",
                 (error, now, job_id, token))
         c.commit()
-    finally:
-        c.close()
     return status if _matched(cur) else None
 
 
@@ -301,6 +392,11 @@ def reclaim_stale(stale_after=None):
     """Running jobs whose heartbeat stopped — their worker died or was
     restarted — go back to the queue, or to 'failed' when out of attempts.
     This is what makes a restart safe. Returns (requeued, failed) counts.
+
+    It is also where reconciler() callbacks run: the queue is only half the
+    picture, and a chat_tasks row left 'running' with no job behind it has
+    nothing here to reclaim. Reconcilers run after (and outside) our
+    transaction, and their failures are logged, never raised.
 
     Both UPDATEs CLEAR locked_by, and that is load-bearing, not tidiness: it
     invalidates the old owner's claim token. A worker that was merely slow
@@ -310,30 +406,29 @@ def reclaim_stale(stale_after=None):
     holder cannot present — a fresh token or NULL, never the old one."""
     stale_after = stale_after_s() if stale_after is None else float(stale_after)
     cutoff = time.time() - stale_after
-    c = db._conn()
-    cur = c.execute(
-        "UPDATE background_jobs SET status='queued', locked_by=NULL, locked_at=NULL, "
-        "heartbeat_at=NULL, error=? WHERE status='running' "
-        "AND COALESCE(heartbeat_at, locked_at, 0) < ? AND attempts < max_attempts",
-        ("stale: worker stopped heartbeating", cutoff))
-    requeued = cur.rowcount if cur.rowcount is not None else 0
-    cur = c.execute(
-        "UPDATE background_jobs SET status='failed', locked_by=NULL, finished_at=?, "
-        "error=? WHERE status='running' AND COALESCE(heartbeat_at, locked_at, 0) < ? "
-        "AND attempts >= max_attempts",
-        (time.time(), "stale: worker stopped heartbeating and no attempts remain", cutoff))
-    failed = cur.rowcount if cur.rowcount is not None else 0
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        cur = c.execute(
+            "UPDATE background_jobs SET status='queued', locked_by=NULL, locked_at=NULL, "
+            "heartbeat_at=NULL, error=? WHERE status='running' "
+            "AND COALESCE(heartbeat_at, locked_at, 0) < ? AND attempts < max_attempts",
+            ("stale: worker stopped heartbeating", cutoff))
+        requeued = cur.rowcount if cur.rowcount is not None else 0
+        cur = c.execute(
+            "UPDATE background_jobs SET status='failed', locked_by=NULL, finished_at=?, "
+            "error=? WHERE status='running' AND COALESCE(heartbeat_at, locked_at, 0) < ? "
+            "AND attempts >= max_attempts",
+            (time.time(), "stale: worker stopped heartbeating and no attempts remain", cutoff))
+        failed = cur.rowcount if cur.rowcount is not None else 0
+        c.commit()
     if requeued or failed:
         log.warning("jobs: reclaimed stale jobs: requeued=%s failed=%s", requeued, failed)
+    run_reconcilers()
     return requeued, failed
 
 
 def stats():
-    c = db._conn()
-    rows = c.execute("SELECT status, COUNT(*) AS n FROM background_jobs GROUP BY status").fetchall()
-    c.close()
+    with db.connect() as c:
+        rows = c.execute("SELECT status, COUNT(*) AS n FROM background_jobs GROUP BY status").fetchall()
     out = {s: 0 for s in STATUSES}
     for r in rows:
         out[r["status"]] = int(r["n"])
@@ -358,8 +453,7 @@ def acquire_lease(name, holder, ttl_s):
     holder already owns, and the read-back confirms who won."""
     now = time.time()
     expires = now + float(ttl_s)
-    c = db._conn()
-    try:
+    with db.connect() as c:
         c.execute(
             "INSERT INTO scheduler_leases (name, holder, expires_at) VALUES (?,?,?) "
             "ON CONFLICT(name) DO UPDATE SET holder=excluded.holder, "
@@ -369,16 +463,13 @@ def acquire_lease(name, holder, ttl_s):
         c.commit()
         r = c.execute("SELECT holder, expires_at FROM scheduler_leases WHERE name=?",
                       (name,)).fetchone()
-    finally:
-        c.close()
     return bool(r and r["holder"] == holder and float(r["expires_at"]) >= expires - 1e-6)
 
 
 def release_lease(name, holder):
-    c = db._conn()
-    c.execute("DELETE FROM scheduler_leases WHERE name=? AND holder=?", (name, holder))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("DELETE FROM scheduler_leases WHERE name=? AND holder=?", (name, holder))
+        c.commit()
 
 
 # ── Worker ───────────────────────────────────────────────────────────────
@@ -387,10 +478,25 @@ def default_worker_id(prefix="worker"):
     return f"{prefix}-{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:6]}"
 
 
+# Floor for a scheduler lease. The bound that matters: an in-flight tick
+# renews every _SCHED_RENEW_S (10s), so the lease only expires after
+# _SCHED_LEASE_FLOOR_S / _SCHED_RENEW_S = 12 consecutive renewals fail — by
+# which point the holder really is gone. It also has to comfortably exceed
+# _SCHED_STOP_WAIT_S (5s), because a stop() that gives up on a stuck tick
+# leaves the lease to expire rather than releasing it.
+_SCHED_LEASE_FLOOR_S = 120.0
+
+
 def _lease_ttl(s):
-    """A scheduler's lease TTL: two full intervals (at least 30s), so a tick
-    that overruns its cadence still holds the lease it is renewing."""
-    return max(2 * s["interval_s"], 30)
+    """A scheduler's lease TTL: four full intervals, never under two minutes.
+
+    Two things need covering. A tick SLOWER than its cadence keeps the lease
+    by renewing under itself, so the TTL is not what protects it. What the TTL
+    bounds is failover: how long a DEAD holder's lease blocks every other
+    replica, and how long a lease abandoned by a stuck tick lingers. Two
+    minutes is the floor because it is ~12 renewal periods — far more than any
+    transient blip — and well past stop()'s five-second grace."""
+    return max(4 * s["interval_s"], _SCHED_LEASE_FLOOR_S)
 
 
 def _default_schedulers():
@@ -472,9 +578,17 @@ class Worker:
         # Give a tick that is still running a bounded moment to finish BEFORE
         # the leases go: releasing the lease under a live tick is what would
         # let another replica start a second copy of the same pass.
-        pending = [f for f in self._sched_inflight.values() if not f.done()]
+        pending = {n: f for n, f in self._sched_inflight.items() if not f.done()}
         if pending:
-            concurrent.futures.wait(pending, timeout=_SCHED_STOP_WAIT_S)
+            concurrent.futures.wait(list(pending.values()), timeout=_SCHED_STOP_WAIT_S)
+        # Whatever is STILL running after the grace period keeps its lease.
+        # The old code released it anyway, and that is exactly the overlap the
+        # lease exists to prevent: our tick is still executing (we cannot kill
+        # it — daemon threads are not preemptible), so handing the name to
+        # another replica starts a second copy of the same pass alongside it.
+        # Leaving it alone costs at most _lease_ttl seconds of no ticking,
+        # which is what the TTL is for; releasing it costs correctness.
+        stuck = {n for n, f in pending.items() if not f.done()}
         if self._sched_pool:
             self._sched_pool.shutdown(wait=False)
             self._sched_pool = None
@@ -483,6 +597,13 @@ class Worker:
             self._pool.shutdown(wait=wait)
             self._pool = None
         for s in self.schedulers or []:
+            if s["name"] in stuck:
+                log.warning(
+                    "jobs: worker %s is stopping while the %s tick is still running — "
+                    "leaving its lease to expire (in up to %.0fs) rather than handing "
+                    "the scheduler to another worker mid-pass",
+                    self.worker_id, s["name"], _lease_ttl(s))
+                continue
             try:
                 release_lease(s["name"], self.worker_id)
             except Exception:
@@ -583,25 +704,47 @@ class Worker:
     def _run_scheduled_tick(self, s):
         """One tick, with the lease RENEWED for as long as it runs. Without
         the renewal a tick slower than its TTL lost the lease under itself and
-        a second replica started the same pass alongside it."""
+        a second replica started the same pass alongside it.
+
+        A renewal that does not come back holding the lease is treated as LOSS
+        of the lease, not as noise to log and move past: we stop renewing (a
+        later renewal would steal the name back from whoever holds it now) and
+        set the tick's abort Event, so a tick that checks jobs.check_claim()
+        at its safe points stops instead of running a second pass alongside
+        the new holder. A transient database blip therefore costs one tick —
+        the safe direction, and the tick simply runs again next interval."""
         ttl = _lease_ttl(s)
         stop = threading.Event()
+        lost = threading.Event()
 
         def _renew():
             while not stop.wait(min(_SCHED_RENEW_S, max(1.0, ttl / 3.0))):
                 try:
-                    acquire_lease(s["name"], self.worker_id, ttl)
+                    held = acquire_lease(s["name"], self.worker_id, ttl)
                 except Exception:
                     log.exception("jobs: scheduler %s lease renewal failed", s["name"])
+                    held = False
+                if not held:
+                    lost.set()
+                    log.warning(
+                        "jobs: scheduler %s lost its lease mid-tick — the tick has been "
+                        "signalled to abandon and will not be renewed again", s["name"])
+                    return
 
         threading.Thread(target=_renew, daemon=True,
                          name=f"sched-lease-{s['name']}").start()
+        prev = getattr(_LOCAL, "abort", None)
+        _LOCAL.abort = lost
         try:
             s["fn"]()
+        except ClaimLost:
+            log.warning("jobs: scheduler %s abandoned its tick after losing the lease",
+                        s["name"])
         except Exception:
             log.exception("jobs: scheduler %s failed", s["name"])
         finally:
             stop.set()
+            _LOCAL.abort = prev
 
 
 def _execute(job):
@@ -611,7 +754,15 @@ def _execute(job):
     Every write carries the claim token claim() put in job["locked_by"]. A
     write that matches nothing means reclaim_stale() handed this job to
     another worker while we ran: we ABANDON it — one log line, no completion,
-    no failure, no retry — and leave the row to its new owner."""
+    no failure, no retry — and leave the row to its new owner.
+
+    The fence keeps a stale worker off the ROW, but the handler is still
+    executing and its side effects are not fenced by anything. So the moment
+    a heartbeat is refused we also set an abort Event — published as
+    job["abort"] and through claim_lost()/check_claim() for this thread — and
+    a handler that checks it raises ClaimLost and is abandoned before writing.
+    A handler that does not check it cannot be stopped (Python has no thread
+    preemption); its at-most-once effects need a database constraint."""
     token = job.get("locked_by")
     fn = _HANDLERS.get(job["kind"])
     if fn is None:
@@ -619,6 +770,7 @@ def _execute(job):
         log.error("jobs: %s kind=%s has no handler", job["id"], job["kind"])
         return
     stop = threading.Event()
+    abort = threading.Event()
 
     def _beat():
         while not stop.wait(_HEARTBEAT_S):
@@ -630,9 +782,14 @@ def _execute(job):
                 # The first notice that our claim is gone. Stop beating at
                 # once: another worker owns the row now, and a heartbeat from
                 # us would keep ITS run looking alive under our stale stamp.
+                # Tell the handler too — the row is already lost, and every
+                # side effect it has left to write would be a duplicate of the
+                # new owner's.
                 stop.set()
+                abort.set()
                 log.warning("jobs: %s claim lost (reclaimed by another worker); "
-                            "heartbeat stopped", job["id"])
+                            "heartbeat stopped and the handler signalled to abandon",
+                            job["id"])
                 return
 
     threading.Thread(target=_beat, daemon=True,
@@ -640,6 +797,10 @@ def _execute(job):
     t0 = time.time()
     log.info("jobs: start %s kind=%s attempt=%s/%s", job["id"], job["kind"],
              job["attempts"], job["max_attempts"])
+    job = dict(job)
+    job["abort"] = abort     # the handler's copy of the cooperative signal
+    prev_abort = getattr(_LOCAL, "abort", None)
+    _LOCAL.abort = abort
     try:
         result = fn(job["payload"] or {}, job)
         try:
@@ -653,6 +814,13 @@ def _execute(job):
             log.warning("jobs: %s kind=%s finished in %.1fs but its claim was gone — "
                         "abandoned to the worker that reclaimed it, result discarded",
                         job["id"], job["kind"], time.time() - t0)
+    except ClaimLost as e:
+        # The handler stopped itself. Deliberately NOT fail(): the attempt it
+        # would burn belongs to the worker that owns the row now, and a
+        # re-queue would run a payload that is already executing.
+        log.warning("jobs: %s kind=%s abandoned after %.1fs — the handler noticed its "
+                    "claim was gone and wrote nothing: %s",
+                    job["id"], job["kind"], time.time() - t0, e)
     except Exception as e:
         status = fail(job["id"], token, f"{type(e).__name__}: {e}", retry=True)
         if status is None:
@@ -664,3 +832,4 @@ def _execute(job):
                         time.time() - t0, e)
     finally:
         stop.set()
+        _LOCAL.abort = prev_abort

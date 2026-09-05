@@ -71,51 +71,50 @@ def init_tables():
     """Mirror the shape of queries.init_tables / supervisor.init_tables: TEXT
     uuid PKs, REAL epoch timestamps, INTEGER bool flags, JSON stored as TEXT
     (db._pg_sql maps ? -> %s and REAL -> DOUBLE PRECISION for Postgres)."""
-    c = db._conn()
-    c.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS autopilot_agents (
-            id TEXT PRIMARY KEY,
-            owner_id TEXT NOT NULL,
-            name TEXT NOT NULL,
-            goal TEXT NOT NULL,
-            trigger_type TEXT NOT NULL,
-            trigger_config TEXT NOT NULL DEFAULT '{}',
-            source TEXT NOT NULL,
-            tables TEXT NOT NULL DEFAULT '[]',
-            model TEXT,
-            enabled INTEGER NOT NULL DEFAULT 1,
-            next_run_at REAL,
-            claimed_at REAL,
-            last_seen_freshness TEXT,
-            last_threshold_state INTEGER,
-            created_at REAL NOT NULL,
-            updated_at REAL NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_autopilot_owner
-            ON autopilot_agents(owner_id, updated_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_autopilot_due
-            ON autopilot_agents(enabled, next_run_at);
+    with db.connect() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS autopilot_agents (
+                id TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                goal TEXT NOT NULL,
+                trigger_type TEXT NOT NULL,
+                trigger_config TEXT NOT NULL DEFAULT '{}',
+                source TEXT NOT NULL,
+                tables TEXT NOT NULL DEFAULT '[]',
+                model TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                next_run_at REAL,
+                claimed_at REAL,
+                last_seen_freshness TEXT,
+                last_threshold_state INTEGER,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_autopilot_owner
+                ON autopilot_agents(owner_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_autopilot_due
+                ON autopilot_agents(enabled, next_run_at);
 
-        CREATE TABLE IF NOT EXISTS autopilot_runs (
-            id TEXT PRIMARY KEY,
-            agent_id TEXT NOT NULL,
-            owner_id TEXT NOT NULL,
-            trigger TEXT,
-            status TEXT NOT NULL,
-            summary TEXT,
-            result TEXT,
-            trace_id TEXT,
-            proposed_job_id TEXT,
-            started_at REAL NOT NULL,
-            finished_at REAL
-        );
-        CREATE INDEX IF NOT EXISTS idx_autopilot_runs_agent
-            ON autopilot_runs(agent_id, started_at DESC);
-        """
-    )
-    c.commit()
-    c.close()
+            CREATE TABLE IF NOT EXISTS autopilot_runs (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                trigger TEXT,
+                status TEXT NOT NULL,
+                summary TEXT,
+                result TEXT,
+                trace_id TEXT,
+                proposed_job_id TEXT,
+                started_at REAL NOT NULL,
+                finished_at REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_autopilot_runs_agent
+                ON autopilot_runs(agent_id, started_at DESC);
+            """
+        )
+        c.commit()
 
 
 # ── Owner identity + scope (RBAC re-resolved at RUN time) ────────────────
@@ -418,13 +417,12 @@ def _record_run(run_id, agent_def, trigger, status, started, summary=None,
         "trace_id": trace_id, "proposed_job_id": proposed_job_id,
         "started_at": started, "finished_at": time.time(),
     }
-    c = db._conn()
     cols = ("id,agent_id,owner_id,trigger,status,summary,result,trace_id,"
             "proposed_job_id,started_at,finished_at")
-    c.execute(f"INSERT INTO autopilot_runs ({cols}) VALUES ({','.join('?' * 11)})",
-              tuple(row[k] for k in cols.split(",")))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute(f"INSERT INTO autopilot_runs ({cols}) VALUES ({','.join('?' * 11)})",
+                  tuple(row[k] for k in cols.split(",")))
+        c.commit()
     return row
 
 
@@ -451,9 +449,8 @@ def _run_row(r):
 
 
 def _get_agent(agent_id):
-    c = db._conn()
-    r = c.execute("SELECT * FROM autopilot_agents WHERE id=?", (agent_id,)).fetchone()
-    c.close()
+    with db.connect() as c:
+        r = c.execute("SELECT * FROM autopilot_agents WHERE id=?", (agent_id,)).fetchone()
     return _agent_row(r) if r else None
 
 
@@ -462,18 +459,16 @@ def _update_fields(agent_id, fields):
         return
     fields = {**fields, "updated_at": time.time()}
     sets = ", ".join(f"{k}=?" for k in fields)
-    c = db._conn()
-    c.execute(f"UPDATE autopilot_agents SET {sets} WHERE id=?",
-              list(fields.values()) + [agent_id])
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute(f"UPDATE autopilot_agents SET {sets} WHERE id=?",
+                  list(fields.values()) + [agent_id])
+        c.commit()
 
 
 def _last_run(agent_id):
-    c = db._conn()
-    r = c.execute("SELECT status, started_at, summary FROM autopilot_runs "
-                  "WHERE agent_id=? ORDER BY started_at DESC LIMIT 1", (agent_id,)).fetchone()
-    c.close()
+    with db.connect() as c:
+        r = c.execute("SELECT status, started_at, summary FROM autopilot_runs "
+                      "WHERE agent_id=? ORDER BY started_at DESC LIMIT 1", (agent_id,)).fetchone()
     return dict(r) if r else None
 
 
@@ -614,14 +609,13 @@ def _validate_model_or_400(user, model):
 @router.get("")
 def list_agents(user=Depends(current_user)):
     """Own agents; an admin sees all (they run the platform)."""
-    c = db._conn()
-    if user["role"] == "admin":
-        rows = c.execute("SELECT * FROM autopilot_agents ORDER BY updated_at DESC "
-                         "LIMIT 500").fetchall()
-    else:
-        rows = c.execute("SELECT * FROM autopilot_agents WHERE owner_id=? "
-                         "ORDER BY updated_at DESC LIMIT 500", (user["id"],)).fetchall()
-    c.close()
+    with db.connect() as c:
+        if user["role"] == "admin":
+            rows = c.execute("SELECT * FROM autopilot_agents ORDER BY updated_at DESC "
+                             "LIMIT 500").fetchall()
+        else:
+            rows = c.execute("SELECT * FROM autopilot_agents WHERE owner_id=? "
+                             "ORDER BY updated_at DESC LIMIT 500", (user["id"],)).fetchall()
     return {"agents": [_public_agent(_agent_row(r)) for r in rows], "can_manage": True}
 
 
@@ -647,14 +641,13 @@ def create_agent(body: AgentIn, user=Depends(current_user)):
         "claimed_at": None, "last_seen_freshness": None, "last_threshold_state": None,
         "created_at": now, "updated_at": now,
     }
-    c = db._conn()
     cols = ("id,owner_id,name,goal,trigger_type,trigger_config,source,tables,model,"
             "enabled,next_run_at,claimed_at,last_seen_freshness,last_threshold_state,"
             "created_at,updated_at")
-    c.execute(f"INSERT INTO autopilot_agents ({cols}) VALUES ({','.join('?' * 16)})",
-              tuple(row[k] for k in cols.split(",")))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute(f"INSERT INTO autopilot_agents ({cols}) VALUES ({','.join('?' * 16)})",
+                  tuple(row[k] for k in cols.split(",")))
+        c.commit()
     db.log_activity(user, "autopilot_create", prompt=name, source=body.source,
                     mode=body.trigger_type)
     return _public_agent(_get_agent(aid))
@@ -725,11 +718,10 @@ def disable_agent(agent_id: str, user=Depends(current_user)):
 @router.delete("/{agent_id}")
 def delete_agent(agent_id: str, user=Depends(current_user)):
     _own_or_404(agent_id, user)
-    c = db._conn()
-    c.execute("DELETE FROM autopilot_agents WHERE id=?", (agent_id,))
-    c.execute("DELETE FROM autopilot_runs WHERE agent_id=?", (agent_id,))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("DELETE FROM autopilot_agents WHERE id=?", (agent_id,))
+        c.execute("DELETE FROM autopilot_runs WHERE agent_id=?", (agent_id,))
+        c.commit()
     db.log_activity(user, "autopilot_delete", prompt=agent_id)
     return {"deleted": True}
 
@@ -749,10 +741,9 @@ def run_now(agent_id: str, user=Depends(current_user)):
 @router.get("/{agent_id}/runs")
 def list_runs(agent_id: str, user=Depends(current_user)):
     _own_or_404(agent_id, user)
-    c = db._conn()
-    rows = c.execute("SELECT * FROM autopilot_runs WHERE agent_id=? "
-                     "ORDER BY started_at DESC LIMIT 100", (agent_id,)).fetchall()
-    c.close()
+    with db.connect() as c:
+        rows = c.execute("SELECT * FROM autopilot_runs WHERE agent_id=? "
+                         "ORDER BY started_at DESC LIMIT 100", (agent_id,)).fetchall()
     return {"runs": [_run_row(r) for r in rows]}
 
 
@@ -780,15 +771,14 @@ def _claim_due(now):
     onto a durable task queue (Celery / Cloud Tasks) at scale with no data-model
     change."""
     stale = now - _CLAIM_STALE
-    c = db._conn()
-    c.execute(
-        "UPDATE autopilot_agents SET claimed_at=? "
-        "WHERE enabled=1 AND next_run_at IS NOT NULL AND next_run_at<=? "
-        "AND (claimed_at IS NULL OR claimed_at<?)",
-        (now, now, stale))
-    c.commit()
-    rows = c.execute("SELECT * FROM autopilot_agents WHERE claimed_at=?", (now,)).fetchall()
-    c.close()
+    with db.connect() as c:
+        c.execute(
+            "UPDATE autopilot_agents SET claimed_at=? "
+            "WHERE enabled=1 AND next_run_at IS NOT NULL AND next_run_at<=? "
+            "AND (claimed_at IS NULL OR claimed_at<?)",
+            (now, now, stale))
+        c.commit()
+        rows = c.execute("SELECT * FROM autopilot_agents WHERE claimed_at=?", (now,)).fetchall()
     return [_agent_row(r) for r in rows]
 
 

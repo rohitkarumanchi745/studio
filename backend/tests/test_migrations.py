@@ -5,8 +5,11 @@ gains every column from apply_pending() and schema_migrations records every
 version;
 a second apply_pending() is a no-op; a FRESH baseline (init_db + init_tables)
 already carries the columns and apply_pending() only records the versions;
-pending() is empty afterwards; MIGRATIONS versions are strictly increasing and
-unique; the startup policy applies under STUDIO_AUTO_MIGRATE=1 and refuses to
+pending() is empty afterwards; migration 7 gives an old database the
+messages.reply_to column AND its UNIQUE partial index (a second answer to the
+same turn cannot be stored, while messages with no reply_to stay
+unconstrained) and leaves a fresh baseline's index alone; MIGRATIONS versions
+are strictly increasing and unique; the startup policy applies under STUDIO_AUTO_MIGRATE=1 and refuses to
 boot (naming the pending work) under STUDIO_AUTO_MIGRATE=0; and two replicas
 booting at the same instant against one database both return without raising,
 with every migration applied exactly once.
@@ -34,6 +37,7 @@ EXPECTED = {
     "chat_tasks": ["steps", "user_message_id"],
     "mcp_servers": ["owner_id"],
     "query_cache": ["seen", "avg_reward", "embedding"],
+    "messages": ["reply_to"],
 }
 
 # Derived from the list itself, so appending a migration does not mean editing
@@ -55,6 +59,9 @@ CREATE TABLE chat_tasks (
 CREATE TABLE mcp_servers (
     id TEXT PRIMARY KEY, name TEXT NOT NULL, transport TEXT NOT NULL, url TEXT, command TEXT,
     args TEXT, enabled INTEGER NOT NULL DEFAULT 1, created_at REAL NOT NULL);
+CREATE TABLE messages (
+    id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, role TEXT NOT NULL,
+    content TEXT NOT NULL, created_at REAL NOT NULL);
 CREATE TABLE query_cache (
     id TEXT PRIMARY KEY, role TEXT NOT NULL, source TEXT NOT NULL, table_scope TEXT NOT NULL,
     prompt TEXT NOT NULL, signature TEXT NOT NULL, sql TEXT NOT NULL, chart TEXT, text TEXT,
@@ -170,6 +177,50 @@ def test_fresh_baseline_records_without_altering(fresh_path):
     assert migrations.pending() == []
     assert _recorded(fresh_path) == ALL_VERSIONS
     assert {t: _columns(fresh_path, t) for t in EXPECTED} == before   # untouched
+
+
+def _indexes(path, table):
+    raw = sqlite3.connect(path)
+    try:
+        return {r[1] for r in raw.execute(f"PRAGMA index_list({table})").fetchall()}
+    finally:
+        raw.close()
+
+
+def test_reply_to_index_is_created_and_enforced_on_an_old_database(old_db):
+    """Migration 7 is the one that carries an INDEX, not just a column: the
+    UNIQUE partial index on messages.reply_to is what makes a background turn
+    answerable exactly once, so an upgraded database must get it too."""
+    assert "idx_messages_reply_to" not in _indexes(old_db, "messages")
+    migrations.apply_pending()
+    assert "reply_to" in _columns(old_db, "messages")
+    assert "idx_messages_reply_to" in _indexes(old_db, "messages")
+
+    raw = sqlite3.connect(old_db)
+    raw.execute("INSERT INTO messages (id, conversation_id, role, content, created_at, reply_to) "
+                "VALUES ('a','c','assistant','{}',1,'u1')")
+    # Two answers to the same user turn: the second cannot be stored.
+    with pytest.raises(sqlite3.IntegrityError):
+        raw.execute("INSERT INTO messages (id, conversation_id, role, content, created_at, reply_to) "
+                    "VALUES ('b','c','assistant','{}',2,'u1')")
+    # The index is PARTIAL: rows with no reply_to are unconstrained, so
+    # ordinary user turns and synchronous answers still pile up freely.
+    raw.execute("INSERT INTO messages (id, conversation_id, role, content, created_at) "
+                "VALUES ('c1','c','user','{}',3)")
+    raw.execute("INSERT INTO messages (id, conversation_id, role, content, created_at) "
+                "VALUES ('c2','c','user','{}',4)")
+    raw.commit()
+    assert raw.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 3
+    raw.close()
+
+
+def test_fresh_baseline_already_has_the_reply_to_index(fresh_path):
+    """The baseline is complete on its own: init_db() creates the index, and
+    migration 7's CREATE ... IF NOT EXISTS leaves it alone."""
+    db.init_db()
+    assert "idx_messages_reply_to" in _indexes(fresh_path, "messages")
+    migrations.apply_pending()
+    assert "idx_messages_reply_to" in _indexes(fresh_path, "messages")
 
 
 def test_missing_table_is_skipped_not_created(fresh_path):

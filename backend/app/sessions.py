@@ -29,38 +29,37 @@ router = APIRouter(prefix="/sessions", tags=["sessions"])
 
 
 def init_tables():
-    c = db._conn()
-    c.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS agent_sessions (
-            id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            conversation_id TEXT,
-            title TEXT NOT NULL,
-            model_spec TEXT,
-            source TEXT,
-            table_scope TEXT,
-            messages TEXT NOT NULL,
-            pinned_context TEXT,
-            prefix_hash TEXT,
-            cache_prefix_len INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'active',
-            tokens_in INTEGER NOT NULL DEFAULT 0,
-            tokens_out INTEGER NOT NULL DEFAULT 0,
-            cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-            cache_write_tokens INTEGER NOT NULL DEFAULT 0,
-            turns INTEGER NOT NULL DEFAULT 0,
-            created_at REAL NOT NULL,
-            updated_at REAL NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_sessions_user
-            ON agent_sessions(user_id, updated_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_sessions_conv
-            ON agent_sessions(conversation_id);
-        """
-    )
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS agent_sessions (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                conversation_id TEXT,
+                title TEXT NOT NULL,
+                model_spec TEXT,
+                source TEXT,
+                table_scope TEXT,
+                messages TEXT NOT NULL,
+                pinned_context TEXT,
+                prefix_hash TEXT,
+                cache_prefix_len INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'active',
+                tokens_in INTEGER NOT NULL DEFAULT 0,
+                tokens_out INTEGER NOT NULL DEFAULT 0,
+                cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                turns INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sessions_user
+                ON agent_sessions(user_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_sessions_conv
+                ON agent_sessions(conversation_id);
+            """
+        )
+        c.commit()
 
 
 # ── Serialization helpers ────────────────────────────────────────────────
@@ -117,50 +116,49 @@ def snapshot(user, *, messages, session_id=None, conversation_id=None, title=Non
     msgs = normalize_messages(messages)
     ph = prefix_hash(model_spec, msgs, pinned_context)
     now = time.time()
-    c = db._conn()
-    existing = None
-    if session_id:
-        existing = c.execute("SELECT * FROM agent_sessions WHERE id=? AND user_id=?",
-                             (session_id, user["id"])).fetchone()
-    if existing is None and conversation_id:
-        existing = c.execute(
-            "SELECT * FROM agent_sessions WHERE conversation_id=? AND user_id=?",
-            (conversation_id, user["id"])).fetchone()
+    with db.connect() as c:
+        existing = None
+        if session_id:
+            existing = c.execute("SELECT * FROM agent_sessions WHERE id=? AND user_id=?",
+                                 (session_id, user["id"])).fetchone()
+        if existing is None and conversation_id:
+            existing = c.execute(
+                "SELECT * FROM agent_sessions WHERE conversation_id=? AND user_id=?",
+                (conversation_id, user["id"])).fetchone()
 
-    if existing is not None:
-        row = dict(existing)
-        totals = _accumulate_usage(row, usage)
-        c.execute(
-            "UPDATE agent_sessions SET messages=?, model_spec=?, source=?, table_scope=?, "
-            "pinned_context=?, prefix_hash=?, cache_prefix_len=?, status=?, "
-            "tokens_in=?, tokens_out=?, cache_read_tokens=?, cache_write_tokens=?, "
-            "turns=?, updated_at=?, title=? WHERE id=?",
-            (json.dumps(msgs), model_spec or row.get("model_spec"),
-             source or row.get("source"), table_scope or row.get("table_scope"),
-             json.dumps(pinned_context or json.loads(row.get("pinned_context") or "[]")),
-             ph, len(msgs), status,
-             totals["tokens_in"], totals["tokens_out"],
-             totals["cache_read_tokens"], totals["cache_write_tokens"],
-             row.get("turns", 0) + (1 if (usage or count_turn) else 0), now,
-             title or row.get("title"), row["id"]),
-        )
-        sid = row["id"]
-    else:
-        sid = session_id or str(uuid.uuid4())
-        totals = _accumulate_usage({}, usage)
-        c.execute(
-            "INSERT INTO agent_sessions (id, user_id, conversation_id, title, model_spec, "
-            "source, table_scope, messages, pinned_context, prefix_hash, cache_prefix_len, "
-            "status, tokens_in, tokens_out, cache_read_tokens, cache_write_tokens, turns, "
-            "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (sid, user["id"], conversation_id, (title or "Session")[:120], model_spec,
-             source, table_scope, json.dumps(msgs), json.dumps(pinned_context or []),
-             ph, len(msgs), status, totals["tokens_in"], totals["tokens_out"],
-             totals["cache_read_tokens"], totals["cache_write_tokens"],
-             1 if (usage or count_turn) else 0, now, now),
-        )
-    c.commit()
-    c.close()
+        if existing is not None:
+            row = dict(existing)
+            totals = _accumulate_usage(row, usage)
+            c.execute(
+                "UPDATE agent_sessions SET messages=?, model_spec=?, source=?, table_scope=?, "
+                "pinned_context=?, prefix_hash=?, cache_prefix_len=?, status=?, "
+                "tokens_in=?, tokens_out=?, cache_read_tokens=?, cache_write_tokens=?, "
+                "turns=?, updated_at=?, title=? WHERE id=?",
+                (json.dumps(msgs), model_spec or row.get("model_spec"),
+                 source or row.get("source"), table_scope or row.get("table_scope"),
+                 json.dumps(pinned_context or json.loads(row.get("pinned_context") or "[]")),
+                 ph, len(msgs), status,
+                 totals["tokens_in"], totals["tokens_out"],
+                 totals["cache_read_tokens"], totals["cache_write_tokens"],
+                 row.get("turns", 0) + (1 if (usage or count_turn) else 0), now,
+                 title or row.get("title"), row["id"]),
+            )
+            sid = row["id"]
+        else:
+            sid = session_id or str(uuid.uuid4())
+            totals = _accumulate_usage({}, usage)
+            c.execute(
+                "INSERT INTO agent_sessions (id, user_id, conversation_id, title, model_spec, "
+                "source, table_scope, messages, pinned_context, prefix_hash, cache_prefix_len, "
+                "status, tokens_in, tokens_out, cache_read_tokens, cache_write_tokens, turns, "
+                "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (sid, user["id"], conversation_id, (title or "Session")[:120], model_spec,
+                 source, table_scope, json.dumps(msgs), json.dumps(pinned_context or []),
+                 ph, len(msgs), status, totals["tokens_in"], totals["tokens_out"],
+                 totals["cache_read_tokens"], totals["cache_write_tokens"],
+                 1 if (usage or count_turn) else 0, now, now),
+            )
+        c.commit()
     return sid
 
 
@@ -178,9 +176,8 @@ def _row(r):
 
 
 def _own_or_404(sid, user):
-    c = db._conn()
-    row = c.execute("SELECT * FROM agent_sessions WHERE id=?", (sid,)).fetchone()
-    c.close()
+    with db.connect() as c:
+        row = c.execute("SELECT * FROM agent_sessions WHERE id=?", (sid,)).fetchone()
     if row is None or dict(row)["user_id"] != user["id"]:
         raise HTTPException(404, "Session not found")  # 404, not 403 — no oracle
     return _row(row)
@@ -190,13 +187,12 @@ def _own_or_404(sid, user):
 
 @router.get("")
 def listing(user=Depends(current_user)):
-    c = db._conn()
-    rows = c.execute(
-        "SELECT id, title, conversation_id, model_spec, source, table_scope, status, "
-        "cache_prefix_len, tokens_in, tokens_out, cache_read_tokens, cache_write_tokens, "
-        "turns, created_at, updated_at FROM agent_sessions WHERE user_id=? "
-        "ORDER BY updated_at DESC LIMIT 100", (user["id"],)).fetchall()
-    c.close()
+    with db.connect() as c:
+        rows = c.execute(
+            "SELECT id, title, conversation_id, model_spec, source, table_scope, status, "
+            "cache_prefix_len, tokens_in, tokens_out, cache_read_tokens, cache_write_tokens, "
+            "turns, created_at, updated_at FROM agent_sessions WHERE user_id=? "
+            "ORDER BY updated_at DESC LIMIT 100", (user["id"],)).fetchall()
     out = []
     for r in rows:
         d = dict(r)
@@ -238,11 +234,10 @@ def resume(sid: str, user=Depends(current_user)):
     """Rehydrate a session: return the state to continue from and mark active.
     The prefix_hash tells the caller which cached prefix a replay will reuse."""
     d = _own_or_404(sid, user)
-    c = db._conn()
-    c.execute("UPDATE agent_sessions SET status='active', updated_at=? WHERE id=?",
-              (time.time(), sid))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("UPDATE agent_sessions SET status='active', updated_at=? WHERE id=?",
+                  (time.time(), sid))
+        c.commit()
     db.log_activity(user, "session_resume", prompt=d["title"])
     return {
         "id": sid,
@@ -273,8 +268,7 @@ def fork(sid: str, user=Depends(current_user)):
 @router.delete("/{sid}")
 def remove(sid: str, user=Depends(current_user)):
     _own_or_404(sid, user)
-    c = db._conn()
-    c.execute("DELETE FROM agent_sessions WHERE id=?", (sid,))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("DELETE FROM agent_sessions WHERE id=?", (sid,))
+        c.commit()
     return {"deleted": True}

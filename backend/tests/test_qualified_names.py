@@ -32,9 +32,10 @@ ALLOWED = ["sales", "web_traffic"]
 PG = frozenset({"public", "acme.public"})
 
 
-def rejected(sql, allowed=ALLOWED, qualifiers=PG, match="outside the configured namespace"):
+def rejected(sql, allowed=ALLOWED, qualifiers=PG, match="outside the configured namespace",
+             dialect=None):
     with pytest.raises(QueryRejected, match=match):
-        validate(sql, allowed, qualifiers=qualifiers)
+        validate(sql, allowed, qualifiers=qualifiers, dialect=dialect)
 
 
 # ── The bypass itself ───────────────────────────────────────────────────
@@ -108,10 +109,25 @@ def test_demo_declares_no_namespace_and_rejects_every_qualified_reference():
     rejected("SELECT * FROM other.sales", qualifiers=quals)
 
 
+def test_a_prefix_is_matched_at_its_own_arity_only():
+    """One part and two parts are different questions. `main` declared as a
+    one-part schema must not answer a two-part `secret_db.main` prefix, and a
+    declared `acme.public` must not answer a one-part `acme` or `public`... —
+    the whole prefix matches, at its own arity, or nothing does."""
+    rejected("SELECT * FROM secret_db.main.sales", qualifiers={"main"})
+    assert validate("SELECT * FROM main.sales", ALLOWED, qualifiers={"main"})
+    rejected("SELECT * FROM acme.sales", qualifiers={"acme.public"})
+    assert validate("SELECT * FROM acme.public.sales", ALLOWED, qualifiers={"acme.public"})
+
+
 def test_postgres_qualifiers_come_from_the_env_it_connects_with(monkeypatch):
     monkeypatch.setenv("POSTGRES_DSN", "postgresql://u:p@host:5432/acme?sslmode=require")
     monkeypatch.setenv("POSTGRES_SCHEMA", "Analytics")
-    assert PostgresConnector().qualifiers() == frozenset({"analytics", "acme.analytics"})
+    # The CONFIGURED SPELLING, verbatim: list_tables() matches
+    # information_schema.table_schema against it as written and the
+    # search_path pin double-quotes it, so a lower-cased declaration would
+    # vouch for a schema neither of those ever reaches.
+    assert PostgresConnector().qualifiers() == frozenset({"Analytics", "acme.Analytics"})
     # key=value DSN form, and the documented default schema.
     monkeypatch.setenv("POSTGRES_DSN", "host=db.internal dbname=warehouse user=svc")
     monkeypatch.delenv("POSTGRES_SCHEMA", raising=False)
@@ -121,37 +137,114 @@ def test_postgres_qualifiers_come_from_the_env_it_connects_with(monkeypatch):
     assert PostgresConnector().qualifiers() == frozenset({"public"})
 
 
-def test_snowflake_and_databricks_declare_database_catalog_and_schema(monkeypatch):
+def test_snowflake_declares_the_schema_and_database_schema_only(monkeypatch):
+    """ARITY is the rule. Snowflake resolves a two-part `x.sales` as
+    SCHEMA.object, so the DATABASE name must not be declared as a one-part
+    qualifier — it was, and `<database>.sales` was accepted as a schema
+    reference to a namespace the catalog never described."""
     monkeypatch.setenv("SNOWFLAKE_DATABASE", "ANALYTICS")
     monkeypatch.setenv("SNOWFLAKE_SCHEMA", "PUBLIC")
-    assert SnowflakeConnector().qualifiers() == frozenset(
-        {"public", "analytics", "analytics.public"})
+    quals = SnowflakeConnector().qualifiers()
+    # UPPER, the name Snowflake STORES for an unquoted env value — the same
+    # reading list_tables() uses (cfg["schema"].upper()).
+    assert quals == frozenset({"PUBLIC", "ANALYTICS.PUBLIC"})
+    rejected("SELECT * FROM analytics.sales", qualifiers=quals, dialect="snowflake",
+             allowed=["SALES"])
+    assert validate("SELECT * FROM public.sales", ["SALES"],
+                    qualifiers=quals, dialect="snowflake")
+    assert validate("SELECT * FROM analytics.public.sales", ["SALES"],
+                    qualifiers=quals, dialect="snowflake")
+
+
+def test_databricks_declares_the_schema_and_catalog_schema_only(monkeypatch):
+    """Same ARITY rule as Snowflake. Unity Catalog / Spark read a two-part
+    `x.sales` as SCHEMA.table in the current catalog, so the bare CATALOG must
+    not be declared as a one-part qualifier — it was, and `main.sales` was
+    accepted as a reference to a schema merely named after the catalog."""
     monkeypatch.setenv("DATABRICKS_CATALOG", "main")
     monkeypatch.setenv("DATABRICKS_SCHEMA", "sales_db")
-    assert DatabricksConnector().qualifiers() == frozenset(
-        {"sales_db", "main", "main.sales_db"})
+    quals = DatabricksConnector().qualifiers()
+    assert quals == frozenset({"sales_db", "main.sales_db"})
+    rejected("SELECT * FROM main.sales", qualifiers=quals, dialect="databricks")
+    assert validate("SELECT * FROM sales_db.sales", ALLOWED,
+                    qualifiers=quals, dialect="databricks")
+    assert validate("SELECT * FROM main.sales_db.sales", ALLOWED,
+                    qualifiers=quals, dialect="databricks")
 
 
 def test_bigquery_declares_dataset_and_project_dataset(monkeypatch):
+    """BigQuery's arities are already right — one part is a DATASET in the
+    default project, two are PROJECT.DATASET — but its ids are case-SENSITIVE,
+    so the configured spelling is kept rather than lower-cased: `Analytics` and
+    `analytics` are different datasets to BigQuery."""
     monkeypatch.setenv("BIGQUERY_PROJECT", "acme_prod")
     monkeypatch.setenv("BIGQUERY_DATASET", "Analytics")
     monkeypatch.delenv("BIGQUERY_CREDENTIALS_JSON", raising=False)
     quals = BigQueryConnector().qualifiers()
-    assert quals == frozenset({"analytics", "acme_prod.analytics"})
-    assert validate("SELECT * FROM analytics.sales", ALLOWED, qualifiers=quals)
-    rejected("SELECT * FROM other_dataset.sales", qualifiers=quals)
+    assert quals == frozenset({"Analytics", "acme_prod.Analytics"})
+    assert validate("SELECT * FROM Analytics.sales", ALLOWED,
+                    qualifiers=quals, dialect="bigquery")
+    assert validate("SELECT * FROM acme_prod.Analytics.sales", ALLOWED,
+                    qualifiers=quals, dialect="bigquery")
+    rejected("SELECT * FROM other_dataset.sales", qualifiers=quals, dialect="bigquery")
+    # Two parts is PROJECT.DATASET, never DATASET.<something else>.
+    rejected("SELECT * FROM Analytics.acme_prod.sales", qualifiers=quals,
+             dialect="bigquery")
     monkeypatch.delenv("BIGQUERY_DATASET", raising=False)
     assert BigQueryConnector().qualifiers() == frozenset()
 
 
-def test_every_registered_connector_declares_a_cheap_namespace():
-    """qualifiers() runs on every query, so it must never touch the network —
-    and every connector must answer with a set of lowercase strings."""
+def test_postgres_pins_search_path_to_the_configured_schema(monkeypatch):
+    """An UNQUALIFIED allowed name must only ever mean the configured schema.
+    Without a pinned search_path it resolves to whichever schema comes first on
+    the server's path — a relation the catalog never described, and one the
+    guard cannot see (a bare name carries no namespace to check)."""
+    import sys
+    import types
+
+    seen = {}
+
+    fake = types.ModuleType("psycopg")
+    fake.connect = lambda dsn, **kw: seen.update(dsn=dsn, **kw) or object()
+    monkeypatch.setitem(sys.modules, "psycopg", fake)
+    monkeypatch.setenv("POSTGRES_DSN", "postgresql://u:p@host:5432/acme")
+    monkeypatch.setenv("POSTGRES_SCHEMA", "analytics")
+
+    conn = PostgresConnector()
+    conn._conn()
+    assert seen["options"] == '-c search_path="analytics"'
+    assert seen["autocommit"] is True
+    # The same schema qualifiers() reports, and quoted so PostgreSQL does not
+    # re-fold the value into a different schema name.
+    assert "analytics" in conn.qualifiers()
+    # A schema that would need escaping is a misconfiguration: fail closed
+    # rather than paste it into libpq's options string.
+    monkeypatch.setenv("POSTGRES_SCHEMA", 'pub"lic x')
+    with pytest.raises(ValueError, match="search_path"):
+        PostgresConnector()._conn()
+
+
+def test_every_registered_connector_declares_a_cheap_arity_keyed_namespace():
+    """qualifiers() runs on every query, so it must never touch the network.
+    Every prefix must be a non-empty dotted string of at most three parts —
+    more than that is not a namespace any target engine can resolve."""
     from app.connectors import _REGISTRY
     for name, conn in _REGISTRY.items():
         quals = conn.qualifiers()
         assert isinstance(quals, frozenset), name
-        assert all(q == q.lower() for q in quals), name
+        for q in quals:
+            parts = q.split(".")
+            assert 1 <= len(parts) <= 3 and all(parts), (name, q)
+        # A declared prefix is a CATALOG spelling — the name the engine
+        # STORES — so each connector folds the env value the way its own
+        # vendor does, and the guard compares it the way it compares an
+        # allowlist entry. Snowflake stores an unquoted name UPPER; Databricks
+        # (Spark) folds everything down; BigQuery and PostgreSQL store what was
+        # written, so their declarations keep the configured spelling.
+        if conn.dialect == "snowflake":
+            assert all(q == q.upper() for q in quals), name
+        elif conn.dialect not in ("bigquery", "postgres"):
+            assert all(q == q.lower() for q in quals), name
 
 
 def test_graph_and_api_sources_declare_no_namespace():

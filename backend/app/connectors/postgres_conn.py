@@ -6,10 +6,16 @@ Reads through the same gate as every source (queryguard → RBAC → governance)
 run_script exists only for the supervised, human-approved write path.
 """
 import os
+import re
 import threading
 from urllib.parse import urlsplit
 
 from .base import Connector, jsonify_rows
+
+# A schema name that needs no escaping inside libpq's `options` string. A
+# configured schema outside this shape is refused rather than pasted in and
+# hoped for: search_path is a security control here, not a convenience.
+_PLAIN_SCHEMA = re.compile(r"[A-Za-z0-9_$]+")
 
 
 class PostgresConnector(Connector):
@@ -44,10 +50,29 @@ class PostgresConnector(Connector):
     def qualifiers(self):
         """The configured schema, plus `database.schema` — the only namespaces
         this connector's credential is meant to reach. Anything else (another
-        schema the login can also see) is refused by the query guard."""
-        schema = self._schema().lower()
+        schema the login can also see) is refused by the query guard.
+
+        ARITY carries the meaning, and PostgreSQL's rule is:
+          one part  `x.sales`      -> x is a SCHEMA in the current database
+          two parts `a.b.sales`    -> a is the DATABASE (only ever the connected
+                                      one; PostgreSQL cannot cross databases in
+                                      a query) and b the SCHEMA
+        So the schema is declared at one part and `database.schema` at two, and
+        neither spelling is accepted at the other arity — a database name in the
+        one-part position would name a schema the catalog never described.
+        CASE is the stored spelling, verbatim — not lower-cased. This
+        connector already treats POSTGRES_SCHEMA as the EXACT name of the
+        schema: list_tables() matches information_schema.table_schema against
+        it as written, and _search_path_option() DOUBLE-QUOTES it so the server
+        does not fold it. Declaring a lower-cased copy contradicted both, and
+        the contradiction was a hole: with POSTGRES_SCHEMA=Analytics the guard
+        admitted `analytics.sales`, which PostgreSQL resolves to a different
+        schema than the one the catalog and the allowlist were built from.
+        Env only, no connection: this runs on every query.
+        """
+        schema = self._schema()
         out = {schema}
-        database = self._database().strip().lower()
+        database = self._database().strip()
         if database:
             out.add(f"{database}.{schema}")
         return frozenset(out)
@@ -61,9 +86,36 @@ class PostgresConnector(Connector):
         except ImportError:
             return False
 
+    def _search_path_option(self):
+        """The libpq `options` string that PINS search_path to the configured
+        schema.
+
+        Invariant: an UNQUALIFIED reference can only ever mean the CONFIGURED
+        schema — the one list_tables() built the catalog from and qualifiers()
+        reports. Without this the server's default search_path applies, so an
+        allowlisted bare name (`sales`) resolves to whichever schema comes
+        FIRST on that path, which can be another schema the login happens to
+        see. The query guard cannot catch that: a bare name carries no
+        namespace to check, so the pin has to happen on the connection.
+
+        Double-quoted so PostgreSQL does not case-fold the value: search_path
+        items are read as identifiers, and an unquoted `Analytics` would silently
+        become `analytics`. The schema is validated first (see _PLAIN_SCHEMA) —
+        a name that would need escaping is a misconfiguration and fails closed.
+        """
+        schema = self._schema()
+        if not _PLAIN_SCHEMA.fullmatch(schema):
+            raise ValueError(
+                f"POSTGRES_SCHEMA={schema!r} is not a plain identifier; "
+                "search_path cannot be pinned safely")
+        return f'-c search_path="{schema}"'
+
     def _conn(self):
         import psycopg
-        return psycopg.connect(self._dsn(), autocommit=True)
+        # `options` as a keyword WINS over anything in the DSN, so a DSN that
+        # carries its own search_path cannot loosen the pin.
+        return psycopg.connect(self._dsn(), autocommit=True,
+                               options=self._search_path_option())
 
     def _execute(self, fn):
         """Run fn(connection) on one pooled connection; reconnect once on a

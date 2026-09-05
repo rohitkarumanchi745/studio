@@ -335,6 +335,12 @@ def test_enforce_limit_tolerates_malformed_sql():
 
 def test_public_api_surface():
     assert callable(queryguard.validate) and callable(queryguard.enforce_limit)
+    # `dialect` is optional and defaults to the historical case-insensitive
+    # reading, so blend.py and dashboards.py keep calling validate(sql, allowed).
+    import inspect
+    sig = inspect.signature(queryguard.validate)
+    assert sig.parameters["dialect"].default is None
+    assert sig.parameters["qualifiers"].default is None
     assert issubclass(queryguard.QueryRejected, Exception)
     assert hasattr(queryguard.TABLE_REF, "findall")
     assert hasattr(queryguard.FORBIDDEN, "search")

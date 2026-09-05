@@ -18,9 +18,10 @@ Dialect discipline (identical to autopilot.init_tables): TEXT uuid PKs, every
 timestamp column declared with a leading-space ' REAL' so db._pg_sql rewrites it
 to DOUBLE PRECISION (Postgres REAL would round a time.time() epoch to whole
 seconds and break ORDER BY next_run_at); '?' placeholders everywhere; one
-db._conn() opened/committed/closed per call. All three tables ship every column
-in the initial CREATE — no ALTER anywhere — so the Postgres "ADD COLUMN IF NOT
-EXISTS" transaction-poison gotcha is sidestepped entirely.
+`with db.connect() as c:` per call, so the connection is returned even when the
+body raises. All three tables ship every column in the initial CREATE — no
+ALTER anywhere — so the Postgres "ADD COLUMN IF NOT EXISTS" transaction-poison
+gotcha is sidestepped entirely.
 """
 import base64
 import os
@@ -58,57 +59,56 @@ def _fernet():
 def init_tables():
     """CREATE TABLE / INDEX IF NOT EXISTS only — no ALTER. Registered in
     main.py startup() next to kag.init_tables()."""
-    c = db._conn()
-    c.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS graph_accounts (
-            id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            auth_mode TEXT NOT NULL,
-            graph_user_id TEXT,
-            access_ct TEXT,
-            refresh_ct TEXT,
-            token_expires_at REAL,
-            drive_delta_link TEXT,
-            mail_delta_link TEXT,
-            next_run_at REAL,
-            claimed_at REAL,
-            status TEXT,
-            last_error TEXT,
-            created_at REAL,
-            updated_at REAL
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_accounts_user
-            ON graph_accounts(user_id);
+    with db.connect() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS graph_accounts (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                auth_mode TEXT NOT NULL,
+                graph_user_id TEXT,
+                access_ct TEXT,
+                refresh_ct TEXT,
+                token_expires_at REAL,
+                drive_delta_link TEXT,
+                mail_delta_link TEXT,
+                next_run_at REAL,
+                claimed_at REAL,
+                status TEXT,
+                last_error TEXT,
+                created_at REAL,
+                updated_at REAL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_accounts_user
+                ON graph_accounts(user_id);
 
-        CREATE TABLE IF NOT EXISTS graph_subscriptions (
-            id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            resource TEXT NOT NULL,
-            client_state_ct TEXT NOT NULL,
-            expires_at REAL NOT NULL,
-            created_at REAL
-        );
-        CREATE INDEX IF NOT EXISTS idx_graph_subscriptions_user
-            ON graph_subscriptions(user_id);
+            CREATE TABLE IF NOT EXISTS graph_subscriptions (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                resource TEXT NOT NULL,
+                client_state_ct TEXT NOT NULL,
+                expires_at REAL NOT NULL,
+                created_at REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_graph_subscriptions_user
+                ON graph_subscriptions(user_id);
 
-        CREATE TABLE IF NOT EXISTS graph_items (
-            id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            graph_id TEXT NOT NULL,
-            kind TEXT,
-            etag TEXT,
-            collection TEXT,
-            source_name TEXT,
-            access_scope TEXT,
-            ingested_at REAL
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_items_key
-            ON graph_items(user_id, graph_id);
-        """
-    )
-    c.commit()
-    c.close()
+            CREATE TABLE IF NOT EXISTS graph_items (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                graph_id TEXT NOT NULL,
+                kind TEXT,
+                etag TEXT,
+                collection TEXT,
+                source_name TEXT,
+                access_scope TEXT,
+                ingested_at REAL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_items_key
+                ON graph_items(user_id, graph_id);
+            """
+        )
+        c.commit()
 
 
 # ── Account row (one per connected Studio user) ──────────────────────────
@@ -117,26 +117,24 @@ def save_account(user_id, auth_mode, graph_user_id=None):
     """Ensure the account row exists (status='onboarding' on first insert) and
     refresh its auth_mode / graph_user_id. Never touches token ciphertext."""
     now = time.time()
-    c = db._conn()
-    r = c.execute("SELECT id FROM graph_accounts WHERE user_id=?", (user_id,)).fetchone()
-    if r:
-        c.execute(
-            "UPDATE graph_accounts SET auth_mode=?, "
-            "graph_user_id=COALESCE(?, graph_user_id), updated_at=? WHERE user_id=?",
-            (auth_mode, graph_user_id, now, user_id))
-    else:
-        c.execute(
-            "INSERT INTO graph_accounts (id, user_id, auth_mode, graph_user_id, "
-            "status, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
-            (str(uuid.uuid4()), user_id, auth_mode, graph_user_id, "onboarding", now, now))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        r = c.execute("SELECT id FROM graph_accounts WHERE user_id=?", (user_id,)).fetchone()
+        if r:
+            c.execute(
+                "UPDATE graph_accounts SET auth_mode=?, "
+                "graph_user_id=COALESCE(?, graph_user_id), updated_at=? WHERE user_id=?",
+                (auth_mode, graph_user_id, now, user_id))
+        else:
+            c.execute(
+                "INSERT INTO graph_accounts (id, user_id, auth_mode, graph_user_id, "
+                "status, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+                (str(uuid.uuid4()), user_id, auth_mode, graph_user_id, "onboarding", now, now))
+        c.commit()
 
 
 def get_account(user_id):
-    c = db._conn()
-    r = c.execute("SELECT * FROM graph_accounts WHERE user_id=?", (user_id,)).fetchone()
-    c.close()
+    with db.connect() as c:
+        r = c.execute("SELECT * FROM graph_accounts WHERE user_id=?", (user_id,)).fetchone()
     return dict(r) if r else None
 
 
@@ -147,11 +145,10 @@ def update_fields(user_id, fields):
     if not fields:
         return
     sets = ", ".join(f"{k}=?" for k in fields)
-    c = db._conn()
-    c.execute(f"UPDATE graph_accounts SET {sets} WHERE user_id=?",
-              list(fields.values()) + [user_id])
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute(f"UPDATE graph_accounts SET {sets} WHERE user_id=?",
+                  list(fields.values()) + [user_id])
+        c.commit()
 
 
 # ── OAuth tokens (encrypted at rest) ─────────────────────────────────────
@@ -163,30 +160,28 @@ def set_tokens(user_id, access, refresh, expires_at):
     ac = f.encrypt((access or "").encode()).decode()
     rc = f.encrypt((refresh or "").encode()).decode()
     now = time.time()
-    c = db._conn()
-    r = c.execute("SELECT id FROM graph_accounts WHERE user_id=?", (user_id,)).fetchone()
-    if not r:
+    with db.connect() as c:
+        r = c.execute("SELECT id FROM graph_accounts WHERE user_id=?", (user_id,)).fetchone()
+        if not r:
+            c.execute(
+                "INSERT INTO graph_accounts (id, user_id, auth_mode, status, "
+                "created_at, updated_at) VALUES (?,?,?,?,?,?)",
+                (str(uuid.uuid4()), user_id,
+                 os.getenv("STUDIO_GRAPH_AUTH_MODE", "delegated"), "onboarding", now, now))
         c.execute(
-            "INSERT INTO graph_accounts (id, user_id, auth_mode, status, "
-            "created_at, updated_at) VALUES (?,?,?,?,?,?)",
-            (str(uuid.uuid4()), user_id,
-             os.getenv("STUDIO_GRAPH_AUTH_MODE", "delegated"), "onboarding", now, now))
-    c.execute(
-        "UPDATE graph_accounts SET access_ct=?, refresh_ct=?, token_expires_at=?, "
-        "updated_at=? WHERE user_id=?", (ac, rc, expires_at, now, user_id))
-    c.commit()
-    c.close()
+            "UPDATE graph_accounts SET access_ct=?, refresh_ct=?, token_expires_at=?, "
+            "updated_at=? WHERE user_id=?", (ac, rc, expires_at, now, user_id))
+        c.commit()
 
 
 def get_tokens(user_id):
     """{access, refresh, expires_at} or None. Returns None on InvalidToken (a
     rotated STUDIO_SECRET) so the caller fails closed and forces a reconnect —
     never a plaintext leak. Never log this."""
-    c = db._conn()
-    r = c.execute(
-        "SELECT access_ct, refresh_ct, token_expires_at FROM graph_accounts "
-        "WHERE user_id=?", (user_id,)).fetchone()
-    c.close()
+    with db.connect() as c:
+        r = c.execute(
+            "SELECT access_ct, refresh_ct, token_expires_at FROM graph_accounts "
+            "WHERE user_id=?", (user_id,)).fetchone()
     if not r or not r["access_ct"] or not r["refresh_ct"]:
         return None
     f = _fernet()
@@ -204,49 +199,44 @@ def set_delta(user_id, kind, delta_link):
     col = _DELTA_COLS.get(kind)
     if not col:
         return
-    c = db._conn()
-    c.execute(f"UPDATE graph_accounts SET {col}=? WHERE user_id=?", (delta_link, user_id))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute(f"UPDATE graph_accounts SET {col}=? WHERE user_id=?", (delta_link, user_id))
+        c.commit()
 
 
 def get_delta(user_id, kind):
     col = _DELTA_COLS.get(kind)
     if not col:
         return None
-    c = db._conn()
-    r = c.execute(f"SELECT {col} AS v FROM graph_accounts WHERE user_id=?", (user_id,)).fetchone()
-    c.close()
+    with db.connect() as c:
+        r = c.execute(f"SELECT {col} AS v FROM graph_accounts WHERE user_id=?", (user_id,)).fetchone()
     return (r["v"] if r else None)
 
 
 # ── Item ledger (idempotency + tombstones) ───────────────────────────────
 
 def get_item(user_id, graph_id):
-    c = db._conn()
-    r = c.execute("SELECT * FROM graph_items WHERE user_id=? AND graph_id=?",
-                  (user_id, graph_id)).fetchone()
-    c.close()
+    with db.connect() as c:
+        r = c.execute("SELECT * FROM graph_items WHERE user_id=? AND graph_id=?",
+                      (user_id, graph_id)).fetchone()
     return dict(r) if r else None
 
 
 def upsert_item(user_id, graph_id, kind, etag, collection, source_name, access_scope):
-    c = db._conn()
-    c.execute("DELETE FROM graph_items WHERE user_id=? AND graph_id=?", (user_id, graph_id))
-    c.execute(
-        "INSERT INTO graph_items (id, user_id, graph_id, kind, etag, collection, "
-        "source_name, access_scope, ingested_at) VALUES (?,?,?,?,?,?,?,?,?)",
-        (str(uuid.uuid4()), user_id, graph_id, kind, etag, collection,
-         source_name, access_scope, time.time()))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("DELETE FROM graph_items WHERE user_id=? AND graph_id=?", (user_id, graph_id))
+        c.execute(
+            "INSERT INTO graph_items (id, user_id, graph_id, kind, etag, collection, "
+            "source_name, access_scope, ingested_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (str(uuid.uuid4()), user_id, graph_id, kind, etag, collection,
+             source_name, access_scope, time.time()))
+        c.commit()
 
 
 def delete_item(user_id, graph_id):
-    c = db._conn()
-    c.execute("DELETE FROM graph_items WHERE user_id=? AND graph_id=?", (user_id, graph_id))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("DELETE FROM graph_items WHERE user_id=? AND graph_id=?", (user_id, graph_id))
+        c.commit()
 
 
 # ── Scheduler claim (autopilot-style race-safe conditional UPDATE) ───────
@@ -257,15 +247,14 @@ def claim_due(now):
     UPDATE is the race guard (SQLite serializes writes; Postgres row-locks), so
     two ticks never both win the same account — identical to autopilot._claim_due."""
     stale = now - _CLAIM_STALE
-    c = db._conn()
-    c.execute(
-        "UPDATE graph_accounts SET claimed_at=? "
-        "WHERE next_run_at IS NOT NULL AND next_run_at<=? AND status!=? "
-        "AND (claimed_at IS NULL OR claimed_at<?)",
-        (now, now, "revoked", stale))
-    c.commit()
-    rows = c.execute("SELECT * FROM graph_accounts WHERE claimed_at=?", (now,)).fetchall()
-    c.close()
+    with db.connect() as c:
+        c.execute(
+            "UPDATE graph_accounts SET claimed_at=? "
+            "WHERE next_run_at IS NOT NULL AND next_run_at<=? AND status!=? "
+            "AND (claimed_at IS NULL OR claimed_at<?)",
+            (now, now, "revoked", stale))
+        c.commit()
+        rows = c.execute("SELECT * FROM graph_accounts WHERE claimed_at=?", (now,)).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -273,23 +262,21 @@ def claim_due(now):
 
 def save_subscription(sub_id, user_id, resource, client_state, expires_at):
     ct = _fernet().encrypt((client_state or "").encode()).decode()
-    c = db._conn()
-    c.execute("DELETE FROM graph_subscriptions WHERE id=?", (sub_id,))
-    c.execute(
-        "INSERT INTO graph_subscriptions (id, user_id, resource, client_state_ct, "
-        "expires_at, created_at) VALUES (?,?,?,?,?,?)",
-        (sub_id, user_id, resource, ct, expires_at, time.time()))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("DELETE FROM graph_subscriptions WHERE id=?", (sub_id,))
+        c.execute(
+            "INSERT INTO graph_subscriptions (id, user_id, resource, client_state_ct, "
+            "expires_at, created_at) VALUES (?,?,?,?,?,?)",
+            (sub_id, user_id, resource, ct, expires_at, time.time()))
+        c.commit()
 
 
 def subscription(sub_id):
     """The subscription with clientState DECRYPTED for a constant-time compare
     in process_notification — internal only, never returned by a route. Returns
     None on InvalidToken (rotated secret → fail closed → ignore the notification)."""
-    c = db._conn()
-    r = c.execute("SELECT * FROM graph_subscriptions WHERE id=?", (sub_id,)).fetchone()
-    c.close()
+    with db.connect() as c:
+        r = c.execute("SELECT * FROM graph_subscriptions WHERE id=?", (sub_id,)).fetchone()
     if not r:
         return None
     d = dict(r)
@@ -303,26 +290,23 @@ def subscription(sub_id):
 
 def subscriptions_for(user_id):
     """Non-secret subscription metadata for renewal/teardown — no ciphertext."""
-    c = db._conn()
-    rows = c.execute(
-        "SELECT id, user_id, resource, expires_at, created_at "
-        "FROM graph_subscriptions WHERE user_id=?", (user_id,)).fetchall()
-    c.close()
+    with db.connect() as c:
+        rows = c.execute(
+            "SELECT id, user_id, resource, expires_at, created_at "
+            "FROM graph_subscriptions WHERE user_id=?", (user_id,)).fetchall()
     return [dict(r) for r in rows]
 
 
 def delete_subscription(sub_id):
-    c = db._conn()
-    c.execute("DELETE FROM graph_subscriptions WHERE id=?", (sub_id,))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("DELETE FROM graph_subscriptions WHERE id=?", (sub_id,))
+        c.commit()
 
 
 def delete_subscriptions(user_id):
-    c = db._conn()
-    c.execute("DELETE FROM graph_subscriptions WHERE user_id=?", (user_id,))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("DELETE FROM graph_subscriptions WHERE user_id=?", (user_id,))
+        c.commit()
 
 
 # ── Revoke / disconnect ──────────────────────────────────────────────────
@@ -332,14 +316,13 @@ def revoke(user_id):
     closed: no plaintext token survives, and claim_due skips revoked rows until
     the user reconnects."""
     now = time.time()
-    c = db._conn()
-    c.execute(
-        "UPDATE graph_accounts SET access_ct=NULL, refresh_ct=NULL, "
-        "token_expires_at=NULL, status=?, next_run_at=NULL, claimed_at=NULL, "
-        "updated_at=? WHERE user_id=?", ("revoked", now, user_id))
-    c.execute("DELETE FROM graph_subscriptions WHERE user_id=?", (user_id,))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute(
+            "UPDATE graph_accounts SET access_ct=NULL, refresh_ct=NULL, "
+            "token_expires_at=NULL, status=?, next_run_at=NULL, claimed_at=NULL, "
+            "updated_at=? WHERE user_id=?", ("revoked", now, user_id))
+        c.execute("DELETE FROM graph_subscriptions WHERE user_id=?", (user_id,))
+        c.commit()
 
 
 # ── Public status (non-secret metadata only) ─────────────────────────────
@@ -352,9 +335,8 @@ def public_status(user_id):
     if not acct:
         return {"connected": False, "mode": None, "status": None,
                 "last_sync": None, "item_count": 0}
-    c = db._conn()
-    r = c.execute("SELECT COUNT(*) AS n FROM graph_items WHERE user_id=?", (user_id,)).fetchone()
-    c.close()
+    with db.connect() as c:
+        r = c.execute("SELECT COUNT(*) AS n FROM graph_items WHERE user_id=?", (user_id,)).fetchone()
     return {
         "connected": acct.get("status") not in (None, "revoked"),
         "mode": acct.get("auth_mode"),

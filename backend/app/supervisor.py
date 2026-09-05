@@ -19,6 +19,11 @@ is ESCALATED — the requester is emailed and a human must approve a retry or
 abort it. An LLM supervisor, when a key is present, adds a written risk review;
 it advises, but policy — not the model — decides whether a write runs.
 
+Job kinds are a CLOSED set (KINDS below) and each one has an explicit
+executor. There is deliberately NO fall-through: a kind nobody handles raises
+instead of inheriting whatever branch happens to be last, so a future kind can
+never silently acquire the warehouse write path.
+
 platform_run jobs (kind "platform_run", target = an orchestration platform from
 platforms.PLATFORMS) trigger external pipelines. Platforms aren't data sources,
 so RBAC table policy doesn't apply — instead only admins and analysts may
@@ -43,42 +48,63 @@ router = APIRouter(prefix="/jobs", tags=["jobs"])
 MAX_RETRIES = 2            # automatic retries before escalating to a human
 _WRITE = queryguard.FORBIDDEN  # DML/DDL keyword detector, reused from the guard
 
+#: SQL text, run statement-by-statement against a data source.
+SQL_KIND = "sql_script"
+#: A Databricks Jobs run-submit body, handed to connector.submit_spark_job.
+SPARK_KIND = "spark_job"
+#: An external orchestration platform run (platforms.PLATFORMS).
+PLATFORM_KIND = "platform_run"
+#: A generated CODE ARTIFACT (toolbuilder's MCP server / tool) whose "execution"
+#: is a human's approval decision and NOTHING ELSE. It rides the supervised-job
+#: lifecycle purely for the admin gate + audit trail; its script is Python, not
+#: SQL, so it must never reach a warehouse executor — see _execute_artifact.
+ARTIFACT_KIND = "mcp_build"
+
+#: Every kind the supervisor knows how to execute. _execute dispatches on this
+#: set and RAISES on anything else — the fall-through that used to hand an
+#: unknown kind to connector.run_script is gone on purpose.
+KINDS = (SQL_KIND, SPARK_KIND, PLATFORM_KIND, ARTIFACT_KIND)
+
 
 def init_tables():
-    c = db._conn()
-    c.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS supervised_jobs (
-            id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            requester_role TEXT,
-            requester_email TEXT,
-            kind TEXT NOT NULL,
-            target TEXT NOT NULL,
-            script TEXT NOT NULL,
-            risk TEXT,
-            status TEXT NOT NULL,
-            supervisor_decision TEXT,
-            supervisor_reasons TEXT,
-            attempts INTEGER NOT NULL DEFAULT 0,
-            max_retries INTEGER NOT NULL DEFAULT 2,
-            last_error TEXT,
-            result TEXT,
-            human_by TEXT,
-            created_at REAL NOT NULL,
-            updated_at REAL NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_jobs_user ON supervised_jobs(user_id, updated_at DESC);
-        """
-    )
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS supervised_jobs (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                requester_role TEXT,
+                requester_email TEXT,
+                kind TEXT NOT NULL,
+                target TEXT NOT NULL,
+                script TEXT NOT NULL,
+                risk TEXT,
+                status TEXT NOT NULL,
+                supervisor_decision TEXT,
+                supervisor_reasons TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                max_retries INTEGER NOT NULL DEFAULT 2,
+                last_error TEXT,
+                result TEXT,
+                human_by TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_jobs_user ON supervised_jobs(user_id, updated_at DESC);
+            """
+        )
+        c.commit()
 
 
 # ── Risk classification + supervisor agent ──────────────────────────────
 
 def classify(kind, script):
-    if kind in ("spark_job", "platform_run"):
+    if kind == ARTIFACT_KIND:
+        # Not a statement at all — a code deliverable awaiting an admin's
+        # signature. Classifying it as SQL would read Python as "write / DDL"
+        # and imply a warehouse is involved; none is.
+        return "artifact"
+    if kind in (SPARK_KIND, PLATFORM_KIND):
         return "job"
     # A SQL script: 'write' if any statement is not a plain SELECT/CTE.
     for stmt in _statements(script):
@@ -95,7 +121,7 @@ def _statements(script):
 def supervise(kind, target, script, user):
     """The supervisor agent's verdict on a job. Returns
     {decision: approve|reject|needs_human, risk, reasons}."""
-    if kind == "platform_run":
+    if kind == PLATFORM_KIND:
         return _supervise_platform_run(target, script, user)
     reasons = []
     # RBAC first: you cannot run anything against a source you can't reach.
@@ -116,6 +142,12 @@ def supervise(kind, target, script, user):
     if risk == "read":
         return {"decision": "approve", "risk": risk,
                 "reasons": reasons + ["Read-only; auto-approved."]}
+    if risk == "artifact":
+        return {"decision": "needs_human", "risk": risk,
+                "reasons": reasons + [
+                    f"Generated code artifact scoped to {target} — an administrator "
+                    "must approve it before it can be registered as a tool server. "
+                    "Nothing is executed by approving it."]}
     label = "Spark job" if risk == "job" else "write / DDL"
     return {"decision": "needs_human", "risk": risk,
             "reasons": reasons + [f"{label} on {target} — requires human approval before it runs."]}
@@ -240,23 +272,56 @@ def _bridge_output(job, user):
     return reg
 
 
+def _execute_artifact(job):
+    """Execute a code-artifact job by recording the decision — running NOTHING.
+
+    INVARIANT — no connector is touched on this path. The job's script is
+    model-generated PYTHON; the deliverable's own module (toolbuilder) writes it
+    to a confined sandbox once it sees human_by on this job, and the MCP client
+    later spawns it as a separate OS process. Studio never executes it, and it
+    must never be mistaken for SQL and handed to a warehouse executor.
+
+    Fails closed: policy makes every artifact job human-gated, so arriving here
+    without an approver means the gate was bypassed."""
+    approver = job.get("human_by")
+    if not approver:
+        raise RuntimeError("A code artifact reached execution without a human approver.")
+    return {"kind": job["kind"], "executed": False, "approved_by": approver,
+            "detail": "Code artifact approved by an administrator; nothing was executed."}
+
+
 def _execute(job):
-    """Run the job against its environment. Raises on any failure."""
+    """Run the job against its environment. Raises on any failure.
+
+    Dispatch is EXHAUSTIVE over KINDS. An unrecognized kind raises instead of
+    falling through to the SQL branch: that fall-through is how a code artifact
+    ended up being fed to connector.run_script, and a default that runs scripts
+    is the wrong default for anything new."""
     user = _requester(job)
     target = job["target"]
+    kind = job["kind"]
 
-    if job["kind"] == "platform_run":
+    if kind == PLATFORM_KIND:
         # Adapters read their own env creds and raise RuntimeError with a clear
         # message; {"run_ref","url"} lands in the result JSON column.
         out = platforms.get_platform(target).trigger(json.loads(job["script"]))
         _record_platform_rollout(user, target, out.get("run_ref"))
         return out
 
+    if kind == ARTIFACT_KIND:
+        # Before any connector lookup — an artifact job has no environment.
+        return _execute_artifact(job)
+
+    if kind not in (SQL_KIND, SPARK_KIND):
+        raise RuntimeError(
+            f"Unknown job kind '{kind}' — refusing to execute it. Known kinds: "
+            + ", ".join(KINDS))
+
     conn = connector_or_400(target)
     if not conn.configured():
         raise RuntimeError(f"The {target} environment is not connected — configure its credentials.")
 
-    if job["kind"] == "spark_job":
+    if kind == SPARK_KIND:
         return conn.submit_spark_job(json.loads(job["script"]))
 
     out = []
@@ -285,7 +350,7 @@ def _run(job):
     while True:
         try:
             result = _execute(job)
-            if job["kind"] == "platform_run":
+            if job["kind"] == PLATFORM_KIND:
                 # Trigger-success only — the pipeline is now running on the
                 # platform, so the job stays "running". /live owns the terminal
                 # state: it flips the job to succeeded/failed when the platform
@@ -299,7 +364,7 @@ def _run(job):
             # parquet output has now produced it (this path runs only after an
             # admin approved the job — spark jobs are always human-gated), so
             # register that output as a queryable dataset.
-            if job["kind"] == "spark_job":
+            if job["kind"] == SPARK_KIND:
                 _bridge_output(job, _requester(job))
             return job
         except Exception as e:
@@ -347,14 +412,13 @@ def submit(kind, target, script, user):
 # ── Persistence ─────────────────────────────────────────────────────────
 
 def _insert(job):
-    c = db._conn()
-    cols = ("id,user_id,requester_role,requester_email,kind,target,script,risk,status,"
-            "supervisor_decision,supervisor_reasons,attempts,max_retries,last_error,"
-            "result,human_by,created_at,updated_at")
-    c.execute(f"INSERT INTO supervised_jobs ({cols}) VALUES ({','.join('?' * 18)})",
-              tuple(job[k] for k in cols.split(",")))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        cols = ("id,user_id,requester_role,requester_email,kind,target,script,risk,status,"
+                "supervisor_decision,supervisor_reasons,attempts,max_retries,last_error,"
+                "result,human_by,created_at,updated_at")
+        c.execute(f"INSERT INTO supervised_jobs ({cols}) VALUES ({','.join('?' * 18)})",
+                  tuple(job[k] for k in cols.split(",")))
+        c.commit()
 
 
 def _save(job, **fields):
@@ -362,11 +426,10 @@ def _save(job, **fields):
     job["updated_at"] = time.time()
     fields["updated_at"] = job["updated_at"]
     sets = ", ".join(f"{k}=?" for k in fields)
-    c = db._conn()
-    c.execute(f"UPDATE supervised_jobs SET {sets} WHERE id=?",
-              list(fields.values()) + [job["id"]])
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute(f"UPDATE supervised_jobs SET {sets} WHERE id=?",
+                  list(fields.values()) + [job["id"]])
+        c.commit()
 
 
 def _row(r):
@@ -381,9 +444,8 @@ def _row(r):
 
 
 def _get(jid):
-    c = db._conn()
-    r = c.execute("SELECT * FROM supervised_jobs WHERE id=?", (jid,)).fetchone()
-    c.close()
+    with db.connect() as c:
+        r = c.execute("SELECT * FROM supervised_jobs WHERE id=?", (jid,)).fetchone()
     return dict(r) if r else None
 
 
@@ -417,11 +479,14 @@ class SubmitIn(BaseModel):
 
 @router.post("", status_code=201)
 def submit_job(body: SubmitIn, user=Depends(current_user)):
-    if body.kind not in ("sql_script", "spark_job", "platform_run"):
+    # ARTIFACT_KIND is deliberately NOT submittable over HTTP: an artifact job
+    # is created by toolbuilder alongside the row it approves, so accepting one
+    # here would mint an approval with no deliverable behind it.
+    if body.kind not in (SQL_KIND, SPARK_KIND, PLATFORM_KIND):
         raise HTTPException(400, "kind must be 'sql_script', 'spark_job' or 'platform_run'")
     if not (body.script or "").strip():
         raise HTTPException(400, "script is required")
-    if body.kind in ("spark_job", "platform_run"):
+    if body.kind in (SPARK_KIND, PLATFORM_KIND):
         # Both are executed via json.loads(script) — fail at submit time with a
         # clear 400 instead of at run time inside the retry/escalation loop.
         try:
@@ -434,13 +499,12 @@ def submit_job(body: SubmitIn, user=Depends(current_user)):
 @router.get("")
 def list_jobs(user=Depends(current_user)):
     """Own jobs; admins see everything (they are the human approvers)."""
-    c = db._conn()
-    if user["role"] == "admin":
-        rows = c.execute("SELECT * FROM supervised_jobs ORDER BY updated_at DESC LIMIT 200").fetchall()
-    else:
-        rows = c.execute("SELECT * FROM supervised_jobs WHERE user_id=? ORDER BY updated_at DESC LIMIT 200",
-                         (user["id"],)).fetchall()
-    c.close()
+    with db.connect() as c:
+        if user["role"] == "admin":
+            rows = c.execute("SELECT * FROM supervised_jobs ORDER BY updated_at DESC LIMIT 200").fetchall()
+        else:
+            rows = c.execute("SELECT * FROM supervised_jobs WHERE user_id=? ORDER BY updated_at DESC LIMIT 200",
+                             (user["id"],)).fetchall()
     return {"jobs": [_public(_row(r)) for r in rows],
             "can_approve": user["role"] == "admin"}
 
@@ -480,7 +544,7 @@ def live_job(jid: str, user=Depends(current_user)):
         stored = {}
     run_ref = stored.get("run_ref") if isinstance(stored, dict) else None
 
-    if row["kind"] != "platform_run" or not run_ref:
+    if row["kind"] != PLATFORM_KIND or not run_ref:
         # Nothing to poll — the stored job is the truth.
         return {"state": row["status"], "detail": row.get("last_error"),
                 "url": None, "metrics": {}, "logs": "", "quality": [],

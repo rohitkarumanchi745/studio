@@ -34,39 +34,38 @@ MAX_STEPS = 6
 
 
 def init_tables():
-    c = db._conn()
-    c.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS pipelines (
-            id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            name TEXT NOT NULL,
-            prompt TEXT NOT NULL,
-            source TEXT NOT NULL,
-            steps TEXT NOT NULL,
-            visibility TEXT NOT NULL DEFAULT 'private',
-            created_at REAL NOT NULL,
-            updated_at REAL NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS pipeline_runs (
-            id TEXT PRIMARY KEY,
-            pipeline_id TEXT NOT NULL,
-            user_id TEXT NOT NULL,
-            status TEXT NOT NULL,
-            steps_result TEXT,
-            failed_step INTEGER,
-            error TEXT,
-            trace_id TEXT,
-            emailed INTEGER NOT NULL DEFAULT 0,
-            started_at REAL NOT NULL,
-            finished_at REAL
-        );
-        CREATE INDEX IF NOT EXISTS idx_pipeline_runs_pl
-            ON pipeline_runs(pipeline_id, started_at DESC);
-        """
-    )
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS pipelines (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                source TEXT NOT NULL,
+                steps TEXT NOT NULL,
+                visibility TEXT NOT NULL DEFAULT 'private',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS pipeline_runs (
+                id TEXT PRIMARY KEY,
+                pipeline_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                steps_result TEXT,
+                failed_step INTEGER,
+                error TEXT,
+                trace_id TEXT,
+                emailed INTEGER NOT NULL DEFAULT 0,
+                started_at REAL NOT NULL,
+                finished_at REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_pipeline_runs_pl
+                ON pipeline_runs(pipeline_id, started_at DESC);
+            """
+        )
+        c.commit()
 
 
 # ── Intent routing: prompt → the source whose tables best match ─────────
@@ -344,16 +343,15 @@ def run_pipeline(pipeline, user):
     if status == "failed":
         emailed = 1 if _email_failure(user, pipeline, failed_step, error, results) else 0
 
-    c = db._conn()
-    c.execute(
-        "INSERT INTO pipeline_runs (id, pipeline_id, user_id, status, steps_result, "
-        "failed_step, error, trace_id, emailed, started_at, finished_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        (rid, pipeline["id"], user["id"], status, json.dumps(results, default=str),
-         failed_step, error, trace_id, emailed, t0, time.time()),
-    )
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute(
+            "INSERT INTO pipeline_runs (id, pipeline_id, user_id, status, steps_result, "
+            "failed_step, error, trace_id, emailed, started_at, finished_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (rid, pipeline["id"], user["id"], status, json.dumps(results, default=str),
+             failed_step, error, trace_id, emailed, t0, time.time()),
+        )
+        c.commit()
     db.log_activity(user, "pipeline_run", prompt=pipeline["name"],
                     source=pipeline["source"], ok=(status == "success"),
                     error=error, duration_ms=dur)
@@ -411,9 +409,8 @@ def _row(r):
 
 
 def _own_or_404(pid, user, *, edit=False):
-    c = db._conn()
-    row = c.execute("SELECT * FROM pipelines WHERE id=?", (pid,)).fetchone()
-    c.close()
+    with db.connect() as c:
+        row = c.execute("SELECT * FROM pipelines WHERE id=?", (pid,)).fetchone()
     if row is None:
         raise HTTPException(404, "Pipeline not found")
     d = _row(row)
@@ -474,26 +471,24 @@ def create(body: SaveIn, user=Depends(current_user)):
     visibility = body.visibility if body.visibility in ("private", "org") else "private"
     now = time.time()
     pid = str(uuid.uuid4())
-    c = db._conn()
-    c.execute(
-        "INSERT INTO pipelines (id, user_id, name, prompt, source, steps, visibility, "
-        "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
-        (pid, user["id"], name, body.prompt, body.source, json.dumps(verified),
-         visibility, now, now),
-    )
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute(
+            "INSERT INTO pipelines (id, user_id, name, prompt, source, steps, visibility, "
+            "created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (pid, user["id"], name, body.prompt, body.source, json.dumps(verified),
+             visibility, now, now),
+        )
+        c.commit()
     db.log_activity(user, "pipeline_save", prompt=name, source=body.source)
     return get(pid, user)
 
 
 @router.get("")
 def listing(user=Depends(current_user)):
-    c = db._conn()
-    rows = c.execute(
-        "SELECT * FROM pipelines WHERE user_id=? OR visibility='org' ORDER BY updated_at DESC",
-        (user["id"],)).fetchall()
-    c.close()
+    with db.connect() as c:
+        rows = c.execute(
+            "SELECT * FROM pipelines WHERE user_id=? OR visibility='org' ORDER BY updated_at DESC",
+            (user["id"],)).fetchall()
     out = []
     for r in rows:
         d = _row(r)
@@ -514,11 +509,10 @@ def get(pid: str, user=Depends(current_user)):
 @router.delete("/{pid}")
 def remove(pid: str, user=Depends(current_user)):
     _own_or_404(pid, user, edit=True)
-    c = db._conn()
-    c.execute("DELETE FROM pipeline_runs WHERE pipeline_id=?", (pid,))
-    c.execute("DELETE FROM pipelines WHERE id=?", (pid,))
-    c.commit()
-    c.close()
+    with db.connect() as c:
+        c.execute("DELETE FROM pipeline_runs WHERE pipeline_id=?", (pid,))
+        c.execute("DELETE FROM pipelines WHERE id=?", (pid,))
+        c.commit()
     return {"deleted": True}
 
 
@@ -533,11 +527,10 @@ def trigger(pid: str, user=Depends(current_user)):
 @router.get("/{pid}/runs")
 def runs(pid: str, user=Depends(current_user)):
     _own_or_404(pid, user)
-    c = db._conn()
-    rows = c.execute(
-        "SELECT * FROM pipeline_runs WHERE pipeline_id=? ORDER BY started_at DESC LIMIT 50",
-        (pid,)).fetchall()
-    c.close()
+    with db.connect() as c:
+        rows = c.execute(
+            "SELECT * FROM pipeline_runs WHERE pipeline_id=? ORDER BY started_at DESC LIMIT 50",
+            (pid,)).fetchall()
     out = []
     for r in rows:
         d = _row(r)

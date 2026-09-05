@@ -26,19 +26,36 @@ class SnowflakeConnector(Connector):
         }
 
     def qualifiers(self):
-        """The configured database/schema — the only namespace RBAC describes.
+        """The configured schema and `database.schema` — the only namespace
+        RBAC describes.
 
         A Snowflake login routinely sees several databases and schemas, so a
         reference qualified with anything else (`other_db.public.sales`) is
         outside what the catalog and the allowlist were built from and the
         query guard refuses it. Env only, no connection: this runs per query.
+
+        ARITY carries the meaning, and Snowflake's rule is:
+          one part  `x.sales`   -> x is a SCHEMA in the CURRENT database
+          two parts `a.b.sales` -> a is the DATABASE, b the SCHEMA
+        So the DATABASE name must NOT be declared as a one-part qualifier: it
+        was, and `ANALYTICS.sales` was therefore accepted while Snowflake reads
+        it as the schema ANALYTICS — a namespace the catalog never described
+        and the allowlist never covered.
+
+        UPPER-cased, because that is the name Snowflake STORES: the env value
+        is an unquoted identifier, and Snowflake folds an unquoted identifier
+        up. list_tables() already reads it that way (`cfg["schema"].upper()`),
+        so the catalog, the allowlist and this declaration now agree on one
+        spelling. The guard canonicalizes a written reference the same way, so
+        a bare `public.sales` still matches PUBLIC while a quoted
+        `"public".sales` — a schema that does not exist — does not.
         """
         cfg = self._cfg()
-        schema = (cfg["schema"] or "PUBLIC").strip().lower()
-        database = (cfg["database"] or "").strip().lower()
+        schema = (cfg["schema"] or "PUBLIC").strip().upper()
+        database = (cfg["database"] or "").strip().upper()
         out = {schema}
         if database:
-            out |= {database, f"{database}.{schema}"}
+            out.add(f"{database}.{schema}")
         return frozenset(out)
 
     def configured(self):

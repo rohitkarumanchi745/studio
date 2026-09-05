@@ -13,8 +13,8 @@ from fastapi.staticfiles import StaticFiles
 
 from . import (auth, autopilot, catalog, chat, dashboards, db, flow, freshness,
                governance, jobs, kag, keys, mcp, migrations, pipelines, pybuild,
-               qcache, queries, repos, semantic, sessions, supervisor, toolbuilder,
-               trainer)
+               qcache, queries, redteam, repos, semantic, sessions, supervisor,
+               toolbuilder, trainer)
 from .agent import llm_available, llm_spec
 from .connectors import objectstore
 from .connectors.demo import seed
@@ -43,7 +43,7 @@ _ROUTERS = (auth.router, catalog.router, chat.router, dashboards.router,
             supervisor.router, mcp.router, pybuild.router, toolbuilder.router,
             kag.router, repos.router, repos._settings, sessions.router,
             flow.router, trainer.router, freshness.router, objectstore.router,
-            semantic.router, autopilot.router, m365.router)
+            semantic.router, autopilot.router, redteam.router, m365.router)
 for _router in _ROUTERS:
     app.include_router(_router, prefix="/api")
 
@@ -81,6 +81,7 @@ def init_state():
     flow.init_tables()
     qcache.init_tables()
     trainer.init_tables()
+    redteam.init_tables()
     objectstore.init_tables()
     autopilot.init_tables()
     # Microsoft 365 / Graph extraction tables (graph_accounts / _subscriptions /
