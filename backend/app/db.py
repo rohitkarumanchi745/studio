@@ -1,11 +1,32 @@
-"""App state store (users, conversations, messages) — SQLite for the prototype."""
+"""App state store (users, conversations, messages) — SQLite or Postgres.
+
+Schema policy: the CREATE TABLE IF NOT EXISTS baseline here (and in every
+module's init_tables()) is the COMPLETE current schema, so a fresh database
+needs no migration. Columns added after a table first shipped are ALSO listed
+in app/migrations.py, which brings an old database up to this baseline once
+and records it in schema_migrations; startup runs it after the last
+init_tables(). Never add a guarded ALTER TABLE here again — add the column to
+the CREATE and a numbered migration.
+
+Connections: _conn() hands out one connection per call and the caller
+close()s it. On SQLite that is a file handle; on Postgres it is a connection
+BORROWED from a process-wide psycopg_pool (see _PgConn), so close() is a
+return, not a disconnect — and close() ends the open transaction first, so the
+connection goes back IDLE (a read-only caller commits nothing, and psycopg
+starts a transaction on its first execute).
+"""
 import json
+import logging
 import os
 import sqlite3
 import time
 import uuid
 
 import bcrypt
+
+from . import bootstrap
+
+log = logging.getLogger("studio.db")
 
 # Postgres when DATABASE_URL is set, else SQLite. Container filesystems are
 # ephemeral, so file-backed SQLite needs STUDIO_DB_PATH on a mounted volume
@@ -14,6 +35,15 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 IS_PG = DATABASE_URL.startswith(("postgres://", "postgresql://"))
 DB_PATH = os.getenv("STUDIO_DB_PATH") or os.path.join(
     os.path.dirname(__file__), "..", "studio.db")
+
+# Postgres pool singleton — created lazily on the first _conn() so importing
+# this module (tests, the CLI, SQLite deployments) never dials a database.
+# _POOL_DISABLED latches when psycopg_pool is not installed: every _conn()
+# then opens a direct connection exactly as before, and _POOL_WARNED makes
+# sure that degradation is logged once per process rather than per query.
+_POOL = None
+_POOL_DISABLED = False
+_POOL_WARNED = False
 
 
 def _pg_sql(sql):
@@ -26,13 +56,92 @@ def _pg_sql(sql):
     return sql.replace("?", "%s").replace(" REAL", " DOUBLE PRECISION")
 
 
+def _pool():
+    """The process-wide psycopg_pool.ConnectionPool, or None when the pool
+    package is unavailable (direct-connect fallback). Sized by
+    STUDIO_PG_POOL_SIZE (max, default 10) and STUDIO_PG_POOL_TIMEOUT (seconds
+    to wait for a free connection, default 30); min_size=1 keeps one warm
+    connection so the first request after idle does not pay a handshake."""
+    global _POOL, _POOL_DISABLED, _POOL_WARNED
+    if _POOL is not None:
+        return _POOL
+    if _POOL_DISABLED:
+        return None
+    try:
+        from psycopg.rows import dict_row
+        from psycopg_pool import ConnectionPool
+    except ImportError:
+        _POOL_DISABLED = True
+        if not _POOL_WARNED:
+            _POOL_WARNED = True
+            log.warning(
+                "db: psycopg_pool is not installed — opening a direct Postgres "
+                "connection per call. Install psycopg[binary,pool] to enable pooling.")
+        return None
+    _POOL = ConnectionPool(
+        DATABASE_URL,
+        min_size=1,
+        max_size=int(os.getenv("STUDIO_PG_POOL_SIZE") or 10),
+        timeout=float(os.getenv("STUDIO_PG_POOL_TIMEOUT") or 30),
+        kwargs={"row_factory": dict_row},
+        open=True,
+    )
+    return _POOL
+
+
+def pool_stats():
+    """Pool gauges for /health, or None: SQLite, direct-connect fallback, or
+    no Postgres connection borrowed yet (the pool is lazy)."""
+    if _POOL is None:
+        return None
+    stats = {"min_size": getattr(_POOL, "min_size", None),
+             "max_size": getattr(_POOL, "max_size", None)}
+    get_stats = getattr(_POOL, "get_stats", None)
+    if callable(get_stats):
+        try:
+            stats.update(get_stats())
+        except Exception:
+            pass
+    return stats
+
+
+def close_pool():
+    """Close the Postgres pool at shutdown so the process exits without
+    leaving server-side sessions to time out. Safe to call on SQLite or
+    before the pool was ever created."""
+    global _POOL
+    pool, _POOL = _POOL, None
+    if pool is None:
+        return
+    try:
+        pool.close()
+    except Exception:
+        pass
+
+
 class _PgConn:
-    """SQLite-shaped facade over psycopg, so callers stay dialect-agnostic."""
+    """SQLite-shaped facade over psycopg, so callers stay dialect-agnostic.
+
+    __init__ borrows a connection from the pool; close() RETURNS it. There
+    are ~180 call sites written as `c = _conn(); ...; c.close()`, so the
+    borrow/return has to be exactly as cheap and forgiving as the old
+    connect/close: close() is idempotent (a second call must not putconn()
+    the same connection twice), and __del__ returns a connection a caller
+    forgot to close — logging it so the leak gets fixed rather than hidden.
+    """
 
     def __init__(self, dsn):
-        import psycopg
-        from psycopg.rows import dict_row
-        self._c = psycopg.connect(dsn, row_factory=dict_row)
+        # _closed starts True so a failure while borrowing (pool timeout,
+        # connect error) leaves nothing for __del__ to return.
+        self._closed = True
+        self._pool = _pool()
+        if self._pool is not None:
+            self._c = self._pool.getconn()
+        else:
+            import psycopg
+            from psycopg.rows import dict_row
+            self._c = psycopg.connect(dsn, row_factory=dict_row)
+        self._closed = False
 
     def execute(self, sql, params=()):
         return self._c.execute(_pg_sql(sql), tuple(params))
@@ -45,8 +154,45 @@ class _PgConn:
     def commit(self):
         self._c.commit()
 
+    def rollback(self):
+        self._c.rollback()
+
     def close(self):
-        self._c.close()
+        if self._closed:
+            return
+        self._closed = True
+        # End the transaction HERE. psycopg opens one implicitly on the first
+        # execute() and never closes it, so a read-only caller — most of them,
+        # they have nothing to commit — used to hand the pool a connection in
+        # INTRANS. putconn() then rolled it back itself: a "returning
+        # connection with transaction in progress" warning and an extra server
+        # round trip on EVERY read. Rolling back keeps close()'s contract
+        # unchanged (a caller that forgot commit() loses its writes, exactly as
+        # a real close() did) and is a no-op after commit(), when the
+        # connection is already idle.
+        try:
+            self._c.rollback()
+        except Exception:
+            # A broken connection cannot be reset; the pool discards it on
+            # return. Never let cleanup raise out of close().
+            log.debug("db: rollback before returning the connection failed", exc_info=True)
+        if self._pool is not None:
+            self._pool.putconn(self._c)
+        else:
+            self._c.close()
+
+    def __del__(self):
+        # Safety net for a leaked connection (caller forgot close(), or an
+        # exception skipped it). Guarded for interpreter shutdown, when
+        # module globals may already be gone.
+        if getattr(self, "_closed", True):
+            return
+        try:
+            log.warning("db: Postgres connection dropped without close() — "
+                        "returning it to the pool; the caller leaked it")
+            self.close()
+        except Exception:
+            pass
 
 
 def _conn():
@@ -70,6 +216,7 @@ def init_db():
             password_hash TEXT NOT NULL,
             name TEXT NOT NULL,
             role TEXT NOT NULL DEFAULT 'viewer',
+            verified INTEGER NOT NULL DEFAULT 1,
             created_at REAL NOT NULL
         );
         CREATE TABLE IF NOT EXISTS conversations (
@@ -154,32 +301,13 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_traces_time ON agent_traces(created_at DESC);
         """
     )
-    # Email-verification flag (guarded ALTER for existing databases). Postgres
-    # gets IF NOT EXISTS rather than a caught error: a failed statement there
-    # aborts the whole transaction, so swallowing it would poison the seeds
-    # that follow — and every restart after the first would fail to boot.
-    if IS_PG:
-        c.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS verified INTEGER NOT NULL DEFAULT 1")
-    else:
-        try:
-            c.execute("ALTER TABLE users ADD COLUMN verified INTEGER NOT NULL DEFAULT 1")
-        except sqlite3.OperationalError:
-            pass
-    # Sidebar folders (guarded ALTER for databases created before folder_id).
-    if IS_PG:
-        c.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS folder_id TEXT")
-    else:
-        try:
-            c.execute("ALTER TABLE conversations ADD COLUMN folder_id TEXT")
-        except sqlite3.OperationalError:
-            pass
-    c.commit()
-    # Seed demo users (one per role) so RBAC is demonstrable out of the box.
-    seeds = [
-        ("admin@studio.local", "admin123", "Admin", "admin"),
-        ("analyst@studio.local", "analyst123", "Analyst", "analyst"),
-        ("viewer@studio.local", "viewer123", "Viewer", "viewer"),
-    ]
+    # users.verified and conversations.folder_id were once added here by
+    # guarded ALTERs; they live in the CREATE above and in migrations 1-2 now.
+    # Seed demo users (one per role) so RBAC is demonstrable out of the box —
+    # ONLY in demo mode. Their passwords are public (README), so a production
+    # deploy must never create them; bootstrap.enforce() also revokes any that
+    # were seeded before this guard existed.
+    seeds = bootstrap.SEED_USERS if bootstrap.demo_mode() else []
     for email, pw, name, role in seeds:
         if not c.execute("SELECT 1 FROM users WHERE email=?", (email,)).fetchone():
             c.execute(
@@ -188,6 +316,14 @@ def init_db():
             )
     c.commit()
     c.close()
+
+
+# Not a bcrypt hash, so verify_password() can never match it: the marker for
+# an account that has no local password at all (SSO-provisioned). Kept
+# distinguishable because bootstrap.ensure_bootstrap_admin() may only promote
+# an existing account in place when the operator can prove control of it, and
+# "there is no password to prove" is one of the two ways to prove that.
+UNUSABLE_PASSWORD_HASH = "!sso-no-local-password"
 
 
 def hash_password(pw):
@@ -220,13 +356,18 @@ def get_user(user_id):
     return dict(row) if row else None
 
 
-def create_user(email, password, name, role="viewer"):
+def create_user(email, password, name, role="viewer", verified=1):
+    """verified defaults to 1 so every pre-existing caller (SSO provisioning,
+    the bootstrap admin, tests) keeps creating usable accounts. Self-service
+    signup is the one caller that passes verified=0: auth.current_user and
+    /auth/login refuse a password account until it clears the emailed code."""
     email = (email or "").strip().lower()
     c = _conn()
     uid = str(uuid.uuid4())
     c.execute(
-        "INSERT INTO users (id, email, password_hash, name, role, created_at) VALUES (?,?,?,?,?,?)",
-        (uid, email, hash_password(password), name, role, time.time()),
+        "INSERT INTO users (id, email, password_hash, name, role, verified, created_at) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (uid, email, hash_password(password), name, role, 1 if verified else 0, time.time()),
     )
     c.commit()
     c.close()
@@ -239,6 +380,32 @@ def create_user(email, password, name, role="viewer"):
     except Exception:
         pass
     return uid
+
+
+def set_user_password(user_id, new_hash):
+    """Takes an already-hashed password so callers can never store plaintext."""
+    c = _conn()
+    c.execute("UPDATE users SET password_hash=? WHERE id=?", (new_hash, user_id))
+    c.commit()
+    c.close()
+
+
+def has_usable_password(user):
+    """False when the account can never be reached by /auth/login — i.e. it was
+    provisioned by SSO. Legacy SSO rows (created before the marker existed)
+    carry a random hash nobody knows and read as True here; that only makes the
+    bootstrap-admin promotion refuse, which fails safe."""
+    if not user:
+        return False
+    return bool(user.get("password_hash")) and user["password_hash"] != UNUSABLE_PASSWORD_HASH
+
+
+def set_user_role(email, role):
+    c = _conn()
+    c.execute("UPDATE users SET role=? WHERE email=?",
+              (role, (email or "").strip().lower()))
+    c.commit()
+    c.close()
 
 
 # ── Audit log (per-user activity: prompts, SQL, outcomes) ───────────────
@@ -423,8 +590,11 @@ def upsert_sso_user(email, name, role):
         c.commit()
         c.close()
     else:
-        create_user(email, uuid.uuid4().hex, name, role=role)
-        mark_verified(email)
+        # SSO users are verified by the identity provider and never sign in
+        # with a local password, so the row gets the unusable-password marker
+        # instead of a random hash.
+        uid = create_user(email, uuid.uuid4().hex, name, role=role, verified=1)
+        set_user_password(uid, UNUSABLE_PASSWORD_HASH)
     return get_user_by_email(email)
 
 

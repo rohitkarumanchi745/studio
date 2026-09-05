@@ -1,4 +1,8 @@
-"""Connector registry."""
+"""Connector registry.
+
+Connectors are looked up here but never executed here: run_query on every
+registered connector is reachable only through app/gateway.py (see base.py).
+"""
 from .bigquery_conn import BigQueryConnector
 from .databricks_conn import DatabricksConnector
 from .demo import DemoConnector

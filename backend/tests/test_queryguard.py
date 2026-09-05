@@ -285,14 +285,19 @@ def test_unterminated_literal_or_comment_rejected():
     rejected("SELECT * FROM sales /* unterminated")
 
 
-# ── Known residual gap (needs per-connector catalog config to close) ────
+# ── Cross-schema prefixes (closed by the `qualifiers` argument) ─────────
 
-def test_cross_database_prefix_is_a_known_gap():
-    """RBAC keys on the bare name, so a `db.schema.table` prefix is not checked.
-    Closing it needs each connector's own database/schema allowlist, which the
-    guard has no access to — documented here so the gap is visible, not silent.
+def test_cross_database_prefix_needs_the_connectors_namespace():
+    """RBAC keys on the bare name, so the guard cannot judge a `db.schema.`
+    prefix on its own: `secret_db.main.sales` still validates when no namespace
+    is supplied, which is why the GATEWAY always supplies one (it passes
+    connector.qualifiers(), built from the env that connector connects with).
+    The closed behaviour is pinned in tests/test_qualified_names.py.
     """
     assert validate("SELECT * FROM secret_db.main.sales", ALLOWED)
+    with pytest.raises(QueryRejected, match="outside the configured namespace"):
+        validate("SELECT * FROM secret_db.main.sales", ALLOWED, qualifiers={"main"})
+    assert validate("SELECT * FROM main.sales", ALLOWED, qualifiers={"main"})
 
 
 # ── enforce_limit ──────────────────────────────────────────────────────

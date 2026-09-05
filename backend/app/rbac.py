@@ -3,45 +3,24 @@
 Three roles for the prototype. "*" means every table in the source.
 Enforced in three places: the catalog (what you can see), the query guard
 (what SQL may touch), and the agent's schema context (what the model is told
-exists). Swap this dict for a policy table / Azure AD group mapping later.
+exists). The built-in policy dict lives in policies.py (a leaf module) so that
+governance can scaffold from it without importing this module; it is
+re-exported here as rbac.POLICIES for existing references.
+
+Layering: rbac sits ABOVE governance — it resolves a role's policy from the
+loaded governance document, falling back to the built-in POLICIES — and
+governance never imports rbac. That is what lets both imports be module-level
+instead of the lazy pair that used to form a governance ↔ rbac cycle.
 """
-
-_MARKETING = ["ga4", "braze", "powerbi_sap", "dynamic_yield", "qualtrics",
-              "google_ads", "microsoft_ads", "sprinklr", "algolia"]
-
-# Object stores are one Studio source each; their "tables" are the datasets an
-# admin registers (connectors/objectstore.py), so "*" here means "every
-# registered dataset" — the registry, not the bucket, is the boundary.
-_OBJECT_STORES = ["s3", "azure_blob", "gcs"]
-
-POLICIES = {
-    "admin": {
-        "demo": "*", "snowflake": "*", "postgres": "*", "databricks": "*",
-        "bigquery": "*", "neo4j": "*",
-        **{o: "*" for o in _OBJECT_STORES},
-        **{m: "*" for m in _MARKETING},
-    },
-    "analyst": {
-        "demo": "*", "snowflake": "*", "postgres": "*", "databricks": "*",
-        "bigquery": "*", "neo4j": "*",
-        **{o: "*" for o in _OBJECT_STORES},
-        **{m: "*" for m in _MARKETING},
-    },
-    "viewer": {
-        # Viewers get aggregate-friendly tables only — no customer PII. The
-        # object stores and BigQuery are deliberately absent: their tables are
-        # whatever an admin registers or lands in a dataset, so no fixed
-        # allowlist can promise a viewer never sees PII. Fail closed until
-        # someone names the tables (or governance grants them).
-        "demo": {"sales", "web_traffic"},
-    },
-}
+from . import governance
+# Re-exported for one release: rbac.POLICIES / rbac._MARKETING /
+# rbac._OBJECT_STORES keep working. New code imports from .policies.
+from .policies import POLICIES, _MARKETING, _OBJECT_STORES  # noqa: F401
 
 
 def _policies():
     """The governance document's roles when one is loaded, else the built-in
     POLICIES. This is the single switch that makes RBAC governance-driven."""
-    from . import governance
     gov = governance.policies()
     return gov if gov is not None else POLICIES
 

@@ -2,9 +2,43 @@
 // routes it to the source you can access whose tables match, drafts verified
 // steps, and lets you save + trigger. A failed run emails you the failing
 // step; every run is traced through Agent Lightning.
+//
+// Honesty rule for this view: a step's badge is DERIVED from the step, never
+// stamped on. `draft.steps` holds only what actually verified (RBAC + guard +
+// a real execution) and `draft.dropped` holds every failure WITH its error —
+// so a step that never ran can never appear here wearing a green tick, and
+// with nothing verified Save is off and says why.
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import Lineage from "./Lineage";
+
+// One drafted step. Works for both lists: the badge, the tone and the reason
+// all come off the step itself. `intent_warnings` (e.g. the request said
+// "monthly" and the SQL buckets by day) warn — they never hide the step.
+function Step({ s }) {
+  const warnings = s.intent_warnings || [];
+  return (
+    <div className="pl-step">
+      <div className="pl-step-head">
+        <span className="query-badge" style={{ color: s.verified ? "var(--ok)" : "var(--bad)" }}>
+          {s.verified ? "✓ verified" : `✗ failed: ${s.error || "did not verify"}`}
+        </span>
+        <b>{s.name}</b>
+        <span className="meta">
+          {s.source}
+          {s.table ? `/${s.table}` : ""}
+          {s.verified ? ` · ${s.row_count} rows` : ""}
+        </span>
+        {warnings.map((w, i) => (
+          <span key={i} className="query-badge" style={{ color: "var(--warn)" }}>
+            ⚠ {w}
+          </span>
+        ))}
+      </div>
+      <pre className="query-sql">{s.sql}</pre>
+    </div>
+  );
+}
 
 export default function Pipelines({ onClose }) {
   const [list, setList] = useState(null);
@@ -163,20 +197,26 @@ export default function Pipelines({ onClose }) {
                 {draft.repo.description ? ` — ${draft.repo.description}` : ""}
               </div>
             )}
-            {draft.steps.map((s, i) => (
-              <div key={i} className="pl-step">
-                <div className="pl-step-head">
-                  <span className="query-badge">✓ verified</span>
-                  <b>{s.name}</b>
-                  <span className="meta">{s.source}{s.table ? `/${s.table}` : ""} · {s.row_count} rows</span>
-                </div>
-                <pre className="query-sql">{s.sql}</pre>
+            {draft.steps.length === 0 && (
+              <div className="meta">
+                No step verified, so there is nothing to save. Every drafted step is
+                listed below with the reason it failed — fix the request (or your
+                access to those tables) and build again.
               </div>
+            )}
+            {draft.steps.map((s, i) => (
+              <Step key={i} s={s} />
             ))}
             {draft.dropped?.length > 0 && (
-              <div className="meta">
-                {draft.dropped.length} step(s) dropped — they didn't verify.
-              </div>
+              <>
+                <div className="meta">
+                  {draft.dropped.length} step(s) dropped — they did not verify and are
+                  not part of this pipeline:
+                </div>
+                {draft.dropped.map((s, i) => (
+                  <Step key={"d" + i} s={s} />
+                ))}
+              </>
             )}
             <Lineage lineage={draft.lineage} />
             <div className="pl-draft-actions">
@@ -186,10 +226,24 @@ export default function Pipelines({ onClose }) {
                 onChange={(e) => setName(e.target.value)}
                 placeholder="Pipeline name"
               />
-              <button className="chip chip-on" onClick={save} disabled={saving || !draft.steps.length}>
+              <button
+                className="chip chip-on"
+                onClick={save}
+                disabled={saving || !draft.steps.length}
+                title={
+                  draft.steps.length
+                    ? "Save these verified steps"
+                    : "Nothing verified — a pipeline can only be saved from steps that ran"
+                }
+              >
                 {saving ? "saving…" : "＋ save pipeline"}
               </button>
               <button className="chip" onClick={() => setDraft(null)}>discard</button>
+              {!draft.steps.length && (
+                <span className="meta">
+                  Save is off: no step verified, so there is no runnable pipeline here.
+                </span>
+              )}
             </div>
           </div>
         )}

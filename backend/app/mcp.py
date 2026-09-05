@@ -7,8 +7,24 @@ internal tools server — so agents can pick up that context without a redeploy.
 Registered servers merge with the env-configured ones and flow into the same
 agent MCP loading, so a "build Python from our existing scripts" request has
 the scripts available as tools.
+
+Two kinds of row share the table, told apart by owner_id:
+  NULL      an admin-registered GLOBAL server — command/args are trusted as
+            stored (an admin chose them) and handed to the client verbatim.
+  set       a toolbuilder-built, model-generated server owned by one user.
+            Its stored command/args are NOT what runs: registered() keeps only
+            the confined path from args and substitutes sandbox.launch_spec(),
+            so the isolation level is decided at load time by the operator's
+            STUDIO_TOOL_RUNNER, never frozen into the row at approval time.
+
+Owner-scoped rows fail CLOSED at every step: a path that cannot be confined, an
+unknown runner, a runner this deployment refuses (the process runner in
+production — sandbox.py), or the tool builder being switched off entirely
+(bootstrap.tool_builder_enabled()) all SKIP the row with a warning. Nothing here
+ever downgrades a row to a weaker launch than the operator configured.
 """
 import json
+import logging
 import re
 import time
 import uuid
@@ -16,8 +32,10 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from . import db
+from . import bootstrap, db, sandbox
 from .auth import current_user
+
+log = logging.getLogger("studio.mcp")
 
 router = APIRouter(prefix="/settings/mcp", tags=["mcp"])
 
@@ -42,16 +60,8 @@ def init_tables():
     )
     # owner_id scopes a server to its owner: NULL = an admin-registered GLOBAL
     # server (loads into every agent); set = a toolbuilder-built tool (loads
-    # ONLY for its owner). Guarded ALTER migrates databases created before the
-    # column existed. Postgres gets IF NOT EXISTS (a failed statement there
-    # aborts the whole transaction); SQLite swallows the duplicate-column error.
-    if db.IS_PG:
-        c.execute("ALTER TABLE mcp_servers ADD COLUMN IF NOT EXISTS owner_id TEXT")
-    else:
-        try:
-            c.execute("ALTER TABLE mcp_servers ADD COLUMN owner_id TEXT")
-        except Exception:
-            pass
+    # ONLY for its owner). Databases created before the column existed get it
+    # from migration 4 (app/migrations.py).
     c.commit()
     c.close()
 
@@ -80,8 +90,40 @@ def registered(user=None):
                 entry["args"] = json.loads(d["args"])
             except Exception:
                 entry["args"] = []
+        if d.get("owner_id") is not None:
+            entry = _sandboxed(d["name"], entry)
+            if entry is None:
+                continue          # logged; a row we cannot confine never loads
         out[d["name"]] = entry
     return out
+
+
+def _sandboxed(name, entry):
+    """The launch spec for an owner-scoped (model-generated) row, or None.
+    The stored args' last element is the server path (toolbuilder stores
+    ["-u", path]); it is re-confined to the sandbox dir HERE, at load time, so
+    a row edited in the DB, a moved sandbox, a bad runner name, or a runner
+    this deployment refuses (the process runner in production) all fail closed
+    with a warning instead of launching something outside the box."""
+    if entry.get("transport") != "stdio":
+        log.warning("mcp: skipping owner-scoped server %s: not stdio", name)
+        return None
+    # An operator can switch the whole feature off after rows already exist;
+    # a registered row must then stop launching, not merely stop being created.
+    if not bootstrap.tool_builder_enabled():
+        log.warning("mcp: skipping owner-scoped server %s: the tool builder is "
+                    "disabled (STUDIO_TOOLBUILDER)", name)
+        return None
+    args = entry.get("args") or []
+    if not args:
+        log.warning("mcp: skipping owner-scoped server %s: no server path", name)
+        return None
+    try:
+        spec = sandbox.launch_spec(args[-1])
+    except ValueError as e:
+        log.warning("mcp: skipping owner-scoped server %s: %s", name, e)
+        return None
+    return {"transport": "stdio", **spec}
 
 
 # Non-HTTP registration for an approved, supervised build (toolbuilder.py). The
@@ -100,6 +142,10 @@ def register_stdio(name, command, args, owner_id=None):
     argv, never through a shell."""
     if not (isinstance(name, str) and _SAFE_SERVER.fullmatch(name)):
         raise ValueError("unsafe server name")
+    # owner_id set = a model-generated, admin-approved build. If the operator
+    # turned the tool builder off, approval no longer produces a runnable row.
+    if owner_id is not None and not bootstrap.tool_builder_enabled():
+        raise ValueError("the tool builder is disabled (STUDIO_TOOLBUILDER)")
     if not command or not isinstance(args, list):
         raise ValueError("stdio server needs a command and an args list")
     c = db._conn()

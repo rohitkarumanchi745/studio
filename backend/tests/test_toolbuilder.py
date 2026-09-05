@@ -3,7 +3,9 @@
 Proves the invariant: build authors CODE but registers NOTHING; an un-approved
 artifact is invisible to agents (not in mcp.registered()); ONLY after a human
 admin approves the supervised job is it written to a confined sandbox and
-registered as an isolated stdio subprocess; a non-admin cannot approve; a built
+registered as an isolated stdio subprocess — which the agent receives as the
+SANDBOXED launch spec (sandbox_runner under a minimal explicit env), never the
+bare interpreter; a non-admin cannot approve; a built
 tool cannot be scoped to a source the owner's role lacks; and a server name is
 injection-safe. The app never exec/imports the generated code.
 
@@ -22,7 +24,7 @@ os.environ["STUDIO_TOOLBUILDER_DIR"] = os.path.join(_TMP, "sandbox")
 import pytest
 from fastapi import HTTPException
 
-from app import agent, db, email_service, mcp, supervisor, toolbuilder
+from app import agent, db, email_service, mcp, sandbox, supervisor, toolbuilder
 from app.connectors.demo import seed
 from app.toolbuilder import BuildIn, SubmitIn
 
@@ -57,6 +59,12 @@ def _sandbox_file(aid):
 
 def _tb_servers(user=None):
     return {n: e for n, e in mcp.registered(user).items() if n.startswith("tb_")}
+
+
+def _server_path(entry):
+    """The confined server path in a sandboxed entry's argv:
+    [-I, -u, sandbox_runner.py, <path>]."""
+    return entry["args"][3]
 
 
 # ── 1. build authors code but registers / writes / runs NOTHING ─────────
@@ -117,13 +125,27 @@ def test_approval_registers_isolated_stdio_server():
     assert name in reg                              # now an agent-loadable server
     entry = reg[name]
     assert entry["transport"] == "stdio"            # isolated subprocess, not in-proc
+    # What the agent gets is the SANDBOXED launch spec, not the bare interpreter:
+    # python -I -u sandbox_runner.py <confined path>, a minimal explicit env,
+    # cwd = the sandbox dir (sandbox.launch_spec, substituted at load time).
+    assert sandbox.is_sandboxed_entry(entry)
     assert entry["command"] == sys.executable       # app's own interpreter, never user input
-    assert entry["args"][0] == "-u"
-    path = entry["args"][1]
+    assert entry["args"][0:2] == ["-I", "-u"]
+    assert entry["args"][2].endswith("sandbox_runner.py")
+    path = _server_path(entry)
     # args path is confined to the sandbox and is the file we wrote.
     assert path == _sandbox_file(a["id"])
     assert os.path.realpath(path).startswith(toolbuilder.SANDBOX + os.sep)
     assert os.path.exists(path)
+    assert entry["cwd"] == toolbuilder.SANDBOX
+    # The child inherits NOTHING from the app's environment but PATH — every
+    # other key is a fixed runner key; a credential reaches a tool only via
+    # STUDIO_TOOL_ENV_ALLOW (none granted here).
+    inherited = {k for k in entry["env"] if k in os.environ and k != "PATH"}
+    assert inherited <= {"HOME", "LANG"} and entry["env"]["HOME"] == toolbuilder.SANDBOX
+    assert entry["env"]["STUDIO_TOOL_SANDBOX"] == toolbuilder.SANDBOX
+    for secret in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "STUDIO_DB_PATH", "JWT_SECRET"):
+        assert secret not in entry["env"]
 
 
 # ── 4. a non-admin cannot approve (the gate is unforgeable) ──────────────
@@ -171,7 +193,8 @@ def test_malicious_name_is_slugged_not_injected():
     assert re.fullmatch(r"tb_[a-z0-9_]+", name)
     assert ";" not in name and "&" not in name and " " not in name and "/" not in name
     # command/args are fixed — the name never reaches a shell.
-    assert mcp.registered(ADMIN)[name]["command"] == sys.executable
+    entry = mcp.registered(ADMIN)[name]
+    assert entry["command"] == sys.executable and sandbox.is_sandboxed_entry(entry)
 
 
 # ── 7. ownership: 404-not-403 for a stranger ────────────────────────────
@@ -275,7 +298,35 @@ def test_same_owner_identical_slug_registers_distinct_servers():
     reg = mcp.registered(ADMIN)
     assert n1 in reg and n2 in reg                    # BOTH still registered
     # Each still points at its OWN sandbox file (no repoint / orphan).
-    assert reg[n1]["args"][1] == _sandbox_file(a1["id"])
-    assert reg[n2]["args"][1] == _sandbox_file(a2["id"])
+    assert _server_path(reg[n1]) == _sandbox_file(a1["id"])
+    assert _server_path(reg[n2]) == _sandbox_file(a2["id"])
     assert os.path.exists(_sandbox_file(a1["id"]))
     assert os.path.exists(_sandbox_file(a2["id"]))
+
+
+# ── 12. a tampered row (path outside the sandbox) never loads ─────────────
+
+def test_owner_row_outside_sandbox_is_skipped_at_load(tmp_path):
+    """Confinement is re-checked at LOAD time from the stored args, so a row
+    edited in the DB to point outside the sandbox is dropped with a warning —
+    it never reaches the agent, sandboxed or otherwise. A global (admin,
+    owner_id NULL) stdio row is passed through verbatim as before."""
+    outside = tmp_path / "evil.py"
+    outside.write_text("print('no')\n")
+    mcp.register_stdio("tb_tampered", sys.executable, ["-u", str(outside)], owner_id=ADMIN["id"])
+    try:
+        assert "tb_tampered" not in mcp.registered(ADMIN)
+        # An unknown runner name fails closed too (never a silent downgrade).
+        a = toolbuilder.build(BuildIn(prompt="runner typo", kind="mcp"), user=ADMIN)
+        sub = toolbuilder.submit(a["id"], SubmitIn(source="demo"), user=ADMIN)
+        supervisor.approve(sub["job"]["id"], user=ADMIN)
+        name = toolbuilder.get_artifact(a["id"], user=ADMIN)["artifact"]["server_name"]
+        assert name in mcp.registered(ADMIN)
+        os.environ["STUDIO_TOOL_RUNNER"] = "dokcer"
+        try:
+            assert name not in mcp.registered(ADMIN)
+        finally:
+            del os.environ["STUDIO_TOOL_RUNNER"]
+        assert name in mcp.registered(ADMIN)
+    finally:
+        mcp.unregister("tb_tampered")

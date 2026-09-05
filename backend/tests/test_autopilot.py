@@ -194,8 +194,10 @@ def test_risky_action_goes_through_supervisor_not_executed(client, monkeypatch):
     assert run["result"]["proposed_job_id"] == "job-123"
     # The demo table was NOT mutated — the write never ran autonomously.
     from app.catalog import _connector_or_400
-    _cols, rows = _connector_or_400("demo").run_query(
-        "SELECT COUNT(*) FROM sales WHERE revenue != 0")
+    from app.connectors.base import unguarded
+    with unguarded():      # test-only: app code reads via gateway.execute
+        _cols, rows = _connector_or_400("demo").run_query(
+            "SELECT COUNT(*) FROM sales WHERE revenue != 0")
     assert rows[0][0] > 0
 
 

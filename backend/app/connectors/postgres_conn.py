@@ -7,6 +7,7 @@ run_script exists only for the supervised, human-approved write path.
 """
 import os
 import threading
+from urllib.parse import urlsplit
 
 from .base import Connector, jsonify_rows
 
@@ -24,6 +25,32 @@ class PostgresConnector(Connector):
 
     def _schema(self):
         return os.getenv("POSTGRES_SCHEMA", "public").strip() or "public"
+
+    def _database(self):
+        """Database name out of the DSN — URI form (…/dbname) or key=value form
+        (dbname=…). Best effort and never a connection: an unparseable DSN just
+        means the `db.schema.table` spelling is not accepted."""
+        dsn = self._dsn()
+        if "://" in dsn:
+            try:
+                return urlsplit(dsn).path.lstrip("/").split("?")[0]
+            except ValueError:
+                return ""
+        for part in dsn.split():
+            if part.startswith("dbname="):
+                return part[len("dbname="):].strip("'\"")
+        return ""
+
+    def qualifiers(self):
+        """The configured schema, plus `database.schema` — the only namespaces
+        this connector's credential is meant to reach. Anything else (another
+        schema the login can also see) is refused by the query guard."""
+        schema = self._schema().lower()
+        out = {schema}
+        database = self._database().strip().lower()
+        if database:
+            out.add(f"{database}.{schema}")
+        return frozenset(out)
 
     def configured(self):
         if not self._dsn():

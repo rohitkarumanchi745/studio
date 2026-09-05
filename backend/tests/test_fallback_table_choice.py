@@ -18,6 +18,11 @@ import pytest
 from app import agent, db
 from app.connectors.demo import DemoConnector, seed
 
+# Previews now execute through gateway.execute, which derives RBAC from the
+# user itself (no user → no rows), so the helper needs a caller. An analyst
+# may read every demo table, which keeps these tests about table CHOICE.
+ANALYST = {"id": "u-fallback-analyst", "email": "ana@studio.test", "role": "analyst"}
+
 
 @pytest.fixture(scope="module", autouse=True)
 def _demo():
@@ -39,7 +44,7 @@ def test_whole_source_fallback_previews_the_named_table():
     conn = DemoConnector()
     allowed = conn.list_tables()
     assert "sales" in allowed and allowed[0] != "sales"
-    out = agent._fallback("show sales by region", conn, "*", allowed)
+    out = agent._fallback("show sales by region", conn, "*", allowed, ANALYST)
     assert out["mode"] == "fallback"
     assert out["sql"].lower().startswith("select * from sales")
     assert "region" in [c.lower() for c in out["columns"]]
@@ -48,5 +53,5 @@ def test_whole_source_fallback_previews_the_named_table():
 def test_whole_source_fallback_without_a_named_table_is_unchanged():
     conn = DemoConnector()
     allowed = conn.list_tables()[:3]
-    out = agent._fallback("what happened last week", conn, "*", allowed)
+    out = agent._fallback("what happened last week", conn, "*", allowed, ANALYST)
     assert out["mode"] == "fallback" and len(out["panels"]) == len(allowed)  # previews all

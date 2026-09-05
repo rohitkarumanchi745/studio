@@ -5,22 +5,22 @@ ingestion schedule (dbt / Fivetran / Airflow, etc.). What it CAN do is read the
 freshness a table records itself: if a table has a load/update timestamp column
 (loaded_at, last_updated, etl_ts, …) or, failing that, a business date column,
 `for_table` returns the MAX of it — the newest data present — plus the row
-count. Detection is a name + type heuristic; the MAX query goes through the same
-query guard + RBAC allowlist as everything else, so freshness can't touch a
-table the role may not see.
+count. Detection is a name + type heuristic; the MAX query goes through
+gateway.execute like every other read, so freshness passes RBAC, the query
+guard and governance and can't touch a table the role may not see. It is the
+one caller that opts out of the audit row: a metadata probe fanned out over up
+to 30 tables must not write 30 audit rows per page load.
 """
-import os
 import re
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from . import queryguard, rbac, util
+from . import gateway, rbac, util
 from .auth import current_user
-from .catalog import _connector_or_400
+from .queryguard import QueryRejected
+from .sources import connector_or_400
 
 router = APIRouter(tags=["freshness"])
-
-MAX_ROWS = int(os.getenv("STUDIO_MAX_ROWS", "50000"))
 
 # A time-typed column whose name looks like a load/ingest/update stamp is the
 # best freshness signal; a plain date column is a fallback ("latest record").
@@ -57,13 +57,21 @@ def detect_col(schema):
     return times[0], "record"
 
 
-def for_table(connector, allowed_tables, table):
-    """Freshness of one table: MAX of its freshness column + row count. RBAC is
-    the caller's `allowed_tables`; the query is guarded. Never raises — returns
-    an `error`/`note` the caller surfaces."""
-    if table not in allowed_tables:
+def for_table(user, source, table, connector=None):
+    """Freshness of one table: MAX of its freshness column + row count. The
+    probe runs through gateway.execute, which derives the role's allowlist
+    itself — callers never pass one. `connector` is an optional already-resolved
+    connector so a fan-out over 30 tables resolves the source once, not 30
+    times; it is only used for the schema read (metadata, not row-returning).
+    Never raises — returns an `error`/`note` the caller surfaces."""
+    # Fail fast on a table the role can't see: no schema read, no query, and
+    # the same "no access" the old allowlist check gave. The gateway would
+    # reject the query anyway; this just keeps column names of a denied table
+    # out of the probe entirely.
+    if not rbac.can_access((user or {}).get("role"), source, table):
         return {"table": table, "error": "no access"}
     try:
+        connector = connector or connector_or_400(source)
         col, kind = detect_col(connector.get_schema(table))
     except Exception as e:
         return {"table": table, "error": f"schema error: {str(e)[:120]}"}
@@ -72,27 +80,33 @@ def for_table(connector, allowed_tables, table):
                 "note": "no date/timestamp column"}
     sql = f"SELECT MAX({col}) AS latest, COUNT(*) AS n FROM {table}"
     try:
-        cleaned = queryguard.enforce_limit(queryguard.validate(sql, allowed_tables), MAX_ROWS)
-        cols, rows = connector.run_query(cleaned)
+        # audit=False: a metadata probe, not a user read — see module docstring.
+        # RBAC / guard / governance still apply; only the audit row is skipped.
+        res = gateway.execute(user, source, sql, "freshness", table_label=table,
+                              max_rows=1, audit=False)
     except Exception as e:
         return {"table": table, "column": col, "kind": kind, "error": str(e)[:160]}
+    rows = res.rows
     latest = rows[0][0] if rows else None
     n = rows[0][1] if rows else None
     return {"table": table, "column": col, "kind": kind, "latest": latest, "rows": n}
 
 
 def for_source(user, source, limit=30):
-    """Freshness of every accessible table in a source, probed concurrently."""
-    conn = _connector_or_400(source)
+    """Freshness of every accessible table in a source, probed concurrently.
+    gateway.scope resolves the connector and the role's table list once; each
+    probe then re-derives its own access inside gateway.execute."""
     try:
-        allowed = rbac.allowed_tables(user["role"], source, conn.list_tables())
+        conn, allowed = gateway.scope(user, source)
+    except QueryRejected as e:
+        raise HTTPException(403, str(e))
+    except HTTPException:
+        raise                                   # unknown / unconfigured source
     except Exception as e:
         raise HTTPException(502, f"Source error: {e}")
-    if not allowed:
-        raise HTTPException(403, "Your role has no access to this source")
     tabs = allowed[:limit]
-    results = util.pmap(lambda t: for_table(conn, allowed, t), tabs, workers=6,
-                        default={"error": "failed"})
+    results = util.pmap(lambda t: for_table(user, source, t, connector=conn), tabs,
+                        workers=6, default={"error": "failed"})
     return {"source": source, "tables": results}
 
 

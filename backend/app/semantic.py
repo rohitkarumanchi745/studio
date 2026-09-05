@@ -22,7 +22,15 @@ query guard and governance masking all apply exactly as they do to any query —
 the semantic layer decides WHAT to compute, never who may see it.
 
 Storage mirrors governance: a single active YAML document, admin-applied and
-hot-reloaded, cached in process.
+hot-reloaded, cached in process — including the freshness check that makes
+that cache safe in a multi-process deployment. `PUT /api/semantic` reloads
+only the replica that served it, so the accessors that decide what a prompt
+compiles to (models_for, catalog) first call _refresh_if_stale(), which at
+most once per STUDIO_SEMANTIC_REFRESH_S (default 5s) per process reads the
+newest (id, applied_at) from semantic_models and reloads when it differs.
+Without it, two replicas answer the same question with two different metric
+definitions indefinitely — exactly the "nobody can trust a number" failure
+this module exists to remove.
 """
 import os
 import re
@@ -36,9 +44,14 @@ from pydantic import BaseModel
 from . import db, queries, rbac, roster
 from .auth import current_user
 
-router = APIRouter(prefix="/api/semantic", tags=["semantic"])
+router = APIRouter(prefix="/semantic", tags=["semantic"])
 
 _STATE = {"doc": None, "yaml": "", "source": None}
+# See _refresh_if_stale(): "at" is this process's last probe of the store,
+# "ident" the (id, applied_at) of the newest applied model as of that probe.
+_FRESH = {"at": 0.0, "ident": None}
+_UNKNOWN = object()          # store unreadable: keep the doc already in hand
+DEFAULT_REFRESH_S = 5.0
 
 _AGGS = {"sum", "avg", "min", "max", "count", "count_distinct", "median"}
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -66,18 +79,70 @@ def init_tables():
             applied_by TEXT,
             applied_at REAL NOT NULL
         );
+        CREATE INDEX IF NOT EXISTS semantic_models_applied_at
+            ON semantic_models (applied_at DESC, id DESC);
         """
     )
     c.commit()
     c.close()
 
 
+def _refresh_ttl():
+    try:
+        return max(0.0, float(os.getenv("STUDIO_SEMANTIC_REFRESH_S", DEFAULT_REFRESH_S)))
+    except (TypeError, ValueError):
+        return DEFAULT_REFRESH_S
+
+
+def _newest_ident():
+    """(id, applied_at) of the newest applied model — its whole identity, as a
+    row is never edited in place. None when the table is empty, _UNKNOWN when
+    the store cannot be read (which must not be read as "no model")."""
+    try:
+        c = db._conn()
+        try:
+            row = c.execute("SELECT id, applied_at FROM semantic_models "
+                            "ORDER BY applied_at DESC, id DESC LIMIT 1").fetchone()
+        finally:
+            c.close()
+    except Exception:
+        return _UNKNOWN
+    return (row["id"], row["applied_at"]) if row else None
+
+
+def _refresh_if_stale():
+    """Adopt a model another process applied; a no-op inside the TTL.
+
+    Same problem and same shape as governance._refresh_if_stale(): _STATE is
+    process-local and PUT /api/semantic reloads only the process that served
+    it, so without this a second replica keeps compiling "revenue" from the
+    previous definition indefinitely. Cost: one single-row indexed read of
+    semantic_models per process per STUDIO_SEMANTIC_REFRESH_S (default 5s).
+    The convergence window is one TTL, not zero. An unreadable store keeps
+    the model already loaded; a malformed stored document still falls back to
+    "no semantic layer" (the agent), never a crash."""
+    now = time.monotonic()
+    if now - _FRESH["at"] < _refresh_ttl():
+        return
+    _FRESH["at"] = now                   # stamp first: one probe per TTL, not per thread
+    ident = _newest_ident()
+    if ident is _UNKNOWN or ident == _FRESH["ident"]:
+        return
+    load()
+
+
 def load():
     """Active document: DB (admin-applied) first, else the STUDIO_SEMANTIC file,
-    else none (chat just uses the agent). Cached; reload() to refresh."""
+    else none (chat just uses the agent). Cached in _STATE; accessors re-check
+    the store every STUDIO_SEMANTIC_REFRESH_S; reload() forces it now."""
     c = db._conn()
-    row = c.execute("SELECT yaml FROM semantic_models ORDER BY applied_at DESC LIMIT 1").fetchone()
+    row = c.execute("SELECT id, yaml, applied_at FROM semantic_models "
+                    "ORDER BY applied_at DESC, id DESC LIMIT 1").fetchone()
     c.close()
+    # Record the identity even when the YAML is unusable, or every refresh
+    # would see a "change" and reload the same broken document forever.
+    _FRESH.update(at=time.monotonic(),
+                  ident=(row["id"], row["applied_at"]) if row else None)
     if row and row["yaml"].strip():
         _set(row["yaml"], "database")
         return
@@ -90,12 +155,16 @@ def load():
 
 
 def _set(text, source):
+    """Install a document in this process. Callers other than load() leave
+    _FRESH["ident"] alone: what they installed stands until the STORE's newest
+    document differs from the one this process last observed."""
     ok, errors, doc = validate(text)
     if ok:
         _STATE.update(doc=doc, yaml=text, source=source)
     else:
         # A malformed stored doc fails closed to "no semantic layer", not a crash.
         _STATE.update(doc=None, yaml=text, source=f"{source} (invalid: {errors[0] if errors else '?'})")
+    _FRESH["at"] = time.monotonic()      # just installed is just checked
 
 
 def reload():
@@ -260,6 +329,9 @@ def validate(text):
 # ── Introspection ───────────────────────────────────────────────────────
 
 def models_for(source, table=None):
+    """The models defined on a source. Refreshes first: every compile decision
+    goes through here, and must not use a definition another process replaced."""
+    _refresh_if_stale()
     doc = _STATE["doc"]
     if not doc:
         return []
@@ -272,6 +344,7 @@ def models_for(source, table=None):
 def catalog(user):
     """The metrics/dimensions defined on sources THIS user's role can reach —
     what the UI shows and what a prompt can resolve against."""
+    _refresh_if_stale()
     doc = _STATE["doc"]
     if not doc:
         return {"loaded": False, "models": []}
@@ -630,6 +703,8 @@ models:
 @router.get("")
 def get_config(user=Depends(current_user)):
     """The active document + a summary. Admins get the raw YAML to edit."""
+    # Whichever replica answers, show the document the fleet is converging on.
+    _refresh_if_stale()
     doc = _STATE["doc"]
     summary = None
     if doc:

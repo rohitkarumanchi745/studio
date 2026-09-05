@@ -333,6 +333,10 @@ def seed_marketing():
 class DemoConnector(Connector):
     name = "demo"
     dialect = "sqlite"
+    # No qualifiers(): one SQLite file has no schema/catalog namespace, so the
+    # base class's empty set is right — the guard then refuses any qualified
+    # reference (`main.sales`, `other.sales`) instead of reducing it to a bare
+    # allowed name.
 
     def configured(self):
         return True

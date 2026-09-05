@@ -26,7 +26,13 @@ _SALT = b"studio-user-api-keys-v1"
 
 
 def _fernet():
-    secret = os.getenv("STUDIO_SECRET", "dev-secret-change-me").encode()
+    # Same secret as the JWT signer (bootstrap.jwt_secret): STUDIO_SECRET, an
+    # ephemeral per-process value in demo mode, never a known placeholder. A
+    # missing secret fails closed rather than encrypting with a public string.
+    from . import bootstrap
+    secret = (bootstrap.jwt_secret() or "").encode()
+    if not secret:
+        raise RuntimeError("STUDIO_SECRET is not set; cannot derive the encryption key")
     kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=_SALT, iterations=200_000)
     return Fernet(base64.urlsafe_b64encode(kdf.derive(secret)))
 

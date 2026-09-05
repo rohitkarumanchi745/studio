@@ -136,7 +136,13 @@ def _from_llm(table, columns, rows=None, n=MAX_SUGGESTIONS):
 
 
 def suggestions_for(connector, table, columns, rows=None):
-    """Questions for one table. Never raises — falls back to the schema rules."""
+    """Questions for one table. Never raises — falls back to the schema rules.
+
+    `columns` and `rows` are what the CALLER may see: the catalog passes the
+    governed schema (denied columns removed) and a gateway.execute sample
+    (denied columns dropped, masked ones as ***), so nothing below — least of
+    all the payload _from_llm sends to an external model — ever holds a value
+    governance would withhold. This function never reads the connector."""
     fp = skills.fingerprint(connector.dialect, [table], {table: columns})
     key = (connector.name, table, fp)
     if key in _CACHE:

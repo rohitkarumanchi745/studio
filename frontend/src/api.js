@@ -22,6 +22,13 @@ export function clearSession() {
   localStorage.removeItem("studio_user");
 }
 
+// SSO handoff: the callback redirect carries a single-use code, never the JWT.
+// POST keeps the token out of the URL, history and Referer on the way back too.
+// Throws on an unknown/expired/replayed code (the backend answers 400).
+export function exchangeSsoCode(code) {
+  return api("/auth/sso/exchange", { method: "POST", body: JSON.stringify({ code }) });
+}
+
 export async function api(path, options = {}) {
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
   const token = getToken();

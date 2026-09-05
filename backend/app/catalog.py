@@ -1,49 +1,68 @@
-"""Catalog: what sources/tables/columns the current user may see (RBAC-filtered)."""
+"""Catalog: what sources/tables/columns the current user may see (RBAC-filtered).
+
+Two kinds of endpoint live here. Metadata (tables, schema, skill) reads the
+connector's catalog directly, with governance's denied columns stripped so the
+UI and the suggestion LLM never learn a column exists that no result may
+carry. Anything that returns ROWS (sample, the per-table sample behind
+suggestions) goes through gateway.execute like every other data path: the
+table name here comes straight from the URL, so before the gateway a role
+with a "*" policy could read any object the warehouse exposed, and the rows
+skipped deny/mask before being shown — and sent to an external model.
+"""
 import re
 import time
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from . import rbac, skills, suggest
+from . import gateway, governance, rbac, skills, suggest
 from .auth import current_user
-from .connectors import all_sources, get_connector
+from .connectors import all_sources
+# match_tables (prompt → ranked tables) lives in matching.py, a leaf module, so
+# chat / pipelines can rank without importing this router. Re-exported for one
+# release so `from .catalog import match_tables` keeps working.
+from .matching import match_tables  # noqa: F401
+from .queryguard import QueryRejected
+from .sources import connector_or_400
 
 router = APIRouter(prefix="/catalog", tags=["catalog"])
 
-_STOP = {"the", "and", "for", "with", "show", "what", "which", "how", "many",
-         "much", "per", "over", "last", "this", "that", "from", "table",
-         "tables", "data", "chart", "level", "give", "get", "top", "all"}
+# A table path segment must LOOK like a table name (optionally qualified)
+# before it is spliced into SQL. The gateway's guard is the real boundary —
+# it resolves every FROM target against the role's allowlist — but a segment
+# such as `sales UNION SELECT ...` would parse as a legal reference to `sales`
+# followed by engine-dependent garbage, and surface as a 502 from the
+# warehouse instead of a clear 4xx here.
+_TABLE_NAME = re.compile(r"^[A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*)*$")
 
 
-def _tokens(text):
-    return {w.rstrip("s") for w in re.findall(r"[a-z0-9]+", text.lower())
-            if len(w) >= 3 and w not in _STOP}
+def _table_name_or_400(table):
+    if not _TABLE_NAME.match(table or ""):
+        raise HTTPException(400, "Invalid table name")
+    return table
 
 
-def match_tables(prompt, table_schemas):
-    """Rank tables by relevance to a business request: overlap between the
-    prompt's terms and each table's name and column names (name hits weigh
-    double). Deterministic — works with or without an LLM."""
-    words = _tokens(prompt)
-    out = []
-    for table, cols in table_schemas.items():
-        name_terms = _tokens(table.replace("_", " "))
-        col_terms = {}
-        for c in cols:
-            for t in _tokens(str(c.get("name", "")).replace("_", " ")):
-                col_terms.setdefault(t, str(c["name"]))
-        name_hits = words & name_terms
-        col_hits = words & set(col_terms)
-        score = 2 * len(name_hits) + len(col_hits)
-        if score > 0:
-            out.append({
-                "table": table,
-                "score": score,
-                "why": sorted(name_hits | {col_terms[h] for h in col_hits})[:6],
-                "columns": [str(c.get("name", "")) for c in cols][:12],
-            })
-    out.sort(key=lambda m: (-m["score"], m["table"]))
-    return out[:5]
+def _governed_schema(source, table, cols):
+    """Schema metadata minus governance's denied columns. Masked columns stay:
+    their values are masked at result time, and the column is not a secret."""
+    deny = governance.column_rules(source, table)["deny"]
+    if not deny:
+        return cols
+    return [c for c in cols if str(c.get("name", "")).lower() not in deny]
+
+
+def _read_rows(user, source, sql, purpose, table, max_rows):
+    """One governed read for the catalog, with this router's error mapping:
+    a guard/RBAC rejection is the caller's 403, an unknown or unconfigured
+    source keeps its own status, and anything the warehouse raised is a 502."""
+    try:
+        return gateway.execute(user, source, sql, purpose,
+                               table_label=table, max_rows=max_rows)
+    except QueryRejected as e:
+        raise HTTPException(403, str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Could not sample {table}: {e}")
 
 
 @router.get("/sources")
@@ -82,7 +101,7 @@ def source_skill(source: str, user=Depends(current_user)):
     schemas = {}
     for t in allowed[:10]:
         try:
-            schemas[t] = conn.get_schema(t)
+            schemas[t] = _governed_schema(source, t, conn.get_schema(t))
         except Exception:
             schemas[t] = []
     return {"source": source, "role": user["role"],
@@ -98,21 +117,26 @@ def source_suggestions(source: str, table: str = "*", user=Depends(current_user)
     """
     if not rbac.can_access(user["role"], source, table):
         raise HTTPException(403, "Your role has no access to this table")
-    conn = _connector_or_400(source)
     try:
-        names = conn.list_tables()
+        conn, allowed = gateway.scope(user, source, table_label=table)
+    except QueryRejected as e:
+        raise HTTPException(403, str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(502, f"Could not list tables on {source}: {e}")
-    allowed = rbac.allowed_tables(user["role"], source, names)
-    if not allowed:
-        raise HTTPException(403, "Your role has no access to this source")
 
     targets = [t for t in _selected_tables(table) if t in allowed] or allowed[:3]
     out = []
     for t in targets[:3]:
+        # The schema and the sample rows must agree column-for-column: the
+        # suggester reads sample values by position. Both drop the same denied
+        # columns (by name), so what the LLM sees is exactly what a result
+        # for this role would carry.
         try:
-            cols = conn.get_schema(t)
-            rows = conn.run_query(f"SELECT * FROM {t} LIMIT 3")[1]
+            cols = _governed_schema(source, t, conn.get_schema(t))
+            rows = gateway.execute(user, source, f"SELECT * FROM {t} LIMIT 3",
+                                   "catalog_suggest", table_label=t, max_rows=3).rows
         except Exception:
             continue
         for q in suggest.suggestions_for(conn, t, cols, rows):
@@ -141,11 +165,13 @@ def _selected_tables(label):
 def schema(source: str, table: str, user=Depends(current_user)):
     if not rbac.can_access(user["role"], source, table):
         raise HTTPException(403, "Your role has no access to this table")
+    _table_name_or_400(table)
     conn = _connector_or_400(source)
     try:
-        return conn.get_schema(table)
+        cols = conn.get_schema(table)
     except Exception as e:
         raise HTTPException(502, f"Could not read schema: {e}")
+    return _governed_schema(source, table, cols)
 
 
 @router.get("/sources/{source}/tables/{table}/sample")
@@ -155,22 +181,25 @@ def sample(source: str, table: str, user=Depends(current_user)):
     data, never a cache."""
     if not rbac.can_access(user["role"], source, table):
         raise HTTPException(403, "Your role has no access to this table")
-    conn = _connector_or_400(source)
-    try:
-        cols = conn.get_schema(table)
-        sample_sql = f"SELECT * FROM {table} LIMIT 50"
-        s_columns, s_rows = conn.run_query(sample_sql)
-    except Exception as e:
-        raise HTTPException(502, f"Could not sample {table}: {e}")
+    _table_name_or_400(table)
+    sample = _read_rows(user, source, f"SELECT * FROM {table} LIMIT 50",
+                        "catalog_sample", table, 50)
+    sample_sql, s_columns, s_rows = sample.sql, sample.columns, sample.rows
 
     panels = []
-    # Auto bar: first text-ish column vs first numeric column, aggregated in SQL.
+    # Auto bar: first text-ish column vs first numeric column, aggregated in
+    # SQL. Chosen from the GOVERNED result, so a denied column can never be the
+    # dimension; masked columns are skipped too — a "***" cell reads as text,
+    # and grouping or summing over it is a chart of nothing.
+    masked = governance.column_rules(source, table)["mask"]
     first = s_rows[0] if s_rows else []
     cat = num = None
     for i, c in enumerate(s_columns):
         v = first[i] if i < len(first) else None
         if c.lower() == "id" or c.lower().endswith("_id"):
             continue  # ids are numeric but summing them means nothing
+        if c.lower() in masked:
+            continue
         if num is None and isinstance(v, (int, float)) and not isinstance(v, bool):
             num = c
         elif cat is None and not isinstance(v, (int, float)):
@@ -179,9 +208,10 @@ def sample(source: str, table: str, user=Depends(current_user)):
         bar_sql = (f"SELECT {cat}, SUM({num}) AS total_{num} FROM {table} "
                    f"GROUP BY {cat} ORDER BY 2 DESC LIMIT 12")
         try:
-            b_columns, b_rows = conn.run_query(bar_sql)
+            bar = gateway.execute(user, source, bar_sql, "catalog_sample",
+                                  table_label=table, max_rows=12)
             panels.append({
-                "sql": bar_sql, "columns": b_columns, "rows": b_rows,
+                "sql": bar.sql, "columns": bar.columns, "rows": bar.rows,
                 "chart": {"type": "bar", "title": f"{num} by {cat} — {table}",
                           "x": cat, "y": [f"total_{num}"]},
             })
@@ -196,15 +226,6 @@ def sample(source: str, table: str, user=Depends(current_user)):
     return {"table": table, "panels": panels, "fetched_at": time.time()}
 
 
-def _connector_or_400(source):
-    try:
-        conn = get_connector(source)
-    except KeyError:
-        raise HTTPException(404, f"Unknown source '{source}'")
-    if not conn.configured():
-        raise HTTPException(
-            400,
-            f"Source '{source}' is not configured. Set its credentials in the "
-            f"backend environment (see .env.example) and install its connector package.",
-        )
-    return conn
+# Moved to sources.connector_or_400 so the gateway can resolve a connector
+# without importing this router; kept as an alias for existing importers.
+_connector_or_400 = connector_or_400

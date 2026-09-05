@@ -1,0 +1,28 @@
+# The isolated runtime for approved, model-generated MCP tool servers when
+# STUDIO_TOOL_RUNNER=docker (see backend/app/sandbox.py). The app never bakes
+# generated code into this image: sandbox.launch_spec bind-mounts ONE approved
+# server file read-only at /srv/<name>.py and runs it as
+#     python -I -u /srv/<name>.py
+# with --network none, --read-only, --cap-drop ALL, memory/cpu/pids caps.
+#
+# Build from the repo root:
+#   docker build -f scripts/Dockerfile.toolrunner -t studio-toolrunner:latest scripts/
+# and point STUDIO_TOOL_IMAGE at the tag if you use a different one.
+FROM python:3.12-slim
+
+# Only the MCP SDK — generated servers import `mcp.server.fastmcp` and nothing
+# else the app provides. Add data-client libraries here deliberately if your
+# tools need them; every extra package is extra attack surface inside the box.
+RUN pip install --no-cache-dir "mcp>=1.2"
+
+# Non-root, no home to write to: the root FS is mounted read-only at run time
+# and /tmp is a tmpfs, so HOME/cwd live there.
+RUN useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin toolrunner
+USER toolrunner
+ENV HOME=/tmp \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+WORKDIR /tmp
+
+# No ENTRYPOINT/CMD on purpose: the full argv is supplied by launch_spec, so
+# nothing in the image decides what runs.

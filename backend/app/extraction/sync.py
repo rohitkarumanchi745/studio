@@ -1,9 +1,10 @@
 """Orchestrates onboard, continuous delta and webhook-nudged sync.
 
-It owns its OWN background ticker, cloned from autopilot exactly (daemon thread,
-race-safe claim, swallow-per-run, reschedule-in-finally), but doubly guarded by
-STUDIO_GRAPH_SYNC_TICKER AND configured() — with no Azure config no thread ever
-starts and no Graph call is ever made.
+Its ticker is cloned from autopilot exactly (race-safe claim, swallow-per-run,
+reschedule-in-finally) and, like autopilot's, is RUN by the job worker
+(jobs.Worker.run_schedulers) under the "m365_sync" lease rather than by a
+thread of its own — doubly guarded by STUDIO_GRAPH_SYNC_TICKER AND
+configured(): with no Azure config no tick runs and no Graph call is ever made.
 
 Lifecycle:
 - enqueue_onboard(user_id) is called from the signup / OAuth-callback hook. It is
@@ -31,7 +32,6 @@ never instructions.
 """
 import hmac
 import os
-import threading
 import time
 
 from . import acl, configured, graphauth, parsers, store
@@ -254,7 +254,7 @@ def _renew_subscriptions(user_id, auth, client):
     public = os.getenv("STUDIO_PUBLIC_URL", "").rstrip("/")
     if not public:
         return
-    notify_url = public + "/m365/webhook"
+    notify_url = public + "/api/m365/webhook"
     try:
         _ensure_subscriptions(user_id, auth, client, notify_url)
     except Exception:
@@ -352,17 +352,15 @@ def _purge_collection(user_id):
 
 # ── The ticker (autopilot clone) ─────────────────────────────────────────
 
-_ticker_thread = None
-_ticker_stop = threading.Event()
-
-
 def _claim(now):
     return store.claim_due(now)
 
 
-def _tick():
+def tick_once():
     """One pass: claim due accounts, run each (isolated), reschedule + release in
-    finally so one failure never kills the ticker."""
+    finally so one failure never kills the ticker. Called by the job worker
+    under the "m365_sync" lease; tests call it directly. A no-op when
+    unconfigured, so it is safe to call in any deployment."""
     if not configured():
         return
     now = time.time()
@@ -380,29 +378,25 @@ def _tick():
                 pass
 
 
-def _ticker_loop():
-    while not _ticker_stop.wait(_TICK_SECONDS):
-        try:
-            _tick()
-        except Exception:
-            pass                                  # the ticker must never die
+_tick = tick_once
+
+
+def ticker_enabled():
+    """STUDIO_GRAPH_SYNC_TICKER kill-switch AND configured(): both are read on
+    every tick, so an unconfigured or disabled deployment never takes the
+    m365_sync lease."""
+    if os.getenv("STUDIO_GRAPH_SYNC_TICKER", "1").lower() in ("0", "false", "no"):
+        return False
+    return configured()
 
 
 def start_ticker():
-    """Daemon ticker, guarded by STUDIO_GRAPH_SYNC_TICKER AND configured(), so it
-    never blocks startup and is fully inert when dormant."""
-    global _ticker_thread
-    if os.getenv("STUDIO_GRAPH_SYNC_TICKER", "1").lower() in ("0", "false", "no"):
-        return
-    if not configured():
-        return
-    if _ticker_thread and _ticker_thread.is_alive():
-        return
-    _ticker_stop.clear()
-    _ticker_thread = threading.Thread(target=_ticker_loop, daemon=True,
-                                      name="m365-sync-ticker")
-    _ticker_thread.start()
+    """Compatibility shim: the daemon ticker thread is gone. The job worker
+    runs tick_once() under the "m365_sync" lease whenever ticker_enabled();
+    nothing starts here, so the dormant guarantee (no thread, no Graph call)
+    holds by construction."""
+    return None
 
 
 def stop_ticker():
-    _ticker_stop.set()
+    return None

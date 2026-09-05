@@ -28,7 +28,11 @@ TABLE_REF = re.compile(r"\b(?:from|join)\s+([a-zA-Z_][\w]*)", re.IGNORECASE)
 
 
 class ApiReportConnector(Connector):
-    """Base: vendor API reports exposed as SQL-queryable tables."""
+    """Base: vendor API reports exposed as SQL-queryable tables.
+
+    No qualifiers(): reports are loaded into a throwaway in-memory SQLite
+    database with bare table names, so the base class's empty set is correct —
+    a qualified reference names nothing here and the guard refuses it."""
 
     dialect = "sqlite"
     #: {table_name: [(col, sqltype), ...]}

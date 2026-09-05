@@ -1,8 +1,9 @@
 """Saved dashboards: pinned chart recipes, layout, and slicer state.
 
 A dashboard stores the RECIPE (sql + chart spec), never rows. Data is
-re-fetched per viewer, so RBAC and the query guard are evaluated at view
-time and a tile can never leak rows the reader may not query.
+re-fetched per viewer through gateway.execute, so RBAC, the query guard, the
+row cap and governance are evaluated at view time — by the one code path
+that owns them — and a tile can never leak rows the reader may not query.
 
 Filters (slicers and cross-filter selections) are applied by viz over the
 cached base rows — the SQL is never rewritten or wrapped, which is what
@@ -21,10 +22,10 @@ from typing import Any, List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from . import db, queryguard, rbac, viz
-from .agent import MAX_ROWS
+from . import db, gateway, governance, queryguard, rbac, viz
 from .auth import current_user
-from .catalog import _connector_or_400
+from .limits import MAX_ROWS
+from .queryguard import QueryRejected
 
 router = APIRouter(prefix="/dashboards", tags=["dashboards"])
 
@@ -669,19 +670,35 @@ def _own_or_404(dashboard_id, user, *, edit=False):
 
 def _guard_tile(user, source, table_label, sql):
     """RBAC + query guard for a tile being written. You cannot pin what you
-    cannot query. Returns the connector's allowed table list."""
+    cannot query. Returns the gateway's allowed table list.
+
+    Two guards, strictest first. validate_sql (this module's tokenizer) rejects
+    a denied table's name in ANY identifier position, because tile SQL is
+    persisted and its rows cached — one accepted string keeps serving. Then
+    gateway.check applies exactly the pipeline tile_data will run at view time,
+    so a pin that passes here cannot fail RBAC/guard later for its author.
+    The allowlist handed to validate_sql comes from the gateway, never from
+    this module: the strict scan only narrows what the gateway already allows.
+    """
     if not source:
         raise HTTPException(400, "Tile needs a source")
-    if not rbac.can_access(user["role"], source, table_label or "*"):
-        raise HTTPException(403, f"Your role has no access to {source}.{table_label or '*'}")
-    connector = _connector_or_400(source)
+    label = table_label or "*"
     try:
-        allowed = rbac.allowed_tables(user["role"], source, connector.list_tables())
+        connector, allowed = gateway.scope(user, source, table_label=label)
+    except QueryRejected:
+        raise HTTPException(403, f"Your role has no access to {source}.{label}")
+    except HTTPException:
+        raise                       # unknown / unconfigured source: 404 / 400
     except Exception as e:
         raise HTTPException(502, f"Source error: {e}")
     try:
-        queryguard.validate(sql or "", allowed)
-    except queryguard.QueryRejected as e:
+        all_tables = connector.list_tables()   # the denied set is all - allowed
+    except Exception as e:
+        raise HTTPException(502, f"Source error: {e}")
+    try:
+        cleaned = validate_sql(sql or "", allowed, all_tables)
+        _connector, allowed, _cleaned = gateway.check(user, source, cleaned, table_label=label)
+    except QueryRejected as e:
         raise HTTPException(400, str(e))
     return allowed
 
@@ -711,9 +728,16 @@ def _capture_key_order(spec, columns, rows):
 
 # ── Data ────────────────────────────────────────────────────────────────
 
-_CACHE = OrderedDict()  # (role, source, sha1(sql)) -> (ts, columns, rows)
+# (role, source, sha1(sql), governance version) -> (ts, columns, rows) — the
+# frame as the gateway returned it under THAT governance version. A policy
+# change is a miss (the version is in the key, and governance.on_change clears
+# this dict); a hit is re-filtered anyway, so tightening a rule between two
+# reads under the same document can never serve pre-policy rows.
+_CACHE = OrderedDict()
 _REDIS = None
 _REDIS_TRIED = False
+
+governance.on_change(_CACHE.clear)
 
 
 def _redis():
@@ -735,34 +759,57 @@ def _redis():
     return _REDIS
 
 
-def _cached_query(source, sql, role, connector, *, refresh=False):
-    """TTL cache of BASE rows. The role is in the key, so two roles can never
-    share rows; queryguard still runs on every request, so the cache can
-    never be an RBAC bypass — only the warehouse round trip is skipped."""
+def _tile_cap():
+    """A tile may lower the server ceiling, never raise it."""
+    return min(TILE_MAX_ROWS, MAX_ROWS)
+
+
+def _cache_key(role, source, sql):
+    """(role, source, sha1(sql), governance version) and the matching Redis key.
+    Two roles can never share rows; two governance documents can never share a
+    frame — on any app instance."""
     digest = hashlib.sha1(sql.encode("utf-8", "replace")).hexdigest()
-    key = (role, source, digest)
+    gov = governance.version()
+    return (role, source, digest, gov), f"studio:tile:{role}:{source}:{digest}:{gov}"
+
+
+def _cached_query(user, source, sql, *, table_label="*", refresh=False):
+    """TTL cache of the base frame, keyed by (role, source, sha1(sql),
+    governance version). A miss goes through gateway.execute — RBAC, guard,
+    cap, governance and the audit row, all in the gateway — and what comes
+    back is cached. A hit still runs gateway.check (RBAC + guard, no
+    execution, no audit) AND governance.filter_result on the cached frame, the
+    same read-time re-filter chat applies to stored rows, so a policy change
+    takes effect immediately — not within the TTL — and the cache can never be
+    an RBAC or governance bypass; only the warehouse round trip and the audit
+    row are skipped. Raises whatever the gateway raises."""
+    role = user["role"]
+    key, rkey = _cache_key(role, source, sql)
     now = time.time()
     hit = _CACHE.get(key)
     if hit and not refresh and now - hit[0] < CACHE_TTL:
-        return hit[1], hit[2], True
+        gateway.check(user, source, sql, table_label=table_label, max_rows=_tile_cap())
+        columns, rows = governance.filter_result(source, sql, hit[1], hit[2])
+        return columns, rows, True
 
-    rkey = f"studio:tile:{role}:{source}:{digest}"
     client = _redis()
     if client is not None and not refresh:
         try:
             blob = client.get(rkey)
-            if blob:
-                payload = json.loads(blob)
-                columns, rows = payload["columns"], payload["rows"]
-                _remember(key, now, columns, rows)
-                return columns, rows, True
+            payload = json.loads(blob) if blob else None
         except Exception:
-            pass
+            payload = None              # a dead Redis is a miss, never an error
+        if payload:
+            # Outside the try: a gateway refusal must propagate, not degrade
+            # into a warehouse round trip that would then be refused anyway.
+            gateway.check(user, source, sql, table_label=table_label, max_rows=_tile_cap())
+            columns, rows = payload["columns"], payload["rows"]
+            _remember(key, now, columns, rows)
+            return governance.filter_result(source, sql, columns, rows) + (True,)
 
-    columns, rows = connector.run_query(sql)
-    columns, rows = list(columns or []), list(rows or [])
-    from . import governance
-    columns, rows = governance.filter_result(source, sql, columns, rows)
+    result = gateway.execute(user, source, sql, "dashboard_tile",
+                             table_label=table_label, max_rows=_tile_cap())
+    columns, rows = list(result.columns or []), list(result.rows or [])
     if client is not None:
         # Round-trip through JSON even on a miss, so a cached read and a fresh
         # read hand downstream transforms identically-typed values.
@@ -814,32 +861,22 @@ def tile_data(tile, user, filters=None, *, refresh=False):
         return out
 
     source, table_label = tile.get("source"), tile.get("table_label")
-    if not rbac.can_access(user["role"], source, table_label or "*"):
-        return fail("forbidden", f"Your role has no access to {source}.{table_label or '*'}", True)
+    # RBAC → guard → cap → execution → governance → audit all happen inside
+    # the gateway (via _cached_query); this function only maps its failures
+    # onto the per-tile error contract.
     try:
-        connector = _connector_or_400(source)
-    except HTTPException as e:
-        return fail("source_error", e.detail)
-    try:
-        allowed = rbac.allowed_tables(user["role"], source, connector.list_tables())
-    except Exception as e:
-        return fail("source_error", e)
-    if not allowed:
-        return fail("forbidden", f"Your role has no access to {source}", True)
-
-    try:
-        cleaned = queryguard.validate(tile.get("sql") or "", allowed)
-        cleaned = queryguard.enforce_limit(cleaned, min(TILE_MAX_ROWS, MAX_ROWS))
-    except queryguard.QueryRejected as e:
-        return fail("query_rejected", e)
-    except Exception as e:
-        return fail("query_rejected", e)
-
-    try:
-        columns, rows, cached = _cached_query(source, cleaned, user["role"], connector,
+        columns, rows, cached = _cached_query(user, source, tile.get("sql") or "",
+                                              table_label=table_label or "*",
                                               refresh=refresh)
+    except QueryRejected as e:
+        # The gateway phrases every RBAC refusal as "no access"; anything
+        # else is the query guard rejecting the SQL itself.
+        denied = "no access" in str(e).lower()
+        return fail("forbidden" if denied else "query_rejected", e, denied)
+    except HTTPException as e:
+        return fail("source_error", e.detail)   # unknown / unconfigured source
     except Exception as e:
-        return fail("source_error", e)
+        return fail("source_error", e)          # connector failure, timeout
     out["cached"] = cached
     out["_base"] = {"columns": columns, "rows": rows}
 
@@ -847,7 +884,7 @@ def tile_data(tile, user, filters=None, *, refresh=False):
         spec, warnings = viz.sanitize_spec(tile.get("spec"), columns, rows)
         result = viz.run_transform(columns, rows, _dict(spec).get("transform"),
                                        injected=list(filters or []),
-                                       max_rows=min(TILE_MAX_ROWS, MAX_ROWS))
+                                       max_rows=_tile_cap())
     except Exception as e:
         return fail("transform_error", e)
 

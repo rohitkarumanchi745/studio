@@ -13,6 +13,7 @@ import pytest
 
 from app import rbac
 from app.connectors import all_sources, get_connector
+from app.connectors.base import unguarded
 
 
 def test_registered_and_granted_but_dormant_without_dsn(monkeypatch):
@@ -37,5 +38,8 @@ def test_live_roundtrip_when_a_dsn_is_present():
     t = tables[0]
     cols = conn.get_schema(t)
     assert cols and {"name", "type"} <= set(cols[0])
-    columns, rows = conn.run_query(f"SELECT * FROM {t} LIMIT 3")
+    # Direct connector execution is a self-test here; app code goes through
+    # gateway.execute, which is the only place the guard opens on its own.
+    with unguarded():
+        columns, rows = conn.run_query(f"SELECT * FROM {t} LIMIT 3")
     assert columns == [c["name"] for c in cols] and len(rows) <= 3

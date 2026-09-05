@@ -22,9 +22,11 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from . import agent, db, email_service, lightning, queries, rbac, suggest
+from . import agent, db, email_service, grains, lightning, queries, rbac, suggest, util
 from .auth import current_user
 from .connectors import all_sources, get_connector
+from .matching import _tokens, match_tables
+from .queryguard import TABLE_REF
 
 router = APIRouter(prefix="/pipelines", tags=["pipelines"])
 
@@ -74,7 +76,6 @@ def _accessible(user):
     the router picks from. RBAC is applied here, so the router can never route
     to a source the user has no access to."""
     role = user["role"]
-    from . import util
 
     def build(meta):
         if not meta["configured"] or meta["name"] not in rbac.allowed_sources(role):
@@ -98,8 +99,6 @@ def _accessible(user):
 def route(user, prompt):
     """Pick the accessible source whose tables best match the prompt, plus the
     ranked matching tables. Returns (source_entry, matched) or (None, [])."""
-    from .catalog import match_tables
-
     best, best_score, best_matched = None, -1.0, []
     for s in _accessible(user):
         matched = match_tables(prompt, s["schemas"])
@@ -111,7 +110,6 @@ def route(user, prompt):
 
 def _step_tables(step):
     """Tables a step reads, from its SQL (falls back to the declared table)."""
-    from .queryguard import TABLE_REF
     refs = {r.strip('"').split(".")[-1].lower()
             for r in TABLE_REF.findall(step.get("sql") or "")}
     if not refs and step.get("table"):
@@ -149,15 +147,66 @@ def lineage(steps, failed_index=None):
     }
 
 
-def _draft_sql(connector, table, columns):
-    """A sensible verified step for one table: aggregate a measure over a
-    dimension/date when the shape allows, else a bounded preview."""
+def _prompt_match(names, terms):
+    """The first column in `names` whose own tokens overlap the prompt's, or
+    None. Order is the caller's ranking (suggest._classify already ranks
+    measures best-first), so this is "the best column the user asked for"."""
+    for n in names:
+        if _tokens(str(n).replace("_", " ")) & terms:
+            return n
+    return None
+
+
+def _relevant(table, columns, terms):
+    """Does this table hold a column the prompt actually named? The
+    deterministic drafter uses this to stop stepping over tables that only
+    matched on an unrelated token — "monthly revenue by region" must not draft
+    a step on customers just because it ranked third."""
+    _, measures, dims = suggest._classify(columns)
+    return bool(_prompt_match(measures, terms) or _prompt_match(dims, terms))
+
+
+def _draft_sql(connector, table, columns, prompt=None):
+    """A sensible verified step for one table, STEERED BY THE PROMPT.
+
+    When the request names a time grain ("monthly revenue by region"), the
+    step buckets the date column to that grain in the connector's own dialect
+    (grains.bucket_expr), aggregates the measure the prompt named, and groups
+    by the dimension it named. Ignoring the grain is how this drafter used to
+    answer a monthly question with a daily table.
+
+    With no grain in the prompt the shape is unchanged from before — first
+    measure over the first date/dimension — so existing behaviour is kept for
+    every request that never asked for a bucket.
+    """
     dates, measures, dims = suggest._classify(columns)
-    if measures and (dates or dims):
+    if not (measures and (dates or dims)):
+        return f"SELECT * FROM {table} LIMIT 200"
+    terms = _tokens(prompt or "")
+    grain = grains.detect(prompt or "")
+    bucket = grains.bucket_expr(connector.dialect, dates[0], grain) if (grain and dates) else None
+    if not bucket:
+        # No grain asked for (or no date column to bucket): today's shape.
         m = measures[0]
         g = dates[0] if dates else dims[0]
         return f"SELECT {g}, SUM({m}) AS total_{m} FROM {table} GROUP BY {g} ORDER BY 1 LIMIT 500"
-    return f"SELECT * FROM {table} LIMIT 200"
+    m = _prompt_match(measures, terms) or measures[0]
+    dim = _prompt_match(dims, terms)
+    select = [f"{bucket} AS {grain}"] + ([dim] if dim else [])
+    group = [bucket] + ([dim] if dim else [])
+    return (f"SELECT {', '.join(select)}, SUM({m}) AS total_{m} FROM {table} "
+            f"GROUP BY {', '.join(group)} ORDER BY 1 LIMIT 500")
+
+
+def _intent_warnings(prompt, sql):
+    """Ways a drafted step visibly does NOT answer the request. Reported on the
+    step (and badged in the UI) — never a reason to drop it: a step that
+    verified is real data, it just may not be the breakdown that was asked
+    for, and only the user can judge that."""
+    grain = grains.detect(prompt or "")
+    if grain and not grains.has_bucket(sql, grain):
+        return [f"does not bucket by {grain}"]
+    return []
 
 
 def _llm_steps(user, source, skill_schemas, prompt, spec):
@@ -182,9 +231,14 @@ def _llm_steps(user, source, skill_schemas, prompt, spec):
 
 
 def build(user, prompt):
-    """Draft an access-verified pipeline from a prompt. Never saves. Every
-    step is verified (RBAC + guard + execution); steps that don't verify are
-    dropped, so a saved draft only contains runnable steps."""
+    """Draft an access-verified pipeline from a prompt. Never saves.
+
+    Every drafted step is verified (RBAC + guard + real execution). Only the
+    ones that PASSED come back in "steps"; every failure comes back in
+    "dropped" with its error. If none passed, "steps" is empty and the
+    response is still 200 — an empty pipeline the UI can explain beats a list
+    of steps labelled "verified" that were never anything of the kind.
+    """
     prompt = (prompt or "").strip()
     if not prompt:
         raise HTTPException(400, "Describe what the pipeline should do")
@@ -201,28 +255,45 @@ def build(user, prompt):
         except Exception:
             drafts = []
     if not drafts:
-        # Deterministic: one step per top matched table.
-        for m in matched[:3]:
+        # Deterministic: one step per top matched table that actually holds a
+        # column the prompt named. `matched` ranks by token overlap, which can
+        # rank a table on a coincidental hit; without this filter a request
+        # drafts steps over tables it never mentioned. Never filter down to
+        # nothing, though — a name-only match (e.g. "inventory levels") is a
+        # real signal, so fall back to the ranking when nothing survives.
+        terms = _tokens(prompt)
+        top = [m for m in matched[:3]
+               if _relevant(m["table"], s["schemas"].get(m["table"], []), terms)] or matched[:3]
+        for m in top:
             t = m["table"]
             drafts.append({"name": f"Extract {t}", "table": t,
-                           "sql": _draft_sql(s["connector"], t, s["schemas"].get(t, []))})
+                           "sql": _draft_sql(s["connector"], t, s["schemas"].get(t, []), prompt)})
     if not drafts:
         raise HTTPException(422, "Could not draft any steps for this request")
 
     steps = []
     for d in drafts[:MAX_STEPS]:
         v = queries.verify_sql(user, source, d.get("table"), d.get("sql", ""))
-        steps.append({
+        sql = v.get("sql") or d.get("sql", "")
+        step = {
             "name": d.get("name") or f"Step {len(steps) + 1}",
             "source": source,
             "table": d.get("table"),
-            "sql": v.get("sql") or d.get("sql", ""),
+            "sql": sql,
             "verified": v["ok"],
             "row_count": v.get("row_count"),
             "columns": v.get("columns", []),
             "error": None if v["ok"] else v.get("error"),
-        })
-    kept = [st for st in steps if st["verified"]] or steps
+            "intent_warnings": _intent_warnings(prompt, sql),
+        }
+        steps.append(step)
+    # INVARIANT: "steps" contains ONLY steps that verified. A step that failed
+    # RBAC / the guard / execution is never handed back as part of the
+    # pipeline — it goes to "dropped" WITH its error so the UI can say why.
+    # When nothing verified this is an empty list and a 200: the caller gets a
+    # truthful "nothing could be built and here is why", not a pipeline of
+    # steps that would fail the moment it ran.
+    kept = [st for st in steps if st["verified"]]
     return {
         "prompt": prompt,
         "source": source,
@@ -374,11 +445,22 @@ class SaveIn(BaseModel):
 
 @router.post("", status_code=201)
 def create(body: SaveIn, user=Depends(current_user)):
-    """Save a pipeline — but only if every step verifies (re-run server-side)."""
+    """Save a pipeline — but only if EVERY step verifies here, server-side.
+
+    A client's `verified` flag is never trusted: each step is re-run through
+    RBAC + guard + execution under THIS user, and the first failure rejects
+    the whole save. That is what makes "saved" mean "runnable", and it is the
+    reason build() may return an empty step list rather than a hopeful one.
+    """
     if not body.steps:
         raise HTTPException(400, "A pipeline needs at least one step")
+    if len(body.steps) > MAX_STEPS:
+        # Truncating silently would save fewer steps than the user submitted.
+        raise HTTPException(400, f"A pipeline can have at most {MAX_STEPS} steps")
     verified = []
-    for st in body.steps[:MAX_STEPS]:
+    for st in body.steps:
+        if not isinstance(st, dict):
+            raise HTTPException(400, "Each step must be an object with a sql field")
         v = queries.verify_sql(user, st.get("source") or body.source,
                                st.get("table"), st.get("sql", ""))
         if not v["ok"]:
@@ -386,7 +468,8 @@ def create(body: SaveIn, user=Depends(current_user)):
         verified.append({"name": st.get("name") or f"Step {len(verified) + 1}",
                          "source": st.get("source") or body.source, "table": st.get("table"),
                          "sql": v["sql"], "verified": True,
-                         "row_count": v["row_count"], "columns": v["columns"]})
+                         "row_count": v["row_count"], "columns": v["columns"],
+                         "intent_warnings": _intent_warnings(body.prompt, v["sql"])})
     name = (body.name or body.prompt)[:120]
     visibility = body.visibility if body.visibility in ("private", "org") else "private"
     now = time.time()

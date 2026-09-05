@@ -7,7 +7,8 @@ Any provider LangChain supports works — the graph, tools, and prompts are
 provider-neutral.
 
 ReAct loop with four tools:
-  run_sql(sql)                    — validated (SELECT-only, RBAC) execution
+  run_sql(sql)                    — execution through gateway.execute (RBAC,
+                                    query guard, row cap, governance, audit)
   render_chart(type, title, x, y) — records an ECharts-ready chart spec
   remember(note)                  — saves a durable note about this user
   email_report(subject)           — emails the current result to the user
@@ -25,7 +26,7 @@ import os
 import re
 from typing import List
 
-from . import db, email_service, progress, queryguard
+from . import db, email_service, gateway, grains, progress
 from .queryguard import QueryRejected
 
 # Full Power BI / Tableau-style catalog (rendered with ECharts client-side)
@@ -50,8 +51,9 @@ _CHART_PHRASES = [
     ("area", "area"), ("line", "line"), ("bar", "bar"), ("column", "bar"),
     ("table", "table"),
 ]
-MAX_ROWS = int(os.getenv("STUDIO_MAX_ROWS", "50000"))  # server ceiling (configurable)
-PREVIEW_ROWS = 40      # rows shown to the model per query
+# Re-exported from limits so `agent.MAX_ROWS` keeps working for every module
+# that already imports it; the gateway reads limits directly.
+from .limits import MAX_ROWS, PREVIEW_ROWS  # noqa: E402,F401
 
 _KEY_FOR_PROVIDER = {
     "anthropic": "ANTHROPIC_API_KEY",
@@ -311,15 +313,6 @@ def _extract_usage(result):
     return tot
 
 
-def _run(connector, sql):
-    """Execute + apply governance compliance in one place, so every path that
-    returns data to a user (agent tool, fallback preview, canvas compose) is
-    covered — deny/mask columns and row caps from the active governance doc."""
-    columns, rows = connector.run_query(sql)
-    from . import governance
-    return governance.filter_result(connector.name, sql, columns, rows)
-
-
 def _final_text(result):
     for message in reversed(result.get("messages", [])):
         if getattr(message, "type", "") == "ai":
@@ -356,7 +349,7 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
 
     spec = model or llm_spec()
     if not llm_available(spec, user):
-        out = _fallback(prompt, connector, table, allowed_tables)
+        out = _fallback(prompt, connector, table, allowed_tables, user)
         out["agents"] = [me]
         return out
 
@@ -374,19 +367,20 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
             sql: A single SELECT (or WITH...SELECT) statement. No DML/DDL.
         """
         progress.emit_for(_tid, f"{_me}: running SQL on {connector.name} — {sql[:80]}")
+        # The gateway derives the table allowlist from this user's role itself;
+        # `allowed_tables` here only shapes the prompt. Each call (rejected or
+        # not) leaves its own audit row under the action "agent_sql".
         try:
-            cleaned = queryguard.validate(sql, allowed_tables)
-            cleaned = queryguard.enforce_limit(cleaned, MAX_ROWS)
-            columns, rows = _run(connector, cleaned)
-            rows = rows[:MAX_ROWS]
+            res = gateway.execute(user, connector.name, sql, "agent_sql", table_label=table)
         except QueryRejected as e:
             ctx["errors"].append(f"rejected: {e}")
             return f"QUERY REJECTED: {e}"
         except Exception as e:
             ctx["errors"].append(f"sql error: {e}")
             return f"QUERY ERROR: {e}"
-        ctx["sql"], ctx["columns"], ctx["rows"] = cleaned, columns, rows
-        preview = {"columns": columns, "rows": rows[:PREVIEW_ROWS], "total_rows": len(rows)}
+        ctx["sql"], ctx["columns"], ctx["rows"] = res.sql, res.columns, res.rows
+        preview = {"columns": res.columns, "rows": res.rows[:PREVIEW_ROWS],
+                   "total_rows": res.row_count}
         return json.dumps(preview, default=str)
 
     @tool
@@ -565,7 +559,7 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         is_auth = ("401" in msg or "authentication_error" in msg
                    or "api key" in msg.lower() and ("invalid" in msg.lower()
                                                     or "incorrect" in msg.lower()))
-        out = _fallback(prompt, connector, table, allowed_tables)
+        out = _fallback(prompt, connector, table, allowed_tables, user)
         if is_auth:
             n = len(out.get("rows") or [])
             out["text"] = (
@@ -739,7 +733,11 @@ def _tables_named(prompt, tables):
     return [t for t in tables if norm(t) and f" {norm(t)} " in text]
 
 
-def _fallback(prompt, connector, table, allowed_tables):
+def _fallback(prompt, connector, table, allowed_tables, user):
+    """Keyless preview. `allowed_tables` picks WHICH table(s) to preview (the
+    caller's RBAC-scoped list, as shown in the UI); every query still goes
+    through gateway.execute, which derives enforcement from `user` itself —
+    no user, no rows."""
     # Whole-source ask that NAMES a table ("show sales by region") → preview
     # that table, not the first one alphabetically or a wall of previews.
     if table == "*":
@@ -755,7 +753,7 @@ def _fallback(prompt, connector, table, allowed_tables):
     # one aggregated panel per granularity (sqlite demo dialect).
     grans = [g for g in ("hour", "day", "week", "month", "year") if g in prompt.lower()]
     if len(grans) >= 2 and connector.dialect == "sqlite":
-        multi = _fallback_granularity_panels(connector, target, allowed_tables, grans)
+        multi = _fallback_granularity_panels(user, connector, target, grans)
         if multi:
             return multi
 
@@ -763,15 +761,15 @@ def _fallback(prompt, connector, table, allowed_tables):
     if table == "*" and 1 < len(allowed_tables) <= 6:
         panels = []
         for t in allowed_tables:
-            sql_t = f"SELECT * FROM {t} LIMIT 2000"
             try:
-                cleaned = queryguard.validate(sql_t, allowed_tables)
-                columns, rows = _run(connector, cleaned)
+                res = gateway.execute(user, connector.name, f"SELECT * FROM {t} LIMIT 2000",
+                                      "fallback_preview", table_label=t)
             except Exception:
-                continue
+                continue        # a table this role may not read simply gets no panel
+            columns, rows = res.columns, res.rows
             chart = _auto_chart(columns, rows, t) or {"type": "table", "title": t, "x": columns[0], "y": columns[1:2]}
             chart = {**chart, "title": t}
-            panels.append({"sql": cleaned, "columns": columns, "rows": rows, "chart": chart})
+            panels.append({"sql": res.sql, "columns": columns, "rows": rows, "chart": chart})
         if panels:
             last = panels[-1]
             key_var = _KEY_FOR_PROVIDER.get(llm_spec().split(":", 1)[0], "the provider API key")
@@ -786,11 +784,11 @@ def _fallback(prompt, connector, table, allowed_tables):
 
     sql = f"SELECT * FROM {target} LIMIT {MAX_ROWS}"
     try:
-        cleaned = queryguard.validate(sql, allowed_tables)
-        columns, rows = _run(connector, cleaned)
+        res = gateway.execute(user, connector.name, sql, "fallback_preview", table_label=target)
     except Exception as e:
         return {"text": f"Could not query {target}: {e}", "sql": sql, "columns": [],
                 "rows": [], "chart": None, "email": None, "mode": "fallback", "model": None}
+    cleaned, columns, rows = res.sql, res.columns, res.rows
 
     chart = _auto_chart(columns, rows, target)
     key_var = _KEY_FOR_PROVIDER.get(llm_spec().split(":", 1)[0], "the provider API key")
@@ -804,16 +802,11 @@ def _fallback(prompt, connector, table, allowed_tables):
             "chart": chart, "panels": panels, "email": None, "mode": "fallback", "model": None}
 
 
-_GRAN_FMT = {  # sqlite strftime formats per granularity
-    "hour": "%Y-%m-%d %H:00",
-    "day": "%Y-%m-%d",
-    "week": "%Y-%W",
-    "month": "%Y-%m",
-    "year": "%Y",
-}
+_GRAN_FMT = grains.SQLITE_FMT   # sqlite strftime formats per granularity;
+# moved to the grains leaf module so pipelines.py buckets by the SAME table.
 
 
-def _fallback_granularity_panels(connector, target, allowed_tables, grans):
+def _fallback_granularity_panels(user, connector, target, grans):
     """Demo-mode small multiples: one aggregate per requested time granularity."""
     try:
         schema = connector.get_schema(target)
@@ -821,11 +814,16 @@ def _fallback_granularity_panels(connector, target, allowed_tables, grans):
         return None
     names = [c["name"] for c in schema]
     date_col = next((n for n in names if re.search(r"date|day|time", n, re.IGNORECASE)), None)
-    # Probe a row to find a numeric measure column.
+    # Probe a row to find a numeric measure column. audit=False: this is a
+    # type probe whose row never leaves the server; the governed reads that
+    # follow are audited. Still gateway-governed, so a denied column can never
+    # be picked as the measure.
     try:
-        cols, probe = connector.run_query(f"SELECT * FROM {target} LIMIT 1")
+        res = gateway.execute(user, connector.name, f"SELECT * FROM {target} LIMIT 1",
+                              "fallback_preview", table_label=target, max_rows=1, audit=False)
     except Exception:
         return None
+    cols, probe = res.columns, res.rows
     if not probe:
         return None
     num_col = next((c for c, v in zip(cols, probe[0]) if isinstance(v, (int, float)) and not re.search(r"id$", c, re.IGNORECASE)), None)
@@ -840,14 +838,13 @@ def _fallback_granularity_panels(connector, target, allowed_tables, grans):
             f"FROM {target} GROUP BY 1 ORDER BY 1"
         )
         try:
-            cleaned = queryguard.validate(sql, allowed_tables)
-            cleaned = queryguard.enforce_limit(cleaned, MAX_ROWS)
-            columns, rows = _run(connector, cleaned)
+            res = gateway.execute(user, connector.name, sql, "fallback_preview",
+                                  table_label=target)
         except Exception:
             continue
         chart_type = "bar" if g == "year" else "line"
         panels.append({
-            "sql": cleaned, "columns": columns, "rows": rows,
+            "sql": res.sql, "columns": res.columns, "rows": res.rows,
             "chart": {"type": chart_type, "title": f"{num_col} — {g} level",
                       "x": g, "y": [f"total_{num_col}"]},
         })
@@ -889,18 +886,23 @@ _CANVAS_SYS = """You edit a chart/data view in an analytics canvas. Given column
 Edits are LOCAL to the canvas — they never modify source tables. Only reference columns that exist."""
 
 
-def edit_canvas(instruction, columns, rows, chart):
+def edit_canvas(instruction, columns, rows, chart, user=None):
     """Apply a natural-language edit to a canvas (chart spec + local data).
 
     The model emits a chart-spec v2 MERGE PATCH (viz.SPEC_PROMPT), so one
     sentence can add measures, table calcs, filters and formatting at once
     without discarding the parts of the spec it did not mention. Transforms
     run server-side over the ORIGINAL rows, so edits stay re-appliable.
+
+    `user` (optional) selects the model key — their own BYOK key over the
+    server's. This path never queries the warehouse, so no user is needed
+    for enforcement; without one the server key (or the rule-based
+    fallback) is used.
     """
     from . import viz
 
     result = None
-    if llm_available():
+    if llm_available(llm_spec(), user):
         try:
             llm = make_llm(llm_spec(), user)
             payload = json.dumps({
@@ -971,13 +973,17 @@ Rules:
 
 
 def compose_canvas(instruction, columns, rows, chart, connector=None,
-                   allowed_tables=None, schemas=None):
+                   allowed_tables=None, schemas=None, user=None):
     """Prompt-driven sheet composition — may return SEVERAL charts.
 
     Unlike edit_canvas (one chart, local rows only), a panel here may carry
     its own SELECT, so views the current result threw away (finer time
-    grain, a different window) can be re-queried. Every SELECT goes through
-    the same query guard and RBAC table allowlist as the agent's own SQL.
+    grain, a different window) can be re-queried. Every SELECT runs through
+    gateway.execute on behalf of `user` — the same RBAC, guard, cap,
+    governance and audit as the agent's own SQL. `allowed_tables` and
+    `schemas` only shape the prompt (what the model is told exists); they
+    are never the enforcement list. Fail closed: a panel that needs fresh
+    SQL with no user bound is skipped, never run.
     """
     from . import viz
 
@@ -995,7 +1001,7 @@ def compose_canvas(instruction, columns, rows, chart, connector=None,
                        "relative windows ('this week') on the data's own MAX(date), "
                        "not on the current date, or the panel will come back empty.")
 
-    llm = make_llm(llm_spec(), user)
+    llm = make_llm(llm_spec(), user)          # user=None → server key
     payload = json.dumps({
         "columns": columns,
         "sample_rows": rows[:15],
@@ -1017,12 +1023,12 @@ def compose_canvas(instruction, columns, rows, chart, connector=None,
             if connector is None:
                 warnings.append(f"{p.get('title') or 'panel'}: no source bound — skipped")
                 continue
+            if user is None:
+                warnings.append(f"{p.get('title') or 'panel'}: no user bound — panel skipped")
+                continue
             try:
-                cleaned = queryguard.validate(sql, allowed_tables or [])
-                cleaned = queryguard.enforce_limit(cleaned, MAX_ROWS)
-                p_cols, p_rows = _run(connector, cleaned)
-                p_rows = p_rows[:MAX_ROWS]
-                p_sql = cleaned
+                res = gateway.execute(user, connector.name, sql, "canvas_compose")
+                p_cols, p_rows, p_sql = res.columns, res.rows, res.sql
             except QueryRejected as e:
                 warnings.append(f"{p.get('title') or 'panel'}: rejected — {e}")
                 continue

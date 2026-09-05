@@ -1,6 +1,5 @@
 """Chat: conversations, the ask endpoint driving the agent, fresh-data rerun,
 email reports, and the per-user activity audit log."""
-import concurrent.futures
 import json
 import os
 import time
@@ -10,18 +9,20 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from . import (agent, db, email_service, keys, lightning, orchestrator,
-               progress, qcache, queryguard, rbac, roster,
-               router as model_router, semantic, sessions, skills)
+from . import (agent, db, email_service, gateway, governance, jobs, keys,
+               lightning, orchestrator, progress, qcache, queryguard, rbac,
+               roster, router as model_router, semantic, sessions, skills)
 from .auth import current_user
-from .catalog import _connector_or_400, match_tables
+from .matching import match_tables
+from .sources import connector_or_400
 
 router = APIRouter(tags=["chat"])
 
 # Background tasks let a user start a question in one chat, move to another, and
-# be notified (a blue dot on the conversation) when it finishes. Bounded pool —
-# a run holds a worker for its duration.
-_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+# be notified (a blue dot on the conversation) when it finishes. They run as
+# durable "chat_turn" jobs (jobs.py): the request records the user's turn and
+# enqueues a JSON payload, and whichever worker claims it rebuilds the context
+# and runs the turn — so a restart never loses an in-flight question.
 
 
 def init_tables():
@@ -37,6 +38,7 @@ def init_tables():
             error TEXT,
             seen INTEGER NOT NULL DEFAULT 0,
             steps TEXT,
+            user_message_id TEXT,
             created_at REAL NOT NULL,
             finished_at REAL
         );
@@ -44,15 +46,10 @@ def init_tables():
             ON chat_tasks(user_id, conversation_id);
         """
     )
-    # steps holds the live activity feed (progress.py). Guarded ALTER migrates
-    # databases created before the column existed — same pattern as mcp.py.
-    if db.IS_PG:
-        c.execute("ALTER TABLE chat_tasks ADD COLUMN IF NOT EXISTS steps TEXT")
-    else:
-        try:
-            c.execute("ALTER TABLE chat_tasks ADD COLUMN steps TEXT")
-        except Exception:
-            pass
+    # steps holds the live activity feed (progress.py); user_message_id is the
+    # turn this task answers (_already_answered). Databases created before
+    # either column existed get them from migrations 3 and 6
+    # (app/migrations.py).
     c.commit()
     c.close()
 
@@ -299,11 +296,12 @@ def remove_share(cid: str, share_user_id: str, user=Depends(current_user)):
     return {"shares": db.list_conversation_shares(cid), "can_share": True}
 
 
-def _prepare(body, user):
-    """Synchronous half of a turn: validate, resolve/create the conversation,
-    append the user message. Returns a context for _run_turn, or raises
-    HTTPException on validation/RBAC errors — so both the sync path and the
-    background submit fail fast, before any agent work starts."""
+def _scope(body, user):
+    """Validate a turn and resolve its scope: the model, and for a single
+    source the connector, the tables the role may see and their schemas.
+    Raises HTTPException on validation/RBAC errors so both the sync path and
+    the background enqueue fail fast, before anything is written. Pure — no
+    writes — so a worker can call it again to rebuild a job's context."""
     prompt = body.prompt.strip()
     if not prompt:
         raise HTTPException(400, "Empty prompt")
@@ -316,16 +314,12 @@ def _prepare(body, user):
 
     # source "*": the orchestrator fans out across per-database agents.
     if body.source == "*":
-        cid, history = _conversation(body.conversation_id, user, prompt)
-        db.add_message(cid, "user", {"text": prompt, "source": "*", "table": "all sources",
-                                     "author_role": user["role"],
-                                     "allow_ambiguous": bool(getattr(body, "allow_ambiguous", False))})
-        return {"mode": "*", "cid": cid, "history": history, "model": model, "prompt": prompt,
+        return {"mode": "*", "model": model, "prompt": prompt,
                 "allow_ambiguous": bool(getattr(body, "allow_ambiguous", False))}
 
     if not rbac.can_access(user["role"], body.source, body.table):
         raise HTTPException(403, "Your role has no access to this table")
-    connector = _connector_or_400(body.source)
+    connector = connector_or_400(body.source)
     try:
         all_tables = connector.list_tables()
     except Exception as e:
@@ -362,13 +356,54 @@ def _prepare(body, user):
     except Exception as e:
         raise HTTPException(502, f"Source error: {e}")
 
-    cid, history = _conversation(body.conversation_id, user, prompt)
-    db.add_message(cid, "user", {"text": prompt, "source": body.source, "table": table_label,
-                                 "author_role": user["role"]})
-    return {"mode": "normal", "cid": cid, "history": history, "model": model, "prompt": prompt,
+    return {"mode": "normal", "model": model, "prompt": prompt,
             "source": body.source, "connector": connector, "all_tables": all_tables,
             "allowed": allowed, "schemas": schemas, "table_param": table_param,
             "table_label": table_label}
+
+
+def _record_user_turn(body, user, scope=None):
+    """Request-time half of a turn: validate (via _scope), resolve/create the
+    conversation and append the user message. Everything here happens
+    exactly once, at request time, whichever process later runs the turn.
+    Returns (conversation id, user message id) — the message id IDENTIFIES
+    this turn, which is how a background task later recognises its own answer
+    (_already_answered). `scope` lets the sync path reuse the validation it
+    already ran instead of fetching schemas twice."""
+    scope = scope or _scope(body, user)
+    prompt = scope["prompt"]
+    cid, _history = _conversation(body.conversation_id, user, prompt)
+    if scope["mode"] == "*":
+        mid = db.add_message(cid, "user", {"text": prompt, "source": "*",
+                                           "table": "all sources",
+                                           "author_role": user["role"],
+                                           "allow_ambiguous": scope["allow_ambiguous"]})
+    else:
+        mid = db.add_message(cid, "user", {"text": prompt, "source": body.source,
+                                           "table": scope["table_label"],
+                                           "author_role": user["role"]})
+    return cid, mid
+
+
+def _build_ctx(body, user, cid, scope=None):
+    """Execution context for _run_turn, rebuilt from ids: the connector,
+    schemas and history are re-derived (the connector is a live object and
+    never crosses the queue). Pure — a worker calls this after
+    _record_user_turn already wrote the user message, so the history drops
+    that trailing message: a turn's own prompt is not its context."""
+    scope = scope or _scope(body, user)
+    _cid, history = _conversation(cid, user, scope["prompt"], recorded=True)
+    ctx = dict(scope)
+    ctx.update({"cid": cid, "history": history})
+    return ctx
+
+
+def _prepare(body, user):
+    """Synchronous turn setup: validate, write the user message, build the
+    context — kept as the one-call form for the sync endpoint."""
+    scope = _scope(body, user)
+    cid, _mid = _record_user_turn(body, user, scope=scope)
+    return _build_ctx(body, user, cid, scope=scope)
 
 
 def _and(names):
@@ -389,6 +424,16 @@ def _resolved_tables(cid):
     except Exception:
         pass
     return out
+
+
+def _answer(ctx, result):
+    """Append the turn's assistant message. A BACKGROUND turn stamps the id of
+    the user message it answers (ctx["reply_to"]) so a retry can recognise its
+    own answer among several concurrent turns' — see _already_answered. A
+    synchronous turn has no task and stamps nothing."""
+    if ctx.get("reply_to"):
+        result["reply_to"] = ctx["reply_to"]
+    return db.add_message(ctx["cid"], "assistant", result)
 
 
 def _clarify_turn(ctx, user, clash, t0):
@@ -420,7 +465,7 @@ def _clarify_turn(ctx, user, clash, t0):
         "author_role": user["role"],
     }
     result["inputs"] = _query_inputs(result)
-    db.add_message(cid, "assistant", result)
+    _answer(ctx, result)
     db.log_activity(user, "chat", prompt=prompt, source="*", table=clash[0]["table"],
                     mode="clarify", ok=True, duration_ms=int((time.time() - t0) * 1000))
     return result
@@ -457,7 +502,7 @@ def _run_turn(ctx, user):
         if tid:
             result["trace_id"] = tid
         result["author_role"] = user["role"]
-        db.add_message(cid, "assistant", result)
+        _answer(ctx, result)
         db.log_activity(
             user, "chat", prompt=prompt, source="*",
             table=",".join(result.get("agents_used") or []) or "all sources",
@@ -548,7 +593,7 @@ def _run_turn(ctx, user):
     if tid:
         result["trace_id"] = tid
     result["author_role"] = user["role"]
-    db.add_message(cid, "assistant", result)
+    _answer(ctx, result)
     db.log_activity(
         user, "chat", prompt=prompt, source=ctx["source"], table=ctx["table_label"],
         sql=result.get("sql"), mode=result.get("mode"),
@@ -572,28 +617,76 @@ def ask_background(body: Ask, user=Depends(current_user)):
     """Start a turn without waiting. Returns immediately with a task id; the
     answer is appended to the conversation when it finishes, and the
     conversation gets an unseen marker (the blue dot) until it's opened. Lets a
-    user run tasks in several chats at once."""
-    ctx = _prepare(body, user)   # validates + writes the user message now
+    user run tasks in several chats at once. The turn itself is a durable
+    chat_turn job: recorded here, run by a worker (jobs.py)."""
+    scope = _scope(body, user)                       # validates now: 4xx before any write
+    # The user message, exactly once — its id is what the task answers, and
+    # what tells two concurrent turns in this conversation apart.
+    cid, mid = _record_user_turn(body, user, scope=scope)
     tid = str(uuid.uuid4())
     now = time.time()
     c = db._conn()
     c.execute("INSERT INTO chat_tasks (id, conversation_id, user_id, prompt, status, "
-              "seen, created_at) VALUES (?,?,?,?,?,?,?)",
-              (tid, ctx["cid"], user["id"], ctx["prompt"][:500], "running", 0, now))
+              "seen, user_message_id, created_at) VALUES (?,?,?,?,?,?,?,?)",
+              (tid, cid, user["id"], scope["prompt"][:500], "running", 0, mid, now))
     c.commit()
     c.close()
-    _EXECUTOR.submit(_bg_run, ctx, dict(user), tid)
-    return {"conversation_id": ctx["cid"], "task_id": tid, "status": "running"}
+    jobs.enqueue("chat_turn", {"body": body.model_dump(), "cid": cid, "tid": tid,
+                               "user_id": user["id"]},
+                 user_id=user["id"], max_attempts=2)
+    return {"conversation_id": cid, "task_id": tid, "status": "running"}
 
 
-def _bg_run(ctx, user, tid):
-    """Runs in a worker thread: execute the turn, then record task outcome."""
-    status, error = "done", None
-    progress.bind(tid)   # this thread's emits feed the task's live activity
-    try:
-        _run_turn(ctx, user)
-    except Exception as e:
-        status, error = "failed", str(e)[:500]
+def _task_turn(tid):
+    """(created_at, user_message_id) for a task, or None. user_message_id is
+    NULL only for a task recorded before the column existed (migration 6)."""
+    c = db._conn()
+    r = c.execute("SELECT created_at, user_message_id FROM chat_tasks WHERE id=?",
+                  (tid,)).fetchone()
+    c.close()
+    return (float(r["created_at"]), r["user_message_id"]) if r else None
+
+
+def _already_answered(cid, tid):
+    """Re-entrancy guard for a retried chat_turn: True when THIS task's turn
+    already carries its assistant message — an earlier attempt finished the
+    turn but died before marking the task done.
+
+    The match is by IDENTITY, not by time: the task row records the id of the
+    user message it answers and _answer() stamps that id on the answer
+    (`reply_to`). The temporal test this replaced ("any assistant message
+    newer than my user turn") silently dropped the second of two background
+    turns started in the same conversation — whichever answered first marked
+    BOTH tasks done, so one question was never answered at all.
+
+    A task written before the column existed (an in-flight turn across a
+    deploy) has no id to match, and falls back to the old temporal test: it is
+    wrong only when turns overlap, and it is what keeps those tasks
+    retry-safe.
+    """
+    turn = _task_turn(tid)
+    if turn is None:
+        return False
+    created_at, mid = turn
+    if mid:
+        return any(m["role"] == "assistant" and (m.get("content") or {}).get("reply_to") == mid
+                   for m in db.list_messages(cid))
+    c = db._conn()
+    # The user message was written just before the task row, in the same
+    # request; the newest user message at or before that moment is this turn's.
+    user_turn = c.execute(
+        "SELECT created_at FROM messages WHERE conversation_id=? AND role='user' "
+        "AND created_at <= ? ORDER BY created_at DESC LIMIT 1",
+        (cid, created_at + 1.0)).fetchone()
+    since = float(user_turn["created_at"]) if user_turn else created_at
+    answered = c.execute(
+        "SELECT 1 FROM messages WHERE conversation_id=? AND role='assistant' "
+        "AND created_at > ? LIMIT 1", (cid, since)).fetchone()
+    c.close()
+    return answered is not None
+
+
+def _finish_task(tid, status, error=None):
     try:
         c = db._conn()
         c.execute("UPDATE chat_tasks SET status=?, error=?, finished_at=? WHERE id=?",
@@ -602,6 +695,45 @@ def _bg_run(ctx, user, tid):
         c.close()
     except Exception:
         pass
+
+
+@jobs.handler("chat_turn")
+def _chat_turn_job(payload, job):
+    """Runs on a worker: rebuild the context from ids, run the turn, record
+    the task outcome. Re-entrant — a retry (or a reclaim after a crashed
+    worker) that finds the answer already written just marks the task done.
+    An exception always propagates so the queue records it: with attempts
+    left the job is retried and the task stays 'running'; on the last attempt
+    the task is marked failed first (exactly as the old thread pool did) and
+    the job fails alongside it, so both rows carry the error."""
+    tid, cid = payload["tid"], payload["cid"]
+    user = db.get_user(payload["user_id"])
+    if user is None:
+        _finish_task(tid, "failed", "user no longer exists")
+        return {"status": "failed", "task_id": tid}
+    if _already_answered(cid, tid):
+        _finish_task(tid, "done")
+        return {"status": "done", "task_id": tid, "reentered": True}
+    last_attempt = int(job.get("attempts") or 1) >= int(job.get("max_attempts") or 1)
+    progress.bind(tid)   # this thread's emits feed the task's live activity
+    try:
+        body = Ask(**payload["body"])
+        ctx = _build_ctx(body, user, cid)
+        turn = _task_turn(tid)
+        # Stamp the answer with the user message this task answers, so the
+        # guard above recognises it on a retry (and never another turn's).
+        ctx["reply_to"] = turn[1] if turn else None
+        _run_turn(ctx, user)
+    except Exception as e:
+        if last_attempt:
+            _finish_task(tid, "failed", str(e)[:500])
+        else:
+            progress.emit(f"attempt failed ({type(e).__name__}); retrying")
+        raise
+    finally:
+        progress.bind(None)
+    _finish_task(tid, "done")
+    return {"status": "done", "task_id": tid}
 
 
 @router.get("/tasks/{tid}")
@@ -666,29 +798,23 @@ class Rerun(BaseModel):
 
 @router.post("/chat/rerun")
 def rerun(body: Rerun, user=Depends(current_user)):
-    """Re-execute a message's SQL live — always fetches the newest records."""
-    connector = _connector_or_400(body.source)
+    """Re-execute a message's SQL live — always fetches the newest records.
+
+    The gateway owns the whole pipeline (RBAC → guard → limit → run →
+    governance) and writes the "rerun" audit row itself, on success and on
+    failure, so nothing is logged here. Only the HTTP mapping is ours: a
+    rejection is the caller's fault (403), an unconfigured source keeps its
+    own status, anything else is the warehouse's (502).
+    """
     try:
-        all_tables = connector.list_tables()
-    except Exception as e:
-        raise HTTPException(502, f"Source error: {e}")
-    allowed = rbac.allowed_tables(user["role"], body.source, all_tables)
-    t0 = time.time()
-    try:
-        cleaned = queryguard.validate(body.sql, allowed)
-        cleaned = queryguard.enforce_limit(cleaned, agent.MAX_ROWS)
-        columns, rows = connector.run_query(cleaned)
-        from . import governance
-        columns, rows = governance.filter_result(body.source, cleaned, columns, rows)
+        result = gateway.execute(user, body.source, body.sql, "rerun")
     except queryguard.QueryRejected as e:
-        db.log_activity(user, "rerun", source=body.source, sql=body.sql, ok=False, error=str(e))
         raise HTTPException(403, str(e))
+    except HTTPException:
+        raise
     except Exception as e:
-        db.log_activity(user, "rerun", source=body.source, sql=body.sql, ok=False, error=str(e)[:300])
         raise HTTPException(502, f"Query failed: {e}")
-    db.log_activity(user, "rerun", source=body.source, sql=cleaned,
-                    row_count=len(rows), duration_ms=int((time.time() - t0) * 1000))
-    return {"columns": columns, "rows": rows}
+    return {"columns": result.columns, "rows": result.rows}
 
 
 class CanvasEdit(BaseModel):
@@ -720,12 +846,17 @@ def canvas_edit(body: CanvasEdit, user=Depends(current_user)):
     # can also issue fresh RBAC-guarded SQL, so views the current result
     # aggregated away (a finer time grain, another window) are reachable.
     result = None
-    if agent.llm_available():
+    # WITH the user: composition is a full LLM call, and a BYOK user (their own
+    # key in keys.py, no server key) is exactly as able to make it as the
+    # server is. Asking about the server key alone sent them to the
+    # single-chart editor forever. Every other LLM entry point on this path
+    # (run_agent, available_models) already passes the user.
+    if agent.llm_available(user=user):
         connector, allowed, schemas = _canvas_source(body, user)
         try:
             result = agent.compose_canvas(
                 instruction, body.columns, body.rows[:agent.MAX_ROWS], body.chart,
-                connector=connector, allowed_tables=allowed, schemas=schemas)
+                connector=connector, allowed_tables=allowed, schemas=schemas, user=user)
             first = result["panels"][0]
             result = {**result, "columns": first["columns"], "rows": first["rows"],
                       "chart": first["chart"]}
@@ -735,7 +866,7 @@ def canvas_edit(body: CanvasEdit, user=Depends(current_user)):
 
     if result is None:
         result = agent.edit_canvas(
-            instruction, body.columns, body.rows[:agent.MAX_ROWS], body.chart)
+            instruction, body.columns, body.rows[:agent.MAX_ROWS], body.chart, user=user)
         result.setdefault("panels", [{"sql": body.sql, "columns": result["columns"],
                                       "rows": result["rows"], "chart": result["chart"]}])
     db.log_activity(user, "canvas_edit", prompt=instruction,
@@ -952,7 +1083,7 @@ def _canvas_source(body, user):
     if not body.source or body.source == "*":
         return None, [], {}
     try:
-        connector = _connector_or_400(body.source)
+        connector = connector_or_400(body.source)
         all_tables = connector.list_tables()
     except Exception:
         return None, [], {}
@@ -968,11 +1099,15 @@ def _canvas_source(body, user):
     return connector, allowed, schemas
 
 
-def _conversation(cid, user, prompt):
-    """Resolve/create the conversation and return (cid, recent history)."""
+def _conversation(cid, user, prompt, recorded=False):
+    """Resolve/create the conversation and return (cid, recent history).
+    recorded=True means this turn's user message is already the newest row
+    (a background job rebuilding its context) and must not count as history."""
     if cid:
         access = _own_or_404(cid, user, need="edit")
         msgs = _visible_messages(cid, user, access)
+        if recorded and msgs and msgs[-1]["role"] == "user":
+            msgs = msgs[:-1]
         # A clarification ("which source?") and the question that triggered it
         # are not conversation for the model: the re-ask repeats the question,
         # so replaying the pair would show the model its own unanswered question
@@ -998,10 +1133,18 @@ def _conversation(cid, user, prompt):
 def _checkpoint(user, cid, result, model, source, table_scope):
     """Serialize the conversation as a resumable agent session after each turn,
     folding in this turn's token/cache usage. Best-effort — a snapshot failure
-    must never fail the chat response."""
+    must never fail the chat response.
+
+    The transcript is the ACTING user's visible view (_visible_messages), not
+    the raw rows: the session lands in that user's own agent_sessions row and
+    is readable back through /sessions, /resume and /fork, so an edit-recipient
+    of a shared chat would otherwise carry every redacted message's text out
+    in their own session. What their role may not see is snapshotted as the
+    redaction placeholder, exactly as the chat shows it to them."""
     try:
+        access = db.conversation_access(cid, user["id"]) or "view"
         transcript = [{"role": m["role"], "text": (m.get("content") or {}).get("text", "")}
-                      for m in db.list_messages(cid)]
+                      for m in _visible_messages(cid, user, access)]
         title = (db.get_conversation_title(cid) if hasattr(db, "get_conversation_title")
                  else None) or (transcript[0]["text"][:80] if transcript else "Session")
         sessions.snapshot(
@@ -1039,18 +1182,62 @@ _ROLE_RANK = {"admin": 3, "analyst": 2, "viewer": 1}
 
 
 def _unrestricted(role, source):
-    """True when the role may read EVERY table in a source ("*" policy)."""
-    return rbac.POLICIES.get(role, {}).get(source) == "*"
+    """True when the role may read EVERY table in a source ("*" policy).
+
+    Resolved through rbac's governance-aware lookup, never rbac.POLICIES
+    directly: a governance YAML that tightens a role (analyst.demo: [sales])
+    must also tighten what that role can be shown from a stored chat.
+    """
+    return rbac._role_policy(role, source) == "*"
 
 
-def _msg_allowed(role, content):
+def _sql_tables_allowed(role, source, content):
+    """Every base table a stored message's SQL (and each panel's SQL) reads
+    must be one the role may query. The client-supplied table label is what
+    the user picked; the SQL is what was actually read, and the two differ
+    whenever the agent followed a question into a neighbouring table. Panels
+    from an orchestrated turn may name their own source; the message's source
+    is the fallback. SQL with no attributable table (unparseable, or a file
+    path) fails closed to the whole-source rule."""
+    checks = [(source, content.get("sql"))]
+    for p in content.get("panels") or []:
+        if isinstance(p, dict):
+            checks.append((p.get("source") or source, p.get("sql")))
+    for src, sql in checks:
+        if not sql or not src or src == "*":
+            continue
+        tables = queryguard.base_tables(sql)
+        if not tables:
+            if not _unrestricted(role, src):
+                return False
+            continue
+        if not all(rbac.can_access(role, src, t) for t in tables):
+            return False
+    return True
+
+
+def _msg_allowed(role, content, msg_role=None):
     """May this role see a stored message's results? Messages carry result
     ROWS, so this is the RBAC boundary for anyone who is not the owner.
+    `msg_role` is the stored row's role ("user" / "assistant"), when known.
 
     Whole-source and orchestrated answers are only released to a role with
-    unrestricted access, since the author may have reached any table.
+    unrestricted access, since the author may have reached any table. A
+    table-labelled answer must additionally pass on every table its SQL
+    references, because the label alone is not trusted.
     """
     content = content or {}
+    # A message carrying no data — a user's question, a clarification, an
+    # agent error — has nothing the whole-source / table rules protect: they
+    # exist for result ROWS. Without this, every prompt in a shared
+    # orchestrated chat was a "Hidden" placeholder for a restricted reader and
+    # an edit-recipient's follow-up ran with the questions stripped from its
+    # history. A message that names SQL or carries rows/panels (a purged
+    # message keeps its SQL) still takes the full gate below: its text may
+    # summarise rows the role cannot query.
+    if msg_role == "user" or content.get("mode") == "clarify":
+        if not (content.get("rows") or content.get("panels") or content.get("sql")):
+            return True
     # The source/table labels on a stored message are client-supplied (canvas
     # edits post their own), so they cannot be trusted on their own. The
     # author's role is stamped server-side: never release a message to a role
@@ -1065,11 +1252,52 @@ def _msg_allowed(role, content):
     label = str(content.get("table") or "*")
     if source == "*":
         sources = rbac.allowed_sources(role)
-        return bool(sources) and all(_unrestricted(role, s) for s in sources)
+        return (bool(sources) and all(_unrestricted(role, s) for s in sources)
+                and _sql_tables_allowed(role, source, content))
     if label in ("*", "all tables", "all sources"):
         return _unrestricted(role, source)
     tables = [t.strip() for t in label.split(",") if t.strip()] or ["*"]
-    return all(rbac.can_access(role, source, t) for t in tables)
+    return (all(rbac.can_access(role, source, t) for t in tables)
+            and _sql_tables_allowed(role, source, content))
+
+
+def _governed(content):
+    """Re-apply the compliance rules to a stored message's rows at READ time.
+
+    Rows were filtered when the query ran, but a governance document applied
+    later (a new deny_columns / mask_columns rule) must reach data that is
+    already sitting in chat history — for every reader, the owner included.
+    Returns a NEW content dict; the stored row is never mutated. Orchestrated
+    messages (source "*") have no single source to key rules on, so only their
+    panels are filtered, each by its own source when it names one.
+    """
+    source = content.get("source")
+
+    def _apply(src, sql, columns, rows):
+        if not src or src == "*" or not columns or not rows:
+            return columns, rows
+        try:
+            return governance.filter_result(src, sql or "", columns, rows)
+        except queryguard.QueryRejected:
+            # A denied column reached inside a CTE / derived table: the gate
+            # refuses that shape outright now, and rows stored under an older
+            # (or no) rule are hidden the same way rather than guessed at.
+            return [], []
+
+    out = dict(content)
+    out["columns"], out["rows"] = _apply(
+        source, content.get("sql"), content.get("columns"), content.get("rows"))
+    panels = content.get("panels")
+    if isinstance(panels, list):
+        new_panels = []
+        for p in panels:
+            if isinstance(p, dict):
+                p = dict(p)
+                p["columns"], p["rows"] = _apply(
+                    p.get("source") or source, p.get("sql"), p.get("columns"), p.get("rows"))
+            new_panels.append(p)
+        out["panels"] = new_panels
+    return out
 
 
 _REDACTED = "🔒 Hidden — this message used data your role cannot access."
@@ -1087,19 +1315,91 @@ def _visible_messages(cid, user, access):
     out = []
     for m in db.list_messages(cid):
         content = m.get("content") or {}
-        if not _msg_allowed(user["role"], content):
+        if not _msg_allowed(user["role"], content, m.get("role")):
             m = {**m, "content": {
                 "text": _REDACTED, "redacted": True,
                 "source": content.get("source"), "table": content.get("table"),
                 "columns": [], "rows": [], "panels": [], "chart": None, "sql": None,
             }}
+        elif content.get("rows") or content.get("panels"):
+            # Released, and carrying data: today's compliance rules apply to
+            # rows stored under yesterday's.
+            m = {**m, "content": _governed(content)}
         out.append(m)
     return out
 
 
+# ── Retention: stored result rows expire, the conversation does not ──────
+
+_PURGED_MARK = '"rows_purged": true'   # json.dumps spelling of the flag we set
+
+
+def _retention_days():
+    try:
+        return int(os.getenv("STUDIO_MESSAGE_ROWS_RETENTION_DAYS", "0") or 0)
+    except ValueError:
+        return 0
+
+
+def purge_message_rows(max_age_days=None, batch=500):
+    """Strip result rows from assistant messages older than `max_age_days`
+    (default: STUDIO_MESSAGE_ROWS_RETENTION_DAYS; 0 keeps rows forever).
+
+    Text, SQL, chart and columns stay, so the history still renders; the
+    message gains rows_purged=True and the UI shows a "rows expired" marker.
+    The SQL is the durable artefact — a reader with access can rerun it for
+    fresh rows. Keyset-paginated over the id so a large table is never read
+    at once, dialect-neutral SQL (SQLite and the Postgres facade), and it
+    never raises: a retention hiccup must not stop the app from booting.
+    Returns the number of messages purged.
+    """
+    days = _retention_days() if max_age_days is None else int(max_age_days)
+    if days <= 0:
+        return 0
+    cutoff = time.time() - days * 86400
+    purged, last_id = 0, ""
+    try:
+        c = db._conn()
+        while True:
+            rows = c.execute(
+                "SELECT id, content FROM messages WHERE role='assistant' AND created_at < ? "
+                "AND id > ? AND content NOT LIKE ? ORDER BY id LIMIT ?",
+                (cutoff, last_id, "%" + _PURGED_MARK + "%", batch)).fetchall()
+            if not rows:
+                break
+            for r in rows:
+                last_id = r["id"]
+                try:
+                    content = json.loads(r["content"])
+                except Exception:
+                    continue
+                if not isinstance(content, dict):
+                    continue
+                panels = content.get("panels")
+                has_rows = bool(content.get("rows")) or any(
+                    isinstance(p, dict) and p.get("rows") for p in (panels or []))
+                if not has_rows:
+                    continue
+                content["rows"] = []
+                if isinstance(panels, list):
+                    content["panels"] = [
+                        {**p, "rows": []} if isinstance(p, dict) else p for p in panels]
+                content["rows_purged"] = True
+                c.execute("UPDATE messages SET content=? WHERE id=?",
+                          (json.dumps(content), r["id"]))
+                purged += 1
+            c.commit()
+            if len(rows) < batch:
+                break
+        c.close()
+    except Exception:
+        pass
+    return purged
+
+
 def _hidden_count(cid, role):
     return sum(1 for m in db.list_messages(cid)
-               if not _msg_allowed(role, m.get("content") or {}))
+               if not _msg_allowed(role, m.get("content") or {}, m.get("role")))
 
 
 def _own_or_404(cid, user, need="view"):

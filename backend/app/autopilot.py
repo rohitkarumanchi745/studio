@@ -26,12 +26,12 @@ Security invariants (non-negotiable):
   deterministic fallback / semantic layer; the ticker never crashes startup.
 
 Scale note: the claim is a race-safe conditional UPDATE (SQLite serializes
-writes; Postgres row-locks), so v1 runs single-instance but lifts onto a
-durable task queue (Celery / Cloud Tasks) at scale without a data-model change.
+writes; Postgres row-locks). The ticking itself is owned by the job worker
+(jobs.Worker.run_schedulers): one lease-guarded tick_once() per interval, so
+N web replicas or workers never run N tickers.
 """
 import json
 import os
-import threading
 import time
 import uuid
 
@@ -42,7 +42,7 @@ from typing import List, Optional
 from . import (agent, db, email_service, freshness, lightning, queries, rbac,
                roster, semantic, skills)
 from .auth import current_user
-from .catalog import _connector_or_400
+from .sources import connector_or_400
 
 router = APIRouter(prefix="/autopilot", tags=["autopilot"])
 
@@ -137,7 +137,7 @@ def _build_scope(owner, source, tables):
     still shrinks it). Identical filtering to chat._prepare."""
     if not rbac.can_access(owner["role"], source, "*"):
         raise PermissionError("owner has no access to this source")
-    connector = _connector_or_400(source)           # raises HTTPException(400) if unknown
+    connector = connector_or_400(source)           # raises HTTPException(400) if unknown
     allowed = rbac.allowed_tables(owner["role"], source, connector.list_tables())
     if not allowed:
         raise PermissionError("owner has no access to this source")
@@ -792,9 +792,11 @@ def _claim_due(now):
     return [_agent_row(r) for r in rows]
 
 
-def _tick():
+def tick_once():
     """One scheduler pass: claim due agents, run each, reschedule. Each agent's
-    run is isolated in try/except so one failure never kills the ticker."""
+    run is isolated in try/except so one failure never kills the ticker.
+    Called by the job worker while it holds the "autopilot" lease (jobs.py);
+    tests call it directly — it needs no lease itself."""
     now = time.time()
     for agent_def in _claim_due(now):
         try:
@@ -816,32 +818,23 @@ def _tick():
                 pass
 
 
-_ticker_thread = None
-_ticker_stop = threading.Event()
+_tick = tick_once   # older tests/callers drive ticks by this name
 
 
-def _ticker_loop():
-    while not _ticker_stop.wait(_TICK_SECONDS):
-        try:
-            _tick()
-        except Exception:
-            pass  # the ticker must never die
+def ticker_enabled():
+    """STUDIO_AUTOPILOT_TICKER kill-switch (default on). Read on every tick so
+    a disabled ticker means the worker's scheduler skips the autopilot lease."""
+    return os.getenv("STUDIO_AUTOPILOT_TICKER", "1").lower() not in ("0", "false", "no")
 
 
 def start_ticker():
-    """Start the background ticker as a daemon thread (mirrors chat's background
-    executor pattern — never blocks startup). Guarded by STUDIO_AUTOPILOT_TICKER
-    so tests / read-only deploys can disable it."""
-    global _ticker_thread
-    if os.getenv("STUDIO_AUTOPILOT_TICKER", "1").lower() in ("0", "false", "no"):
-        return
-    if _ticker_thread and _ticker_thread.is_alive():
-        return
-    _ticker_stop.clear()
-    _ticker_thread = threading.Thread(target=_ticker_loop, daemon=True,
-                                      name="autopilot-ticker")
-    _ticker_thread.start()
+    """Compatibility shim. The daemon ticker thread is gone: the job worker
+    (jobs.Worker, started by main.py per STUDIO_WORKER_MODE, or
+    `python -m app.worker`) runs tick_once() under the "autopilot" lease on
+    the old cadence. Nothing to start here; the env guard keeps its meaning
+    through ticker_enabled()."""
+    return None
 
 
 def stop_ticker():
-    _ticker_stop.set()
+    return None

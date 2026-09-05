@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, getToken, getUser, setSession } from "./api";
+import { Navigate, Route, Routes, useLocation, useMatch, useNavigate, useParams } from "react-router-dom";
+import { api, exchangeSsoCode, getToken, getUser, setSession } from "./api";
 import Activity from "./components/Activity";
 import Agents from "./components/Agents";
 import Autopilot from "./components/Autopilot";
@@ -20,71 +21,111 @@ import Skills from "./components/Skills";
 import ToolBuilder from "./components/ToolBuilder";
 import Sidebar from "./components/Sidebar";
 
-// Complete an Entra SSO redirect: /?sso_token=…&sso_user=… → store session.
+// Complete an Entra SSO redirect: /?sso_code=… → POST it for the session.
+// The redirect never carries the token itself (a URL lands in history, Referer
+// headers and every proxy log on the path); the backend parks it under this
+// single-use 60s code and /auth/sso/exchange hands it over exactly once.
+//
+// Runs at module load, before the router mounts, so the router only ever sees
+// the scrubbed URL. The exchange resolves after React has already read
+// localStorage, so a successful handoff reloads onto the stored session
+// instead of leaving the login screen up in front of it.
 (function acceptSso() {
   const q = new URLSearchParams(window.location.search);
-  const token = q.get("sso_token");
-  const userB64 = q.get("sso_user");
-  if (token && userB64) {
-    try {
-      const user = JSON.parse(atob(userB64.replace(/-/g, "+").replace(/_/g, "/")));
-      setSession(token, user);
-    } catch {}
-    window.history.replaceState({}, "", window.location.pathname);
-  }
+  const code = q.get("sso_code");
+  if (!code) return;
+  // Scrub first: the code is spent by the POST below, so a refresh (or the
+  // router reading the URL) must never see it again.
+  window.history.replaceState({}, "", window.location.pathname);
+  exchangeSsoCode(code)
+    .then(({ access_token, user }) => {
+      setSession(access_token, user);
+      window.location.reload();
+    })
+    .catch(() => {});   // spent/expired code → the plain login screen
 })();
 
+// Every surface is a route: the URL is the only "which view is open" state,
+// so the sidebar just navigates and deep links / back-button work for free.
+// Activity is the one exception — it is a modal over whatever is open, not a
+// page, so it stays a boolean.
+
+// "/" and "/c/:conversationId" both render this. React Router wraps a route's
+// element in an unkeyed RenderedRoute, so moving between the two keeps the
+// same Chat instance mounted — which matters because onConversationCreated
+// fires mid-stream on the first answer; a remount would drop it.
+function ChatPage({ modelsEpoch, onConversationCreated }) {
+  const { conversationId = null } = useParams();
+  const navigate = useNavigate();
+  return (
+    <Chat
+      conversationId={conversationId}
+      onConversationCreated={onConversationCreated}
+      onOpenDashboard={(id) => navigate(id ? `/dashboards/${id}` : "/dashboards")}
+      modelsEpoch={modelsEpoch}
+    />
+  );
+}
+
+function DashboardPage({ user }) {
+  const { dashboardId } = useParams();
+  const navigate = useNavigate();
+  return <Dashboard dashboardId={dashboardId} user={user} onClose={() => navigate("/dashboards")} />;
+}
+
 export default function App() {
+  const navigate = useNavigate();
+  const location = useLocation();
   const [user, setUser] = useState(getToken() ? getUser() : null);
   const [conversations, setConversations] = useState([]);
   const [convsLoaded, setConvsLoaded] = useState(false);
-  const [activeId, setActiveIdRaw] = useState(null);
+  // The active conversation IS the URL; nothing else may hold it.
+  const activeId = useMatch("/c/:conversationId")?.params.conversationId ?? null;
+  const onChatRoot = location.pathname === "/";
+  const convKey = "studio_conv:" + (user?.id || "");
 
   // The open conversation survives a browser refresh: persist it per user and
   // restore on load — otherwise a refresh lands on an empty "New chat" and the
-  // (server-saved) history looks lost.
-  const setActiveId = useCallback((id) => {
-    setActiveIdRaw(id);
-    const key = "studio_conv:" + (getUser()?.id || "");
-    if (id) localStorage.setItem(key, id);
-    else localStorage.removeItem(key);
-  }, []);
-  const restoredRef = useRef(null);
+  // (server-saved) history looks lost. Only a landing on "/" is redirected,
+  // exactly once; a deep link to /jobs or /c/<other> is left alone.
+  // Phases: "init" → ("validating" saved id | "done") → "done".
+  const restore = useRef({ phase: "init", id: null });
   useEffect(() => {
-    if (!user) return;
-    const saved = localStorage.getItem("studio_conv:" + (user.id || ""));
-    if (saved) {
-      restoredRef.current = saved;   // only THIS id may be dropped as stale
-      setActiveIdRaw(saved);
+    if (!user || restore.current.phase !== "init") return;
+    const saved = localStorage.getItem(convKey);
+    if (saved && onChatRoot) {
+      restore.current = { phase: "validating", id: saved };
+      navigate(`/c/${saved}`, { replace: true });
+    } else {
+      restore.current = { phase: "done", id: null };
     }
-  }, [user]);
+  }, [user]);   // deliberately not re-run on route changes: one-shot
   // Validate ONLY the id restored from localStorage, and only once the list has
   // loaded — it may point at a deleted conversation or another account's.
   // This must never run against a freshly created conversation: `conversations`
   // lags the create by one refresh, so a general "is activeId in the list?"
   // check deselects the chat the moment you ask your first question in it.
   useEffect(() => {
-    if (!convsLoaded || !restoredRef.current) return;
-    const stale = !conversations.some((c) => c.id === restoredRef.current);
-    if (stale && activeId === restoredRef.current) setActiveId(null);
-    restoredRef.current = null;      // one-shot
-  }, [convsLoaded, conversations, activeId, setActiveId]);
+    if (!convsLoaded || restore.current.phase !== "validating") return;
+    const { id } = restore.current;
+    restore.current = { phase: "done", id: null };   // one-shot
+    if (!conversations.some((c) => c.id === id)) {
+      localStorage.removeItem(convKey);
+      if (activeId === id) navigate("/", { replace: true });
+    }
+  }, [convsLoaded, conversations, activeId, convKey, navigate]);
+  // Persist: an open chat is remembered; "New chat" (landing on "/") forgets
+  // it; visiting another surface leaves the memory untouched. Skipped until the
+  // restore has settled so the initial "/" render can't wipe the saved id
+  // before the redirect to it lands.
+  useEffect(() => {
+    if (!user || restore.current.phase !== "done") return;
+    if (activeId) localStorage.setItem(convKey, activeId);
+    else if (onChatRoot) localStorage.removeItem(convKey);
+  }, [user, activeId, onChatRoot, convKey]);
+
   const [showActivity, setShowActivity] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [dashboardId, setDashboardId] = useState(null);
-  const [showQueries, setShowQueries] = useState(false);
-  const [showPipelines, setShowPipelines] = useState(false);
-  const [showGovernance, setShowGovernance] = useState(false);
-  const [showSemantic, setShowSemantic] = useState(false);
-  const [showJobs, setShowJobs] = useState(false);
-  const [showPy, setShowPy] = useState(false);
-  const [showSessions, setShowSessions] = useState(false);
-  const [showAgents, setShowAgents] = useState(false);
-  const [showFlow, setShowFlow] = useState(false);
-  const [showSkills, setShowSkills] = useState(false);
-  const [showAutopilot, setShowAutopilot] = useState(false);
-  const [showToolBuilder, setShowToolBuilder] = useState(false);
-  const [showKag, setShowKag] = useState(false);
   // Bumped when a user connects/removes a key so the model menu refetches.
   const [modelsEpoch, setModelsEpoch] = useState(0);
 
@@ -116,42 +157,51 @@ export default function App() {
 
   if (!user) return <Login onLogin={setUser} />;
 
+  const go = (path) => () => navigate(path);
+  const home = go("/");
+  const chat = (
+    <ChatPage
+      modelsEpoch={modelsEpoch}
+      onConversationCreated={(id) => { navigate(`/c/${id}`); refresh(); }}
+    />
+  );
+
   return (
     <div className="layout">
       {!sidebarOpen && (
         <div className="rail">
           <button className="rail-btn" onClick={() => setSidebarOpen(true)} title="Open sidebar">☰</button>
-          <button className="rail-btn" onClick={() => setActiveId(null)} title="New chat">+</button>
+          <button className="rail-btn" onClick={home} title="New chat">+</button>
         </div>
       )}
       {sidebarOpen && (
       <Sidebar
         conversations={conversations}
         activeId={activeId}
-        onSelect={setActiveId}
-        onNew={() => setActiveId(null)}
+        onSelect={(id) => navigate(`/c/${id}`)}
+        onNew={home}
         onRefresh={refresh}
         onCollapse={() => setSidebarOpen(false)}
         onDelete={async (id) => {
           await api(`/conversations/${id}`, { method: "DELETE" });
-          if (id === activeId) setActiveId(null);
+          if (id === activeId) navigate("/");
           refresh();
         }}
         onActivity={() => setShowActivity(true)}
-        onDashboards={() => setDashboardId("*")}
-        onQueries={() => setShowQueries(true)}
-        onPipelines={() => setShowPipelines(true)}
-        onGovernance={() => setShowGovernance(true)}
-        onSemantic={() => setShowSemantic(true)}
-        onJobs={() => setShowJobs(true)}
-        onPyBuild={() => setShowPy(true)}
-        onSessions={() => setShowSessions(true)}
-        onAgents={() => setShowAgents(true)}
-        onFlow={() => setShowFlow(true)}
-        onSkills={() => setShowSkills(true)}
-        onAutopilot={() => setShowAutopilot(true)}
-        onToolBuilder={() => setShowToolBuilder(true)}
-        onKag={() => setShowKag(true)}
+        onDashboards={go("/dashboards")}
+        onQueries={go("/queries")}
+        onPipelines={go("/pipelines")}
+        onGovernance={go("/governance")}
+        onSemantic={go("/semantic")}
+        onJobs={go("/jobs")}
+        onPyBuild={go("/py")}
+        onSessions={go("/sessions")}
+        onAgents={go("/agents")}
+        onFlow={go("/flow")}
+        onSkills={go("/skills")}
+        onAutopilot={go("/autopilot")}
+        onToolBuilder={go("/toolbuilder")}
+        onKag={go("/kag")}
         onKeysChanged={() => setModelsEpoch((n) => n + 1)}
         onRename={async (id, title) => {
           await api(`/conversations/${id}`, {
@@ -163,66 +213,41 @@ export default function App() {
       />
       )}
       {showActivity && <Activity onClose={() => setShowActivity(false)} />}
-      {showSkills ? (
-        <Skills onClose={() => setShowSkills(false)} />
-      ) : showAutopilot ? (
-        <Autopilot
-          user={user}
-          onClose={() => setShowAutopilot(false)}
-          onOpenJobs={() => { setShowAutopilot(false); setShowJobs(true); }}
+      <Routes>
+        <Route path="/skills" element={<Skills onClose={home} />} />
+        <Route path="/autopilot" element={<Autopilot user={user} onClose={home} onOpenJobs={go("/jobs")} />} />
+        <Route path="/kag" element={<Kag user={user} onClose={home} />} />
+        <Route path="/toolbuilder" element={<ToolBuilder onClose={home} onOpenJobs={go("/jobs")} />} />
+        <Route path="/flow" element={<Flow onClose={home} onOpenJobs={go("/jobs")} />} />
+        <Route path="/agents" element={<Agents onClose={home} />} />
+        <Route
+          path="/sessions"
+          element={
+            <Sessions
+              onClose={home}
+              onResume={(state) => {
+                // Resuming drops back into the exact conversation; its next turn
+                // replays the same stable prefix, reusing the provider cache.
+                navigate(state?.conversation_id ? `/c/${state.conversation_id}` : "/");
+              }}
+            />
+          }
         />
-      ) : showKag ? (
-        <Kag user={user} onClose={() => setShowKag(false)} />
-      ) : showToolBuilder ? (
-        <ToolBuilder
-          onClose={() => setShowToolBuilder(false)}
-          onOpenJobs={() => { setShowToolBuilder(false); setShowJobs(true); }}
+        <Route path="/py" element={<PyBuild onClose={home} />} />
+        <Route path="/jobs" element={<Jobs onClose={home} />} />
+        <Route path="/governance" element={<Governance onClose={home} />} />
+        <Route path="/semantic" element={<Semantic user={user} onClose={home} />} />
+        <Route path="/pipelines" element={<Pipelines onClose={home} />} />
+        <Route path="/queries" element={<QueryLibrary onClose={home} />} />
+        <Route
+          path="/dashboards"
+          element={<DashboardList onOpen={(id) => navigate(`/dashboards/${id}`)} onClose={home} />}
         />
-      ) : showFlow ? (
-        <Flow onClose={() => setShowFlow(false)} onOpenJobs={() => { setShowFlow(false); setShowJobs(true); }} />
-      ) : showAgents ? (
-        <Agents onClose={() => setShowAgents(false)} />
-      ) : showSessions ? (
-        <Sessions
-          onClose={() => setShowSessions(false)}
-          onResume={(state) => {
-            // Resuming drops back into the exact conversation; its next turn
-            // replays the same stable prefix, reusing the provider cache.
-            setShowSessions(false);
-            if (state?.conversation_id) setActiveId(state.conversation_id);
-          }}
-        />
-      ) : showPy ? (
-        <PyBuild onClose={() => setShowPy(false)} />
-      ) : showJobs ? (
-        <Jobs onClose={() => setShowJobs(false)} />
-      ) : showGovernance ? (
-        <Governance onClose={() => setShowGovernance(false)} />
-      ) : showSemantic ? (
-        <Semantic user={user} onClose={() => setShowSemantic(false)} />
-      ) : showPipelines ? (
-        <Pipelines onClose={() => setShowPipelines(false)} />
-      ) : showQueries ? (
-        <QueryLibrary onClose={() => setShowQueries(false)} />
-      ) : dashboardId === "*" ? (
-        <DashboardList onOpen={setDashboardId} onClose={() => setDashboardId(null)} />
-      ) : dashboardId ? (
-        <Dashboard
-          dashboardId={dashboardId}
-          user={user}
-          onClose={() => setDashboardId("*")}
-        />
-      ) : (
-        <Chat
-          conversationId={activeId}
-          onConversationCreated={(id) => {
-            setActiveId(id);
-            refresh();
-          }}
-          onOpenDashboard={(id) => setDashboardId(id || "*")}
-          modelsEpoch={modelsEpoch}
-        />
-      )}
+        <Route path="/dashboards/:dashboardId" element={<DashboardPage user={user} />} />
+        <Route path="/c/:conversationId" element={chat} />
+        <Route path="/" element={chat} />
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
     </div>
   );
 }

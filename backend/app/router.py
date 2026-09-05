@@ -42,11 +42,10 @@ def _has_access(user, source, sql):
     'same access'. The pattern is centralized (some other user may have
     established it), so only a requester who can actually access its data is
     routed to BitNet. Execution is guarded regardless; this gates the routing."""
-    from . import queryguard, rbac
-    from .catalog import _connector_or_400
+    from . import gateway, queryguard
     try:
-        conn = _connector_or_400(source)
-        allowed = {t.lower() for t in rbac.allowed_tables(user["role"], source, conn.list_tables())}
+        _conn, allowed_tables = gateway.scope(user, source)
+        allowed = {t.lower() for t in allowed_tables}
     except Exception:
         return False
     refs = {r.strip('"').split(".")[-1].lower() for r in queryguard.TABLE_REF.findall(sql or "")}

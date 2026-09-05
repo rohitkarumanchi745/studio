@@ -21,7 +21,8 @@ langchain-mcp-adapters>=0.1
 cryptography>=42.0
 
 # State store: Postgres when DATABASE_URL is set, else SQLite (stdlib).
-psycopg[binary]>=3.1
+# The pool extra backs db._conn()'s connection pool (STUDIO_PG_POOL_SIZE).
+psycopg[binary,pool]>=3.1
 # Tile-result cache when REDIS_URL is set; the app runs without it.
 redis>=5.0
 # agentlightning  # optional — Agent Lightning (trace/RL/APO) integration; loop works without it

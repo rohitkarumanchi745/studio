@@ -18,9 +18,9 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from . import agent, db, queryguard, rbac
+from . import db, gateway
 from .auth import current_user
-from .catalog import _connector_or_400
+from .queryguard import QueryRejected
 
 router = APIRouter(prefix="/queries", tags=["queries"])
 
@@ -60,57 +60,50 @@ def init_tables():
 # ── Verification: the gate everything passes through ────────────────────
 
 def verify_sql(user, source, table_label, sql, full_rows=False):
-    """RBAC + query guard + real execution. Returns
-    {ok, columns, rows, row_count, sql, error}. Never raises for a rejected
-    query — a failed verification is a normal result the caller surfaces.
+    """RBAC + query guard + real execution + governance, via gateway.execute.
+    Returns {ok, columns, rows, row_count, sql, took_ms} or {ok: False, error,
+    sql?}. Never raises for a rejected query — a failed verification is a
+    normal result the caller surfaces (and blend/autopilot/flow/pipelines/
+    semantic all rely on that: they branch on `ok`, never on exceptions).
+
+    This is a thin wrapper, not a second pipeline: the gateway owns the order
+    RBAC → guard → LIMIT → execute → governance → audit, and every verify shows
+    up in audit_log under the "verify" action. All this function adds is the
+    dict contract and the error-string mapping the UI and the reward function
+    (_verify_reward keys on "guard"/"rejected") depend on.
 
     `rows` is a PREVIEW (PREVIEW_ROWS) because every caller so far only shows
     the user a sample; `row_count` is always the true count. full_rows=True
-    returns every row (still capped at agent.MAX_ROWS) for callers that need the
-    data itself — blend.py materializes parts into DuckDB. It stays a flag on
-    this one function rather than a second fetch path, so there is exactly one
-    gate: re-implementing RBAC + guard + governance elsewhere is how they drift.
+    returns every row (still capped at limits.MAX_ROWS by the gateway) for
+    callers that need the data itself — blend.py materializes parts into
+    DuckDB. It stays a flag on this one function rather than a second fetch
+    path, so there is exactly one gate.
     """
     sql = (sql or "").strip()
     if not sql:
         return {"ok": False, "error": "SQL is empty."}
     if not source:
         return {"ok": False, "error": "No source selected."}
-    if not rbac.can_access(user["role"], source, table_label or "*"):
-        return {"ok": False, "error": f"Your role has no access to {source}."}
     try:
-        connector = _connector_or_400(source)
-        allowed = rbac.allowed_tables(user["role"], source, connector.list_tables())
-    except HTTPException as e:
-        return {"ok": False, "error": e.detail}
-    except Exception as e:
-        return {"ok": False, "error": f"Source error: {e}"}
-    if not allowed:
-        return {"ok": False, "error": "Your role has no access to this source."}
-
-    try:
-        cleaned = queryguard.validate(sql, allowed)
-        cleaned = queryguard.enforce_limit(cleaned, agent.MAX_ROWS)
-    except queryguard.QueryRejected as e:
+        result = gateway.execute(user, source, sql, "verify", table_label=table_label or "*")
+    except QueryRejected as e:
+        # RBAC denials and guard rejections both arrive as QueryRejected; the
+        # prefix is what the UI shows and what _verify_reward scores as 0.2.
         return {"ok": False, "error": f"Rejected by the query guard: {e}"}
-
-    t0 = time.time()
-    try:
-        columns, rows = connector.run_query(cleaned)
+    except HTTPException as e:
+        return {"ok": False, "error": e.detail}       # unknown / unconfigured source
     except Exception as e:
-        return {"ok": False, "error": f"Query failed: {str(e)[:300]}", "sql": cleaned}
-    rows = rows[:agent.MAX_ROWS]
-    # Compliance: strip denied columns, mask masked ones, cap rows — before
-    # anything leaves the backend, so even SELECT * can't leak a denied column.
-    from . import governance
-    columns, rows = governance.filter_result(source, cleaned, columns, rows)
+        # Connector, timeout or list_tables failure: the message is truncated
+        # like the audit row so a driver stack trace never reaches the UI.
+        return {"ok": False, "error": f"Query failed: {str(e)[:300]}"}
+    rows = result.rows
     return {
         "ok": True,
-        "sql": cleaned,
-        "columns": columns,
+        "sql": result.sql,
+        "columns": result.columns,
         "rows": rows if full_rows else rows[:PREVIEW_ROWS],
-        "row_count": len(rows),
-        "took_ms": int((time.time() - t0) * 1000),
+        "row_count": result.row_count,
+        "took_ms": result.took_ms,
     }
 
 

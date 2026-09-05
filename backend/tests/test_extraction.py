@@ -297,7 +297,7 @@ def test_start_ticker_spawns_no_thread_when_dormant(env, monkeypatch):
 
 def test_status_route_dormant_returns_configured_false(client):
     _login(client)
-    for prefix in ("", "/api"):
+    for prefix in ("/api",):
         r = client.get(prefix + "/m365/status")
         assert r.status_code == 200
         assert r.json() == {"configured": False}
@@ -305,7 +305,7 @@ def test_status_route_dormant_returns_configured_false(client):
 
 def test_sync_route_dormant_returns_configured_false_not_500(client):
     _login(client)
-    r = client.post("/m365/sync")
+    r = client.post("/api/m365/sync")
     assert r.status_code == 200 and r.json() == {"configured": False}
 
 
@@ -762,7 +762,7 @@ def test_process_notification_valid_and_invalid_client_state(env, monkeypatch):
 
 
 def test_webhook_route_echoes_validation_token(client):
-    for prefix in ("", "/api"):
+    for prefix in ("/api",):
         r = client.post(prefix + "/m365/webhook?validationToken=hs-123")
         assert r.status_code == 200 and r.text == "hs-123"
         assert r.headers["content-type"].startswith("text/plain")
@@ -799,7 +799,7 @@ def test_connect_delegated_returns_authorize_url(client, monkeypatch):
     _configure_azure(monkeypatch)
     monkeypatch.setenv("STUDIO_GRAPH_AUTH_MODE", "delegated")
     _login(client)
-    r = client.post("/m365/connect")
+    r = client.post("/api/m365/connect")
     assert r.status_code == 200
     url = r.json()["authorize_url"]
     assert "login.microsoftonline.com/tenant-abc" in url
@@ -811,7 +811,7 @@ def test_connect_app_mode_provisions_row(client, monkeypatch):
     _configure_azure(monkeypatch)
     monkeypatch.setenv("STUDIO_GRAPH_AUTH_MODE", "app")
     _login(client)
-    r = client.post("/m365/connect")
+    r = client.post("/api/m365/connect")
     assert r.status_code == 200 and r.json().get("connected") is True
 
     from app.extraction import store
@@ -828,7 +828,7 @@ def test_status_never_returns_a_token(client, monkeypatch):
     store.save_account(admin["id"], "delegated", "g")
     store.set_tokens(admin["id"], "TOP-SECRET-ACCESS", "TOP-SECRET-REFRESH",
                      time.time() + 3600)
-    r = client.get("/m365/status")
+    r = client.get("/api/m365/status")
     assert r.status_code == 200
     body = r.text
     assert "TOP-SECRET" not in body

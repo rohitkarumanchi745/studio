@@ -72,19 +72,8 @@ def init_tables():
             ON query_cache(role, source, table_scope);
         """
     )
-    # Columns for any table created before routing / embeddings existed.
-    if db.IS_PG:
-        c.execute("ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS seen INTEGER NOT NULL DEFAULT 0")
-        c.execute("ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS avg_reward REAL")
-        c.execute("ALTER TABLE query_cache ADD COLUMN IF NOT EXISTS embedding TEXT")
-    else:
-        for ddl in ("ALTER TABLE query_cache ADD COLUMN seen INTEGER NOT NULL DEFAULT 0",
-                    "ALTER TABLE query_cache ADD COLUMN avg_reward REAL",
-                    "ALTER TABLE query_cache ADD COLUMN embedding TEXT"):
-            try:
-                c.execute(ddl)
-            except Exception:
-                pass
+    # seen / avg_reward / embedding arrived with routing and embeddings; a
+    # table created before them gets them from migration 5 (app/migrations.py).
     c.commit()
     c.close()
 
@@ -136,17 +125,14 @@ def _sim(q_vec, q_sig, e_vec, e_sig):
 
 
 def _exec_full(user, source, sql):
-    """Re-run cached SQL with full rows, re-checking RBAC + guard + governance.
-    Returns (columns, rows) or None on any failure (→ cache miss, run the agent)."""
-    from . import agent, governance, queryguard, rbac
-    from .catalog import _connector_or_400
+    """Re-run cached SQL with full rows through the gateway (RBAC + guard +
+    governance + audit, purpose "cache_replay"). Returns (columns, rows) or
+    None on ANY failure — a denied table, an unconfigured source, a connector
+    error — which the caller treats as a cache miss and runs the agent."""
+    from . import gateway
     try:
-        conn = _connector_or_400(source)
-        allowed = rbac.allowed_tables(user["role"], source, conn.list_tables())
-        cleaned = queryguard.enforce_limit(queryguard.validate(sql, allowed), agent.MAX_ROWS)
-        cols, rows = conn.run_query(cleaned)
-        cols, rows = governance.filter_result(source, cleaned, cols, rows)
-        return cols, rows[:agent.MAX_ROWS]
+        res = gateway.execute(user, source, sql, "cache_replay")
+        return res.columns, res.rows
     except Exception:
         return None
 

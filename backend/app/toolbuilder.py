@@ -24,6 +24,11 @@ admin's approval of the supervised job. The app's only contact with the
 generated code is open(path,"w").write(code); it is never import/exec/eval'd
 in-process. It runs only when the MCP client spawns it as a separate OS process
 over stdio, and only for the approved, enabled=1 row.
+
+HOW it runs is not decided here. The row stores only the confined path; at
+load time mcp.registered() replaces command/args with sandbox.launch_spec(path)
+— a process runner (rlimits, watchdog, minimal explicit env) or a docker
+runner (no network, read-only FS) chosen by STUDIO_TOOL_RUNNER. See sandbox.py.
 """
 import os
 import re
@@ -34,7 +39,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from . import agent, db, mcp, supervisor
+from . import agent, db, mcp, sandbox, supervisor
 from .auth import current_user
 from .orchestrator import accessible_sources
 
@@ -42,9 +47,9 @@ router = APIRouter(prefix="/toolbuilder", tags=["toolbuilder"])
 
 # A single confined directory for approved servers. srv_{uuid}.py — no user
 # input in the path — and every write is realpath-checked to stay under it.
-SANDBOX = os.path.realpath(os.getenv(
-    "STUDIO_TOOLBUILDER_DIR",
-    os.path.join(os.path.dirname(__file__), "..", "toolbuilder_sandbox")))
+# The constant lives in sandbox.py (mcp.py confines against the same dir
+# without importing this module); it is re-exported here for its callers.
+SANDBOX = sandbox.sandbox_dir()
 
 _STATUS = ("draft", "awaiting_approval", "registered", "rejected")
 
@@ -267,7 +272,9 @@ def _register(a):
     with open(path, "w") as f:                        # WRITE only — never import/exec
         f.write(code)
     # command is the app's own interpreter (never user/model supplied); args is
-    # a fixed [-u, <confined path>] list handed straight to the stdio transport.
+    # a fixed [-u, <confined path>] list. The stored args are the source of
+    # truth for the PATH only: mcp.registered() re-confines it and substitutes
+    # the sandboxed launch spec (sandbox.launch_spec) every time it is loaded.
     mcp.register_stdio(name, sys.executable, ["-u", path], owner_id=a["owner_id"])
     _save(a, status="registered", server_name=name)
 

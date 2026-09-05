@@ -59,6 +59,24 @@ class BigQueryConnector(Connector):
         every /catalog/sources request."""
         return self._cfg()["project"] or self._creds_info().get("project_id", "")
 
+    def qualifiers(self):
+        """The configured dataset, bare and project-qualified — the only
+        namespace RBAC describes.
+
+        A service account usually holds bigquery.dataViewer on more than one
+        dataset, so `other_dataset.customers` (or another project's) is outside
+        what the catalog was built from and the query guard refuses it. Env and
+        the inline key only — never a network call, since this runs per query.
+        """
+        dataset = (self._cfg()["dataset"] or "").strip().lower()
+        if not dataset:
+            return frozenset()
+        project = (self._project() or "").strip().lower()
+        out = {dataset}
+        if project:
+            out.add(f"{project}.{dataset}")
+        return frozenset(out)
+
     def configured(self):
         cfg = self._cfg()
         if not (cfg["dataset"] and self._project()):

@@ -255,7 +255,11 @@ class ObjectStoreConnector(Connector):
     """One Studio source per object store; `name` selects the scheme and
     extension spec from _SOURCES. Writes are not implemented on purpose —
     object storage is read-only in Studio, so run_script/submit_spark_job keep
-    the base NotImplementedError and the supervisor path stays shut."""
+    the base NotImplementedError and the supervisor path stays shut.
+
+    No qualifiers() either: datasets are DuckDB views registered by name in the
+    session's own default schema, so there is no namespace to qualify with and
+    the base class's empty set makes the guard refuse `x.dataset` outright."""
 
     dialect = "duckdb"
 

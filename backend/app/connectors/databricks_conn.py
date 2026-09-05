@@ -24,6 +24,22 @@ class DatabricksConnector(Connector):
             "schema": os.getenv("DATABRICKS_SCHEMA", "default"),
         }
 
+    def qualifiers(self):
+        """The configured catalog/schema — the only namespace RBAC describes.
+
+        Unity Catalog gives a warehouse token visibility over many catalogs, so
+        `other_catalog.default.sales` is outside what list_tables() (and hence
+        the allowlist) was built from and the query guard refuses it. Env only,
+        no connection: this runs per query.
+        """
+        cfg = self._cfg()
+        schema = (cfg["schema"] or "default").strip().lower()
+        catalog = (cfg["catalog"] or "").strip().lower()
+        out = {schema}
+        if catalog:
+            out |= {catalog, f"{catalog}.{schema}"}
+        return frozenset(out)
+
     def configured(self):
         cfg = self._cfg()
         if not (cfg["server_hostname"] and cfg["http_path"] and cfg["access_token"]):

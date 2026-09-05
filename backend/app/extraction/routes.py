@@ -38,8 +38,8 @@ def _redirect_uri():
         return explicit
     public = os.getenv("STUDIO_PUBLIC_URL", "").rstrip("/")
     if public:
-        return public + "/m365/oauth/callback"
-    return "http://localhost:8000/m365/oauth/callback"
+        return public + "/api/m365/oauth/callback"
+    return "http://localhost:8000/api/m365/oauth/callback"
 
 
 def _make_state(user_id):

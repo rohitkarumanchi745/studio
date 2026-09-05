@@ -18,6 +18,15 @@ query guard + verify_sql, and approval/execution go through supervisor.py so
 Studio's read-only invariant and human-in-the-loop gate are preserved. The flow
 just sequences them, records each as a rollout, and fails fast — a failing stage
 stops the chain and is traced with reward 0.
+
+INVARIANT — the generated Python is a DELIVERABLE, not a deployable. Studio
+never executes model-generated Python in-process; the Validator only PARSES it
+(ValidationResult.artifact_status == "syntax_checked_not_executed") and the
+executor only ever submits DeploymentRequest.script, which is built from the
+verified SQL steps (DeploymentRequest.deploys / artifact_deployed=False). So a
+run whose artifact would raise on its first line is reported as
+"succeeded_sql_only", never as a plain success, and the pipeline view and the
+digest email both name what actually ran (ExecutionResult.deployed).
 """
 import json
 import time
@@ -29,11 +38,17 @@ from pydantic import BaseModel
 from . import (db, email_service, pipelines, pybuild, queries, queryguard, roster,
                supervisor)
 from .auth import current_user
-from .catalog import _connector_or_400
+from .sources import connector_or_400
 
 router = APIRouter(prefix="/flow", tags=["flow"])
 
 MAX_REPAIRS = 2   # validate→repair attempts before a pipeline goes to human review
+
+# Overall statuses that count as "the run did what it could". "succeeded_sql_only"
+# is here because the verified SQL steps really did deploy and run — it is
+# separate from "succeeded" only so nobody reads it as "the generated Python
+# artifact ran too". Nothing in Studio ever executes model-generated Python.
+OK_STATUSES = ("succeeded", "succeeded_sql_only", "awaiting_approval")
 
 
 # ── Typed contracts between stages ───────────────────────────────────────
@@ -73,6 +88,11 @@ class ValidationResult(BaseModel):
     ok: bool
     checks: list[Check] = []
     errors: list[str] = []
+    # What was actually done to the generated artifact. Studio NEVER executes
+    # model-generated Python in-process, so a passing python check means the
+    # file PARSED — not that it runs.
+    #   "syntax_checked_not_executed" | "sql_guarded" | "none"
+    artifact_status: str = "none"
     validator: str = "Validator"
 
 
@@ -83,6 +103,11 @@ class DeploymentRequest(BaseModel):
     decision: str = "reject"        # approve | needs_human | reject
     reasons: list[str] = []
     script: str = ""
+    # What this request actually deploys. `script` is built from the VERIFIED
+    # SQL steps (or a Spark payload of them) — the generated Python artifact
+    # is a deliverable the user takes away, and is never submitted or run.
+    deploys: str = "sql_steps"      # "sql_steps" | "spark_job"
+    artifact_deployed: bool = False
     approver: str = "Approval agent"
 
 
@@ -96,6 +121,9 @@ class ExecutionResult(BaseModel):
     result: object | None = None
     error: str | None = None
     job_id: str | None = None
+    # Plain-English statement of WHAT RAN, so no reader has to infer it from
+    # the presence of an artifact. Rendered in the pipeline view and the email.
+    deployed: str | None = None
     executor: str = "Deployment executor"
 
 
@@ -278,9 +306,16 @@ def repair(user, spec, artifact, validation, attempt):
     return fixed, tid
 
 
+#: The Python artifact check's name. It carries the caveat IN THE NAME because
+#: the name is what the stage view, the pipeline view and the email render —
+#: "python syntax" alone read as "the generated program works".
+PY_CHECK = "python syntax (static only — not executed)"
+
+
 def validate(user, spec, artifact):
     """Validator → ValidationResult. Re-verifies every planned step (RBAC +
-    guard + real execution) and static-checks the generated code."""
+    guard + real execution) and STATICALLY checks the generated code — the
+    artifact is parsed, never run (see PY_CHECK / artifact_status)."""
     t0 = time.time()
     checks, errors = [], []
     for s in spec.steps:
@@ -290,17 +325,24 @@ def validate(user, spec, artifact):
         if not v["ok"]:
             errors.append(f"{s.name}: {v.get('error')}")
 
-    # Static check of the generated code — never executed here (that's the
-    # supervised executor's job), only parsed/guarded.
+    # Static check of the generated code. Studio's invariant is that it NEVER
+    # executes model-generated Python — not here, not in the executor — so this
+    # is a PARSE, and the check is named to say so. A Python artifact that
+    # compiles can still raise on its first line at runtime; nothing in this
+    # flow has ever run it, and nothing downstream may claim otherwise.
+    artifact_status = "none"
     if artifact.code.strip():
         if artifact.language == "python":
+            artifact_status = "syntax_checked_not_executed"
             try:
                 compile(artifact.code, "<artifact>", "exec")
-                checks.append(Check(name="python syntax", ok=True))
+                checks.append(Check(name=PY_CHECK, ok=True,
+                                    detail="parsed only — Studio does not run generated Python"))
             except SyntaxError as e:
-                checks.append(Check(name="python syntax", ok=False, detail=str(e)))
-                errors.append(f"python syntax: {e}")
+                checks.append(Check(name=PY_CHECK, ok=False, detail=str(e)))
+                errors.append(f"{PY_CHECK}: {e}")
         else:
+            artifact_status = "sql_guarded"
             bad = queryguard.FORBIDDEN.search(artifact.code)
             checks.append(Check(name="sql guard", ok=not bad,
                                 detail=None if not bad else f"forbidden: {bad.group(0)}"))
@@ -308,7 +350,8 @@ def validate(user, spec, artifact):
                 errors.append(f"sql guard: {bad.group(0)}")
 
     ok = not errors and bool(spec.steps)
-    result = ValidationResult(ok=ok, checks=checks, errors=errors)
+    result = ValidationResult(ok=ok, checks=checks, errors=errors,
+                              artifact_status=artifact_status)
     tid = _trace(user, "validate", "Validator", spec.request, spec.source,
                  result.model_dump(), ok=ok, reward=1.0 if ok else 0.0,
                  error=None if ok else "; ".join(errors[:3]),
@@ -335,10 +378,15 @@ def request_approval(user, spec, validation, target, kind, output=None):
     else:
         script = ";\n".join(s.sql for s in spec.steps if s.sql)
 
+    # The artifact is a DELIVERABLE, never a deployable: `script` above is built
+    # from the verified SQL steps (or a Spark payload of them) and that is the
+    # only thing supervisor.submit ever sees.
+    deploys = "spark_job" if kind == "spark_job" else "sql_steps"
+
     if not validation.ok:
         req = DeploymentRequest(target=target, kind=kind, risk="n/a", decision="reject",
                                 reasons=["Validation failed — not eligible for deployment."],
-                                script=script)
+                                script=script, deploys=deploys, artifact_deployed=False)
         tid = _trace(user, "approve", "Approval agent", spec.request, target,
                      req.model_dump(), ok=False, reward=0.0, error="validation failed",
                      duration_ms=int((time.time() - t0) * 1000))
@@ -347,7 +395,7 @@ def request_approval(user, spec, validation, target, kind, output=None):
     verdict = supervisor.supervise(kind, target, script, user)
     req = DeploymentRequest(target=target, kind=kind, risk=verdict["risk"],
                             decision=verdict["decision"], reasons=verdict["reasons"],
-                            script=script)
+                            script=script, deploys=deploys, artifact_deployed=False)
     # needs_human is not a failure — it's the gate working as designed.
     reward = {"approve": 1.0, "needs_human": 0.7, "reject": 0.0}.get(verdict["decision"], 0.0)
     tid = _trace(user, "approve", "Approval agent", spec.request, target,
@@ -357,7 +405,25 @@ def request_approval(user, spec, validation, target, kind, output=None):
     return req, tid
 
 
-def deploy_execute(user, spec, deployment):
+def deployed_note(spec, deployment, artifact_status, status):
+    """One sentence naming WHAT RAN — the phrase the pipeline view and the
+    email print. Written here, once, so the view, the email and the trace can
+    never drift into implying the generated Python was deployed."""
+    n = sum(1 for s in spec.steps if s.sql)
+    plural = "" if n == 1 else "s"
+    if status in ("deploy_failed", "rejected"):
+        ran = "nothing was deployed"
+    elif deployment.deploys == "spark_job":
+        ran = f"submitted a Spark job built from the {n} verified SQL step{plural}"
+    else:
+        ran = f"deployed the {n} verified SQL step{plural}"
+    if artifact_status == "syntax_checked_not_executed":
+        ran += ("; the generated Python artifact is a deliverable and was not "
+                "executed (syntax-checked only)")
+    return ran
+
+
+def deploy_execute(user, spec, deployment, artifact_status="none"):
     """Airflow / Databricks executor → ExecutionResult, in two phases:
 
       Deploy — submit to the platform via supervisor.submit (policy enforced).
@@ -365,11 +431,17 @@ def deploy_execute(user, spec, deployment):
       Run   — execution, with the platform's automatic retries. If it keeps
               failing the run is STOPPED, the requester is ALERTED, and the
               deployment is ROLLED BACK (best-effort, per connector).
+
+    What is deployed is `deployment.script` — the VERIFIED SQL steps, or a
+    Spark payload built from them. The generated Python artifact is never
+    submitted and never executed; `artifact_status` only flows in so the
+    result can SAY that (ExecutionResult.deployed).
     """
     t0 = time.time()
     executor = roster.executor_name(deployment.target)
 
     def done(res, reward, error=None):
+        res.deployed = deployed_note(spec, deployment, artifact_status, res.status)
         tid = _trace(user, "execute", executor, spec.request, deployment.target,
                      res.model_dump(), ok=res.status in ("succeeded", "awaiting_approval"),
                      reward=reward, error=error, duration_ms=int((time.time() - t0) * 1000))
@@ -430,7 +502,7 @@ def _rollback(user, deployment, job):
     if deployment.risk == "read":
         return {"done": True, "detail": "read-only — nothing to roll back"}
     try:
-        conn = _connector_or_400(deployment.target)
+        conn = connector_or_400(deployment.target)
         conn.rollback(job.get("result"))
         return {"done": True, "detail": f"rolled back on {deployment.target}"}
     except NotImplementedError:
@@ -530,11 +602,17 @@ def run_flow(user, request, target=None, kind="sql_script", output=None):
         return _finish(user, request, target, kind, "rejected", spec, artifact,
                        validation, deployment, None, traces)
 
-    execution, traces["execute"] = deploy_execute(user, spec, deployment)
+    execution, traces["execute"] = deploy_execute(user, spec, deployment,
+                                                  validation.artifact_status)
     status = {"succeeded": "succeeded", "awaiting_approval": "awaiting_approval",
               "deploy_failed": "deploy_failed", "rolled_back": "rolled_back",
               "failed": "execute_failed", "rejected": "rejected"}.get(
                   execution.status, execution.status)
+    # A run that produced a Python artifact must NOT read as a plain success:
+    # the SQL steps ran, the artifact did not. "succeeded_sql_only" is the
+    # honest headline, and _pipeline_view/_pipeline_email spell out the rest.
+    if status == "succeeded" and validation.artifact_status == "syntax_checked_not_executed":
+        status = "succeeded_sql_only"
     return _finish(user, request, target, kind, status, spec, artifact,
                    validation, deployment, execution, traces)
 
@@ -556,7 +634,7 @@ def _finish(user, request, target, kind, status, spec, artifact, validation,
     c.commit()
     c.close()
     db.log_activity(user, "flow_run", prompt=request[:200], source=target,
-                    ok=status in ("succeeded", "awaiting_approval"))
+                    ok=status in OK_STATUSES)
     resp = {
         "id": fid, "status": status, "request": request, "target": target, "kind": kind,
         "spec": _obj(spec), "artifact": _obj(artifact), "validation": _obj(validation),
@@ -699,6 +777,15 @@ def _pipeline_view(d):
     res = ex.get("result")
     reg = res.get("registered_dataset") if isinstance(res, dict) else None
     reg = reg if isinstance(reg, dict) else {}
+    # What actually ran vs. what was merely produced. The generated Python is
+    # a deliverable: it is never submitted and never executed, so the view
+    # states that in words rather than leaving the reader to infer it from the
+    # artifact panel sitting next to a green tick.
+    artifact_status = val.get("artifact_status") or "none"
+    deployed = ex.get("deployed")
+    if not deployed and artifact_status == "syntax_checked_not_executed":
+        deployed = ("nothing was deployed; the generated Python artifact is a "
+                    "deliverable and was not executed (syntax-checked only)")
     return {
         "source": spec.get("source"),
         "steps": steps,
@@ -708,6 +795,10 @@ def _pipeline_view(d):
         "decision": dep.get("decision"),
         "executor": ex.get("executor"),
         "run_status": ex.get("status"),
+        "deploys": dep.get("deploys"),                # "sql_steps" | "spark_job"
+        "artifact_deployed": bool(dep.get("artifact_deployed")),
+        "artifact_status": artifact_status,
+        "deployed": deployed,                         # plain-English "what ran"
         "deploy_ok": (ex.get("deploy") or {}).get("ok") if ex.get("deploy") else None,
         "run_ok": (ex.get("run") or {}).get("ok") if ex.get("run") else None,
         "job_id": ex.get("job_id"),
@@ -721,7 +812,7 @@ def _pipeline_email(user, request, pv, overall):
     """One digest per run reporting EACH step's success/failure (not 5 separate
     emails). Sent on both success and failure, so every run's per-step outcome
     lands in the inbox; _alert still fires for the urgent 'action required' cases."""
-    ok = overall in ("succeeded", "awaiting_approval")
+    ok = overall in OK_STATUSES
     color = {"ok": "#0e7a4d", "failed": "#c5221f", "pending": "#79766f"}
     label = {"ok": "PASS", "failed": "FAIL", "pending": "pending"}
     rows = "".join(
@@ -730,9 +821,17 @@ def _pipeline_email(user, request, pv, overall):
         f"<td>{(s.get('detail') or '')[:140]}</td></tr>"
         for i, s in enumerate(pv.get("steps") or []))
     runs_on = pv.get("executor") or pv.get("target") or "?"
+    # The headline is the REAL status, not a success/failure coin flip: a
+    # "succeeded_sql_only" run must not arrive in the inbox reading "succeeded".
+    headline = (overall or "").replace("_", " ") or ("succeeded" if ok else "failed")
+    # ...and the body names what ran, so nobody reads a green digest as
+    # "the generated Python artifact ran".
+    what_ran = pv.get("deployed")
+    ran_line = f"<p>What ran: <b>{what_ran}</b>.</p>" if what_ran else ""
     html = (
-        f"<p>Pipeline <b>{'succeeded' if ok else 'failed'}</b> for your request:</p>"
+        f"<p>Pipeline <b>{headline}</b> for your request:</p>"
         f"<p><i>{request}</i></p>"
+        f"{ran_line}"
         f"<p>Source <b>{pv.get('source')}</b> &rarr; runs on <b>{runs_on}</b> "
         f"({pv.get('kind') or 'sql_script'}) &rarr; status <b>{pv.get('run_status') or overall}</b></p>"
         f"<table cellpadding='6' style='border-collapse:collapse;border:1px solid #e3e1de'>"
@@ -741,7 +840,7 @@ def _pipeline_email(user, request, pv, overall):
         f"{rows}</table>")
     try:
         email_service.send(user["email"],
-                           f"Studio pipeline {'succeeded' if ok else 'failed'}: {request[:60]}", html)
+                           f"Studio pipeline {headline}: {request[:60]}", html)
     except Exception:
         pass
 
@@ -754,12 +853,16 @@ def _stage_view_from_dict(d):
     out = [
         {"stage": "plan", "agent": "Pipeline planner", "produces": "PipelineSpec",
          "ok": bool(spec.get("steps")), "trace_id": traces.get("plan")},
+        # The artifact is produced, never run — say so on the stage that makes
+        # it, not only in the fine print of the validation result.
         {"stage": "codegen", "agent": "Code generator", "produces": "GeneratedArtifact",
-         "ok": bool(art.get("code")), "trace_id": traces.get("codegen")},
+         "ok": bool(art.get("code")), "trace_id": traces.get("codegen"),
+         "note": "deliverable — Studio does not execute generated Python"},
     ]
     if val is not None:
         row = {"stage": "validate", "agent": "Validator", "produces": "ValidationResult",
-               "ok": bool(val.get("ok")), "trace_id": traces.get("validate")}
+               "ok": bool(val.get("ok")), "trace_id": traces.get("validate"),
+               "artifact_status": val.get("artifact_status") or "none"}
         if repairs:
             row["repairs"] = len(repairs)   # validate→repair loop ran this many times
         out.append(row)
@@ -771,5 +874,6 @@ def _stage_view_from_dict(d):
         out.append({"stage": "execute", "agent": roster.executor_name((dep or {}).get("target")),
                     "produces": "ExecutionResult",
                     "ok": ex.get("status") in ("succeeded", "awaiting_approval"),
+                    "deployed": ex.get("deployed"),   # what actually ran
                     "trace_id": traces.get("execute")})
     return out

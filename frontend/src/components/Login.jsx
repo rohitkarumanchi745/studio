@@ -1,17 +1,29 @@
+// Sign in / register. Registration does NOT create a session: /auth/register
+// creates the account UNVERIFIED and returns no token, so the only honest flow
+// is register -> enter the emailed 6-digit code -> sign in. Assuming a session
+// here would leave the user "logged in" with a token the API never issued.
 import { useEffect, useState } from "react";
 import { api, setSession } from "../api";
 
 export default function Login({ onLogin }) {
-  const [mode, setMode] = useState("login");
+  const [mode, setMode] = useState("login");   // login | register | verify
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [name, setName] = useState("");
+  const [code, setCode] = useState("");
+  const [notice, setNotice] = useState("");
   const [error, setError] = useState(new URLSearchParams(window.location.search).get("sso_error") || "");
   const [busy, setBusy] = useState(false);
   const [azureReady, setAzureReady] = useState(true);
+  // Production closes self-registration. Offering a Register form that can
+  // only answer 403 is worse than not offering one, so the link waits for
+  // /auth/sso to say signup is open (assume closed until it answers).
+  const [openReg, setOpenReg] = useState(false);
 
   useEffect(() => {
-    api("/auth/sso").then((s) => setAzureReady(!!s.azure)).catch(() => {});
+    api("/auth/sso")
+      .then((s) => { setAzureReady(!!s.azure); setOpenReg(!!s.open_registration); })
+      .catch(() => {});
   }, []);
 
   async function submit(e) {
@@ -19,8 +31,32 @@ export default function Login({ onLogin }) {
     setBusy(true);
     setError("");
     try {
-      const body = mode === "login" ? { email, password } : { email, password, name };
-      const data = await api(`/auth/${mode}`, { method: "POST", body: JSON.stringify(body) });
+      if (mode === "register") {
+        // No token comes back — the account is unverified until the code is
+        // accepted, so go to the code step instead of pretending to be in.
+        await api("/auth/register", {
+          method: "POST",
+          body: JSON.stringify({ email, password, name }),
+        });
+        setNotice(`We emailed a 6-digit code to ${email}. Enter it to finish.`);
+        setMode("verify");
+        return;
+      }
+      if (mode === "verify") {
+        await api("/auth/verify-email", {
+          method: "POST",
+          body: JSON.stringify({ email, code: code.trim() }),
+        });
+        // Verification issues no token either: sign in for a real session.
+        setNotice("Email verified — sign in to continue.");
+        setCode("");
+        setMode("login");
+        return;
+      }
+      const data = await api("/auth/login", {
+        method: "POST",
+        body: JSON.stringify({ email, password }),
+      });
       setSession(data.access_token, data.user);
       onLogin(data.user);
     } catch (err) {
@@ -61,14 +97,29 @@ export default function Login({ onLogin }) {
             onChange={(e) => setEmail(e.target.value)}
             autoFocus
           />
-          <input
-            placeholder="Password"
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-          />
+          {mode === "verify" ? (
+            <input
+              placeholder="6-digit code"
+              inputMode="numeric"
+              value={code}
+              onChange={(e) => setCode(e.target.value)}
+            />
+          ) : (
+            <input
+              placeholder="Password"
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+            />
+          )}
           <button className="primary" disabled={busy}>
-            {busy ? "…" : mode === "login" ? "Sign in" : "Create account"}
+            {busy
+              ? "…"
+              : mode === "login"
+                ? "Sign in"
+                : mode === "register"
+                  ? "Create account"
+                  : "Verify email"}
           </button>
         </form>
 
@@ -88,15 +139,18 @@ export default function Login({ onLogin }) {
         </button>
 
         {error && <div className="error">{error}</div>}
+        {notice && <div className="meta">{notice}</div>}
 
         <div className="login-switch">
           {mode === "login" ? (
-            <>
-              No account? <a onClick={() => setMode("register")}>Register</a>
-            </>
+            openReg && (
+              <>
+                No account? <a onClick={() => { setNotice(""); setMode("register"); }}>Register</a>
+              </>
+            )
           ) : (
             <>
-              Have an account? <a onClick={() => setMode("login")}>Sign in</a>
+              Have an account? <a onClick={() => { setNotice(""); setMode("login"); }}>Sign in</a>
             </>
           )}
         </div>

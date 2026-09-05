@@ -25,6 +25,22 @@ class SnowflakeConnector(Connector):
             "schema": os.getenv("SNOWFLAKE_SCHEMA", "PUBLIC"),
         }
 
+    def qualifiers(self):
+        """The configured database/schema — the only namespace RBAC describes.
+
+        A Snowflake login routinely sees several databases and schemas, so a
+        reference qualified with anything else (`other_db.public.sales`) is
+        outside what the catalog and the allowlist were built from and the
+        query guard refuses it. Env only, no connection: this runs per query.
+        """
+        cfg = self._cfg()
+        schema = (cfg["schema"] or "PUBLIC").strip().lower()
+        database = (cfg["database"] or "").strip().lower()
+        out = {schema}
+        if database:
+            out |= {database, f"{database}.{schema}"}
+        return frozenset(out)
+
     def configured(self):
         cfg = self._cfg()
         if not (cfg["account"] and cfg["user"] and cfg["password"] and cfg["database"]):

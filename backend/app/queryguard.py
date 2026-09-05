@@ -9,6 +9,11 @@ analytics SQL. Tokenizing fixes both at once.
 
 validate() returns the COMMENT-FREE SQL and callers must execute that string —
 validating one text and running another is how `FROM/**/customers` got through.
+
+Table names are matched on their BARE name (that is what RBAC and governance
+key on) but a qualifier is no longer discarded: `secret_schema.sales` is not
+`sales`, and the gateway passes the connector's own namespace so a reference
+outside it is refused rather than silently reduced to an allowed name.
 """
 import re
 
@@ -161,8 +166,17 @@ def _skip_parens(toks, i):
 
 
 def _qualified_name(toks, i):
-    """`db.schema."Tbl"` -> ('tbl', index after it). The bare name is what RBAC
-    keys on, so only the last part matters."""
+    """`db.schema."Tbl"` -> ('tbl', 'db.schema', index after it).
+
+    The bare name stays the RBAC key: every allowlist and every governance rule
+    is keyed on bare names. But the QUALIFIER is returned alongside it, because
+    dropping it was a hole: an allowlist containing `sales` also accepted
+    `secret_schema.sales`, so a service account whose warehouse credentials can
+    see a second schema/catalog read straight past the catalog/RBAC boundary
+    (rbac.allowed_tables only ever lists the connector's configured namespace).
+    validate() checks the qualifier against the connector's own namespace when
+    the caller passes one; see `qualifiers` there.
+    """
     parts, n = [], len(toks)
     while i < n and toks[i][0] in ("word", "ident"):
         parts.append(toks[i][1])
@@ -173,11 +187,13 @@ def _qualified_name(toks, i):
         break
     if not parts:
         raise QueryRejected("Unreadable table reference after FROM/JOIN")
-    name = parts[-1].strip('"').lower()
-    if any(c in name for c in "/:\\"):
-        # `JOIN "s3://bucket/x.parquet"` — a path wearing an identifier's quotes.
+    clean = [p.strip('"').lower() for p in parts]
+    if any(c in p for p in clean for c in "/:\\"):
+        # `JOIN "s3://bucket/x.parquet"` — a path wearing an identifier's
+        # quotes. Checked on every part, not just the last: the qualifier is a
+        # path too in `"s3://bucket"."x.parquet"`.
         raise QueryRejected("A file or URI is not a permitted data source")
-    return name, i
+    return clean[-1], ".".join(clean[:-1]), i
 
 
 def _read_ref(toks, i, depth, refs):
@@ -192,14 +208,15 @@ def _read_ref(toks, i, depth, refs):
         raise QueryRejected("A file or URI is not a permitted data source")
     if i < n and toks[i][0] == "word" and toks[i][1].lower() in _SUBQUERY_HEAD:
         return i, depth
-    name, j = _qualified_name(toks, i)
-    refs.append((name, i))
+    name, qualifier, j = _qualified_name(toks, i)
+    refs.append((name, qualifier, i))
     return j, depth
 
 
 def _table_refs(toks):
-    """[(name, token index)] for every FROM/JOIN target, comma-joined arms
-    included — `FROM sales, customers` hid its second arm from the regex."""
+    """[(name, qualifier, token index)] for every FROM/JOIN target, comma-joined
+    arms included — `FROM sales, customers` hid its second arm from the regex.
+    `qualifier` is "" for an unqualified name."""
     refs, i, n, depth, from_depth = [], 0, len(toks), 0, None
     while i < n:
         kind, text = toks[i]
@@ -309,9 +326,35 @@ def _cte_legal(bindings, name, at):
 
 # ── Public API ──────────────────────────────────────────────────────────
 
-def validate(sql, allowed_tables):
+def _qualifier_ok(qualifier, qualifiers):
+    """Is `db.schema` one of the namespaces this connector was configured with?
+
+    Whole-string comparison only, deliberately. Accepting a qualifier because
+    its LAST part matches would re-open the hole this check exists to close:
+    with a configured schema of `public`, `other_db.public.sales` would pass
+    while reading another database's PUBLIC schema. Connectors therefore
+    declare every spelling they accept (schema, database.schema, ...) in
+    Connector.qualifiers(), built from the same env they connect with.
+    """
+    return qualifier in qualifiers
+
+
+def validate(sql, allowed_tables, qualifiers=None):
     """Raise QueryRejected unless `sql` is a single SELECT touching only
-    allowed tables. Returns the comment-free SQL the caller must execute."""
+    allowed tables. Returns the comment-free SQL the caller must execute.
+
+    `qualifiers` is the connector's own namespace — the set of lowercase
+    prefixes a table reference may carry (Connector.qualifiers(); the gateway
+    passes it). When given, `secret_schema.sales` is refused even though the
+    bare name `sales` is allowed, because RBAC's allowlist only ever describes
+    the CONFIGURED namespace and a warehouse credential usually sees more than
+    that. An unqualified name is always fine, an empty set means "no qualifier
+    at all" (sqlite/DuckDB/API sources), and None keeps the historical
+    behaviour of not looking at qualifiers — the default so that callers
+    without a connector in hand (blend, dashboards) are unaffected.
+    """
+    quals = None if qualifiers is None else {
+        str(q).strip('"').strip("`").lower() for q in qualifiers}
     raw = (sql or "").strip().rstrip(";").strip()
     toks, cleaned = _tokens(raw)
     if not toks:
@@ -345,7 +388,20 @@ def validate(sql, allowed_tables):
     allowed = {str(t).strip('"').lower() for t in allowed_tables}
     ctes = _cte_bindings(toks)
     refs = _table_refs(toks)
-    for name, at in refs:
+    for name, qualifier, at in refs:
+        if quals is not None and qualifier:
+            if not _qualifier_ok(qualifier, quals):
+                raise QueryRejected(
+                    f"Table '{qualifier}.{name}' is outside the configured "
+                    f"namespace for this source")
+            # A qualified reference names a real table in that namespace, never
+            # a CTE (CTE names are bare), so it must be on the allowlist itself
+            # — otherwise `WITH sales AS (...) SELECT * FROM other.sales` would
+            # launder the CTE's permission onto the base table.
+            if name not in allowed:
+                raise QueryRejected(
+                    f"Access to table '{name}' is not permitted for your role")
+            continue
         # A CTE legalizes a ref only where the ENGINE would resolve it to that
         # CTE: bound earlier, within the binding's paren scope, and never a
         # non-recursive self-reference. Order-only tracking let an inner-scoped
@@ -379,3 +435,21 @@ def enforce_limit(sql, max_rows=500):
         elif kind == "word" and depth == 0 and text.lower() == "limit":
             return cleaned                      # a LIMIT inside a CTE bounds nothing
     return f"{cleaned} LIMIT {max_rows}"
+
+
+def base_tables(sql):
+    """Lowercased names of every FROM/JOIN target that is NOT resolved by a CTE
+    binding — the real tables a query reads. BARE names, qualifier dropped:
+    governance and chat key their rules on bare names, and validate() is where
+    the qualifier is checked against the connector's namespace. Purely lexical
+    (no warehouse access), so chat can re-check a stored message against the
+    reader's role at read time. Returns an empty set for empty or unparseable
+    input rather than raising: callers treat "no attributable table" as
+    fail-closed."""
+    try:
+        toks, _ = _tokens((sql or "").strip().rstrip(";").strip())
+        ctes = _cte_bindings(toks)
+        return {name for name, _qual, at in _table_refs(toks)
+                if not _cte_legal(ctes, name, at)}
+    except QueryRejected:
+        return set()

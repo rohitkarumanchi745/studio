@@ -34,9 +34,9 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from . import agent, db, email_service, governance, platforms, queryguard, rbac
+from . import agent, db, email_service, gateway, platforms, queryguard, rbac
 from .auth import current_user
-from .catalog import _connector_or_400
+from .sources import connector_or_400
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
@@ -252,24 +252,29 @@ def _execute(job):
         _record_platform_rollout(user, target, out.get("run_ref"))
         return out
 
-    conn = _connector_or_400(target)
+    conn = connector_or_400(target)
     if not conn.configured():
         raise RuntimeError(f"The {target} environment is not connected — configure its credentials.")
 
     if job["kind"] == "spark_job":
         return conn.submit_spark_job(json.loads(job["script"]))
 
-    allowed = rbac.allowed_tables(user["role"], target, conn.list_tables())
     out = []
     for stmt in _statements(job["script"]):
         low = stmt.lstrip().lower()
         if low.startswith("select") or low.startswith("with"):
-            cleaned = queryguard.enforce_limit(queryguard.validate(stmt, allowed), agent.MAX_ROWS)
-            cols, rows = conn.run_query(cleaned)
-            cols, rows = governance.filter_result(target, cleaned, cols, rows)
-            out.append({"statement": stmt[:120], "type": "read", "rows": len(rows)})
+            # A read runs as the REQUESTER through the gateway — RBAC, guard,
+            # governance and an audit row — even though the job was approved:
+            # approval never widens what the requester's role may see.
+            res = gateway.execute(user, target, stmt, "supervised_read")
+            out.append({"statement": stmt[:120], "type": "read", "rows": res.row_count})
         else:
-            res = conn.run_script(stmt)   # write/DDL — only reached post-approval
+            # Write/DDL — only reached post-approval. This is the approved-write
+            # path and stays OUTSIDE the gateway by design: the gateway is the
+            # read pipeline (row-returning SELECTs), while a write's authority
+            # is the human approval recorded on the job (human_by), audited by
+            # job_approve. The connector's run_script is the write hook.
+            res = conn.run_script(stmt)
             out.append({"statement": stmt[:120], "type": "write", "result": res})
     return out
 
