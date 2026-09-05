@@ -16,6 +16,14 @@ Self-service signup follows the same line: open_registration() is ON in demo
 mode and OFF in production unless STUDIO_OPEN_REGISTRATION says otherwise —
 removing the seeds is pointless if anyone can mint a fresh account instead.
 
+That leaves a public deploy with no way to make a login for testers at all, so
+ensure_shared_login() adds one deliberate exception: STUDIO_SHARED_LOGIN_EMAIL
++ _PASSWORD create ONE pre-verified account (role from STUDIO_SHARED_LOGIN_ROLE,
+default analyst) that the operator hands out. Pre-verified because with no SMTP
+the emailed code only reaches backend/outbox/ inside the container; a shared
+credential rather than open signup because it is one known identity the
+operator can rotate or delete, not an unbounded set of self-minted ones.
+
 The tool runner follows it too: the default 'process' runner launches approved,
 model-generated MCP servers as the app's own uid (see sandbox.py), so a
 production boot refuses it rather than letting a deploy discover that the first
@@ -148,12 +156,14 @@ def enforce():
     if demo_mode():
         log.info("bootstrap: demo mode: seed accounts enabled, ephemeral JWT secret")
         ensure_bootstrap_admin()
+        ensure_shared_login()
         return
     log.info("bootstrap: production mode")
     _require_strong_secret()
     _require_isolated_tool_runner()
     revoke_default_passwords()
     ensure_bootstrap_admin()
+    ensure_shared_login()
 
 
 def _require_strong_secret():
@@ -277,3 +287,192 @@ def _promote_admin(user, email, password):
     db.set_user_role(email, "admin")
     log.info("bootstrap: promoted %s to admin (%s)", email,
              "SSO-provisioned account" if sso else "password verified")
+
+
+# ── Shared login ─────────────────────────────────────────────────────────
+# One credential the operator hands to every tester of a public deploy. It
+# exists because production has no other way to MAKE a login: registration is
+# closed by default and, with no SMTP configured, the 6-digit verification code
+# only ever reaches backend/outbox/ on the container — so a tester who did
+# register could never sign in. This account is created pre-verified, so it
+# needs no mail at all, and it does NOT re-open self-registration.
+
+SHARED_LOGIN_EMAIL_ENV = "STUDIO_SHARED_LOGIN_EMAIL"
+SHARED_LOGIN_PASSWORD_ENV = "STUDIO_SHARED_LOGIN_PASSWORD"
+SHARED_LOGIN_ROLE_ENV = "STUDIO_SHARED_LOGIN_ROLE"
+SHARED_LOGIN_SHOW_ENV = "STUDIO_SHARED_LOGIN_SHOW"
+DEFAULT_SHARED_LOGIN_ROLE = "analyst"
+
+
+def shared_login_email():
+    """The shared account's address, lowercased, or "" when the feature is off.
+    Empty is the default: no env var, no account, nothing changes."""
+    return (os.getenv(SHARED_LOGIN_EMAIL_ENV) or "").strip().lower()
+
+
+def _studio_roles():
+    """The role names this deployment actually has, read from the built-in
+    RBAC table rather than duplicated here — a role added to policies.py is
+    accepted by STUDIO_SHARED_LOGIN_ROLE the same day, and one removed from it
+    stops being accepted. policies is a pure leaf (it imports nothing from
+    app), so this edge adds no cycle; it is imported inside the function to
+    keep this module importable from db at module level."""
+    from .policies import POLICIES
+    return sorted(POLICIES)
+
+
+def shared_login_role():
+    """STUDIO_SHARED_LOGIN_ROLE, defaulting to 'analyst' — enough to query and
+    build without holding the admin powers listed in _warn_shared_admin().
+    Validated against the real role table; an unknown value refuses the boot
+    rather than silently creating an account whose role resolves to no policy
+    at all (rbac fails closed, so the testers would just see empty catalogs)."""
+    raw = (os.getenv(SHARED_LOGIN_ROLE_ENV) or "").strip().lower()
+    role = raw or DEFAULT_SHARED_LOGIN_ROLE
+    valid = _studio_roles()
+    if role not in valid:
+        raise RuntimeError(
+            f"{SHARED_LOGIN_ROLE_ENV}={raw!r} is not a Studio role. Valid roles "
+            f"are: {', '.join(valid)} (see app/policies.py). Leave it unset for "
+            f"the default '{DEFAULT_SHARED_LOGIN_ROLE}'."
+        )
+    return role
+
+
+def shared_login_show():
+    """Whether GET /auth/sso may disclose the shared address. OFF by default:
+    creating the account and ADVERTISING it are separate decisions."""
+    return (os.getenv(SHARED_LOGIN_SHOW_ENV, "") or "").strip().lower() in TRUTHY
+
+
+def shared_login_public():
+    """What the login page may be told about the shared account: {"email",
+    "role"} or None. NEVER the password — the operator distributes that
+    themselves, by whatever channel they chose.
+
+    Turning STUDIO_SHARED_LOGIN_SHOW on advertises the address to EVERYONE who
+    loads the login page, including bots: it is published on an unauthenticated
+    endpoint. That is the point for a public demo (testers stop guessing which
+    address to type), and the wrong default everywhere else, which is why it is
+    a second env var rather than a consequence of the first.
+
+    Returns None for a role the env no longer accepts (changed under a running
+    process): enforce() validated it at boot, so this endpoint reports nothing
+    rather than raising a 500 on the login page.
+    """
+    email = shared_login_email()
+    if not email or not shared_login_show():
+        return None
+    try:
+        role = shared_login_role()
+    except RuntimeError:
+        return None
+    return {"email": email, "role": role}
+
+
+def ensure_shared_login():
+    """Create/refresh the env-driven shared login. Runs in BOTH modes.
+
+    WHY THIS BREAKS ensure_bootstrap_admin's never-touch-the-password RULE:
+    the bootstrap admin belongs to a PERSON — rotating STUDIO_ADMIN_PASSWORD
+    must not overwrite the password that person later set for themselves, so
+    that path only ever proves control and promotes. This account belongs to
+    the DEPLOYMENT. Its password is not a person's secret but a configuration
+    value the operator hands out, so the environment is its source of truth:
+    every boot re-asserts the password and the role, and changing
+    STUDIO_SHARED_LOGIN_PASSWORD rotates the credential for everyone on the
+    next restart. The corollary is that STUDIO_SHARED_LOGIN_EMAIL must not
+    name a real person's account: if it does, this takes it over (password,
+    role and verified flag) on the next boot.
+
+    The account is created verified=1, which is what makes it usable with no
+    SMTP: /auth/login and current_user both refuse an unverified password
+    account, and a code that only reaches backend/outbox/ inside a container is
+    not a login path. It does NOT open self-registration — that stays off.
+
+    In EVERY other respect this is an ordinary account. No bypasses: RBAC
+    (rbac.can_access on its role), governance, the gateway and the audit log
+    treat it exactly like any other user. The cost of a shared credential is
+    attribution — the audit log records every tester's prompts, SQL and
+    approvals against this ONE identity, so "who ran that" stops being a
+    question the log can answer. Hand out per-person accounts when that
+    matters.
+    """
+    from . import db
+    email = shared_login_email()
+    if not email:
+        return
+    role = shared_login_role()          # refuses an unknown role
+    password = os.getenv(SHARED_LOGIN_PASSWORD_ENV) or ""
+    if len(password) < MIN_ADMIN_PASSWORD_LEN:
+        state = "is not set" if not password else \
+            f"is shorter than {MIN_ADMIN_PASSWORD_LEN} characters"
+        raise RuntimeError(
+            f"{SHARED_LOGIN_EMAIL_ENV}={email} is set, so "
+            f"{SHARED_LOGIN_PASSWORD_ENV} (at least {MIN_ADMIN_PASSWORD_LEN} "
+            f"characters) is required: it {state}. This one password is handed "
+            f"to every tester — make it long and random, and unset "
+            f"{SHARED_LOGIN_EMAIL_ENV} to turn the shared login off."
+        )
+    _warn_shared_admin(email, role)
+
+    user = db.get_user_by_email(email)
+    if not user:
+        try:
+            db.create_user(email, password, email.split("@")[0],
+                           role=role, verified=1)
+        except Exception:
+            # Two replicas booting at once race on the same email; the loser
+            # sees a unique violation. Re-read and fall through to the same
+            # sync rule rather than crashing the container.
+            user = db.get_user_by_email(email)
+            if not user:
+                raise
+        else:
+            log.info("bootstrap: created shared login %s (role %s, pre-verified) "
+                     "from %s", email, role, SHARED_LOGIN_EMAIL_ENV)
+            return
+    _sync_shared_login(user, email, role, password)
+
+
+def _sync_shared_login(user, email, role, password):
+    """Re-assert the environment on an account that already exists: password,
+    role, verified. Each is a no-op when it already matches, so a boot that
+    changed nothing logs nothing."""
+    from . import db
+    if not db.verify_password(password, user["password_hash"]):
+        db.set_user_password(user["id"], db.hash_password(password))
+        log.info("bootstrap: shared login %s — password reset to match %s "
+                 "(the old one no longer works)", email, SHARED_LOGIN_PASSWORD_ENV)
+    if user["role"] != role:
+        db.set_user_role(email, role)
+        log.info("bootstrap: shared login %s — role %s → %s (%s)",
+                 email, user["role"], role, SHARED_LOGIN_ROLE_ENV)
+    if not user.get("verified", 1):
+        db.mark_verified(email)
+        log.info("bootstrap: shared login %s — marked verified (no SMTP needed)", email)
+
+
+def _warn_shared_admin(email, role):
+    """A shared ADMIN credential in production is a foot-gun, not an error.
+
+    The operator may have chosen it deliberately (a demo where testers need the
+    admin screens), so the boot is NOT refused — but the log says exactly what
+    the credential grants, because 'admin' reads like a convenience and is not.
+    """
+    if role != "admin" or demo_mode():
+        return
+    for line in (
+        "=" * 72,
+        f"bootstrap: SHARED ADMIN LOGIN — {email} is an admin account whose "
+        f"password is handed to every tester.",
+        "bootstrap: anyone holding it can: APPROVE MODEL-GENERATED CODE FOR "
+        "EXECUTION (tool builder), EDIT GOVERNANCE (widen what every role may "
+        "read), REGISTER MCP SERVERS, and READ EVERY USER'S ACTIVITY (prompts, "
+        "SQL, results in the audit log).",
+        f"bootstrap: keep it only if you meant it — set STUDIO_TOOLBUILDER=0 so "
+        f"no generated code can be registered or launched, or set "
+        f"{SHARED_LOGIN_ROLE_ENV}=analyst instead.",
+        "=" * 72,
+    ):
+        log.warning("%s", line)

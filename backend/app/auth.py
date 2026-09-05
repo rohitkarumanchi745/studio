@@ -233,9 +233,20 @@ def _group_role_map():
 def sso_status():
     """Which SSO providers are configured, and whether signup is open at all —
     drives the login button state and lets the UI hide the Register link
-    instead of offering a form that can only answer 403."""
+    instead of offering a form that can only answer 403.
+
+    `shared_login` is {"email", "role"} or null: the address of the one shared
+    account a public deploy hands to its testers (bootstrap.ensure_shared_login),
+    so the login page can show it instead of leaving people guessing. NEVER the
+    password — this endpoint is unauthenticated, and the password is the whole
+    credential. It is null unless the operator sets STUDIO_SHARED_LOGIN_SHOW=1,
+    because publishing the address here advertises it to everyone (and every
+    bot) that loads the page; creating the account and advertising it are
+    separate decisions.
+    """
     return {"azure": _azure_cfg() is not None,
-            "open_registration": bootstrap.open_registration()}
+            "open_registration": bootstrap.open_registration(),
+            "shared_login": bootstrap.shared_login_public()}
 
 
 @router.get("/azure/login")

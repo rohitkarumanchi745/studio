@@ -40,8 +40,11 @@ PKG = "app"
 #   queryguard  SQL guard                       (stdlib only)
 #   util        pmap and friends                (stdlib only)
 #   sources     connector-or-400 helper         → connectors (the registry it wraps)
-#   bootstrap   boot-time secret checks         → db, LAZILY: db imports bootstrap
-#                                                 for demo_mode(), see its docstring
+#   bootstrap   boot-time secret checks         → db, policies. LAZILY: db imports
+#                                                 bootstrap for demo_mode(), see its
+#                                                 docstring; policies is a pure leaf,
+#                                                 read for the valid role names in
+#                                                 STUDIO_SHARED_LOGIN_ROLE
 LAYERS: dict[str, set[str]] = {
     "limits": set(),
     "policies": set(),
@@ -49,7 +52,7 @@ LAYERS: dict[str, set[str]] = {
     "queryguard": set(),
     "util": set(),
     "sources": {"connectors"},
-    "bootstrap": {"db"},
+    "bootstrap": {"db", "policies"},
 }
 
 # Edges that the policies.py / matching.py split removed. If one of these

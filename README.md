@@ -1350,7 +1350,8 @@ optional and falls back to the in-process cache silently.
 - **Self-registration is closed in production** — `POST /api/auth/register` is
   gated on `bootstrap.open_registration()`: ON in demo mode, OFF in production,
   either way overridable with `STUDIO_OPEN_REGISTRATION`. Closed, it answers
-  `403` and accounts come only from SSO or `STUDIO_ADMIN_EMAIL`. Open, it takes
+  `403` and accounts come only from SSO, `STUDIO_ADMIN_EMAIL`, or the shared
+  login below. Open, it takes
   a 10+ character password, creates the account **unverified**, and returns
   **no token** — the emailed 6-digit code is the gate, not decoration. Until
   `POST /api/auth/verify-email` accepts it, `/auth/login` *and* every
@@ -1358,6 +1359,24 @@ optional and falls back to the in-process cache silently.
   (re-checked on every request, so a token minted by an older build cannot
   outlive the gate). SSO / Entra users are provisioned verified and never see
   it.
+- **A shared login is a deliberate, bounded exception** — a public test
+  deployment can hand every tester ONE account via
+  `STUDIO_SHARED_LOGIN_EMAIL` / `_PASSWORD` (12+ characters), created
+  pre-verified at boot so it works with no SMTP and with self-registration
+  still closed. Unlike `STUDIO_ADMIN_*`, the environment OWNS this credential:
+  each boot re-asserts its password and role, so rotating the variable rotates
+  the login for everyone. It is an ordinary account everywhere else — RBAC,
+  governance, the gateway and the audit log treat it like any user — with two
+  costs the operator accepts knowingly. Attribution: every tester's prompts,
+  SQL and approvals are recorded against this one identity. And role:
+  `analyst` (the default) reaches every analytics feature and all configured
+  sources, `viewer` only the demo warehouse's `sales` and `web_traffic`, while
+  `admin` also gets governance editing and job approval — and approving a
+  tool-builder artifact runs model-written Python with this app's filesystem,
+  network and secrets unless `STUDIO_TOOLBUILDER=0` or
+  `STUDIO_TOOL_RUNNER=docker`. Boot logs a prominent warning for a public
+  admin. `STUDIO_SHARED_LOGIN_SHOW=1` advertises the address (never the
+  password) on the login page.
 - **`STUDIO_ADMIN_EMAIL` cannot be used to steal an account** — if the address
   already belongs to an account, it is promoted only when the operator can
   prove control: the account is SSO-provisioned (no usable local password) or
