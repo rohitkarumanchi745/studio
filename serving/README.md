@@ -45,8 +45,14 @@ docker compose --profile gpu config       # validate compose without starting
 
 ## 2. The BitNet base model — where to get it
 
-- **Base (training + vLLM):** [`microsoft/bitnet-b1.58-2B-4T`](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T)
-  — the same HF id the trainer uses (`STUDIO_TRAIN_BASE_MODEL`). NOTE: **stock
+- **Base for TRAINING:** [`microsoft/bitnet-b1.58-2B-4T-bf16`](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T-bf16)
+  — the master-weights variant, and the trainer's default `STUDIO_TRAIN_BASE_MODEL`.
+  The packed repo below **cannot be fine-tuned**: transformers refuses it with
+  *"quantized with QuantizationMethod.BITNET but that quantization method do not
+  support training"*. Train on bf16 masters; the i2_s GGUF this box serves is the
+  quantization of those same weights, so the LoRA composes at inference.
+- **Base (vLLM):** [`microsoft/bitnet-b1.58-2B-4T`](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T)
+  — the packed 1-bit inference artifact. NOTE: **stock
   vLLM cannot load this** (no `BitnetForCausalLM`); it's for TRAINING + a
   BitNet-enabled vLLM only. vLLM pulls it on
   first start into the `hf-cache` volume. A gated pull needs `HUGGING_FACE_HUB_TOKEN`.

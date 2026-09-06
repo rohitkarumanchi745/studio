@@ -45,7 +45,8 @@ CONFIG (env, all optional except credentials):
   STUDIO_API_URL            base URL of the Studio API      (default http://localhost:8000)
   STUDIO_TRAINER_TOKEN      admin JWT (skips login), OR
   STUDIO_TRAINER_EMAIL/PASSWORD   admin service-account login
-  STUDIO_TRAIN_BASE_MODEL   HF id of the base            (default microsoft/bitnet-b1.58-2B-4T)
+  STUDIO_TRAIN_BASE_MODEL   HF id of the TRAINABLE base  (default microsoft/bitnet-b1.58-2B-4T-bf16;
+                            the packed 1-bit repo cannot be fine-tuned — see BASE_MODEL)
   STUDIO_TRAIN_OUTPUT_DIR   where adapters + cursor live (default ./adapters)
   STUDIO_TRAIN_MIN_REWARD   keep rollouts with reward >= (default 0.6 — the "learned" band)
   STUDIO_TRAIN_MIN_NEW      min new usable samples before an SFT round (default 32)
@@ -78,7 +79,14 @@ import urllib.request
 
 API = os.getenv("STUDIO_API_URL", "http://localhost:8000").rstrip("/")
 OUT_DIR = os.getenv("STUDIO_TRAIN_OUTPUT_DIR", "./adapters")
-BASE_MODEL = os.getenv("STUDIO_TRAIN_BASE_MODEL", "microsoft/bitnet-b1.58-2B-4T")
+# The -bf16 MASTER-WEIGHTS repo, not the packed 1-bit one. `bitnet-b1.58-2B-4T`
+# ships the quantized inference artifact, and transformers refuses to fine-tune
+# it outright: "The model you are trying to fine-tune is quantized with
+# QuantizationMethod.BITNET but that quantization method do not support
+# training." Training happens on bf16 masters; the i2_s GGUF the serving box
+# runs is the quantization OF those same weights, so the LoRA composes at
+# inference. Serving is unaffected by this value.
+BASE_MODEL = os.getenv("STUDIO_TRAIN_BASE_MODEL", "microsoft/bitnet-b1.58-2B-4T-bf16")
 MIN_REWARD = float(os.getenv("STUDIO_TRAIN_MIN_REWARD", "0.6"))
 MIN_NEW = int(os.getenv("STUDIO_TRAIN_MIN_NEW", "32"))
 POLL_SECONDS = int(os.getenv("STUDIO_TRAIN_POLL_SECONDS", "60"))
@@ -445,7 +453,7 @@ def train_lora(samples, base_model, out_dir, epochs):
             "    pip install -r scripts/requirements-trainer.txt\n"
             f"  (missing: {e.name}). Use --dry-run to exercise the loop without it.")
 
-    tok = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
+    tok = AutoTokenizer.from_pretrained(base_model)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
@@ -472,7 +480,7 @@ def train_lora(samples, base_model, out_dir, epochs):
 
     ds = Dataset.from_dict({"text": [_fmt(s) for s in samples]})
     model = AutoModelForCausalLM.from_pretrained(
-        base_model, trust_remote_code=True, torch_dtype=torch.float32)
+        base_model, torch_dtype=torch.float32)
     lora = LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05, bias="none",
                       task_type="CAUSAL_LM",
                       target_modules=["q_proj", "k_proj", "v_proj", "o_proj"])
@@ -513,7 +521,7 @@ def train_dpo(pairs, base_model, out_dir, epochs):
             "    pip install -r scripts/requirements-trainer.txt\n"
             f"  (missing: {e.name}). Use --dry-run to mine pairs without it.")
 
-    tok = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
+    tok = AutoTokenizer.from_pretrained(base_model)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
@@ -541,7 +549,7 @@ def train_dpo(pairs, base_model, out_dir, epochs):
         "chosen": [p["chosen"] for p in pairs],
         "rejected": [p["rejected"] for p in pairs]})
     model = AutoModelForCausalLM.from_pretrained(
-        base_model, trust_remote_code=True, torch_dtype=torch.float32)
+        base_model, torch_dtype=torch.float32)
     lora = LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05, bias="none",
                       task_type="CAUSAL_LM",
                       target_modules=["q_proj", "k_proj", "v_proj", "o_proj"])
