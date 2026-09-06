@@ -3,16 +3,25 @@
 Agent Lightning decouples the AGENT (many concurrent rollout producers) from the
 TRAINER (consumes rollouts, updates the policy). They run at the same time:
 
-    Studio agent ──rollouts──▶  trainer (CPU worker)  ──adapters──▶  Studio serving
-      (produces)                (SFT / DPO / GRPO)                   (hot-swaps)
+    Studio agent ──rollouts──▶  trainer (GPU worker)  ──adapters──▶  Studio serving
+      (produces)                (SFT / DPO / GRPO)                   (hot-swaps, CPU)
          ▲                                                               │
          └──────────────────── keeps serving with the newest ───────────┘
 
-The trainer is a CPU worker — BitNet's 1-bit base is CPU-efficient and its LoRA
-adapters are small, so no GPU is required (one only speeds it up). This module is
-the producer + adapter server: it streams reward-labeled rollouts to the trainer,
-holds the registry of published LoRA adapters, and tells the serving layer which
-to load — a GLOBAL tool-calling adapter plus an optional PER-USER style adapter,
+The hardware split is the opposite of the intuitive one, and it is worth stating
+here because this docstring used to get it wrong. TRAINING wants a GPU: the
+packed 1-bit repo cannot be fine-tuned at all (transformers refuses), so the
+LoRA is trained on microsoft/bitnet-b1.58-2B-4T-bf16 — 4.8 GB of ordinary dense
+master weights whose linears re-quantize to ternary on every forward. CPU/MPS
+finishes but is slower by more than an order of magnitude (measured: ~170 s per
+micro-batch at max_length=128 on an Apple M1). SERVING is the CPU half: stock
+vLLM cannot load BitNet (vllm#17279, "not planned") and the supported runtime is
+bitnet.cpp, whose ternary kernels are CPU kernels. See serving/README.md §1 and
+scripts/README-training.md.
+
+This module is the producer + adapter server: it streams reward-labeled rollouts
+to the trainer, holds the registry of published LoRA adapters, and tells the
+serving layer which to load — a GLOBAL tool-calling adapter plus an optional PER-USER style adapter,
 composed per request. The trainer loop (scripts/train_online.py) polls the
 stream, trains, and publishes new adapter versions here; serving picks them up on
 the next call, so training and serving are genuinely simultaneous. The trainer's

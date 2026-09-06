@@ -97,47 +97,6 @@ def env_int(name, default):
         return int(default)
 
 
-# ── Paths ────────────────────────────────────────────────────────────────
-DATA_DIR = env("STUDIO_DATA_DIR", "/data")
-MODELS_DIR = env("STUDIO_MODELS_DIR", os.path.join(DATA_DIR, "models"))
-ADAPTERS_DIR = env("STUDIO_ADAPTERS_DIR", os.path.join(DATA_DIR, "adapters"))
-GGUF_NAME = env("STUDIO_BITNET_GGUF", "ggml-model-i2_s.gguf")
-GGUF_REPO = env("STUDIO_BITNET_GGUF_REPO", "microsoft/bitnet-b1.58-2B-4T-gguf")
-GGUF_URL = env("STUDIO_BITNET_GGUF_URL") or \
-    f"https://huggingface.co/{GGUF_REPO}/resolve/main/{GGUF_NAME}"
-# Verified with an HTTP HEAD against the repo: ggml-model-i2_s.gguf is exactly
-# 1,187,801,280 bytes. A short file means a truncated transfer, not a model.
-GGUF_BYTES = env_int("STUDIO_BITNET_GGUF_BYTES", 1187801280)
-ADAPTER_NAME = env("STUDIO_TOOLCALL_GGUF", "tool_call.gguf")
-ADAPTER_URL = env("STUDIO_ADAPTER_URL")
-MODEL_PATH = os.path.join(MODELS_DIR, GGUF_NAME)
-ADAPTER_PATH = os.path.join(ADAPTERS_DIR, ADAPTER_NAME)
-# The supervisor is the only process that knows what it actually did — whether
-# the model landed, whether the engine came up, and WHICH adapter file it
-# launched with. The gateway serves /health and answers Studio, but it starts
-# BEFORE any of that is true. This file is how the one that knows tells the one
-# that answers; without it /health can only guess, and guessing "ok" while a
-# 1.1 GB download is in flight is how a platform routes traffic into a void.
-STATE_PATH = os.path.join(DATA_DIR, "state.json")
-# Written beside the adapter when its provenance is known: the published uri the
-# file came from. Without it the mounted adapter is anonymous, and an anonymous
-# adapter can never be PROVEN to be the one Studio asked for.
-ADAPTER_URI_PATH = ADAPTER_PATH + ".uri"
-
-# ── Ports ────────────────────────────────────────────────────────────────
-PUBLIC_PORT = env_int("PORT", 9000)          # Railway injects PORT
-GATEWAY_PORT = env_int("STUDIO_GATEWAY_PORT", 9001)
-ENGINE_PORT = env_int("STUDIO_ENGINE_PORT", 8080)
-BRIDGE = env("STUDIO_SUPERVISOR_BRIDGE", "1").lower() in ("1", "true", "yes")
-
-# ── Engine tuning ────────────────────────────────────────────────────────
-CTX_SIZE = env_int("LLAMA_CTX_SIZE", 4096)   # = the model's max_position_embeddings
-PARALLEL = env_int("LLAMA_PARALLEL", 1)
-BASE_MODEL_NAME = env("STUDIO_BASE_MODEL_NAME", "bitnet")
-ENGINE_BIN = env("STUDIO_ENGINE_BIN", "/opt/bitnet/bin/llama-server")
-POLL_SECONDS = env_int("STUDIO_ADAPTER_POLL_SECONDS", 15)
-FETCH_RETRIES = max(1, env_int("STUDIO_MODEL_FETCH_RETRIES", 3))
-
 _STOP = threading.Event()
 
 
@@ -172,7 +131,79 @@ def cpu_quota():
     return max(1, n)
 
 
-THREADS = env_int("LLAMA_THREADS", 0) or cpu_quota()
+# ── Configuration, read in ONE place ─────────────────────────────────
+# Every value below is an environment read, and they now live in a function so
+# this module can be IMPORTED and re-pointed, not only executed as PID 1 of the
+# Railway container. serving/run_local.py sets the environment for a developer
+# machine (a ./bitnet-local directory instead of /data, the llama-server the
+# owner built instead of /opt/bitnet/bin) and calls load_config() before main().
+# The container path is unchanged: load_config() runs once at import with
+# exactly the defaults it always had, so `CMD python3 -u /app/supervisor.py`
+# behaves identically to before.
+
+def load_config():
+    """(Re)read every configuration global from os.environ."""
+    global DATA_DIR, MODELS_DIR, ADAPTERS_DIR, GGUF_NAME, GGUF_REPO, GGUF_URL
+    global GGUF_BYTES, ADAPTER_NAME, ADAPTER_URL, MODEL_PATH, ADAPTER_PATH
+    global STATE_PATH, ADAPTER_URI_PATH, PUBLIC_PORT, GATEWAY_PORT, ENGINE_PORT
+    global BRIDGE, CTX_SIZE, PARALLEL, BASE_MODEL_NAME, ENGINE_BIN
+    global POLL_SECONDS, FETCH_RETRIES, THREADS, LOCAL
+
+    # ── Where this unit is running ───────────────────────────────────
+    # "platform" (the default) = a Railway/Docker service; "local" = a laptop
+    # under run_local.py. It changes NOTHING about what this process does — only
+    # which fix a failure message tells the operator to apply, because
+    # "Variables → add HUGGING_FACE_HUB_TOKEN, then redeploy" is useless advice
+    # to someone standing in a shell.
+    LOCAL = env("STUDIO_SUPERVISOR_MODE", "platform").lower() == "local"
+
+    # ── Paths ────────────────────────────────────────────────────────────────
+    DATA_DIR = env("STUDIO_DATA_DIR", "/data")
+    MODELS_DIR = env("STUDIO_MODELS_DIR", os.path.join(DATA_DIR, "models"))
+    ADAPTERS_DIR = env("STUDIO_ADAPTERS_DIR", os.path.join(DATA_DIR, "adapters"))
+    GGUF_NAME = env("STUDIO_BITNET_GGUF", "ggml-model-i2_s.gguf")
+    GGUF_REPO = env("STUDIO_BITNET_GGUF_REPO", "microsoft/bitnet-b1.58-2B-4T-gguf")
+    GGUF_URL = env("STUDIO_BITNET_GGUF_URL") or \
+        f"https://huggingface.co/{GGUF_REPO}/resolve/main/{GGUF_NAME}"
+    # Verified with an HTTP HEAD against the repo: ggml-model-i2_s.gguf is exactly
+    # 1,187,801,280 bytes. A short file means a truncated transfer, not a model.
+    GGUF_BYTES = env_int("STUDIO_BITNET_GGUF_BYTES", 1187801280)
+    ADAPTER_NAME = env("STUDIO_TOOLCALL_GGUF", "tool_call.gguf")
+    ADAPTER_URL = env("STUDIO_ADAPTER_URL")
+    MODEL_PATH = os.path.join(MODELS_DIR, GGUF_NAME)
+    ADAPTER_PATH = os.path.join(ADAPTERS_DIR, ADAPTER_NAME)
+    # The supervisor is the only process that knows what it actually did — whether
+    # the model landed, whether the engine came up, and WHICH adapter file it
+    # launched with. The gateway serves /health and answers Studio, but it starts
+    # BEFORE any of that is true. This file is how the one that knows tells the one
+    # that answers; without it /health can only guess, and guessing "ok" while a
+    # 1.1 GB download is in flight is how a platform routes traffic into a void.
+    STATE_PATH = os.path.join(DATA_DIR, "state.json")
+    # Written beside the adapter when its provenance is known: the published uri the
+    # file came from. Without it the mounted adapter is anonymous, and an anonymous
+    # adapter can never be PROVEN to be the one Studio asked for.
+    ADAPTER_URI_PATH = ADAPTER_PATH + ".uri"
+
+    # ── Ports ────────────────────────────────────────────────────────────────
+    PUBLIC_PORT = env_int("PORT", 9000)          # Railway injects PORT
+    GATEWAY_PORT = env_int("STUDIO_GATEWAY_PORT", 9001)
+    ENGINE_PORT = env_int("STUDIO_ENGINE_PORT", 8080)
+    BRIDGE = env("STUDIO_SUPERVISOR_BRIDGE", "1").lower() in ("1", "true", "yes")
+
+    # ── Engine tuning ────────────────────────────────────────────────────────
+    CTX_SIZE = env_int("LLAMA_CTX_SIZE", 4096)   # = the model's max_position_embeddings
+    PARALLEL = env_int("LLAMA_PARALLEL", 1)
+    BASE_MODEL_NAME = env("STUDIO_BASE_MODEL_NAME", "bitnet")
+    ENGINE_BIN = env("STUDIO_ENGINE_BIN", "/opt/bitnet/bin/llama-server")
+    POLL_SECONDS = env_int("STUDIO_ADAPTER_POLL_SECONDS", 15)
+    FETCH_RETRIES = max(1, env_int("STUDIO_MODEL_FETCH_RETRIES", 3))
+
+    # os.cpu_count() reports the HOST's cores; cpu_quota() is what this
+    # container/box may actually use. LLAMA_THREADS overrides both.
+    THREADS = env_int("LLAMA_THREADS", 0) or cpu_quota()
+
+
+load_config()
 
 
 # ── Downloads (model + optional adapter) ─────────────────────────────────
@@ -188,24 +219,37 @@ def _hf_token():
     return env("HUGGING_FACE_HUB_TOKEN") or env("HF_TOKEN")
 
 
+def _token_fix():
+    """Where to actually put HUGGING_FACE_HUB_TOKEN. Same variable, two very
+    different places: a Railway service's Variables tab, or the shell the owner
+    is standing in when run_local.py fails."""
+    if LOCAL:
+        return (f"  FIX: make a READ token at huggingface.co/settings/tokens, accept\n"
+                f"       {GGUF_REPO}'s licence on its model page if it asks, then\n"
+                f"       export HUGGING_FACE_HUB_TOKEN=hf_... in the shell you run\n"
+                f"       serving/run_local.py from and start it again.")
+    return (f"  FIX: on this Railway service, Variables → add HUGGING_FACE_HUB_TOKEN\n"
+            f"       = a HuggingFace access token with READ access to {GGUF_REPO}\n"
+            f"       (huggingface.co/settings/tokens), accept the model's licence on\n"
+            f"       the model page if it asks, then redeploy.")
+
+
 def _explain_http(code, url, what):
     """Turn an HTTP status into an instruction, not a stack trace."""
     tokened = "set" if _hf_token() else "NOT set"
+    where = "in your shell" if LOCAL else "on this Railway service"
     if code in (401, 403):
         return (
             f"{what}: HuggingFace refused the download of {url} (HTTP {code}).\n"
             f"  HUGGING_FACE_HUB_TOKEN is currently {tokened}.\n"
             f"  The repo is gated, private, or the token is invalid/expired.\n"
-            f"  FIX: on this Railway service, Variables → add HUGGING_FACE_HUB_TOKEN\n"
-            f"       = a HuggingFace access token with READ access to {GGUF_REPO}\n"
-            f"       (huggingface.co/settings/tokens), accept the model's licence on\n"
-            f"       the model page if it asks, then redeploy.")
+            + _token_fix())
     if code == 429:
         return (
             f"{what}: HuggingFace rate-limited the download of {url} (HTTP 429).\n"
             f"  HUGGING_FACE_HUB_TOKEN is currently {tokened}.\n"
-            f"  FIX: set HUGGING_FACE_HUB_TOKEN on this Railway service — authenticated\n"
-            f"       pulls get a far higher limit — or host the file yourself and set\n"
+            f"  FIX: set HUGGING_FACE_HUB_TOKEN {where} — authenticated pulls get a\n"
+            f"       far higher limit — or host the file yourself and set\n"
             f"       STUDIO_BITNET_GGUF_URL to that URL.")
     if code == 404:
         return (f"{what}: {url} does not exist (HTTP 404). Check "
@@ -285,11 +329,14 @@ def ensure_model():
     free = shutil.disk_usage(os.path.dirname(MODEL_PATH) or "/").free
     need = (GGUF_BYTES or 1_200_000_000) + 200_000_000
     if free < need:
+        fix = ("Free up disk, or point --dir at a drive that has room."
+               if LOCAL else
+               f"Attach a Railway volume (≥5 GB) mounted at {DATA_DIR}, or the "
+               f"download will fail.")
         log(f"WARNING: only {free // 2**20} MiB free at {MODELS_DIR}; the model needs "
-            f"~{need // 2**20} MiB. Attach a Railway volume (≥5 GB) mounted at "
-            f"{DATA_DIR}, or the download will fail.")
-    log(f"model missing — downloading once onto the volume ({DATA_DIR}). "
-        f"This takes a few minutes on first boot only.")
+            f"~{need // 2**20} MiB. {fix}")
+    log(f"model missing — downloading it once into {MODELS_DIR} (~1.1 GB). "
+        f"This happens on the FIRST run only; every later start reuses the file.")
     return fetch(GGUF_URL, MODEL_PATH, GGUF_BYTES, "model", FETCH_RETRIES)
 
 
@@ -533,7 +580,18 @@ def start_engine(adapter_present):
     argv = engine_argv(adapter_present)
     log(f"starting engine ({'WITH' if adapter_present else 'WITHOUT'} adapter, "
         f"epoch {_ENGINE_EPOCH}): {' '.join(argv)}")
-    return subprocess.Popen(argv)
+    try:
+        return subprocess.Popen(argv)
+    except OSError as e:
+        # The binary was there at start-up and is not now (an uninstall, a
+        # rebuild in progress, a bad STUDIO_ENGINE_BIN). Raising here would be a
+        # traceback out of a watchdog loop; returning None lets the caller treat
+        # it as the engine being down, which is what it is.
+        log(f"FATAL: cannot execute the engine at {ENGINE_BIN}: {e}. "
+            f"It must be a bitnet.cpp build of llama-server "
+            f"(github.com/microsoft/BitNet); set STUDIO_ENGINE_BIN, or "
+            f"run_local.py --engine <path>, to the right binary.")
+        return None
 
 
 def stop(proc, name, timeout=20):
@@ -583,8 +641,10 @@ def main():
     if not ensure_model():
         write_state("model_failed", detail="the model file could not be fetched")
         log("FATAL: no model file — the engine cannot start. See the message "
-            "above for the fix. Exiting so Railway surfaces a failed deploy "
-            "rather than a permanently empty serving box.")
+            "above for the fix. " + ("Exiting; fix that and run it again."
+                                     if LOCAL else
+                                     "Exiting so Railway surfaces a failed deploy "
+                                     "rather than a permanently empty serving box."))
         stop(gateway, "gateway")
         return 1
 
@@ -598,6 +658,10 @@ def main():
             f"False until scripts/train_online.py publishes a tool_call adapter, "
             f"so Studio sends nothing here yet.")
     engine = start_engine(live_sig is not None)
+    if engine is None:                   # unusable binary — see start_engine
+        write_state("engine_down", detail="the engine binary could not be executed")
+        stop(gateway, "gateway")
+        return 1
     # The engine is up but not yet answering; the gateway probes it before it
     # reports ready, so this stage is honest about the gap.
     write_state("ready", adapter=mounted_adapter())
@@ -607,8 +671,9 @@ def main():
     while not _STOP.is_set():
         time.sleep(POLL_SECONDS)
         if gateway.poll() is not None:
-            log(f"FATAL: gateway exited ({gateway.returncode}); "
-                f"exiting so Railway restarts the service.")
+            log(f"FATAL: gateway exited ({gateway.returncode}); " +
+                ("exiting — start run_local.py again." if LOCAL else
+                 "exiting so Railway restarts the service."))
             stop(engine, "engine")
             return 1
         if engine.poll() is not None:
@@ -618,14 +683,19 @@ def main():
             log(f"engine exited ({engine.returncode}) — restart {fails}/5")
             if fails >= 5:
                 log("FATAL: engine will not stay up. Most likely causes: the GGUF "
-                    "is not loadable by this build, the container ran out of "
+                    "is not loadable by this build (a STOCK llama.cpp cannot load "
+                    "i2_s — it must be a bitnet.cpp build), the box ran out of "
                     "memory (needs ~2 GB at ctx 4096), or LLAMA_EXTRA_ARGS is "
-                    "invalid. Exiting so Railway surfaces the failure.")
+                    "invalid. " + ("Exiting." if LOCAL else
+                                   "Exiting so Railway surfaces the failure."))
                 stop(gateway, "gateway")
                 return 1
             time.sleep(min(60, 5 * fails))
             live_sig = stable_adapter_sig()
             engine = start_engine(live_sig is not None)
+            if engine is None:
+                stop(gateway, "gateway")
+                return 1
             write_state("ready", adapter=mounted_adapter())
             continue
         fails = 0
@@ -637,6 +707,9 @@ def main():
             stop(engine, "engine")
             live_sig = sig
             engine = start_engine(sig is not None)
+            if engine is None:
+                stop(gateway, "gateway")
+                return 1
             # Only now is the new adapter really the one being served — the
             # gateway will not claim it before this line runs.
             write_state("ready", adapter=mounted_adapter())

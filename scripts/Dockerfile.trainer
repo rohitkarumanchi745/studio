@@ -1,7 +1,16 @@
-# The online BitNet trainer as a standalone CPU worker (a separate container /
-# Railway service — NOT part of the lean API image). It pulls reward-labeled
-# rollouts from Studio and publishes LoRA adapters back. No GPU: BitNet's 1-bit
-# base + a small LoRA trains on CPU.
+# The online BitNet trainer as a standalone container worker (a separate
+# container / Railway service — NOT part of the lean API image). It pulls
+# reward-labeled rollouts from Studio and publishes LoRA adapters back.
+#
+# CPU-ONLY, AND THAT IS THE SLOW ROAD. Training does NOT happen on BitNet's
+# packed 1-bit repo — transformers refuses to fine-tune it at all — but on the
+# bf16 MASTER weights (microsoft/bitnet-b1.58-2B-4T-bf16, 4.8 GB), which are an
+# ordinary dense model whose linears re-quantize to ternary on every forward.
+# A measured SFT micro-batch on an Apple M1 (MPS, max_length=128) took ~170 s;
+# a CPU box is not faster. This image is for a machine with no GPU at all, or
+# for a smoke test. On a machine WITH an NVIDIA card, run the trainer directly
+# with a CUDA torch wheel — scripts/README-training.md §3 — and do not use this
+# Dockerfile. Serving BitNet is the CPU half; training is the GPU half.
 #
 # Build from the repo root so this canonical scripts/train_online.py is used
 # (there is exactly one — do not reintroduce a copy under backend/):
@@ -10,7 +19,9 @@ FROM python:3.12-slim
 
 WORKDIR /trainer
 COPY requirements-trainer.txt .
-# CPU torch wheel — small enough for a plain CPU box.
+# CPU torch wheel — small enough for a plain CPU box, and useless on a GPU
+# one: `torch.cuda.is_available()` is False with this wheel no matter what
+# card is present. A CUDA build needs the cu### index instead.
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
     && pip install --no-cache-dir -r requirements-trainer.txt
 COPY train_online.py .

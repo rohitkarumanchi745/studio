@@ -1,14 +1,22 @@
-# Heavy ML deps for the CPU trainer worker (scripts/train_online.py).
+# Heavy ML deps for the trainer worker (scripts/train_online.py).
 # Deliberately OUT of the lean API image (backend/requirements.txt) — this runs
-# on a separate CPU box that talks to Studio over HTTP. CPU-only is fine:
-# BitNet's 1-bit base + a small LoRA adapter trains without a GPU.
+# on a separate box that talks to Studio over HTTP.
+#
+# TRAINING WANTS A GPU. The LoRA is trained on the bf16 MASTER weights
+# (microsoft/bitnet-b1.58-2B-4T-bf16, 4.8 GB) — the packed 1-bit repo cannot be
+# fine-tuned at all — and those re-quantize to ternary inside every linear on
+# every forward, which is punishing without CUDA (a measured M1/MPS micro-batch
+# at max_length=128 took ~170 s). `pip install torch` gives you the CPU wheel;
+# on an NVIDIA machine install torch from the cu### index FIRST.
+# See scripts/README-training.md §3. (Serving BitNet is the CPU half of the
+# split — that is bitnet.cpp, and it needs none of this file.)
 #
 #   pip install -r scripts/requirements-trainer.txt
 #
 # The plumbing (poll / format / publish) needs none of these — `--dry-run` and
 # `--status` run on the Python stdlib alone.
 
-torch>=2.2            # CPU wheels are fine (pip install torch)
+torch>=2.2            # on NVIDIA: install from the cu### index BEFORE this file
 transformers>=4.44    # BitNet base support lands in recent transformers
 peft>=0.12            # LoRA adapters
 trl>=0.12             # SFTTrainer/SFTConfig + DPOTrainer/DPOConfig (processing_class)

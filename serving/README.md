@@ -27,6 +27,16 @@ or a global scale call (llama.cpp). **The gateway bridges that gap.** You point
 | **cpu** *(supported BitNet path)* | `llama-server` serving the BitNet GGUF — but it must be **[bitnet.cpp](https://github.com/microsoft/BitNet)'s** build, NOT stock [llama.cpp](https://github.com/ggml-org/llama.cpp), which cannot load the `i2_s` GGUF (§2) | Adapter mounted at **startup**; runtime toggles its **scale**. Serves the **global tool_call adapter only.** | CPU-only box. **BitNet's native runtime — the recommended way to serve BitNet.** |
 | **gpu** *(needs BitNet-enabled vLLM)* | [vLLM](https://docs.vllm.ai) OpenAI server | Runtime multi-LoRA + per-user style adapters. **But stock vLLM has NO BitNet support** ([vllm #17279](https://github.com/vllm-project/vllm/issues/17279), *not planned*) — the BitNet base won't load. Use only with a BitNet-enabled vLLM build, or set `STUDIO_VLLM_MODEL` to a vLLM-supported base for GPU multi-LoRA. | NVIDIA GPU **+** a BitNet-capable vLLM (or a non-BitNet base). |
 
+> **Self-hosting on your own machine — no Docker, no Railway, no paid
+> service?** Use **[SELFHOST.md](SELFHOST.md)** + `run_local.py`. It is the
+> `cpu` profile above without the container: one command that finds your
+> bitnet.cpp build, fetches the GGUF, starts engine + gateway, and prints the
+> `STUDIO_LLM_BASE_URL` line to paste into Studio. It also explains the hardware
+> split that surprises everyone — **serving BitNet is a CPU job and the GPU does
+> not help; training the LoRA is the GPU job** — and covers building bitnet.cpp
+> on Windows (WSL2), CUDA training, and getting the converted adapter onto the
+> box.
+
 > **Deploying on Railway?** Neither profile applies as-is — Railway runs one
 > container per service and a volume belongs to one service. Use
 > **[RAILWAY.md](RAILWAY.md)** + `Dockerfile.railway` + `supervisor.py`: one
@@ -240,3 +250,35 @@ on 2–4 vCPU: right for the learned, repeated, background work the router sends
 here; not a frontier replacement in an interactive chat box. Full breakdown,
 break-even maths, and the list of what could not be verified without a container:
 [RAILWAY.md §9–§10](RAILWAY.md).
+
+---
+
+## 9. Your own machine (no Docker) — see SELFHOST.md
+
+`docker-compose.yml` needs a Docker daemon and `Dockerfile.railway` needs a
+platform. A laptop needs neither, and the same two processes run on it directly:
+
+```
+serving/
+  run_local.py         ONE command: resolve laptop paths, find your bitnet.cpp
+                       llama-server, fetch the GGUF once, start supervisor.py,
+                       print the STUDIO_LLM_BASE_URL line, Ctrl-C stops both
+  SELFHOST.md          the guide: why the GPU can't serve BitNet and does train
+                       the adapter, building bitnet.cpp on Windows via WSL2,
+                       what CPU inference feels like, connecting Studio (local
+                       vs. a tunnel), CUDA training, converting the adapter, and
+                       a curl-by-curl verification
+```
+
+```bash
+python3 serving/run_local.py --engine ~/BitNet/build/bin/llama-server
+# → ./bitnet-local/{models,adapters}, engine + gateway on 127.0.0.1:9000
+# → prints:  STUDIO_LLM_BASE_URL=http://127.0.0.1:9000/v1
+```
+
+`run_local.py` does **not** fork the supervisor's logic — it sets the
+environment `supervisor.load_config()` reads and calls `supervisor.main()`, so
+the download, the conditional `--lora`, the adapter watch, the engine epoch and
+the state file are all the same code the container runs. The container defaults
+(`/data`, `/opt/bitnet/bin/llama-server`, the dual-stack bridge) are unchanged
+and pinned by `backend/tests/test_selfhost_runner.py`.
