@@ -148,7 +148,35 @@ def health():
         "agent": "ready" if llm_available() else "fallback (no API key)",
         "mcp_servers": list(__import__("app.agent", fromlist=["mcp_servers"]).mcp_servers().keys()),
         "agent_lightning": __import__("app.lightning", fromlist=["agl_available"]).agl_available(),
+        # Boot posture, so "why can nobody log in?" is answerable from outside
+        # without a shell on the container. Deliberately booleans and a mode
+        # name: in production seed_logins is always false, so this discloses
+        # nothing an attacker could not learn by trying the documented
+        # passwords, and in demo mode those passwords are public by design.
+        "auth": _auth_posture(),
     }
+
+
+def _auth_posture():
+    """What the running build decided at startup — the fast answer to a login
+    that fails for no visible reason. `mode` says which branch of
+    bootstrap.enforce() ran; `seed_logins` is the ground truth for whether the
+    documented demo credentials work RIGHT NOW on THIS database, which is what
+    a stale deploy or a revoked-then-restored account gets wrong."""
+    from . import bootstrap, db
+    out = {"mode": "demo" if bootstrap.demo_mode() else "production",
+           "open_registration": bootstrap.open_registration(),
+           "shared_login": bool(bootstrap.shared_login_email()),
+           "seed_logins": False}
+    try:
+        for email, pw, _n, _r in bootstrap.SEED_USERS:
+            user = db.get_user_by_email(email)
+            if user and db.verify_password(pw, user["password_hash"]):
+                out["seed_logins"] = True
+                break
+    except Exception:
+        out["seed_logins"] = None      # database unreachable; say so, don't lie
+    return out
 
 
 # Serve the built frontend (single-service deploys, e.g. Railway). The
