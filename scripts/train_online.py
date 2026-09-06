@@ -448,8 +448,9 @@ def _device_and_dtype():
     machine in bf16 on Apple's MPS backend does a 512-token micro-batch in ~4.5s
     (measured, M1/16 GB), so an epoch over a few hundred samples is minutes.
 
-    bf16 everywhere that supports it — CUDA, and MPS on Apple silicon — and
-    fp32 only on plain CPU, where bf16 is usually slower rather than faster.
+    bf16 everywhere that supports it — MPS on Apple silicon, and CUDA from
+    Ampere on — fp16 on older CUDA cards that only emulate bf16, and fp32 only
+    on plain CPU, where bf16 is usually slower rather than faster.
     STUDIO_TRAIN_DEVICE / STUDIO_TRAIN_DTYPE override both for a box that knows
     better than this heuristic.
     """
@@ -469,8 +470,17 @@ def _device_and_dtype():
         dtype = torch.float16
     elif want in ("fp32", "float32"):
         dtype = torch.float32
+    elif dev == "cpu":
+        dtype = torch.float32            # bf16 on CPU is usually slower, not faster
+    elif dev == "cuda":
+        # bf16 needs Ampere or newer. On a GTX 16xx / RTX 20xx (compute < 8.0)
+        # torch reports bf16 as "available" but emulates it, which is slower than
+        # fp16 and can silently underflow — so ask whether it is actually
+        # supported and fall back to fp16, which every CUDA GPU since Pascal
+        # does in hardware.
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     else:
-        dtype = torch.float32 if dev == "cpu" else torch.bfloat16
+        dtype = torch.bfloat16           # mps: bf16 is the fast path
     return dev, dtype
 
 
