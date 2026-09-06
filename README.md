@@ -1054,6 +1054,44 @@ growing scope. The heavy ML deps live in `scripts/requirements-trainer.txt`
 The whole path is **dormant until `STUDIO_LLM_BASE_URL` (BitNet) and
 `HARRIER_EMBED_URL` (Harrier) are configured**, so it changes nothing on its own.
 
+### Running it on your own machine
+
+The serving unit does not need a cloud service. **[`serving/SELFHOST.md`](serving/SELFHOST.md)**
+is the end-to-end guide, and `python serving/run_local.py` brings it up with one
+command — no Docker, no Railway. It finds the `llama-server` you built, tells you
+how to build it if you have not, fetches the GGUF once, and prints the exact
+`STUDIO_LLM_BASE_URL` line to paste into Studio's `.env`. Start with
+`--check`: it validates everything and starts nothing.
+
+**The hardware split is the opposite of the intuitive one, and it decides how you
+set this up:**
+
+| Job | Where | Why |
+|---|---|---|
+| **Serving** BitNet | **CPU** | Stock vLLM cannot load BitNet at all ([vllm#17279](https://github.com/vllm-project/vllm/issues/17279), *not planned*). The runtime is [bitnet.cpp](https://github.com/microsoft/BitNet), and 1-bit inference on a CPU is the model's entire design goal — not a fallback. |
+| **Training** the LoRA | **GPU** | The packed 1-bit repo cannot be fine-tuned (`QuantizationMethod.BITNET … do not support training`). The adapter trains on 4.8 GB of `-bf16` master weights; the GGUF you serve is the quantization of those same weights. |
+
+So one laptop can run both halves. **[`scripts/README-training.md`](scripts/README-training.md)**
+is the trainer's operator guide — the CUDA install, a VRAM table by card, what a
+good run looks like, and the failure modes with their fixes.
+
+### The first adapter, without waiting for traffic
+
+Training needs reward-labeled rollouts, and rollouts need usage — a circle a new
+deployment cannot break on its own. `scripts/bootstrap_rollouts.py` breaks it:
+it pairs `suggest.py`'s schema-grounded questions with `pipelines._draft_sql`'s
+statements, **runs every pair through the gateway and keeps only the ones that
+actually execute**, and writes them as `agent_traces` rows marked
+`reward_source='bootstrap'` so a human can tell them from organic rollouts and
+delete them later. On the demo warehouse that is ~324 verified rollouts in about
+a second.
+
+Be honest with yourself about what that corpus can teach: it reports its own
+distinct-SQL-shape count, and a first adapter trained on template-generated
+questions and a deterministic drafter learns *this schema, this dialect, this
+question shape* — not human phrasing variety. It unblocks training; organic
+rollouts are what make the adapter good.
+
 ---
 
 ## Performance
@@ -1834,6 +1872,9 @@ you in: the account is created unverified and the emailed 6-digit code
 | `STUDIO_PROMPT_CACHE` | Toggle Anthropic prompt/KV caching (default on) |
 | `STUDIO_QCACHE_THRESHOLD` | Cache-band similarity threshold (default 0.9) |
 | `STUDIO_TRAIN_THRESHOLD` | Prompts to collect before "ready to train" (default 500) |
+| `STUDIO_TRAIN_BASE_MODEL` | HF id of the **trainable** base (default `microsoft/bitnet-b1.58-2B-4T-bf16`) — the packed 1-bit repo cannot be fine-tuned |
+| `STUDIO_TRAIN_DEVICE` / `STUDIO_TRAIN_DTYPE` | Override the accelerator and weight dtype; by default cuda→bf16 (fp16 on pre-Ampere), mps→bf16, cpu→fp32 |
+| `STUDIO_TRAIN_MAX_LENGTH` / `_BATCH_SIZE` / `_GRAD_ACCUM` / `_GRAD_CHECKPOINT` | The VRAM levers; checkpointing defaults on for CUDA, which is what makes an 8 GB card fit |
 | `STUDIO_REDTEAM_MAX_CASES` | Maximum attack cases in one adversarial benchmark after expanding attacker × technique × objective × trial (default 500) |
 | `STUDIO_REDTEAM_MAX_MODEL_CALLS` | Maximum estimated attacker + target + judge calls in one benchmark (default 3000) |
 | `STUDIO_REDTEAM_MODEL_TIMEOUT_S` | Per-call timeout used uniformly for attacker, target, and judge models (default 60; clamped to 5–300 seconds). Each model object also gets one provider-level retry |
@@ -1970,7 +2011,7 @@ with **React Router** URLs for every view.
 
 ### What Studio still does not do
 
-Three limits are worth stating plainly, because each is easy to read the other
+Four limits are worth stating plainly, because each is easy to read the other
 way round from the feature list above:
 
 - **Natural language produces verified, independent read-only SQL bundles — not
@@ -1987,6 +2028,17 @@ way round from the feature list above:
   them**, through the supervisor and its human-approval gate — with
   `artifact_deployed: false` and a run reported as `succeeded_sql_only`. The
   artifact is yours to take away and run wherever you run code.
+- **The BitNet serving path is built and unit-tested, but no one has run the
+  engine.** Studio's half is proven end to end against a stub: the routing
+  gates, the wire contract, the gateway's readiness and adapter-identity checks,
+  the bootstrap corpus, and the trainer's poll → format → publish loop. What has
+  never run anywhere is the engine itself — nobody has compiled bitnet.cpp,
+  generated a token from a 1-bit model, trained on CUDA, or converted a LoRA for
+  this architecture. The single largest risk is that `--lora` may not apply on
+  an `i2_s` base at all, in which case serving works but stays base-only and no
+  amount of training changes it. `serving/SELFHOST.md` §9 and
+  `serving/RAILWAY.md` carry the verified-versus-unverified tables, and every
+  speed and cost figure in them is arithmetic rather than measurement.
 
 ### Future rollouts
 
