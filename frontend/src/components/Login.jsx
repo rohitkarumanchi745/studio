@@ -19,10 +19,20 @@ export default function Login({ onLogin }) {
   // only answer 403 is worse than not offering one, so the link waits for
   // /auth/sso to say signup is open (assume closed until it answers).
   const [openReg, setOpenReg] = useState(false);
+  // The seeded demo logins are real only in demo mode — production revokes
+  // them. Advertising them there hands out credentials the server has already
+  // killed, so assume they are dead until /auth/sso says otherwise.
+  const [demoMode, setDemoMode] = useState(false);
+  const [sharedLogin, setSharedLogin] = useState(null);
 
   useEffect(() => {
     api("/auth/sso")
-      .then((s) => { setAzureReady(!!s.azure); setOpenReg(!!s.open_registration); })
+      .then((s) => {
+        setAzureReady(!!s.azure);
+        setOpenReg(!!s.open_registration);
+        setDemoMode(!!s.demo_mode);
+        setSharedLogin(s.shared_login || null);
+      })
       .catch(() => {});
   }, []);
 
@@ -155,10 +165,18 @@ export default function Login({ onLogin }) {
           )}
         </div>
 
-        <div className="demo-creds">
-          Demo logins — admin@studio.local / admin123 · analyst@studio.local / analyst123 ·
-          viewer@studio.local / viewer123
-        </div>
+        {demoMode && (
+          <div className="demo-creds">
+            Demo logins — admin@studio.local / admin123 · analyst@studio.local / analyst123 ·
+            viewer@studio.local / viewer123
+          </div>
+        )}
+        {!demoMode && sharedLogin && (
+          <div className="demo-creds">
+            Shared test login — {sharedLogin.email} ({sharedLogin.role}). Ask
+            whoever runs this deployment for the password.
+          </div>
+        )}
       </div>
     </div>
   );

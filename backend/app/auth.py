@@ -235,6 +235,11 @@ def sso_status():
     drives the login button state and lets the UI hide the Register link
     instead of offering a form that can only answer 403.
 
+    `demo_mode` tells the login page whether the seeded demo credentials are
+    actually live on this deployment. Production revokes them, so printing them
+    there sends people round in circles trying credentials the server has
+    already killed — which is exactly what happened on a real deployment.
+
     `shared_login` is {"email", "role"} or null: the address of the one shared
     account a public deploy hands to its testers (bootstrap.ensure_shared_login),
     so the login page can show it instead of leaving people guessing. NEVER the
@@ -245,6 +250,7 @@ def sso_status():
     separate decisions.
     """
     return {"azure": _azure_cfg() is not None,
+            "demo_mode": bootstrap.demo_mode(),
             "open_registration": bootstrap.open_registration(),
             "shared_login": bootstrap.shared_login_public()}
 
