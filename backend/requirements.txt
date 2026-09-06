@@ -25,7 +25,18 @@ cryptography>=42.0
 psycopg[binary,pool]>=3.1
 # Tile-result cache when REDIS_URL is set; the app runs without it.
 redis>=5.0
-# agentlightning  # optional — Agent Lightning (trace/RL/APO) integration; loop works without it
+# Agent Lightning (github.com/microsoft/agent-lightning) — not optional any
+# more: app/lightning.py is a real client of it. Its schemas (RolloutCreate /
+# EventCreate / RewardData) are the wire format Studio's rollouts are
+# delivered in, so Agent Lightning's own store and its verl/GRPO trainer read
+# Studio's real traffic. Core deps are light and mostly already here (fastapi,
+# httpx, pydantic, uvicorn, pyyaml, jinja2 + structlog, hydra-core/omegaconf,
+# kr8s) — NO torch: the RL trainer's heavy deps are the trainer's, not ours.
+# It adds ~17 MB to the image (35 resolved packages, verified with pip's
+# --dry-run report). Needs Python >=3.12; the image is 3.12-slim.
+# Delivery still only happens when STUDIO_AGL_URL is set, and the module
+# imports the package lazily, so an image built without it still boots.
+agentlightning>=1.0.1,<2
 
 # KAG (Knowledge-Augmented Generation) document parsers — pure-Python, no
 # torch/pandas: cosine lives in embed.py, csv+email are stdlib.

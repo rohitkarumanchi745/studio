@@ -11,7 +11,8 @@ run) with a human in the loop. What that flow deploys is the verified SQL steps,
 or a Spark payload built from them; the Python it generates is a syntax-checked
 **deliverable Studio never executes**. Around both sit **governance-as-code**
 and a learning loop (**Agent Lightning**) that records every run as a rewarded
-rollout. Once a use case has been learned, a **self-hosted BitNet** — trained
+rollout — and delivers it to a real Agent Lightning server when one is
+configured. Once a use case has been learned, a **self-hosted BitNet** — trained
 continuously from those rollouts — takes over the recurring work, leaving the
 frontier LLM to handle only what's genuinely new.
 
@@ -45,7 +46,7 @@ flowchart TB
         gate["gateway.execute — the ONE data gate<br/>rbac · guard (SQL / Cypher) · limit · governance · audit"]
         jobs["jobs.py · durable queue + worker<br/>chat turns · autopilot / M365 tickers (leased)"]
         subgraph learn["Agent Lightning · learning"]
-            light["lightning.py · rollouts + reward"]
+            light["lightning.py · rollouts + reward<br/>+ delivery to an Agent Lightning server"]
             tr["trainer.py · rollout stream + adapter registry"]
             emb2["embed.py · Harrier"]
             sess["sessions.py · serialize + prompt cache"]
@@ -236,7 +237,7 @@ sequenceDiagram
     participant A as Agent (LangGraph)
     participant G as gateway.execute · RBAC+guard+gov+audit
     participant W as Warehouse
-    participant L as Agent Lightning
+    participant L as Agent Lightning (trace now, server via the queue)
 
     U->>API: "revenue by region"
     API->>S: resolves to a defined metric?
@@ -252,7 +253,7 @@ sequenceDiagram
     W-->>G: columns + rows
     G->>G: governance deny / mask / cap · audit_log(action = purpose)
     G-->>API: rows + chart
-    API->>L: record rollout (prompt, sql, reward)
+    API->>L: record rollout (prompt, sql, reward) + queue its delivery
     API-->>U: answer + chart on the canvas
 ```
 
@@ -429,7 +430,8 @@ you can judge that.
 A pipeline renders a **source → table → step lineage diagram** (drawn from the
 verified steps only) so a multi-source request shows exactly where each table
 comes from; a failed step emails the requester naming the failing source/table,
-and every run is traced through Agent Lightning.
+and every run is traced through Agent Lightning (into `agent_traces`; pipeline
+runs are not among the rollouts shipped to an Agent Lightning server).
 
 ### The staged flow — safe production behavior
 
@@ -830,30 +832,143 @@ the state store until an admin deletes the run.
 
 ---
 
-## Agent Lightning — the learning loop
+## Agent Lightning — the learning loop, and a real client of its server
 
-Modeled on Microsoft's [Agent Lightning](https://github.com/microsoft/agent-lightning):
-every run becomes a **rollout** (prompt → actions → outcome) with a **reward**,
-persisted to the `agent_traces` table.
+Every run becomes a **rollout** (prompt → actions → outcome) with a **reward**,
+persisted to the `agent_traces` table. That loop is Studio's own. On top of it,
+the [`agentlightning`](https://github.com/microsoft/agent-lightning) package
+(1.0.1 — a **real requirement** in `backend/requirements.txt`, not an optional
+extra: its core deps are fastapi / httpx / pydantic / uvicorn / pyyaml / jinja2
+plus structlog, hydra-core and kr8s, **no torch** — 35 resolved packages,
+≈17 MB on disk, `python-box` 9 MB of it) makes Studio a
+**client of a real Agent Lightning server**: set `STUDIO_AGL_URL` and every
+rollout Studio records is also delivered there in the package's own schemas, so
+Agent Lightning's store holds Studio's real traffic and its own tooling reads
+it back (`GET /api/rollouts/terminal`, `GET /api/rollouts/{id}/events`, the
+verl bridge) with no Studio-specific code on that side.
 
 ```mermaid
 flowchart LR
-    run["Any run<br/>chat · pipeline · flow · SQL-verify"] --> roll[("agent_traces<br/>prompt · sql · reward · agents")]
+    run["Any run<br/>chat · autopilot · crew agents"] --> roll[("agent_traces<br/>prompt · sql · reward · agents")]
     roll --> fb["👍 / 👎 overwrites the heuristic reward"]
     roll --> fail["recent failures → system prompt<br/>(immediate, in-context)"]
     roll --> apo["APO distills low-reward traces<br/>→ prompts/system_learned.txt"]
-    roll --> exp["export_rollouts() → JSONL<br/>(ready for VERL / GRPO)"]
-    fb --> apo
+    roll -->|"one INSERT — agl_emit job"| q[["jobs.py · durable queue"]]
+    q -->|"worker does the HTTP"| agl[["Agent Lightning server<br/>RolloutCreate · EventCreate · RewardData"]]
+    fb -->|"reconciler sweep re-enqueues"| q
+    agl --> verl["/api/rollouts/terminal<br/>→ verl / GRPO"]
 ```
+
+**The turn never waits on it.** `record_chat_trace()` writes the trace and
+enqueues ONE `agl_emit` job — a single INSERT into `background_jobs` — then
+returns; the worker makes every HTTP call — four fixed (create the rollout,
+read the attempt's events, two lifecycle patches) plus one POST per event
+type, so 7 for an unscored fallback turn and 8 once a reward rides along.
+Measured on SQLite: recording a trace goes from 3 statements (BEGIN / INSERT /
+COMMIT, 0.45 ms) to 6 (0.96 ms) — exactly one extra INSERT — and an end-to-end
+`/api/chat` turn moves **+0.24 ms median** (63.1 → 63.4 ms over 40 turns each
+way) with `STUDIO_AGL_URL` set versus unset, which is inside the turn's own
+noise. Across those 40 configured turns the web process made **zero** HTTP
+calls to the server and never imported `agentlightning`. Delivery is
+**at-least-once**: the queue owns the retries (`STUDIO_AGL_MAX_ATTEMPTS`, 5 by
+default, with the queue's 5 s / 10 s / 20 s… backoff, across restarts), the
+rollout id is `studio-<trace id>` and creation with a caller-supplied id is
+idempotent server-side, and the handler posts only the event types the attempt
+is missing — so a retried job never creates a second rollout or a duplicate
+event. A server that is down, unauthorized or misconfigured fails the JOB and
+is visible in `/api/health`; the answer already went out.
+
+**What maps to what** (`lightning.py`, verified against the installed 1.0.1):
+
+| Agent Lightning | Studio |
+|---|---|
+| `RolloutCreate.rollout_id` | `studio-<trace id>` — stable, so a retry and a later reward address the same rollout |
+| `RolloutCreate.input` | `data_id` (the trace id — the field `/api/rollouts/terminal` projects), `prompt`, `source`, `table`, `conversation_id`, `history` (the turns the model actually saw, so training conditions the way serving does) |
+| `RolloutCreate.metadata` | `studio_trace_id`, `studio_user_id`, `studio_role`, `mode`, `model`, `agents`, `created_at` — `RolloutMetadata` allows extras; the opaque user id travels, never the email |
+| `RolloutCreate.is_train` | `STUDIO_AGL_TRAIN` (default true) |
+| `EventCreate` | `studio.run` (mode · model · source · table · ok · duration · agents) · `studio.query` (sql · row_count) · `studio.chart` (type · panel_count) · `studio.errors` — row counts, chart types and SQL have no first-class fields in the package's schemas, and correctly ride as trajectory events |
+| `RewardData` | `value` = the trace's reward, `source` = `heuristic` / `user` / `per_agent`, `reason` = a machine slug, `message` = the 👍/👎 note or a compact outcome string |
+| rollout state | `queuing → running → succeeded / failed` from the run's `ok`, which is what puts the rollout in the terminal log a trainer pages through |
+
+Fallback-mode runs (no LLM key) are deliberately **unscored** — no reward event
+at all — until a human votes; shipping a fake `0` would poison training.
+
+**A later 👍/👎 updates the reward, it does not append a second one.** Feedback
+overwrites the reward on the trace; a `jobs.reconciler` sweep (after every
+reclaim pass, ≈30 s) notices that what was delivered no longer matches what the
+trace says and re-enqueues one delivery. Because the store scopes event reads
+to a single attempt, the handler opens the NEXT attempt, patches
+`last_attempt_id` to it and re-posts the trajectory with the new reward — every
+reader (the events route, verl's `reward_events[-1]`) then sees exactly one
+reward, the current one, with the previous attempt kept as history. Durable
+rather than instant: feedback given while the server or the worker was down is
+delivered on a later pass, and a click reaches the server seconds after it
+happens, not in the same request. The sweep runs where the queue heals itself,
+so it needs something running the queue — under `STUDIO_WORKER_MODE=off`
+nothing sweeps until a reclaim pass is driven by hand.
+
+**Unset, nothing changes.** With `STUDIO_AGL_URL` unset there is no queue
+traffic, no HTTP, and not even the two bookkeeping tables (`agl_deliveries`,
+`agl_status`) — the loop behaves exactly as it did before the client existed,
+which is what makes this safe to ship on by default. The chat path never
+imports `agentlightning` (the schemas and client are imported lazily, inside
+the job); the only place that touches the package unconditionally is
+`/api/health`, and only to read `__version__` — the package's `__init__` is a
+version string, so hydra, kr8s and the client itself never load (measured:
+importing it pulls in nothing else at all).
+
+`/api/health` and `/learning` report `agent_lightning` as `{version, installed,
+configured, url, reachable, last_contact_at, last_error}`, where `reachable` is
+the last real outcome of a worker talking to
+the server (persisted, so the web process tells the truth about a server it
+never calls itself), and `null` when the package is absent *and* delivery is
+unconfigured. `/api/health` is unauthenticated, so note that when delivery is
+configured it now shows the Agent Lightning URL and the last delivery error —
+the same posture as the DB path and LLM spec it already reports, but keep the
+server on a private network. `/learning` is admin-only.
+
+**What it does not do yet**, stated plainly: a FIRST delivery that exhausts its
+attempts (the server down for hours) is left as a failed `background_jobs` row
+and nothing re-drives it — the sweep only reconsiders traces that already
+delivered once, because sweeping every undelivered trace would replay the whole
+history the first time `STUDIO_AGL_URL` is set. The trace INSERT and the queue
+INSERT are also two transactions, so a crash between them loses that delivery
+(never the trace). And the reward re-delivery is a sweep rather than an enqueue
+at the moment of the click, which is why it is seconds rather than immediate.
+The event de-duplication is read-then-post rather than atomic, so two
+deliveries of the same trace overlapping in different workers could double an
+event, and a delivery that dies between opening a superseding attempt and
+posting into it leaves that attempt briefly empty until the retry fills it —
+both self-heal, and neither can touch the trace the answer came from.
+
+**Scope of delivery.** Chat turns (synchronous and background), autopilot
+turns, and the crew's per-agent rollouts go through this door — everything
+that calls `lightning.record_chat_trace()` / `record_agent_rollout()`. The
+four writers that call `db.add_trace()` directly — flow stages (`flow.py`),
+`/verify-sql` rollouts (`queries.py`), pipeline runs (`pipelines.py`) and
+platform runs (`supervisor.py`) — still land in `agent_traces` only and are
+**not** shipped, until they are routed through `lightning.record_*` too.
 
 **Is it reinforcement learning?** Yes in structure, no in the usual sense. The
 rollout + reward machinery *is* RL. But Studio runs on hosted models (Claude /
 GPT) whose weights are frozen, so it can't do gradient/weight RL. Instead it
 optimizes the **prompt** — recent failures injected in-context (immediate) and
-APO distilling low-reward traces offline (RLAIF-style). The traces export in the
-exact shape a real RL trainer consumes, so the day a self-hosted open-weight
-model is added, the same rewarded data drives true weight RL — nothing about
-collection changes.
+APO distilling low-reward traces offline (RLAIF-style). The rollouts now live
+in a real Agent Lightning store in the shape a real RL trainer reads, so the
+day a self-hosted open-weight model is added, the same rewarded data drives
+true weight RL — nothing about collection changes.
+
+**What the verl path would consume next.** Agent Lightning's verl trainer
+enqueues its own rollouts from a dataset and, for each terminal rollout, reads
+the events with `format=triplet`: prompt/response **token ids** from
+`model_request` events, plus `reward_events[-1]` as the final reward. Studio
+supplies the rollouts, their inputs and their rewards; it does not supply
+`model_request` events, because those are written by Agent Lightning's LLM
+**proxy** and Studio calls Anthropic / OpenAI directly. So today the store is a
+real, queryable corpus of rewarded Studio rollouts — enough for prompt-level
+optimization and as the dataset side of a training run — and closing the GRPO
+loop means routing Studio's model calls through the Agent Lightning gateway so
+token ids land beside the reward that is already there.
 
 **Per-agent reward shaping.** Each named agent is scored on its *own* decision,
 not a blended answer-level reward: a worker on grounded SQL + rows + a real
@@ -862,6 +977,7 @@ the SQL verifier on whether its check ran. So the orchestrated crew produces a
 per-worker rollout plus an aggregator rollout, and the `/learning` tally counts
 only single-agent rollouts — no agent's average is smeared by another's work.
 Each agent's reward + rollout count shows on its card in the **Agents** panel.
+Each is its own rollout on the server, so a fan-out turn delivers several.
 
 **Train our own model.** `GET /training` reports prompts collected vs. a
 threshold, reward-labeled and human-rated counts, and readiness; the admin
@@ -1627,6 +1743,27 @@ secret, so a backend restart logs everyone out — fine for a local demo, never
 for production. Background jobs and the tickers run inside the web process
 (`STUDIO_WORKER_MODE=thread`); `python -m app.worker` runs them separately.
 
+To watch rollouts land in a real Agent Lightning store, run its server from the
+installed package and point Studio at it — the worker delivers, the turn does
+not wait:
+
+```bash
+# its own CLI (hydra; add hydra.run.dir=. to keep it from making an outputs/ tree)
+python -m agentlightning.server host=127.0.0.1 port=9099 key=$AGL_KEY
+export STUDIO_AGL_URL=http://127.0.0.1:9099 STUDIO_AGL_TOKEN=$AGL_KEY   # in Studio's env
+
+curl http://127.0.0.1:9099/healthz                      # the only unauthenticated route
+# after a chat turn AND its queued job (a worker, or python -m app.worker):
+curl -H "Authorization: Bearer $AGL_KEY" http://127.0.0.1:9099/api/rollouts/studio-<trace id>
+curl -H "Authorization: Bearer $AGL_KEY" http://127.0.0.1:9099/api/rollouts/studio-<trace id>/events
+curl -H "Authorization: Bearer $AGL_KEY" http://127.0.0.1:9099/api/rollouts/terminal
+```
+
+The rollout comes back in Agent Lightning's own schema — `input.data_id` is the
+Studio trace id, the trajectory is `studio.run` / `studio.query` / `studio.chart`
+events, and the reward is a `RewardData` event whose `source` is `heuristic`
+until somebody votes and `user` after.
+
 ### Frontend
 ```bash
 cd frontend
@@ -1700,6 +1837,17 @@ you in: the account is created unverified and the emailed 6-digit code
 | `STUDIO_REDTEAM_MAX_CASES` | Maximum attack cases in one adversarial benchmark after expanding attacker × technique × objective × trial (default 500) |
 | `STUDIO_REDTEAM_MAX_MODEL_CALLS` | Maximum estimated attacker + target + judge calls in one benchmark (default 3000) |
 | `STUDIO_REDTEAM_MODEL_TIMEOUT_S` | Per-call timeout used uniformly for attacker, target, and judge models (default 60; clamped to 5–300 seconds). Each model object also gets one provider-level retry |
+
+**Agent Lightning delivery** (see *Agent Lightning* above; unset = off)
+
+| Variable | Purpose |
+|---|---|
+| `STUDIO_AGL_URL` | Base URL of an Agent Lightning server (its API is under `/api`). **The only switch**: set, every recorded rollout is queued for delivery; unset, nothing is enqueued, no bookkeeping table is created, and behaviour is exactly what it was. The chat path never imports `agentlightning` either way — only the job does, plus `/api/health` reading its `__version__` |
+| `STUDIO_AGL_TOKEN` | The server's `AGL_KEY`, sent as `Authorization: Bearer …` (the server also accepts `x-api-key`). Omit when the server runs without a key |
+| `STUDIO_AGL_TIMEOUT_S` | Per-HTTP-call timeout for one delivery (default 10). Client-side retries are off on purpose — the durable queue owns retries |
+| `STUDIO_AGL_MAX_ATTEMPTS` | Queue attempts per delivery before the job is failed (default 5, with the queue's 5 s / 10 s / 20 s… backoff) |
+| `STUDIO_AGL_TRAIN` | `is_train` on delivered rollouts: `1`/default = training data, `0`/`false`/`no` = evaluation |
+| `STUDIO_AGL_PENDING_STALE_S` | Seconds before a reward re-delivery that was queued but never completed is retried by the sweep (default 600) |
 
 **Data gate & results**
 

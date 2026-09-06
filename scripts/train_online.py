@@ -437,6 +437,43 @@ def write_samples_jsonl(samples, path):
 
 # ── LoRA training (real; heavy deps imported lazily) ─────────────────────
 
+def _device_and_dtype():
+    """Pick the accelerator and weight dtype the way the hardware wants.
+
+    The trainer used to hardcode torch_dtype=torch.float32 and let the Trainer
+    guess the device. On a 2.4B model that is 9.6 GB of weights, which on a
+    16 GB laptop means swapping before the first optimizer step completes — one
+    measured run sat 26 minutes without finishing step 1, and led to the wrong
+    conclusion that fine-tuning needs a dedicated box. It does not: the same
+    machine in bf16 on Apple's MPS backend does a 512-token micro-batch in ~4.5s
+    (measured, M1/16 GB), so an epoch over a few hundred samples is minutes.
+
+    bf16 everywhere that supports it — CUDA, and MPS on Apple silicon — and
+    fp32 only on plain CPU, where bf16 is usually slower rather than faster.
+    STUDIO_TRAIN_DEVICE / STUDIO_TRAIN_DTYPE override both for a box that knows
+    better than this heuristic.
+    """
+    import torch
+    dev = os.getenv("STUDIO_TRAIN_DEVICE", "").strip().lower()
+    if not dev:
+        if torch.cuda.is_available():
+            dev = "cuda"
+        elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            dev = "mps"
+        else:
+            dev = "cpu"
+    want = os.getenv("STUDIO_TRAIN_DTYPE", "").strip().lower()
+    if want in ("bf16", "bfloat16"):
+        dtype = torch.bfloat16
+    elif want in ("fp16", "float16"):
+        dtype = torch.float16
+    elif want in ("fp32", "float32"):
+        dtype = torch.float32
+    else:
+        dtype = torch.float32 if dev == "cpu" else torch.bfloat16
+    return dev, dtype
+
+
 def train_lora(samples, base_model, out_dir, epochs):
     """Reward-filtered SFT of a small LoRA adapter on the base model. CPU is
     sufficient for a 1-bit base + a small adapter. Returns (adapter_dir, metrics).
@@ -479,8 +516,11 @@ def train_lora(samples, base_model, out_dir, epochs):
             return f"{sys_prefix}{hist}<|user|>\n{s['prompt']}\n<|assistant|>\n{s['completion']}{tok.eos_token}"
 
     ds = Dataset.from_dict({"text": [_fmt(s) for s in samples]})
-    model = AutoModelForCausalLM.from_pretrained(
-        base_model, torch_dtype=torch.float32)
+    device, dtype = _device_and_dtype()
+    print(f"[trainer] device={device} dtype={str(dtype).split('.')[-1]}")
+    model = AutoModelForCausalLM.from_pretrained(base_model, torch_dtype=dtype)
+    if device != "cpu":
+        model = model.to(device)
     lora = LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05, bias="none",
                       task_type="CAUSAL_LM",
                       target_modules=["q_proj", "k_proj", "v_proj", "o_proj"])
@@ -548,8 +588,11 @@ def train_dpo(pairs, base_model, out_dir, epochs):
         "prompt": [_prompt(p) for p in pairs],
         "chosen": [p["chosen"] for p in pairs],
         "rejected": [p["rejected"] for p in pairs]})
-    model = AutoModelForCausalLM.from_pretrained(
-        base_model, torch_dtype=torch.float32)
+    device, dtype = _device_and_dtype()
+    print(f"[trainer] device={device} dtype={str(dtype).split('.')[-1]}")
+    model = AutoModelForCausalLM.from_pretrained(base_model, torch_dtype=dtype)
+    if device != "cpu":
+        model = model.to(device)
     lora = LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05, bias="none",
                       task_type="CAUSAL_LM",
                       target_modules=["q_proj", "k_proj", "v_proj", "o_proj"])
