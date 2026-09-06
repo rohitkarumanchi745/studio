@@ -549,8 +549,24 @@ def _run_turn(ctx, user):
     # documents-first turn grounded in the user's own knowledge collections.
     if model == "bitnet" and model_router.bitnet_ready(user):
         progress.emit("routing to the self-hosted BitNet engine")
-        result = _run(model_router.bitnet_spec())
-        result.setdefault("served_by", "bitnet")
+        # Explicitly choosing BitNet picks WHO answers first, not whether the
+        # turn is allowed to fail. The automatic tier below already escalates a
+        # BitNet attempt that comes back with no SQL, with errors, or raising;
+        # this branch used to stamp served_by="bitnet" on whatever came back,
+        # so a dead endpoint handed the user the keyless preview labelled as a
+        # BitNet answer. Same test, same escalation — and served_by tells the
+        # truth about which engine actually produced the result.
+        try:
+            result = _run(model_router.bitnet_spec())
+        except Exception:
+            result = None
+        if result is not None and result.get("sql") and not result.get("errors"):
+            result.setdefault("served_by", "bitnet")
+        else:
+            progress.emit("BitNet couldn't answer — escalating to the frontier model")
+            result = _run(None)          # None = the configured frontier model
+            result["served_by"] = "frontier"
+            result.setdefault("routed", {})["escalated_from"] = "bitnet"
     elif model == "kag":
         progress.emit("searching your knowledge collections")
         result = _run(None, kag_first=True)

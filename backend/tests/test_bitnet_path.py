@@ -619,3 +619,73 @@ def test_a_failed_bitnet_attempt_is_never_served_as_a_bitnet_answer(monkeypatch)
                           history=[], user=ADMIN, model="openai:bitnet")
     assert out["errors"] and "bitnet unavailable" in out["errors"][0]
     assert out["mode"] == "fallback"          # a preview, not a BitNet answer
+
+
+# ── Explicitly choosing BitNet picks who answers FIRST, not whether the turn
+#    is allowed to fail. ─────────────────────────────────────────────────
+
+def _ask_explicit_bitnet(client, prompt=REPEAT_PROMPT):
+    r = client.post("/api/chat", json={"prompt": prompt, "source": "demo",
+                                       "table": "sales", "model": "bitnet"})
+    assert r.status_code == 200, r.text
+    return r.json()["message"]
+
+
+def test_explicit_bitnet_escalates_when_it_produces_no_sql(client, monkeypatch, stub):
+    """The reported lifecycle gap. Selecting 'bitnet' in the model picker took a
+    branch that stamped served_by="bitnet" on WHATEVER came back and never
+    escalated — so a dead endpoint handed the user the keyless preview labelled
+    as a BitNet answer. The automatic tier has always escalated; this branch
+    must apply the same test."""
+    monkeypatch.setenv("STUDIO_LLM_BASE_URL", stub.base_url)
+    _publish_tool_call()
+    calls = _route_recorder(monkeypatch, lambda kw: dict(
+        FRONTIER_ANSWER, sql=None, rows=[], text="I could not write SQL.",
+        model=kw["model"]))
+
+    msg = _ask_explicit_bitnet(client)
+    assert calls == ["openai:bitnet", None], "explicit selection must still escalate"
+    assert msg["served_by"] == "frontier", "served_by must name who actually answered"
+    assert msg.get("routed", {}).get("escalated_from") == "bitnet"
+    assert msg["sql"] and msg["rows"], "the turn still has to answer"
+
+
+def test_explicit_bitnet_escalates_when_it_errors(client, monkeypatch, stub):
+    monkeypatch.setenv("STUDIO_LLM_BASE_URL", stub.base_url)
+    _publish_tool_call()
+    calls = _route_recorder(monkeypatch, lambda kw: dict(
+        FRONTIER_ANSWER, errors=["bitnet unavailable: connection refused"],
+        model=kw["model"]))
+
+    msg = _ask_explicit_bitnet(client)
+    assert calls == ["openai:bitnet", None]
+    assert msg["served_by"] == "frontier"
+
+
+def test_explicit_bitnet_escalates_when_it_raises(client, monkeypatch, stub):
+    monkeypatch.setenv("STUDIO_LLM_BASE_URL", stub.base_url)
+    _publish_tool_call()
+    calls = []
+
+    def _run(**kw):
+        calls.append(kw["model"])
+        if kw["model"] == "openai:bitnet":
+            raise RuntimeError("engine exploded")
+        return dict(FRONTIER_ANSWER, model=kw["model"])
+    monkeypatch.setattr("app.agent.run_agent", lambda **kw: _run(**kw))
+
+    msg = _ask_explicit_bitnet(client)
+    assert calls == ["openai:bitnet", None]
+    assert msg["served_by"] == "frontier"
+
+
+def test_explicit_bitnet_still_serves_a_good_answer_as_bitnet(client, monkeypatch, stub):
+    """The success path must be untouched: a real BitNet answer is still
+    reported as BitNet, with no escalation."""
+    monkeypatch.setenv("STUDIO_LLM_BASE_URL", stub.base_url)
+    _publish_tool_call()
+    calls = _route_recorder(monkeypatch, lambda kw: dict(FRONTIER_ANSWER, model=kw["model"]))
+
+    msg = _ask_explicit_bitnet(client)
+    assert calls == ["openai:bitnet"], "a good answer must not consult the frontier"
+    assert msg["served_by"] == "bitnet"

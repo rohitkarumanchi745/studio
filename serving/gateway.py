@@ -120,6 +120,12 @@ _LOADED = set()          # backend LoRA names we have successfully loaded this r
 # Last refused adapter request, surfaced on /health so a mismatch is visible
 # rather than silent: {"requested": uri, "mounted": uri or None}.
 _MISMATCH = {}
+# The engine generation _LOADED was populated against. A restarted engine has
+# enabled NOTHING — llama mounts at scale 0 (--lora-init-without-apply) and vLLM
+# loses its runtime LoRAs entirely — so a cache that outlives the engine makes
+# the gateway skip the very call that turns the adapter on, and report an
+# adapter that is not applied. See _sync_engine_epoch.
+_ENGINE_EPOCH = None
 
 # The supervisor writes this; see serving/supervisor.py write_state(). The
 # gateway starts BEFORE the model is downloaded and before the engine exists,
@@ -153,6 +159,32 @@ def _supervisor_state():
             "adapter": None}
 
 
+def _sync_engine_epoch(state=None):
+    """Drop the enabled-adapter cache when the engine has been replaced.
+
+    The gateway outlives the engine: the supervisor restarts llama-server when
+    an adapter file lands or the process dies, while this process keeps running.
+    Every adapter the gateway had enabled is off again after that restart, so
+    the cache must not survive it — otherwise `if name in _LOADED: return True`
+    skips the POST /lora-adapters that applies the adapter, and the box serves
+    the base model with both sides reporting success."""
+    global _ENGINE_EPOCH
+    st = state if state is not None else _supervisor_state()
+    epoch = st.get("engine_epoch")
+    if epoch is None:                       # unsupervised: no restarts to track
+        return st
+    with _NAME_LOCK:
+        if _ENGINE_EPOCH != epoch:
+            if _ENGINE_EPOCH is not None and _LOADED:
+                _log(f"engine restarted (epoch {_ENGINE_EPOCH} → {epoch}) — dropping "
+                     f"{len(_LOADED)} cached adapter(s); they will be re-enabled on "
+                     f"the next request that asks for them.")
+            _ENGINE_EPOCH = epoch
+            _LOADED.clear()
+            _MISMATCH.clear()
+    return st
+
+
 def _engine_answers(timeout=3):
     """Does the backend actually respond? The last link /health can check
     without generating a token."""
@@ -167,7 +199,7 @@ def _readiness():
     """(http_status, payload) for GET /health. 200 ONLY when a request would be
     served; 503 with a machine-readable stage otherwise, so an operator can see
     which link is missing instead of a silent black hole."""
-    st = _supervisor_state()
+    st = _sync_engine_epoch()
     stage = st.get("stage")
     adapter = st.get("adapter")
     body = {"stage": stage, "backend": BACKEND_URL, "kind": BACKEND_KIND,
@@ -230,6 +262,7 @@ def _ensure_loaded_vllm(uri, name):
     success, False on failure (caller falls back to the base model).
     Requires the server started with --enable-lora AND
     VLLM_ALLOW_RUNTIME_LORA_UPDATING=True (see README)."""
+    _sync_engine_epoch()      # a restarted vLLM has dropped its runtime LoRAs
     if name in _LOADED:
         return True
     try:
@@ -277,7 +310,7 @@ def _ensure_loaded_llama(uri, name):
     A mismatch is not an error — the request proceeds on the base model, which
     is the honest degradation — but it is refused, logged, and visible on
     /health as mounted_adapter versus the uri that was asked for."""
-    mounted = (_supervisor_state().get("adapter") or {})
+    mounted = (_sync_engine_epoch().get("adapter") or {})
     mounted_uri = mounted.get("uri")
     if mounted_uri != uri:
         with _NAME_LOCK:

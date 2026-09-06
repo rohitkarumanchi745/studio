@@ -334,6 +334,9 @@ def write_state(stage, adapter=None, detail=None):
     """
     payload = {"stage": stage, "detail": detail, "adapter": adapter,
                "model_path": MODEL_PATH, "engine_port": ENGINE_PORT,
+               # Bumped on every engine start; the gateway drops its
+               # enabled-adapter cache when it changes (see start_engine).
+               "engine_epoch": _ENGINE_EPOCH,
                "updated_at": time.time()}
     tmp = STATE_PATH + ".tmp"
     try:
@@ -512,10 +515,24 @@ def start_gateway():
     return subprocess.Popen(argv, env=gateway_env())
 
 
+_ENGINE_EPOCH = 0
+
+
 def start_engine(adapter_present):
+    """Start llama-server and bump the epoch.
+
+    The epoch is what lets the GATEWAY know the engine underneath it was
+    replaced. That matters because the gateway caches which adapters it has
+    enabled, and a restarted engine has enabled none: --lora-init-without-apply
+    mounts at scale 0, and only the gateway's POST /lora-adapters turns it on.
+    Without the epoch the cache survives the restart, the scale call is never
+    re-sent, and the box serves the BASE model while both sides believe the
+    adapter is live."""
+    global _ENGINE_EPOCH
+    _ENGINE_EPOCH += 1
     argv = engine_argv(adapter_present)
-    log(f"starting engine ({'WITH' if adapter_present else 'WITHOUT'} adapter): "
-        f"{' '.join(argv)}")
+    log(f"starting engine ({'WITH' if adapter_present else 'WITHOUT'} adapter, "
+        f"epoch {_ENGINE_EPOCH}): {' '.join(argv)}")
     return subprocess.Popen(argv)
 
 

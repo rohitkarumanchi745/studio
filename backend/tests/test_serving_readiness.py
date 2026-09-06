@@ -269,3 +269,43 @@ def test_a_plain_request_still_works(gateway, engine):
     sent = [c for c in engine.calls if c[0].startswith("/v1/chat/completions")]
     assert sent and "studio_adapters" not in sent[0][1], \
         "the private field must be stripped before the engine sees it"
+
+
+# ── 3. The enabled-adapter cache must not outlive the engine ────────────
+
+def test_an_engine_restart_drops_the_enabled_adapter_cache(gateway, engine, tmp_path):
+    """The reported lifecycle bug. The gateway outlives the engine: the
+    supervisor restarts llama-server when an adapter lands or the process dies,
+    while this process keeps running. A restarted engine has enabled NOTHING
+    (llama mounts at scale 0 via --lora-init-without-apply), so a cache that
+    survives the restart makes `if name in _LOADED: return True` skip the very
+    POST /lora-adapters that applies the adapter — the box serves the base
+    model while both sides report success.
+    """
+    port, state_path = gateway(state={"stage": "ready", "adapter": MOUNTED,
+                                      "engine_epoch": 1})
+    _chat(port, {"tool_call": {"uri": MOUNTED["uri"], "version": 7}})
+    scales = [c for c in engine.calls if c[0].rstrip("/") == "/lora-adapters"]
+    assert len(scales) == 1, "the first request should enable the adapter"
+
+    # Same epoch: the cache is legitimately warm, no second call needed.
+    _chat(port, {"tool_call": {"uri": MOUNTED["uri"], "version": 7}})
+    assert len([c for c in engine.calls if c[0].rstrip("/") == "/lora-adapters"]) == 1
+
+    # The supervisor restarts the engine and bumps the epoch.
+    state_path.write_text(json.dumps({"stage": "ready", "adapter": MOUNTED,
+                                      "engine_epoch": 2}))
+    _chat(port, {"tool_call": {"uri": MOUNTED["uri"], "version": 7}})
+    assert len([c for c in engine.calls if c[0].rstrip("/") == "/lora-adapters"]) == 2, \
+        "after an engine restart the adapter must be re-enabled, not assumed"
+
+
+def test_health_reflects_the_dropped_cache_after_a_restart(gateway, engine, tmp_path):
+    port, state_path = gateway(state={"stage": "ready", "adapter": MOUNTED,
+                                      "engine_epoch": 1})
+    _chat(port, {"tool_call": {"uri": MOUNTED["uri"], "version": 7}})
+    assert _health(port)[1]["loaded_adapters"], "adapter should be reported loaded"
+    state_path.write_text(json.dumps({"stage": "ready", "adapter": MOUNTED,
+                                      "engine_epoch": 2}))
+    assert _health(port)[1]["loaded_adapters"] == [], \
+        "a restarted engine has nothing loaded; /health must not claim otherwise"
