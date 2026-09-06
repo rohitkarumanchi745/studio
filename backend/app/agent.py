@@ -170,9 +170,35 @@ def user_key(user, spec=None):
         return None
 
 
+def self_hosted(spec):
+    """True when `spec` names the SELF-HOSTED engine (the BitNet served behind
+    STUDIO_LLM_BASE_URL) and a serving endpoint is actually configured.
+
+    This is the ONLY case in which STUDIO_LLM_BASE_URL may be applied. It used
+    to be applied to every spec, which silently re-pointed the *frontier* model
+    (anthropic:… by default) at the BitNet gateway the moment an operator set
+    the variable — so configuring serving broke every frontier turn, including
+    the escalation a failed BitNet answer depends on."""
+    if not os.getenv("STUDIO_LLM_BASE_URL", "").strip():
+        return False
+    try:
+        from . import router as model_router
+        target = model_router.bitnet_spec()
+    except Exception:                                   # pragma: no cover - import guard
+        target = os.getenv("STUDIO_BITNET_LLM", "openai:bitnet")
+    return bool(spec) and spec.strip() == (target or "").strip()
+
+
 def llm_available(spec=None, user=None):
-    """A provider is usable when the server has a key, or this user brought one."""
-    provider = (spec or llm_spec()).split(":", 1)[0]
+    """A provider is usable when the server has a key, or this user brought one.
+
+    The self-hosted engine is the exception: it is reached by URL, not by a
+    provider key (serving/README.md: the base URL + the model spec are "all
+    Studio needs"), so it is available whenever an endpoint is configured."""
+    spec = spec or llm_spec()
+    if self_hosted(spec):
+        return True
+    provider = spec.split(":", 1)[0]
     key_var = _KEY_FOR_PROVIDER.get(provider)
     if key_var is None:
         return True  # unknown provider — let LangChain resolve credentials
@@ -183,27 +209,39 @@ def make_llm(spec, user=None, **kwargs):
     """init_chat_model, preferring this user's key over the server's.
 
     When STUDIO_LLM_BASE_URL points at a self-hosted, OpenAI-compatible endpoint
-    (a BitNet served by vLLM / llama.cpp), the request is routed there and the
-    user's active LoRA adapters — a global tool-calling adapter plus this user's
-    style adapter — ride along, so simultaneous training's newest weights serve
-    the next call. A no-op for hosted Claude/GPT."""
+    (a BitNet served by vLLM / llama.cpp behind serving/gateway.py), a request
+    for THAT spec is routed there and the user's active LoRA adapters — a global
+    tool-calling adapter plus this user's style adapter — ride along, so
+    simultaneous training's newest weights serve the next call. A genuine no-op
+    for hosted Claude/GPT: only `spec == router.bitnet_spec()` is redirected, so
+    the frontier keeps talking to its own provider even while BitNet serves.
+
+    The self-hosted endpoint is authenticated by STUDIO_LLM_API_KEY (the gateway's
+    STUDIO_GATEWAY_API_KEY, when it sets one), never by the user's BYOK provider
+    key — an OpenAI key belongs to OpenAI, not to a self-hosted box. The OpenAI
+    client insists on *some* credential, so an unauthenticated gateway gets a
+    placeholder."""
     from langchain.chat_models import init_chat_model
-    key = user_key(user, spec)
-    if key:
-        kwargs["api_key"] = key
-    base_url = os.getenv("STUDIO_LLM_BASE_URL", "").strip()
-    if base_url:
-        kwargs["base_url"] = base_url
+    if self_hosted(spec):
+        kwargs.setdefault("base_url", os.getenv("STUDIO_LLM_BASE_URL", "").strip())
+        kwargs.setdefault("api_key", os.getenv("STUDIO_LLM_API_KEY", "").strip()
+                          or "studio-local")
         try:
             from . import trainer
             adapters = trainer.active_adapters(user.get("id") if user else None)
             if adapters:
-                # Passed through to the self-hosted server, which loads the LoRAs
-                # (vLLM multi-LoRA). Harmless extra field for other servers.
-                mk = kwargs.setdefault("model_kwargs", {})
-                mk.setdefault("extra_body", {})["studio_adapters"] = adapters
+                # Top-level body field the serving gateway parses to pick a LoRA
+                # ({"tool_call": {"uri","version"}, "user_style": {...}}). Passed
+                # explicitly rather than through model_kwargs: langchain warns on
+                # the latter, and older releases fold an unknown kwarg into
+                # model_kwargs anyway, so this reaches the wire either way.
+                kwargs.setdefault("extra_body", {})["studio_adapters"] = adapters
         except Exception:
             pass
+    else:
+        key = user_key(user, spec)
+        if key:
+            kwargs["api_key"] = key
     return init_chat_model(spec, **kwargs)
 
 
@@ -582,6 +620,15 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
             out["text"] = f"(Agent error: {e}) — showing a basic preview instead.\n\n" + out["text"]
             out["model_error"] = {"spec": spec, "detail": msg[:300],
                                   "retryable_with_default": spec != llm_spec()}
+        # A FAILED self-hosted attempt must never be served *as* a BitNet answer.
+        # The keyless preview _fallback returns carries a `sql` and no `errors`,
+        # which is exactly the shape chat._run_turn accepts as a good BitNet
+        # answer — so a dead endpoint would have pinned every learned prompt to a
+        # "SELECT * LIMIT" preview instead of escalating. Flag it: the caller
+        # sees an error and escalates to the frontier (and the explicit-engine
+        # path still gets a preview rather than a 500).
+        if self_hosted(spec):
+            out.setdefault("errors", []).append(f"bitnet unavailable: {msg[:200]}")
         out["agents"] = [me]
         return out
 

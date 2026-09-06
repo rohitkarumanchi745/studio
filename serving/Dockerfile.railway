@@ -1,0 +1,117 @@
+# Studio BitNet serving unit — ONE Railway service (engine + gateway).
+#
+# docker-compose.yml runs this as TWO containers sharing a bind-mount. Railway
+# runs ONE container per service and a volume belongs to exactly one service, so
+# the two halves live here together under supervisor.py. Full reasoning, env vars
+# and cost: RAILWAY.md.
+#
+# ── THE ENGINE IS bitnet.cpp, NOT STOCK llama.cpp ───────────────────────────
+# microsoft/bitnet-b1.58-2B-4T-gguf ships ggml-model-i2_s.gguf, and I2_S is a
+# quantisation type that exists only in Microsoft's llama.cpp fork. Stock
+# ggml-org/llama.cpp FAILS to load it:
+#     tensor 'blk.0.ffn_down.weight' of type 36 (TYPE_IQ4_NL_4_4 REMOVED …)
+#     has 6912 elements per row, not a multiple of block size (0)
+#   — ggml-org/llama.cpp#12997, still open; and the model card is explicit:
+#     "you MUST use the dedicated C++ implementation: bitnet.cpp".
+# So this image BUILDS bitnet.cpp (github.com/microsoft/BitNet) from source. Its
+# vendored llama.cpp is recent enough to have tools/server, which means the
+# llama-server it produces still speaks everything gateway.py needs:
+# /v1/chat/completions, /health, GET+POST /lora-adapters, --lora,
+# --lora-init-without-apply. (docker-compose.yml's cpu profile uses the stock
+# image and would NOT load this GGUF — see README §1.)
+#
+# BUILD COST: a from-source C++ build, ~10-20 min of Railway build time on a
+# first build. It is cached afterwards and only re-runs when BITNET_REF changes.
+
+# ── Stage 1: build llama-server from bitnet.cpp ─────────────────────────────
+FROM ubuntu:24.04 AS build
+
+# Pinned to a real commit, not a moving branch: microsoft/BitNet has no tags, and
+# an unpinned HEAD makes two builds of "the same" image different engines.
+ARG BITNET_REF=0b341e582afbf9e1011f24744b554c96a3477eb5
+
+# Portability, not peak speed. llama.cpp defaults GGML_NATIVE=ON, i.e. -march=
+# native — compiled against the BUILDER's CPU. Railway builds and runs on
+# different machines, so a native build can die with SIGILL on the run host.
+# AVX2/FMA/F16C is the safe modern-x86 baseline (every current cloud x86 has it).
+# On a box where you control both ends, `-DGGML_NATIVE=ON` is worth ~10-20%.
+ARG BITNET_CMAKE_EXTRA="-DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git ca-certificates cmake make clang-18 libcurl4-openssl-dev python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+# Full clone + full submodules: the pinned SHA is not necessarily a branch tip,
+# and a shallow submodule fetch of an arbitrary SHA is not guaranteed to work.
+RUN git clone --recurse-submodules https://github.com/microsoft/BitNet.git bitnet \
+    && cd bitnet \
+    && git checkout "${BITNET_REF}" \
+    && git submodule update --init --recursive
+
+WORKDIR /src/bitnet
+# These -D flags are exactly what bitnet.cpp's own setup_env.py passes for
+# `-q i2_s` on x86_64 (COMPILER_EXTRA_ARGS["x86_64"] = ["-DBITNET_X86_TL2=OFF"],
+# plus the LLAMA_BUILD_* set). setup_env.py additionally downloads a model and,
+# for tl1/tl2 only, runs a codegen step — for i2_s gen_code() does nothing, so
+# calling cmake directly is the same build without pulling 1.1 GB into a layer.
+RUN cmake -B build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBITNET_X86_TL2=OFF \
+        -DCMAKE_C_COMPILER=clang-18 \
+        -DCMAKE_CXX_COMPILER=clang++-18 \
+        -DLLAMA_BUILD_TOOLS=ON \
+        -DLLAMA_BUILD_EXAMPLES=ON \
+        -DLLAMA_BUILD_COMMON=ON \
+        -DLLAMA_BUILD_SERVER=ON \
+        ${BITNET_CMAKE_EXTRA} \
+    && cmake --build build --config Release -j "$(nproc)" \
+    && test -x build/bin/llama-server \
+    && ./build/bin/llama-server --help > /dev/null
+# The `--help` line is a smoke test: it fails the BUILD if the binary cannot
+# start (a missing runtime lib, a bad -march choice), rather than letting a
+# broken image reach production and crash-loop. llama.cpp's arg parser exits 0
+# on --help; if a future build ever changes that, this is the line to relax.
+
+# ── Stage 2: runtime ────────────────────────────────────────────────────────
+# Same base as the builder so libstdc++/libgomp ABIs match. No compiler, no
+# source, no model — a small image whose only large artefact is the engine.
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 ca-certificates curl libgomp1 libcurl4 \
+    && rm -rf /var/lib/apt/lists/*
+
+# The whole bin/ dir, not just the binary: llama.cpp may build shared ggml/llama
+# libs alongside it, and copying the directory is correct either way.
+COPY --from=build /src/bitnet/build/bin /opt/bitnet/bin
+ENV LD_LIBRARY_PATH=/opt/bitnet/bin
+
+WORKDIR /app
+COPY gateway.py supervisor.py /app/
+
+# Defaults that make a bare `docker run` (or a Railway service with no variables
+# set at all) work. Everything here is overridable from Railway → Variables.
+ENV STUDIO_DATA_DIR=/data \
+    STUDIO_BITNET_GGUF=ggml-model-i2_s.gguf \
+    STUDIO_BITNET_GGUF_REPO=microsoft/bitnet-b1.58-2B-4T-gguf \
+    STUDIO_TOOLCALL_GGUF=tool_call.gguf \
+    STUDIO_BASE_MODEL_NAME=bitnet \
+    STUDIO_BACKEND_KIND=llama \
+    STUDIO_GATEWAY_ADAPTER_PRIORITY=tool_call \
+    STUDIO_ENGINE_BIN=/opt/bitnet/bin/llama-server \
+    STUDIO_ENGINE_PORT=8080 \
+    STUDIO_GATEWAY_PORT=9001 \
+    LLAMA_CTX_SIZE=4096 \
+    PORT=9000
+
+# Runs as root on purpose: a Railway volume is mounted root-owned, and the model
+# download writes into it on first boot. Nothing here is reachable except the one
+# port below — llama-server and gateway.py both bind 127.0.0.1 (see supervisor).
+VOLUME ["/data"]
+EXPOSE 9000
+
+# supervisor.py is PID 1: it owns the public listener, gateway.py and
+# llama-server, fetches the model once onto the volume, starts the engine with
+# --lora only if an adapter exists, and restarts it when one arrives.
+CMD ["python3", "-u", "/app/supervisor.py"]

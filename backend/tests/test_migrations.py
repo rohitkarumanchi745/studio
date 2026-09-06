@@ -28,7 +28,7 @@ os.environ.setdefault("STUDIO_DB_PATH", os.path.join(_TMP, "studio.db"))
 
 import pytest
 
-from app import chat, db, mcp, migrations, qcache
+from app import chat, db, mcp, migrations, qcache, redteam
 
 # Table -> columns a migration must add. Mirrors MIGRATIONS.
 EXPECTED = {
@@ -38,6 +38,7 @@ EXPECTED = {
     "mcp_servers": ["owner_id"],
     "query_cache": ["seen", "avg_reward", "embedding"],
     "messages": ["reply_to"],
+    "redteam_benchmarks": ["model_revision"],
 }
 
 # Derived from the list itself, so appending a migration does not mean editing
@@ -66,6 +67,9 @@ CREATE TABLE query_cache (
     id TEXT PRIMARY KEY, role TEXT NOT NULL, source TEXT NOT NULL, table_scope TEXT NOT NULL,
     prompt TEXT NOT NULL, signature TEXT NOT NULL, sql TEXT NOT NULL, chart TEXT, text TEXT,
     hits INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, updated_at REAL NOT NULL);
+CREATE TABLE redteam_benchmarks (
+    id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, name TEXT NOT NULL,
+    created_at REAL NOT NULL);
 """
 
 
@@ -151,14 +155,20 @@ def test_apply_twice_is_noop(old_db):
 
 def test_old_columns_get_working_defaults(old_db):
     """The added columns are usable by today's code paths: a pre-migration
-    user reads as verified, a task carries steps, cache rows have seen=0."""
+    user reads as verified, cache rows have seen=0, and an old red-team run
+    gets a non-null revision sentinel rather than breaking report/cache code."""
     migrations.apply_pending()
     raw = sqlite3.connect(old_db)
     raw.execute("INSERT INTO users (id,email,password_hash,name,created_at) VALUES ('u','a@b','h','A',1)")
     raw.execute("INSERT INTO query_cache (id,role,source,table_scope,prompt,signature,sql,created_at,updated_at) "
                 "VALUES ('q','r','s','t','p','sig','select 1',1,1)")
+    raw.execute("INSERT INTO redteam_benchmarks (id,owner_id,name,created_at) "
+                "VALUES ('r','u','old run',1)")
     assert raw.execute("SELECT verified FROM users").fetchone()[0] == 1
     assert raw.execute("SELECT seen, avg_reward, embedding FROM query_cache").fetchone() == (0, None, None)
+    assert raw.execute(
+        "SELECT model_revision FROM redteam_benchmarks WHERE id='r'"
+    ).fetchone()[0] == "unversioned"
     raw.close()
 
 
@@ -169,6 +179,7 @@ def test_fresh_baseline_records_without_altering(fresh_path):
     chat.init_tables()
     mcp.init_tables()
     qcache.init_tables()
+    redteam.init_tables()
     _assert_complete(fresh_path)                          # baseline is complete
     before = {t: _columns(fresh_path, t) for t in EXPECTED}
 

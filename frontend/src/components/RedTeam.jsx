@@ -67,9 +67,16 @@ function CreateBenchmark({ options, onCreated }) {
   const [error, setError] = useState("");
 
   useEffect(() => {
-    if (!target && first) setTarget(first);
-    if (!judge && first) setJudge(first);
-    if (!attackers.length && available.length) setAttackers(available.slice(0, 2).map((m) => m.spec));
+    if (!first) return;
+    const targetDefault = first;
+    const judgeDefault = available.find((m) => m.spec !== targetDefault)?.spec || "";
+    if (!target) setTarget(targetDefault);
+    if (!judge) setJudge(judgeDefault);
+    if (!attackers.length) {
+      setAttackers(available.filter(
+        (m) => m.spec !== targetDefault && m.spec !== judgeDefault
+      ).slice(0, 2).map((m) => m.spec));
+    }
   }, [first, available.length]); // model menu changes only when options reloads
 
   useEffect(() => {
@@ -83,7 +90,10 @@ function CreateBenchmark({ options, onCreated }) {
     (sum, technique) => sum + 2 * (technique === "crescendo" ? Number(turns || 0) : 1), 0);
   const estimatedCalls = attackers.length * objectives.length * Number(trials || 0) *
     attackCallsPerBlock + cases * scorers.length;
-  const limit = options?.limits?.max_cases || 0;
+  const caseLimit = options?.limits?.max_cases || 0;
+  const callLimit = options?.limits?.max_model_calls || 0;
+  const distinctRoles = target && judge && target !== judge &&
+    !attackers.includes(target) && !attackers.includes(judge);
 
   function toggle(value, values, setValues) {
     setValues(values.includes(value) ? values.filter((v) => v !== value) : [...values, value]);
@@ -105,7 +115,7 @@ function CreateBenchmark({ options, onCreated }) {
         }),
       });
       setAuthorized(false);
-      onCreated(created.id);
+      await onCreated(created.id);
     } catch (e) {
       setError(e.message);
     } finally {
@@ -113,9 +123,10 @@ function CreateBenchmark({ options, onCreated }) {
     }
   }
 
-  const valid = name.trim() && dataset.trim() && target && judge && attackers.length &&
+  const valid = name.trim() && dataset.trim() && distinctRoles && attackers.length &&
     techniques.length && scorers.length && objectives.length && authorized && cases > 0 &&
-    (!limit || cases <= limit) && (!useCache || modelRevision.trim());
+    (!caseLimit || cases <= caseLimit) && (!callLimit || estimatedCalls <= callLimit) &&
+    (!useCache || modelRevision.trim());
 
   return (
     <div className="rt-create">
@@ -131,12 +142,14 @@ function CreateBenchmark({ options, onCreated }) {
         <label>Dataset label<input value={dataset} maxLength={120} onChange={(e) => setDataset(e.target.value)} /></label>
         <label>Objective target
           <select value={target} onChange={(e) => setTarget(e.target.value)}>
-            {available.map((m) => <option key={m.spec} value={m.spec}>{m.label || m.spec}</option>)}
+            {available.map((m) => <option key={m.spec} value={m.spec}
+              disabled={m.spec === judge || attackers.includes(m.spec)}>{m.label || m.spec}</option>)}
           </select>
         </label>
         <label>Independent judge
           <select value={judge} onChange={(e) => setJudge(e.target.value)}>
-            {available.map((m) => <option key={m.spec} value={m.spec}>{m.label || m.spec}</option>)}
+            {available.map((m) => <option key={m.spec} value={m.spec}
+              disabled={m.spec === target || attackers.includes(m.spec)}>{m.label || m.spec}</option>)}
           </select>
         </label>
         <label>Model/deployment revision
@@ -160,11 +173,14 @@ function CreateBenchmark({ options, onCreated }) {
       <div className="rt-picks">
         {available.map((m) => (
           <button key={m.spec} className={`chip ${attackers.includes(m.spec) ? "chip-active" : ""}`}
+            disabled={m.spec === target || m.spec === judge}
             onClick={() => toggle(m.spec, attackers, setAttackers)} title={m.spec}>
             {m.label || m.spec}
           </button>
         ))}
         {!available.length && <span className="error">Connect a provider key before benchmarking.</span>}
+        {available.length > 0 && available.length < 3 &&
+          <span className="error">At least three distinct model aliases are required for target, judge and attacker roles.</span>}
       </div>
 
       <div className="rt-picker-label">Attack techniques</div>
@@ -198,10 +214,11 @@ function CreateBenchmark({ options, onCreated }) {
         <label><input type="checkbox" checked={authorized}
           onChange={(e) => setAuthorized(e.target.checked)} /> I am authorized to test this target</label>
       </div>
-      <div className={`rt-estimate ${limit && cases > limit ? "error" : "meta"}`}>
+      <div className={`rt-estimate ${(caseLimit && cases > caseLimit) ||
+        (callLimit && estimatedCalls > callLimit) ? "error" : "meta"}`}>
         {cases} attack cases × {scorers.length} scorer{scorers.length === 1 ? "" : "s"} · up to {estimatedCalls} model calls
-        {limit ? ` · case limit ${limit}` : ""}
-        {options?.limits?.max_model_calls ? ` · call limit ${options.limits.max_model_calls}` : ""}
+        {caseLimit ? ` · case limit ${caseLimit}` : ""}
+        {callLimit ? ` · call limit ${callLimit}` : ""}
         {useCache && !modelRevision.trim() ? " · add a model revision to cache safely" : ""}
       </div>
       <button className="primary" disabled={!valid || busy} onClick={start}>

@@ -789,7 +789,9 @@ One run pins the objective target, target system prompt, exact objective set,
 attack techniques, scorer rubrics, judge model, turn limit, seed, and trial
 numbers. It varies only the selected attacker models. The matrix is ordered in
 paired blocks, with a deterministic attacker rotation, so one model does not
-always receive the first request in every block.
+always receive the first request in every block. Target, judge, and attacker
+candidates must use distinct model aliases, avoiding self-judging and role
+contamination in the comparison.
 
 - **Techniques:** direct red team, role play, and adaptive multi-turn Crescendo.
 - **Independent scoring:** task achievement and harmful-content rubrics score
@@ -809,7 +811,8 @@ always receive the first request in every block.
 - **Exact cache only:** cache lookup is owner-scoped and hashes the full attack
   configuration; scorer cache additionally hashes the exact transcript and
   rubric. Because a provider alias can move to new weights, cache reuse is
-  refused until the operator supplies a model/deployment revision fingerprint.
+  off by default and refused until the operator supplies a model/deployment
+  revision fingerprint.
 - **Contained execution:** only admins can run it and must affirm authorization.
   Attacker, target, and judge are bare chat-model calls—no SQL, KAG, memory,
   email, MCP, Studio tools, or arbitrary target URL is exposed. Matrix size and

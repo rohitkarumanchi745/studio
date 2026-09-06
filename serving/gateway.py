@@ -117,6 +117,79 @@ def _log(*a):
 # loaded at most once). Keyed by uri → name; a name in _LOADED is known-present.
 _NAME_LOCK = threading.Lock()
 _LOADED = set()          # backend LoRA names we have successfully loaded this run
+# Last refused adapter request, surfaced on /health so a mismatch is visible
+# rather than silent: {"requested": uri, "mounted": uri or None}.
+_MISMATCH = {}
+
+# The supervisor writes this; see serving/supervisor.py write_state(). The
+# gateway starts BEFORE the model is downloaded and before the engine exists,
+# so a /health that just says {"ok": true} is a readiness FALSE-POSITIVE: the
+# platform reads a pass as permission to route traffic, and every request then
+# hits a box with no engine. Reading the supervisor's state is how /health
+# stops guessing.
+STATE_PATH = os.getenv("STUDIO_STATE_PATH",
+                       os.path.join(os.getenv("STUDIO_DATA_DIR", "/data"), "state.json"))
+# Stages in which the unit can actually answer a completion.
+_READY_STAGES = {"ready"}
+
+
+def _supervisor_state():
+    """The supervisor's last published state, or a conservative stand-in.
+
+    A missing or unreadable file means the supervisor has not got that far (or
+    the gateway is running standalone, e.g. under docker-compose where the
+    engine is a separate always-on container). Standalone is the only case
+    where "no state file" is not a problem, so it is distinguished by name
+    rather than silently treated as ready."""
+    try:
+        with open(STATE_PATH) as f:
+            st = json.load(f)
+        if isinstance(st, dict) and st.get("stage"):
+            return st
+    except (OSError, ValueError):
+        pass
+    return {"stage": "unsupervised", "detail":
+            f"no supervisor state at {STATE_PATH}; readiness falls back to probing the engine",
+            "adapter": None}
+
+
+def _engine_answers(timeout=3):
+    """Does the backend actually respond? The last link /health can check
+    without generating a token."""
+    try:
+        _http_json("GET", f"{BACKEND_URL}/models", None, timeout=timeout)
+        return True
+    except Exception:
+        return False
+
+
+def _readiness():
+    """(http_status, payload) for GET /health. 200 ONLY when a request would be
+    served; 503 with a machine-readable stage otherwise, so an operator can see
+    which link is missing instead of a silent black hole."""
+    st = _supervisor_state()
+    stage = st.get("stage")
+    adapter = st.get("adapter")
+    body = {"stage": stage, "backend": BACKEND_URL, "kind": BACKEND_KIND,
+            "base_model": BASE_MODEL_NAME, "priority": PRIORITY,
+            "mounted_adapter": adapter, "loaded_adapters": sorted(_LOADED)}
+    if _MISMATCH:
+        body["adapter_mismatch"] = dict(_MISMATCH)
+    if st.get("detail"):
+        body["detail"] = st["detail"]
+    if stage in _READY_STAGES or stage == "unsupervised":
+        # The supervisor says the engine is up — confirm it actually answers
+        # before claiming readiness. A running process that cannot serve is
+        # exactly the state this endpoint exists to expose.
+        if not _engine_answers():
+            body["ok"] = False
+            body["stage"] = "engine_not_answering"
+            body.setdefault("detail", "the engine process is up but its API did not respond")
+            return 503, body
+        body["ok"] = True
+        return 200, body
+    body["ok"] = False
+    return 503, body
 _URI_TO_NAME = {}        # uri → lora name
 
 
@@ -186,19 +259,46 @@ def _ensure_loaded_vllm(uri, name):
 
 
 def _ensure_loaded_llama(uri, name):
-    """llama.cpp CPU path. llama-server does NOT dynamically load an adapter FILE
-    at runtime — adapters are fixed at startup via --lora/--lora-scaled; only their
-    SCALE is adjustable at runtime via POST /lora-adapters. So here we enable the
-    mounted tool_call adapter (id 0) at scale 1.0. If the freshly trained file
-    isn't the one mounted, the server must be restarted (see README CPU caveat).
-    We optimistically enable adapter id 0; failure → base model (fail-safe)."""
+    """llama.cpp CPU path: enable the mounted adapter — but ONLY if the mounted
+    file is provably the one being asked for.
+
+    llama-server cannot hot-load an adapter FILE; adapters are fixed at startup
+    via --lora and only their SCALE is adjustable (POST /lora-adapters). The
+    obvious implementation — scale id 0 and report success — is a LIE whenever
+    the mounted file is not the requested one: it returns True for a uri that
+    has never existed on this box. Studio reads that as "the adapter is
+    serving", so the router sends learned prompts to a model that is actually
+    the BASE, or a stale adapter, and nothing anywhere reports the mismatch.
+
+    So the identity of the mounted file is checked against the request. The
+    supervisor records it (path + the published uri from the .uri sidecar) in
+    the state file; an adapter with no recorded uri is ANONYMOUS and can never
+    match, because "a file is mounted" is not evidence it is the right file.
+    A mismatch is not an error — the request proceeds on the base model, which
+    is the honest degradation — but it is refused, logged, and visible on
+    /health as mounted_adapter versus the uri that was asked for."""
+    mounted = (_supervisor_state().get("adapter") or {})
+    mounted_uri = mounted.get("uri")
+    if mounted_uri != uri:
+        with _NAME_LOCK:
+            _MISMATCH["requested"] = uri
+            _MISMATCH["mounted"] = mounted_uri
+        why = ("no adapter is mounted" if not mounted else
+               "the mounted adapter has no recorded uri (anonymous)" if not mounted_uri
+               else f"the mounted adapter is {mounted_uri}")
+        _log(f"llama.cpp REFUSING to claim {name} (uri={uri}): {why}. Serving the "
+             f"BASE model. The supervisor restarts the engine when a new adapter "
+             f"file lands; until then Studio's routing is ahead of this box.")
+        return False
     if name in _LOADED:
         return True
     try:
-        # Set the (single, mounted) global adapter's scale to 1.0.
+        # Set the (single, mounted, VERIFIED) global adapter's scale to 1.0.
         _http_json("POST", f"{_ROOT}/lora-adapters", [{"id": 0, "scale": 1.0}], timeout=30)
         _LOADED.add(name)
-        _log(f"llama.cpp enabled mounted LoRA id0 for {name} (uri={uri})")
+        with _NAME_LOCK:
+            _MISMATCH.clear()
+        _log(f"llama.cpp enabled mounted LoRA id0 for {name} (uri={uri}, verified)")
         return True
     except Exception as e:
         _log(f"llama.cpp enable FAILED for {name}: {e}")
@@ -259,10 +359,8 @@ class Handler(BaseHTTPRequestHandler):
     # ---- routing ----
     def do_GET(self):
         if self.path.rstrip("/") == "/health":
-            return self._send_json(200, {
-                "ok": True, "backend": BACKEND_URL, "kind": BACKEND_KIND,
-                "base_model": BASE_MODEL_NAME, "loaded_adapters": sorted(_LOADED),
-                "priority": PRIORITY})
+            status, body = _readiness()
+            return self._send_json(status, body)
         if self.path.startswith("/v1/models"):
             if not self._auth_ok():
                 return self._send_json(401, {"error": "unauthorized"})

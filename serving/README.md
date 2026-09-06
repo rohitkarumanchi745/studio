@@ -24,8 +24,14 @@ or a global scale call (llama.cpp). **The gateway bridges that gap.** You point
 
 | Profile | Engine | LoRA story | Use when |
 |--------|--------|-----------|----------|
-| **cpu** *(supported BitNet path)* | [llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server` serving the BitNet GGUF | Adapter mounted at **startup**; runtime toggles its **scale**. Serves the **global tool_call adapter only.** | CPU-only box. **BitNet's native runtime — the recommended way to serve BitNet.** |
+| **cpu** *(supported BitNet path)* | `llama-server` serving the BitNet GGUF — but it must be **[bitnet.cpp](https://github.com/microsoft/BitNet)'s** build, NOT stock [llama.cpp](https://github.com/ggml-org/llama.cpp), which cannot load the `i2_s` GGUF (§2) | Adapter mounted at **startup**; runtime toggles its **scale**. Serves the **global tool_call adapter only.** | CPU-only box. **BitNet's native runtime — the recommended way to serve BitNet.** |
 | **gpu** *(needs BitNet-enabled vLLM)* | [vLLM](https://docs.vllm.ai) OpenAI server | Runtime multi-LoRA + per-user style adapters. **But stock vLLM has NO BitNet support** ([vllm #17279](https://github.com/vllm-project/vllm/issues/17279), *not planned*) — the BitNet base won't load. Use only with a BitNet-enabled vLLM build, or set `STUDIO_VLLM_MODEL` to a vLLM-supported base for GPU multi-LoRA. | NVIDIA GPU **+** a BitNet-capable vLLM (or a non-BitNet base). |
+
+> **Deploying on Railway?** Neither profile applies as-is — Railway runs one
+> container per service and a volume belongs to one service. Use
+> **[RAILWAY.md](RAILWAY.md)** + `Dockerfile.railway` + `supervisor.py`: one
+> service, engine + gateway together, boots with no adapter, and an honest
+> cost/speed brief. `gateway.py` is unchanged.
 
 ```bash
 cd serving
@@ -47,9 +53,21 @@ docker compose --profile gpu config       # validate compose without starting
 - **GGUF (CPU / llama.cpp):** [`microsoft/bitnet-b1.58-2B-4T-gguf`](https://huggingface.co/microsoft/bitnet-b1.58-2B-4T-gguf)
   — download the `i2_s` GGUF into `${STUDIO_MODELS_DIR:-./models}` and set
   `STUDIO_BITNET_GGUF` to its filename. BitNet's official CPU runtime is
-  [BitNet.cpp](https://github.com/microsoft/BitNet) (a llama.cpp fork); the stock
-  `ghcr.io/ggml-org/llama.cpp:server` image serves the same GGUF over the OpenAI
-  API and is what this compose uses.
+  [BitNet.cpp](https://github.com/microsoft/BitNet) (a llama.cpp fork), and this
+  compose points the stock `ghcr.io/ggml-org/llama.cpp:server` image at that GGUF.
+
+  > ⚠️ **That does not work, and this is the correction.** `I2_S` is a quant type
+  > that exists only in Microsoft's fork. Stock llama.cpp REJECTS the file —
+  > `tensor 'blk.0.ffn_down.weight' of type 36 (TYPE_IQ4_NL_4_4 REMOVED …) has
+  > 6912 elements per row, not a multiple of block size (0)`
+  > ([llama.cpp#12997](https://github.com/ggml-org/llama.cpp/issues/12997), open)
+  > — and the model card says you *"MUST use the dedicated C++ implementation:
+  > bitnet.cpp"*. So the `cpu` profile above needs a **bitnet.cpp-built
+  > `llama-server`**, not the stock image. `Dockerfile.railway` builds exactly
+  > that from source and is the working reference; see
+  > [RAILWAY.md §2](RAILWAY.md). Everything else about the CPU profile — the
+  > flags, the startup `--lora`, the runtime scale API, the gateway contract —
+  > is unchanged, because bitnet.cpp *is* a llama.cpp fork with `tools/server`.
 
 ---
 
@@ -94,9 +112,12 @@ That is all Studio needs. `backend/app/router.py::bitnet_ready` then returns tru
 once a global `tool_call` adapter is published, and matching prompts route to
 BitNet (SQL still re-guarded; any failure escalates to the frontier).
 
-> If you set `STUDIO_GATEWAY_API_KEY` on the gateway, also give Studio a matching
-> key for the OpenAI base_url (the LangChain OpenAI client's `api_key`), since the
-> gateway will then require `Authorization: Bearer <key>`.
+> If you set `STUDIO_GATEWAY_API_KEY` on the gateway, set **`STUDIO_LLM_API_KEY`**
+> to the same string on Studio — `agent.py::make_llm` sends it as the OpenAI
+> client's `api_key` **for the self-hosted spec only** (never a user's BYOK
+> provider key), because the gateway then requires `Authorization: Bearer <key>`.
+> With no gateway key it sends a `studio-local` placeholder, since the OpenAI
+> client insists on some credential.
 
 Gateway env (defaults live in `docker-compose.yml`):
 
@@ -176,3 +197,40 @@ Pin these; the runtime-LoRA API and CLI flags are version-sensitive.
 - The gateway is **fail-safe by design**: any adapter-load trouble falls back to the
   base model. Studio re-guards BitNet's SQL and escalates to the frontier on any
   failure, so a fallback answer is safe — just un-personalized.
+
+---
+
+## 8. Railway (one service) — see RAILWAY.md
+
+`docker-compose.yml` is a **two-container** unit sharing a bind-mount. Railway
+runs **one container per service**, and *"each service can only have a single
+volume"* — so the engine and the adapter directory cannot be split across two
+services. The Railway shape is therefore **one service** running both halves
+under a supervisor:
+
+```
+serving/
+  Dockerfile.railway   builds bitnet.cpp's llama-server from source (§2 correction),
+                       then ships it with gateway.py + supervisor.py — no model inside
+  railway.json         DOCKERFILE builder, healthcheck /health
+  supervisor.py        PID 1: public listener + gateway.py + llama-server
+  RAILWAY.md           the deployment brief: steps, env on BOTH sides, cost, speed
+```
+
+What the supervisor adds over the compose command line:
+
+| Problem on Railway | What it does |
+|---|---|
+| The 1.1 GB GGUF can't be in git | Pulls it **once onto the volume** at first boot; verifies size + `GGUF` magic; a gated/rate-limited pull fails with a message naming `HUGGING_FACE_HUB_TOKEN`. |
+| **Compose hard-codes `--lora`, so a new deployment crash-loops** — `--lora` is a startup flag and llama-server won't start without the file, but no adapter exists until the trainer publishes one | Adds `--lora` **only if the file is there**. No adapter → serves the base model, and the gateway's existing fail-safe covers it. |
+| A new adapter can't be hot-loaded (§3) | Watches the adapter path and **restarts only the engine** when a stable new file lands. The gateway and the public port stay up. |
+| A legacy Railway environment's private network is IPv6-only; `gateway.py`'s `http.server` is `AF_INET`-only | Fronts it with a dual-stack `[::]` TCP splice on `$PORT` (transparent to SSE). |
+| The host reports 32–64 cores; the service has 2–4 | Derives `--threads` from the **cgroup CPU quota**. |
+
+**Cost, stated plainly:** ~1.8 GB resident at ctx 4096 ⇒ **~$19/month floor even
+at zero traffic**, ~$23–39/month in use, on Railway's $10/GB-RAM + $20/vCPU +
+$0.15/GB-volume rates. **Expect 5–15 tok/s** decode and **5–30 s to first token**
+on 2–4 vCPU: right for the learned, repeated, background work the router sends
+here; not a frontier replacement in an interactive chat box. Full breakdown,
+break-even maths, and the list of what could not be verified without a container:
+[RAILWAY.md §9–§10](RAILWAY.md).

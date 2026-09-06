@@ -149,6 +149,20 @@ def _m7_messages_reply_to(c, is_pg):
               "ON messages(reply_to) WHERE reply_to IS NOT NULL")
 
 
+def _m8_redteam_benchmarks_model_revision(c, is_pg):
+    # Exact benchmark-cache reuse must bind to a deployment/model revision,
+    # not merely a provider alias that can move underneath an experiment.
+    # "unversioned" preserves already-created benchmarks; new cached runs are
+    # rejected at the API boundary unless the operator supplies a fingerprint.
+    _add_column(
+        c,
+        "redteam_benchmarks",
+        "model_revision",
+        "TEXT NOT NULL DEFAULT 'unversioned'",
+        is_pg,
+    )
+
+
 MIGRATIONS = [
     (1, "users.verified", _m1_users_verified),
     (2, "conversations.folder_id", _m2_conversations_folder_id),
@@ -157,6 +171,7 @@ MIGRATIONS = [
     (5, "query_cache.seen+avg_reward+embedding", _m5_query_cache_routing_columns),
     (6, "chat_tasks.user_message_id", _m6_chat_tasks_user_message_id),
     (7, "messages.reply_to + unique index", _m7_messages_reply_to),
+    (8, "redteam_benchmarks.model_revision", _m8_redteam_benchmarks_model_revision),
 ]
 
 

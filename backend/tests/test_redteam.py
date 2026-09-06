@@ -138,6 +138,21 @@ def test_create_is_admin_authorized_and_atomic(store, monkeypatch):
     assert queued and queued["kind"] == "redteam_benchmark"
 
 
+def test_audit_outage_does_not_break_committed_lifecycle(store, monkeypatch):
+    fake_models(monkeypatch)
+    monkeypatch.setattr(
+        redteam.db,
+        "log_activity",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("audit unavailable")),
+    )
+    created = redteam.create_benchmark(body(), user=store["admin"])
+    assert created["status"] == "queued"
+    run_queued()
+    assert redteam.get_benchmark(created["id"], user=store["admin"])[
+        "benchmark"
+    ]["status"] == "completed"
+
+
 def test_matrix_report_asr_ci_and_scorer_disagreement(store, monkeypatch):
     calls = fake_models(monkeypatch)
     created = redteam.create_benchmark(body(), user=store["admin"])
@@ -181,10 +196,25 @@ def test_exact_owner_scoped_cache_reuses_cases_and_scores(store, monkeypatch):
     assert all(c["cached"] for c in report["cases"])
     assert all(s["cached"] for c in report["cases"] for s in c["scores"])
 
+    # A rubric edit is part of the score identity. Attack transcripts and the
+    # unchanged task scorer still reuse exactly; the changed harm scorer does not.
+    monkeypatch.setitem(
+        redteam._SCORE_SYSTEM,
+        "harm_content",
+        redteam._SCORE_SYSTEM["harm_content"] + " Revised rubric.",
+    )
+    revised = redteam.create_benchmark(body(name="revised scoring rubric"),
+                                       user=store["admin"])
+    run_queued()
+    revised_report = redteam.get_benchmark(revised["id"], user=store["admin"])
+    assert len(calls) == first_calls + 4              # one new judge call per case
+    assert revised_report["benchmark"]["cached_cases"] == 4
+    assert sum(s["cached"] for c in revised_report["cases"] for s in c["scores"]) == 4
+
     # A second admin cannot see or reuse the first admin's cache.
     third = redteam.create_benchmark(body(name="other owner"), user=store["other"])
     run_queued()
-    assert len(calls) == first_calls + 16
+    assert len(calls) == first_calls + 4 + 16
     assert redteam.get_benchmark(third["id"], user=store["other"])["benchmark"][
         "cached_cases"] == 0
 
@@ -205,6 +235,7 @@ def test_case_errors_count_in_asr_and_resume_retries_only_errors(store, monkeypa
     calls = fake_models(monkeypatch, fail_attackers=False)
     resumed = redteam.resume_benchmark(created["id"], user=store["admin"])
     assert resumed["status"] == "queued"
+    assert resumed["completed_cases"] == 0
     run_queued()
     final = redteam.get_benchmark(created["id"], user=store["admin"])
     assert final["benchmark"]["status"] == "completed"
@@ -232,6 +263,13 @@ def test_owner_isolation_and_model_validation(store):
 
     with pytest.raises(HTTPException, match="not offered"):
         redteam.create_benchmark(body(target_model="unknown"), user=store["admin"])
+
+    with pytest.raises(HTTPException, match="distinct model aliases"):
+        redteam.create_benchmark(body(judge_model="attacker-a"), user=store["admin"])
+    with pytest.raises(HTTPException, match="distinct model aliases"):
+        redteam.create_benchmark(
+            body(attacker_models=["target", "attacker-a"]), user=store["admin"]
+        )
 
     opts = redteam.options(user=store["admin"])
     assert {m["spec"] for m in opts["models"]} == {
@@ -273,3 +311,20 @@ def test_main_registers_router_and_worker_handler(store):
     assert "/api/redteam/options" in paths
     assert "/api/redteam/benchmarks" in paths
     assert "redteam_benchmark" in jobs.handlers()
+
+
+def test_superseded_worker_cannot_take_over_new_execution(store, monkeypatch):
+    calls = fake_models(monkeypatch)
+    created = redteam.create_benchmark(body(), user=store["admin"])
+    with db.connect() as c:
+        c.execute(
+            "UPDATE redteam_benchmarks SET job_id=? WHERE id=?",
+            ("replacement-job", created["id"]),
+        )
+        c.commit()
+
+    result = redteam._benchmark_job(
+        {"benchmark_id": created["id"]}, {"id": created["job_id"], "attempts": 1}
+    )
+    assert result["status"] == "superseded"
+    assert calls == []
