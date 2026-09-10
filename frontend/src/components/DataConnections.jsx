@@ -6,7 +6,7 @@
 // and every response is non-secret metadata. When the deployment has no Azure
 // credentials the feature is dormant and this surface says so instead of 500ing.
 import { useEffect, useState } from "react";
-import { api } from "../api";
+import { api, getUser } from "../api";
 
 const STATUS_LABEL = {
   onboarding: "Onboarding — first sync running",
@@ -122,10 +122,10 @@ export default function DataConnections({ onClose }) {
           <div>
             <div className="canvas-title">Data connections</div>
             <div className="meta">
-              Connect Microsoft 365 to sync your OneDrive / SharePoint files and
-              Outlook mail into a private knowledge collection only you (and admins)
-              can retrieve. Documents are quoted reference material, never
-              instructions — and Studio never sees your password or tokens.
+              Connect Microsoft 365 to sync your files and mail into your private
+              knowledge collection — and connect databases (Postgres, Snowflake,
+              Databricks, BigQuery, Neo4j) so they appear as sources in the chat
+              picker. Credentials are stored encrypted and never shown again.
             </div>
           </div>
           <button className="chip" onClick={onClose}>✕ close</button>
@@ -208,7 +208,131 @@ export default function DataConnections({ onClose }) {
             </>
           )}
         </div>
+
+        <Databases onNote={setNote} onError={setError} />
       </div>
+    </div>
+  );
+}
+
+// ── Databases: admin connects a warehouse; it becomes a source in the picker ──
+
+function Databases({ onNote, onError }) {
+  const user = getUser();
+  const isAdmin = user?.role === "admin";
+  const [conns, setConns] = useState([]);
+  const [types, setTypes] = useState([]);
+  const [open, setOpen] = useState(false);
+  const [ctype, setCtype] = useState("postgres");
+  const [name, setName] = useState("");
+  const [cfg, setCfg] = useState({});
+  const [test, setTest] = useState(null);   // null | {ok, tables?, error?}
+  const [busy, setBusy] = useState("");
+
+  function load() {
+    api("/connections").then(setConns).catch(() => {});
+    api("/connections/types").then(setTypes).catch(() => {});
+  }
+  useEffect(() => { if (isAdmin) load(); }, [isAdmin]);
+
+  if (!isAdmin) {
+    return (
+      <div className="m365-card">
+        <div className="m365-head">
+          <div className="m365-title"><span className="m365-glyph" aria-hidden="true">◫</span>Databases</div>
+        </div>
+        <div className="meta">An administrator can connect databases here; sources your role may use appear in the chat picker automatically.</div>
+      </div>
+    );
+  }
+
+  const t = types.find((x) => x.ctype === ctype);
+
+  function setField(k, v) { setCfg((c) => ({ ...c, [k]: v })); setTest(null); }
+
+  function reset() { setName(""); setCfg({}); setTest(null); setOpen(false); }
+
+  async function runTest() {
+    setBusy("test"); setTest(null);
+    try { setTest(await api("/connections/test", { method: "POST", body: JSON.stringify({ ctype, config: cfg }) })); }
+    catch (e) { setTest({ ok: false, error: e.message }); }
+    finally { setBusy(""); }
+  }
+
+  async function save() {
+    setBusy("save"); onError(""); onNote("");
+    try {
+      await api("/connections", { method: "POST", body: JSON.stringify({ name: name.trim(), ctype, config: cfg }) });
+      onNote(`Connected — “${name.trim()}” is now a source in the chat picker (open a new chat or refresh to see it).`);
+      reset(); load();
+    } catch (e) { onError(e.message); }
+    finally { setBusy(""); }
+  }
+
+  async function remove(c) {
+    if (!confirm(`Remove the “${c.name}” connection? Queries against it will stop working.`)) return;
+    try { await api(`/connections/${c.id}`, { method: "DELETE" }); load(); }
+    catch (e) { onError(e.message); }
+  }
+
+  const canSave = /^[a-z0-9][a-z0-9_-]{1,30}$/.test(name.trim()) &&
+    (t?.fields || []).every((f) => !f.required || (cfg[f.key] || "").trim());
+
+  return (
+    <div className="m365-card">
+      <div className="m365-head">
+        <div className="m365-title"><span className="m365-glyph" aria-hidden="true">◫</span>Databases</div>
+        <span className="m365-badge">{conns.length} connected</span>
+      </div>
+
+      {conns.map((c) => (
+        <div key={c.id} className="dbconn-row">
+          <span className="query-tag">{c.type_label}</span>
+          <b>{c.name}</b>
+          <span className="meta">{c.hint}</span>
+          {!c.configured && <span className="m365-badge m365-badge-off">needs reconnect</span>}
+          <button className="chip ctx-danger" onClick={() => remove(c)}>✕</button>
+        </div>
+      ))}
+
+      {!open ? (
+        <div className="m365-actions">
+          <button className="chip chip-on" onClick={() => { setOpen(true); setTest(null); }}>+ Connect a database</button>
+        </div>
+      ) : (
+        <div className="dbconn-form">
+          <div className="dbconn-grid">
+            <select value={ctype} onChange={(e) => { setCtype(e.target.value); setCfg({}); setTest(null); }}>
+              {types.map((x) => <option key={x.ctype} value={x.ctype}>{x.label}</option>)}
+            </select>
+            <input placeholder="source name — e.g. sales-pg" value={name}
+                   onChange={(e) => setName(e.target.value)} />
+          </div>
+          <div className="dbconn-grid">
+            {(t?.fields || []).map((f) => (
+              <input key={f.key} type={f.secret ? "password" : "text"}
+                     placeholder={f.label + (f.required ? " *" : "") + (f.placeholder ? ` — ${f.placeholder}` : "")}
+                     value={cfg[f.key] ?? ""} onChange={(e) => setField(f.key, e.target.value)} />
+            ))}
+          </div>
+          {test && (test.ok
+            ? <div className="meta share-notice">✓ Connected — {test.tables} tables{test.sample?.length ? `: ${test.sample.join(", ")}` : ""}</div>
+            : <div className="error">{test.error}</div>)}
+          <div className="m365-actions">
+            <button className="chip" onClick={runTest} disabled={!!busy}>
+              {busy === "test" ? "testing…" : "⚡ Test connection"}
+            </button>
+            <button className="primary" onClick={save} disabled={!!busy || !canSave}>
+              {busy === "save" ? "saving…" : "✓ Save connection"}
+            </button>
+            <button className="chip" onClick={reset} disabled={!!busy}>cancel</button>
+          </div>
+          <div className="meta">
+            Credentials are encrypted at rest and never displayed again. The new source is
+            visible to admins; grant it to other roles in Governance.
+          </div>
+        </div>
+      )}
     </div>
   );
 }

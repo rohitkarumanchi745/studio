@@ -75,7 +75,13 @@ INTENTIONAL_LAZY_CYCLES = [
     #   extraction sits above db, so db reaches it lazily and best-effort.
     # kag ⇄ extraction: kag.init_tables() registers the M365 docx/pptx parsers
     #   (plug-in registration); extraction ingests through kag.
-    frozenset({"bootstrap", "db", "extraction", "kag"}),
+    # connectors ⇄ connections: an admin can connect a database at runtime;
+    #   connections is BUILT ON the connector classes (postgres/snowflake/…) and
+    #   is resolved BY the connector registry (get_connector/all_sources reach
+    #   connections lazily), so a UI-added source flows through every existing
+    #   chokepoint. connections also reads bootstrap for its at-rest key
+    #   (keys.py pattern), joining the same runtime cluster.
+    frozenset({"bootstrap", "db", "extraction", "kag", "connections", "connectors"}),
 ]
 
 

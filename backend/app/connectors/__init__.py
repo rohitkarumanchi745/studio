@@ -33,12 +33,28 @@ for _mc in MARKETING_CONNECTORS:
 def get_connector(name):
     conn = _REGISTRY.get(name)
     if conn is None:
+        # User-connected sources (added from the UI, stored encrypted) resolve
+        # here so every existing chokepoint — gateway, RBAC, catalog — treats
+        # them exactly like an env-configured source. Lazy import: connections
+        # imports the connector classes above.
+        try:
+            from .. import connections
+            conn = connections.resolve(name)
+        except Exception:
+            conn = None
+    if conn is None:
         raise KeyError(f"Unknown source '{name}'")
     return conn
 
 
 def all_sources():
-    return [
+    out = [
         {"name": c.name, "dialect": c.dialect, "configured": c.configured()}
         for c in _REGISTRY.values()
     ]
+    try:
+        from .. import connections
+        out += connections.source_entries()
+    except Exception:
+        pass
+    return out

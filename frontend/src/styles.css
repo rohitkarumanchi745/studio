@@ -1009,3 +1009,20 @@ input:focus, select:focus, .composer-pill:focus-within { box-shadow: 0 0 0 1px v
   .rt-history { width: 100%; max-height: 160px; border-right: none; border-bottom: 1px solid var(--line); padding: 0 0 10px; }
   .rt-turn { grid-template-columns: 1fr; }
 }
+
+/* ── Data connections: databases section ─────────────────────────────── */
+.dbconn-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px; border: 1px solid var(--border, #e3e6ea);
+  border-radius: 8px; margin-bottom: 8px; background: var(--panel, #fff);
+}
+.dbconn-row b { font-size: 13px; }
+.dbconn-row .chip { margin-left: auto; }
+.dbconn-form { margin-top: 10px; }
+.dbconn-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 8px;
+}
+.dbconn-grid input, .dbconn-grid select {
+  padding: 8px 10px; border: 1px solid var(--border, #d6dade);
+  border-radius: 7px; font: inherit; background: var(--panel, #fff);
+}

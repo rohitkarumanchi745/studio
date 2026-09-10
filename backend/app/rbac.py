@@ -25,20 +25,46 @@ def _policies():
     return gov if gov is not None else POLICIES
 
 
+def _user_connection(source):
+    """True when `source` is an admin-connected database (connections.py).
+    Lazy and guarded so rbac stays importable on its own."""
+    try:
+        from . import connections
+        return connections._row_by_name(source) is not None
+    except Exception:
+        return False
+
+
 def _role_policy(role, source):
     """Resolve a role's policy for a source under the active document. A role
-    whose whole `sources` is '*' can see every source and table."""
+    whose whole `sources` is '*' can see every source and table.
+
+    Admin-connected databases (added at runtime from the UI) are not in the
+    static policy document, so they resolve here: reachable by ADMIN in full,
+    and by no other role until a governance policy names them — fail closed."""
     role_pol = _policies().get(role, {})
     if role_pol == "*":
         return "*"
-    return role_pol.get(source)
+    pol = role_pol.get(source)
+    if pol is None and role == "admin" and _user_connection(source):
+        return "*"
+    return pol
 
 
 def allowed_sources(role):
     pol = _policies().get(role, {})
     if pol == "*":
         return {s["name"] for s in _all_source_names()}
-    return set(pol.keys())
+    out = set(pol.keys())
+    if role == "admin":
+        # Admin-connected databases are admin-reachable by default; other roles
+        # gain them only through an explicit governance grant.
+        try:
+            from . import connections
+            out |= {r["name"] for r in connections._rows()}
+        except Exception:
+            pass
+    return out
 
 
 def _all_source_names():
