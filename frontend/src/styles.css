@@ -210,6 +210,34 @@ td { color: var(--ink-2); }
 }
 .composer input { flex: 1; border-radius: 12px; padding: 12px 14px; }
 .composer .primary { border-radius: 12px; width: 46px; }
+.chat-composer { flex-direction: column; }
+.composer-pipeline-option { display: flex; align-items: center; gap: 7px; color: var(--ink-2); font-size: 12px; }
+.composer .composer-pipeline-option input { flex: none; width: auto; accent-color: var(--accent); }
+.chat-pipeline { border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin: 10px 0; }
+.chat-pipeline-heading { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 4px 10px; }
+.chat-pipeline-heading strong { font-size: 13px; overflow-wrap: anywhere; }
+.chat-pipeline-status { color: var(--ink-2); font-size: 11px; }
+.chat-pipeline-status.ok { color: var(--ok); }
+.chat-pipeline-status.bad { color: var(--bad); }
+.chat-pipeline-status.warn, .chat-pipeline-warnings { color: var(--warn); }
+.chat-pipeline-description { color: var(--ink-3); font-size: 12px; margin: 6px 0; }
+.chat-pipeline-step { border-top: 1px solid var(--line); padding: 7px 0; }
+.chat-pipeline-step summary { cursor: pointer; font-size: 12px; overflow-wrap: anywhere; }
+.chat-pipeline-step summary span + span { display: block; padding-left: 14px; }
+.chat-pipeline-step pre { margin-top: 6px; }
+.chat-pipeline-warnings { font-size: 12px; margin: 6px 0; overflow-wrap: anywhere; }
+.chat-pipeline-warnings ul, ul.chat-pipeline-warnings { padding-left: 18px; }
+.chat-pipeline-results { margin: 8px 0; overflow-wrap: anywhere; }
+.chat-pipeline-run { margin-top: 8px; font-size: 12px; }
+.chat-platform-payload {
+  display: block; width: 100%; box-sizing: border-box; min-height: 100px;
+  resize: vertical; margin: 10px 0; padding: 9px 12px;
+  color: var(--ink); background: var(--surface-2);
+  border: 1px solid var(--line); border-radius: 8px;
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+.chat-platform-payload:focus { outline-color: var(--accent); }
+.chat-platform-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
 
 /* ── Canvas mode: chart on main screen, chat docked aside ── */
 .workspace { flex: 1; display: flex; min-width: 0; }
@@ -1026,3 +1054,11 @@ input:focus, select:focus, .composer-pill:focus-within { box-shadow: 0 0 0 1px v
   padding: 8px 10px; border: 1px solid var(--border, #d6dade);
   border-radius: 7px; font: inherit; background: var(--panel, #fff);
 }
+
+/* Autopilot panel scrolls as a whole. Its cards are direct children of the
+   bounded flex column (.dashboard); with the default flex-shrink they squished
+   to fit and .query-item's overflow:hidden CLIPPED the taller create form —
+   the Watch table dropdown and the Governed action script box became
+   unreachable. Pin them so content overflows and .dashboard scrolls instead. */
+.ap-create,
+.ap-list { flex-shrink: 0; }
