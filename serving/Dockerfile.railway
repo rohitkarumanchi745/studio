@@ -105,10 +105,11 @@ ENV STUDIO_DATA_DIR=/data \
     LLAMA_CTX_SIZE=4096 \
     PORT=9000
 
-# Runs as root on purpose: a Railway volume is mounted root-owned, and the model
-# download writes into it on first boot. Nothing here is reachable except the one
-# port below — llama-server and gateway.py both bind 127.0.0.1 (see supervisor).
-VOLUME ["/data"]
+# Runs as root on purpose: the Railway-managed volume is mounted root-owned at
+# /data, and the model download writes into it on first boot. Do not add a Docker
+# VOLUME instruction here: Railway rejects it and owns the mount through the
+# service configuration. Nothing is reachable except the one port below —
+# llama-server and gateway.py both bind 127.0.0.1 (see supervisor).
 EXPOSE 9000
 
 # supervisor.py is PID 1: it owns the public listener, gateway.py and
