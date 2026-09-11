@@ -93,6 +93,8 @@ function CreateForm({ sources, models, onCreated }) {
   const [value, setValue] = useState("");
   // event
   const [eventTable, setEventTable] = useState("");
+  const [tablesLoading, setTablesLoading] = useState(false);
+  const [tablesErr, setTablesErr] = useState("");
   // optional governed action (routed through supervisor → needs approval)
   const [actOpen, setActOpen] = useState(false);
   const [actKind, setActKind] = useState("sql_script");
@@ -101,15 +103,22 @@ function CreateForm({ sources, models, onCreated }) {
 
   useEffect(() => {
     const allowed = sources.filter((s) => s.allowed !== false);
-    if (!source && allowed.length) setSource(allowed[0].name);
+    if (!source && allowed.length) {
+      // Prefer a connected source so the form doesn't open pointed at an
+      // unconfigured warehouse (e.g. databricks) that lists no tables.
+      const pick = allowed.find((s) => s.configured !== false) || allowed[0];
+      setSource(pick.name);
+    }
   }, [sources, source]);
 
   useEffect(() => {
-    setSel([]); setTables([]); setEventTable("");
+    setSel([]); setTables([]); setEventTable(""); setTablesErr("");
     if (!source) return;
+    setTablesLoading(true);
     api(`/catalog/sources/${source}/tables`)
       .then((t) => setTables(Array.isArray(t) ? t : []))
-      .catch(() => setTables([]));
+      .catch((e) => setTablesErr(e?.message || "could not list tables"))
+      .finally(() => setTablesLoading(false));
   }, [source]);
 
   function toggleTable(t) {
@@ -256,30 +265,52 @@ function CreateForm({ sources, models, onCreated }) {
           <label className="meta">Source</label>
           <select value={source} onChange={(e) => setSource(e.target.value)}>
             {allowedSources.length === 0 && <option value="">no sources</option>}
-            {allowedSources.map((s) => <option key={s.name} value={s.name}>{s.name}</option>)}
+            {allowedSources.map((s) => (
+              <option key={s.name} value={s.name}>
+                {s.name}{s.configured === false ? " — not connected" : ""}
+              </option>
+            ))}
           </select>
         </div>
 
         {trigger === "event" ? (
           <div className="job-form-row">
             <label className="meta">Watch table</label>
-            <select value={eventTable} onChange={(e) => setEventTable(e.target.value)}>
-              <option value="">select a table…</option>
+            <select value={eventTable} onChange={(e) => setEventTable(e.target.value)}
+                    disabled={tablesLoading || tables.length === 0}>
+              <option value="">
+                {tablesLoading ? "loading tables…"
+                  : tables.length === 0 ? "no tables available"
+                  : "select a table…"}
+              </option>
               {tables.map((t) => <option key={t} value={t}>{t}</option>)}
             </select>
+            {!tablesLoading && tables.length === 0 && (
+              <span className="meta ap-hint">
+                {tablesErr
+                  ? `Can't list tables for “${source}” — ${tablesErr}. Pick a connected source.`
+                  : `“${source}” has no tables (or isn't connected). Pick another source.`}
+              </span>
+            )}
           </div>
+        ) : tablesLoading ? (
+          <div className="meta ap-hint">loading tables…</div>
+        ) : tables.length > 0 ? (
+          <>
+            <div className="meta ap-hint">Tables (none = all tables you can access)</div>
+            <div className="inputs-row ap-tables">
+              {tables.map((t) => (
+                <button key={t} className={"chip" + (sel.includes(t) ? " chip-on" : "")}
+                  onClick={() => toggleTable(t)}>{t}</button>
+              ))}
+            </div>
+          </>
         ) : (
-          tables.length > 0 && (
-            <>
-              <div className="meta ap-hint">Tables (none = all tables you can access)</div>
-              <div className="inputs-row ap-tables">
-                {tables.map((t) => (
-                  <button key={t} className={"chip" + (sel.includes(t) ? " chip-on" : "")}
-                    onClick={() => toggleTable(t)}>{t}</button>
-                ))}
-              </div>
-            </>
-          )
+          <div className="meta ap-hint">
+            {tablesErr
+              ? `Can't list tables for “${source}” — ${tablesErr}. The agent will use all tables your role can access.`
+              : `No tables listed for “${source}”. The agent will use all tables your role can access.`}
+          </div>
         )}
 
         {models.length > 0 && (
