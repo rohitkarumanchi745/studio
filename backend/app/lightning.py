@@ -38,6 +38,7 @@ import json
 import logging
 import os
 import time
+import uuid
 
 from . import db, jobs
 
@@ -260,6 +261,134 @@ def record_chat_trace(user, conversation_id, prompt, result, duration_ms, histor
     return tid
 
 
+def record_pipeline_outcome(user, *, run_id, prompt, source, action, status,
+                            error=None, conversation_id=None, repairs_run_id=None,
+                            duration_ms=None):
+    """Record one immutable, observed execution outcome and its complete action.
+
+    A failed attempt and its corrected successor have different run ids and
+    remain separate examples. Replaying an outcome never replaces feedback,
+    changes its stream cursor, or turns a failed execution into a success.
+    Pending approvals, submissions and other unproved outcomes are unscored.
+    Structured pipeline actions stay separate from the single-query ``sql``
+    column: the SQL-only BitNet trainer must not treat a platform payload or
+    an entire step bundle as a ``run_sql`` call.
+    """
+    status = str(status or "").strip().lower()
+    if status not in {"success", "succeeded", "succeeded_sql_only", "failed"}:
+        return None
+    if not run_id or not isinstance(action, dict):
+        return None
+    try:
+        # JSON serialization also snapshots mutable caller-owned recipes.
+        action = json.loads(json.dumps(action))
+        kind = action.get("type")
+        if kind == "sql_pipeline":
+            steps = action.get("steps")
+            if not isinstance(steps, list) or not steps or any(
+                    not isinstance(s, dict) or not isinstance(s.get("sql"), str)
+                    or not s["sql"].strip() for s in steps):
+                return None
+            action = {"type": kind, "steps": [
+                {k: step.get(k) for k in ("name", "source", "table", "sql")}
+                for step in steps]}
+        elif kind == "platform_run":
+            if not action.get("target") or not isinstance(action.get("payload"), dict):
+                return None
+            action = {"type": kind, "target": action["target"], "payload": action["payload"]}
+        elif kind == "airflow_dag":
+            plan = action.get("plan")
+            if not isinstance(plan, dict) or not plan.get("tasks") or not plan.get("source"):
+                return None
+            # Full immutable recipe, with no chat payload/logs/credentials.
+            action = {"type": kind, "plan": {k: plan[k] for k in
+                      ("version", "name", "dag_id", "source", "schedule", "tasks", "parameters", "prompt") if k in plan}}
+        else:
+            return None
+        success = status != "failed"
+        tid = str(uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(
+            ["studio-pipeline-outcome", str(user["id"]), str(run_id)])))
+        meta = {"action": action, "run_id": str(run_id), "status": status,
+                "agents": ["Pipeline executor"], "errors": [str(error)[:500]] if error else []}
+        if repairs_run_id and str(repairs_run_id) != str(run_id):
+            meta["repairs_run_id"] = str(repairs_run_id)
+        with db.connect() as c:
+            cur = c.execute(
+                "INSERT INTO agent_traces (id,user_id,email,role,conversation_id,prompt,"
+                "mode,source,sql,ok,error,panel_count,duration_ms,reward,reward_source,meta,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING",
+                (tid, user["id"], user["email"], user["role"], conversation_id,
+                 str(prompt or "")[:1000], "pipeline", source, None,
+                 int(success), str(error)[:500] if error else None,
+                 len(action.get("steps") or []), duration_ms, 1.0 if success else 0.0,
+                 "pipeline_outcome", json.dumps(meta), time.time()))
+            if cur.rowcount == 1:
+                # The trace and its delivery job commit together. If the
+                # queue is unavailable, the caller can retry this run id.
+                _enqueue_emit(tid, conn=c)
+            c.commit()
+        return tid
+    except Exception:
+        log.warning("pipeline outcome could not be recorded for run %s", run_id, exc_info=True)
+        return None
+
+
+def recent_pipeline_examples(user, source=None, limit=3):
+    """The caller's recent pipeline outcomes, for prompt context only.
+
+    SQL recipes are rechecked against current permissions and namespaces
+    without execution. Platform payloads stay owner-scoped; their consumer
+    must apply the usual platform validation/approval before any submission.
+    A user's thumbs-up does not turn an observed failed run into a proven
+    success: ``status`` comes from the immutable execution metadata.
+    """
+    from . import queryguard, rbac
+    from .connectors import get_connector
+
+    limit = max(1, min(int(limit), 10))
+    with db.connect() as c:
+        rows = c.execute(
+            "SELECT id,prompt,source,error,reward,meta FROM agent_traces "
+            "WHERE user_id=? AND mode='pipeline' ORDER BY created_at DESC LIMIT ?",
+            (user["id"], max(30, limit * 10))).fetchall()
+    examples = []
+    for row in rows:
+        try:
+            meta = json.loads(row["meta"] or "{}")
+            action = meta.get("action") or {}
+            if meta.get("status") not in {"success", "succeeded", "succeeded_sql_only", "failed"}:
+                continue
+            if source and source != "*" and row["source"] != source:
+                continue
+            if action.get("type") == "sql_pipeline":
+                steps = action.get("steps") or []
+                if not steps:
+                    continue
+                for step in steps:
+                    src = step.get("source") or row["source"]
+                    if source and source != "*" and src != source:
+                        raise ValueError("outside selected source")
+                    connector = get_connector(src)
+                    dialect = getattr(connector, "dialect", None)
+                    tokens, _ = queryguard._tokens(step["sql"])
+                    allowed = [queryguard._canon(parts[-1], dialect)
+                               for parts, _ in queryguard._table_refs(tokens)
+                               if rbac.can_access(user["role"], src, parts[-1].text)]
+                    queryguard.validate(step["sql"], allowed,
+                                        qualifiers=connector.qualifiers(), dialect=dialect)
+            elif action.get("type") != "platform_run":
+                continue
+            examples.append({"trace_id": row["id"], "run_id": meta.get("run_id"),
+                             "prompt": row["prompt"], "source": row["source"],
+                             "action": action, "status": meta["status"], "error": row["error"],
+                             "reward": row["reward"], "repairs_run_id": meta.get("repairs_run_id")})
+        except (KeyError, TypeError, ValueError, queryguard.QueryRejected):
+            continue
+        if len(examples) >= limit:
+            break
+    return examples
+
+
 def export_rollouts(path, limit=5000):
     """Write traces as JSONL in the shape RL/APO training jobs consume."""
     n = 0
@@ -267,14 +396,18 @@ def export_rollouts(path, limit=5000):
         for t in db.list_traces(limit=limit):
             if t.get("reward") is None:
                 continue
+            meta = json.loads(t.get("meta") or "{}")
             f.write(json.dumps({
                 "prompt": t["prompt"],
-                "response": {"sql": t["sql"], "chart_type": t["chart_type"]},
+                "response": (meta.get("action")
+                             or {"sql": t["sql"], "chart_type": t["chart_type"]}),
                 "reward": t["reward"],
                 "metadata": {
                     "model": t["model"], "source": t["source"], "table": t["tbl"],
                     "error": t["error"], "reward_source": t["reward_source"],
                     "duration_ms": t["duration_ms"],
+                    "run_id": meta.get("run_id"), "repairs_run_id": meta.get("repairs_run_id"),
+                    "execution_status": meta.get("status"),
                 },
             }, default=str) + "\n")
             n += 1
@@ -326,7 +459,7 @@ def _ensure_tables():
     _TABLES_READY = True
 
 
-def _enqueue_emit(trace_id):
+def _enqueue_emit(trace_id, *, conn=None):
     """Queue one delivery for a trace. Returns the job id, or None when
     delivery is off (the unconfigured default) or the queue rejected it.
 
@@ -337,8 +470,10 @@ def _enqueue_emit(trace_id):
         return None
     try:
         return jobs.enqueue(AGL_KIND, {"trace_id": trace_id},
-                            max_attempts=_max_attempts())
+                            max_attempts=_max_attempts(), conn=conn)
     except Exception:
+        if conn is not None:
+            raise  # caller owns the transaction; do not commit a trace without its job
         log.warning("agl: could not enqueue delivery for trace %s", trace_id, exc_info=True)
         return None
 
@@ -424,6 +559,11 @@ def rollout_metadata(t):
         "model": t.get("model"),
         "agents": [a for a in (meta.get("agents") or []) if a],
         "created_at": t.get("created_at"),
+        "run_id": meta.get("run_id"), "repairs_run_id": meta.get("repairs_run_id"),
+        "execution_status": meta.get("status"),
+        # The terminal projection includes metadata. Keep the observed
+        # action here as a label, never in the model's conditioning input.
+        "action": meta.get("action"),
     }
 
 
@@ -459,6 +599,10 @@ def trajectory_events(t, schemas):
         "conversation_id": t.get("conversation_id"),
         "agents": [a for a in (meta.get("agents") or []) if a],
     })]
+    if meta.get("action"):
+        out.append(schemas.EventCreate(event_type="studio.action", data={
+            "action": meta["action"], "run_id": meta.get("run_id"),
+            "repairs_run_id": meta.get("repairs_run_id"), "status": meta.get("status")}))
     if t.get("sql"):
         out.append(schemas.EventCreate(event_type="studio.query", data={
             "sql": t["sql"], "row_count": t.get("row_count"),

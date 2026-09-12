@@ -15,7 +15,8 @@ Contract (consumed by supervisor.py; run refs live inside supervised_jobs.result
 
 Payload shapes (the UI renders these):
     airflow:         {"dag_id": "etl_daily", "conf": {...}}   # conf optional
-    databricks_jobs: a Jobs 2.1 runs/submit body, e.g.
+    databricks_jobs: {"job_id": 123, "job_parameters": {...}} for an existing
+                     job, or a Jobs 2.1 runs/submit body, e.g.
                      {"run_name": "...", "tasks": [{"task_key": "t1", ...}]}
     dbt_cloud:       {"job_id": 123, "cause": "why"}          # job_id falls back
                      # to DBT_CLOUD_JOB_ID; cause optional; extra keys (e.g.
@@ -145,6 +146,21 @@ class AirflowPlatform(Platform):
         dag_id, _, run_id = run_ref.partition(":")
         return dag_id, run_id
 
+    def dag_ready(self, dag_id):
+        """Observe scheduler registration; never enable an existing DAG."""
+        cfg = self._cfg()
+        try:
+            dag = _json("GET", self._api(cfg, f"/dags/{quote(dag_id, safe='')}"), self._headers(cfg))
+        except RuntimeError as exc:
+            return {"ready": False, "detail": str(exc)[:500]}
+        if dag.get("dag_id") != dag_id:
+            return {"ready": False, "detail": "Airflow has not registered the requested DAG"}
+        if dag.get("is_paused", True):
+            return {"ready": False, "detail": "DAG is paused in Airflow; an administrator must unpause it"}
+        if dag.get("has_import_errors") or dag.get("is_active") is False:
+            return {"ready": False, "detail": "Airflow reports this DAG inactive or with import errors"}
+        return {"ready": True}
+
     def trigger(self, payload):
         dag_id = (payload or {}).get("dag_id")
         if not dag_id:
@@ -222,7 +238,7 @@ class AirflowPlatform(Platform):
 # ── Databricks Jobs ─────────────────────────────────────────────────────
 
 class DatabricksJobsPlatform(Platform):
-    """Databricks one-time job runs via Jobs API 2.1 runs/submit.
+    """Databricks runs via Jobs API 2.1 run-now or runs/submit.
 
     Env: DATABRICKS_SERVER_HOSTNAME + DATABRICKS_TOKEN — the same pair
     connectors/databricks_conn.submit_spark_job already uses. Hostname may
@@ -260,15 +276,28 @@ class DatabricksJobsPlatform(Platform):
         return {"Authorization": f"Bearer {cfg['token']}"}
 
     def trigger(self, payload):
-        if not isinstance(payload, dict) or not payload.get("tasks"):
-            raise RuntimeError('databricks_jobs payload must be a Jobs 2.1 '
-                               'runs/submit body with a non-empty "tasks" list')
+        if not isinstance(payload, dict):
+            raise RuntimeError('databricks_jobs payload must be a JSON object')
+        body = dict(payload)
+        if "job_id" in payload:
+            job_id = payload["job_id"]
+            if isinstance(job_id, bool) or not re.fullmatch(r"[1-9][0-9]*", str(job_id)):
+                raise RuntimeError('databricks_jobs "job_id" must be a positive integer')
+            if "tasks" in payload:
+                raise RuntimeError('Choose an existing "job_id" or a new "tasks" list, not both')
+            body["job_id"] = int(job_id)
+            endpoint = "run-now"
+        else:
+            if not isinstance(payload.get("tasks"), list) or not payload["tasks"]:
+                raise RuntimeError('databricks_jobs payload needs "job_id" or a Jobs 2.1 '
+                                   'runs/submit body with a non-empty "tasks" list')
+            endpoint = "runs/submit"
         cfg = self._cfg()
-        d = _json("POST", f"{cfg['base']}/api/2.1/jobs/runs/submit",
-                  self._headers(cfg), payload)
+        d = _json("POST", f"{cfg['base']}/api/2.1/jobs/{endpoint}",
+                  self._headers(cfg), body)
         run_id = d.get("run_id")
         if run_id is None:
-            raise RuntimeError(f"databricks runs/submit returned no run_id: {d}")
+            raise RuntimeError(f"databricks {endpoint} returned no run_id: {d}")
         # run_page_url only appears on runs/get; status() supplies the url.
         return {"run_ref": str(run_id), "url": None}
 

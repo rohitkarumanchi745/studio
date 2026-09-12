@@ -10,6 +10,9 @@ import os
 import re
 import tempfile
 import threading
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
@@ -72,10 +75,22 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, {"detail": f"no mock route for GET {path}"})
 
 
+def _persist_user(user):
+    with db.connect() as c:
+        c.execute(
+            "INSERT INTO users (id,email,password_hash,name,role,verified,created_at) "
+            "VALUES (?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING",
+            (user["id"], user["email"], db.UNUSABLE_PASSWORD_HASH, user["name"],
+             user["role"], 1, time.time()))
+        c.commit()
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _tables():
     db.init_db()
     supervisor.init_tables()
+    for user in (ADMIN, ANALYST, VIEWER):
+        _persist_user(user)
 
 
 @pytest.fixture(scope="module")
@@ -184,14 +199,174 @@ def test_admin_approval_triggers_and_stores_run_ref(airflow_env):
     assert meta["run_ref"] == res["run_ref"]
 
 
-def test_trigger_failure_retries_then_escalates(airflow_env):
+def test_trigger_failure_escalates_without_automatic_retry(airflow_env):
     job = _submit(ANALYST, dag_id="forbidden")
     before = len(_platform_traces())
     out = approve(job["id"], user=ADMIN)
     assert out["status"] == "escalated"
-    assert out["attempts"] == supervisor.MAX_RETRIES + 1
+    assert out["attempts"] == 1
+    assert "uncertain" in out["last_error"]
     assert "403" in out["last_error"]
     assert len(_platform_traces()) == before  # failed trigger -> no rollout
+
+
+def test_platform_request_id_is_idempotent_after_approval(airflow_env, monkeypatch):
+    sent = []
+    monkeypatch.setattr(email_service, "send", lambda *a, **k: sent.append(a))
+    jid = str(uuid.uuid4())
+    script = json.dumps({"dag_id": "etl_daily"})
+    first = supervisor.submit("platform_run", "airflow", script, ANALYST, job_id=jid)
+    second = supervisor.submit("platform_run", "airflow", script, ANALYST, job_id=jid)
+    assert first == second
+    assert len(sent) == 1
+    out = approve(jid, user=ADMIN)
+    replay = supervisor.submit("platform_run", "airflow", script, ANALYST, job_id=jid)
+    assert replay["status"] == "running"
+    assert json.loads(replay["result"]) == out["result"]
+    assert len(sent) == 1
+
+
+def test_platform_submission_can_suppress_email(airflow_env, monkeypatch):
+    monkeypatch.setattr(email_service, "send", lambda *a, **k: pytest.fail("sent email"))
+    out = supervisor.submit("platform_run", "airflow", '{"dag_id":"etl_daily"}',
+                            ANALYST, job_id=str(uuid.uuid4()), notify=False)
+    assert out["status"] == "awaiting_approval"
+
+
+@pytest.mark.parametrize("changed", ["user", "target", "script"])
+def test_request_id_cannot_be_reused_for_different_request(airflow_env, changed):
+    jid = str(uuid.uuid4())
+    script = '{"dag_id":"etl_daily"}'
+    supervisor.submit("platform_run", "airflow", script, ANALYST, job_id=jid, notify=False)
+    with pytest.raises(HTTPException) as e:
+        supervisor.submit("platform_run", "dbt_cloud" if changed == "target" else "airflow",
+                          '{}' if changed == "script" else script,
+                          ADMIN if changed == "user" else ANALYST, job_id=jid)
+    assert e.value.status_code == 409
+
+
+def test_nonplatform_cannot_supply_request_id():
+    with pytest.raises(HTTPException) as e:
+        supervisor.submit("sql_script", "demo", "SELECT 1", ANALYST, job_id="cannot-replay")
+    assert e.value.status_code == 400
+
+
+def test_reclaimed_worker_cannot_submit(airflow_env, monkeypatch):
+    def lost():
+        raise supervisor.jobs.ClaimLost("reclaimed")
+    monkeypatch.setattr(supervisor.jobs, "check_claim", lost)
+    jid = str(uuid.uuid4())
+    with pytest.raises(supervisor.jobs.ClaimLost):
+        supervisor.submit("platform_run", "airflow", '{"dag_id":"etl_daily"}',
+                          ANALYST, job_id=jid, notify=False)
+    assert supervisor._get(jid) is None
+
+
+def test_concurrent_submissions_share_one_approval_and_email(airflow_env, monkeypatch):
+    barrier = threading.Barrier(2)
+    original = supervisor.supervise
+    sent = []
+    def together(*args):
+        result = original(*args)
+        barrier.wait(timeout=5)
+        return result
+    monkeypatch.setattr(supervisor, "supervise", together)
+    monkeypatch.setattr(email_service, "send", lambda *a, **k: sent.append(a))
+    jid = str(uuid.uuid4())
+    def submit_once():
+        return supervisor.submit("platform_run", "airflow", '{"dag_id":"etl_daily"}',
+                                 ANALYST, job_id=jid)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first, second = [f.result() for f in [pool.submit(submit_once), pool.submit(submit_once)]]
+    assert first == second
+    assert len(sent) == 1
+
+
+@pytest.mark.parametrize("other_decision", ["approve", "reject"])
+def test_concurrent_human_decisions_only_one_wins(airflow_env, monkeypatch, other_decision):
+    jid = _submit(ANALYST)["id"]
+    barrier = threading.Barrier(2)
+    original = supervisor._need_approver
+    triggered = []
+    def together(*args):
+        result = original(*args)
+        barrier.wait(timeout=5)
+        return result
+    monkeypatch.setattr(supervisor, "_need_approver", together)
+    monkeypatch.setattr(supervisor.platforms.PLATFORMS["airflow"], "trigger",
+                        lambda payload: triggered.append(payload) or {"run_ref": "d:r", "url": None})
+    def decide(fn):
+        try:
+            return fn(jid, user=ADMIN)
+        except HTTPException as exc:
+            return exc.status_code
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = [f.result() for f in [pool.submit(decide, approve),
+                   pool.submit(decide, getattr(supervisor, other_decision))]]
+    assert sum(r == 409 for r in results) == 1
+    winner = next(r for r in results if isinstance(r, dict))
+    assert len(triggered) == (1 if winner["status"] == "running" else 0)
+
+
+def test_timeout_triggers_once_and_requires_explicit_reapproval(airflow_env, monkeypatch):
+    calls = []
+    def timeout(payload):
+        calls.append(payload)
+        raise TimeoutError("response lost")
+    monkeypatch.setattr(supervisor.platforms.PLATFORMS["airflow"], "trigger", timeout)
+    jid = _submit(ANALYST)["id"]
+    first = approve(jid, user=ADMIN)
+    assert first["status"] == "escalated" and len(calls) == 1
+    second = approve(jid, user=ADMIN)
+    assert second["status"] == "escalated" and len(calls) == 2
+
+
+def test_stale_escalated_revision_cannot_reapprove(airflow_env, monkeypatch):
+    def timeout(payload):
+        raise TimeoutError("response lost")
+    monkeypatch.setattr(supervisor.platforms.PLATFORMS["airflow"], "trigger", timeout)
+    jid = _submit(ANALYST)["id"]
+    approve(jid, user=ADMIN)
+    old_revision = supervisor._get(jid)
+    approve(jid, user=ADMIN)
+    with pytest.raises(HTTPException) as e:
+        supervisor._decide(old_revision, "running", ADMIN)
+    assert e.value.status_code == 409
+
+
+def test_execution_requires_human_approval(airflow_env, monkeypatch):
+    jid = _submit(ANALYST)["id"]
+    monkeypatch.setattr(supervisor.platforms.PLATFORMS["airflow"], "trigger",
+                        lambda payload: pytest.fail("unapproved trigger"))
+    with pytest.raises(RuntimeError, match="human approver"):
+        supervisor._execute(supervisor._get(jid))
+
+
+def test_approval_rechecks_requester_role(airflow_env, monkeypatch):
+    jid = _submit(ANALYST)["id"]
+    monkeypatch.setattr(db, "get_user", lambda uid: {**ANALYST, "role": "viewer"})
+    with pytest.raises(HTTPException) as e:
+        approve(jid, user=ADMIN)
+    assert e.value.status_code == 403
+    assert supervisor._get(jid)["status"] == "awaiting_approval"
+
+
+def test_deleted_requester_cannot_have_a_platform_run_approved(airflow_env, monkeypatch):
+    user_id = str(uuid.uuid4())
+    requester = {**ANALYST, "id": user_id, "email": f"{user_id}@studio.test"}
+    _persist_user(requester)
+    jid = _submit(requester)["id"]
+    with db.connect() as c:
+        c.execute("DELETE FROM users WHERE id=?", (user_id,))
+        c.commit()
+    monkeypatch.setattr(supervisor.platforms.PLATFORMS["airflow"], "trigger",
+                        lambda payload: pytest.fail("Deleted requester's job was triggered"))
+    with pytest.raises(HTTPException) as e:
+        approve(jid, user=ADMIN)
+    assert e.value.status_code == 403
+    stored = supervisor._get(jid)
+    assert stored["status"] == "awaiting_approval"
+    assert stored["human_by"] is None
 
 
 # ── /jobs/platforms picker ──────────────────────────────────────────────

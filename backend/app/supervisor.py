@@ -14,9 +14,10 @@ passes a SUPERVISOR AGENT before it runs:
 
 Policy: read-only statements the user's role may run are auto-approved. Writes,
 DDL, and Spark jobs are high-risk and require a human (admin) to approve before
-they execute. On execution failure the job retries; after repeated failures it
-is ESCALATED — the requester is emailed and a human must approve a retry or
-abort it. An LLM supervisor, when a key is present, adds a written risk review;
+they execute. On execution failure a source job retries; after repeated failures
+it is ESCALATED. Platform trigger errors escalate immediately because a lost
+response can hide a successful remote run. A human must check the platform
+before approving a retry. An LLM supervisor, when a key is present, adds a written risk review;
 it advises, but policy — not the model — decides whether a write runs.
 
 Job kinds are a CLOSED set (KINDS below) and each one has an explicit
@@ -33,17 +34,19 @@ job "running" with the platform's {run_ref, url} in the result JSON column
 from the platform and flips the job on a terminal state.
 """
 import json
+import logging
 import time
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from . import agent, db, email_service, gateway, platforms, queryguard, rbac
+from . import agent, db, email_service, gateway, jobs, platforms, queryguard, rbac
 from .auth import current_user
 from .sources import connector_or_400
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
+log = logging.getLogger(__name__)
 
 MAX_RETRIES = 2            # automatic retries before escalating to a human
 _WRITE = queryguard.FORBIDDEN  # DML/DDL keyword detector, reused from the guard
@@ -54,6 +57,9 @@ SQL_KIND = "sql_script"
 SPARK_KIND = "spark_job"
 #: An external orchestration platform run (platforms.PLATFORMS).
 PLATFORM_KIND = "platform_run"
+# A trusted compiler publishes the approved declarative DAG; a leased worker
+# waits for scheduler registration before its single external trigger attempt.
+DAG_KIND = "airflow_dag"
 #: A generated CODE ARTIFACT (toolbuilder's MCP server / tool) whose "execution"
 #: is a human's approval decision and NOTHING ELSE. It rides the supervised-job
 #: lifecycle purely for the admin gate + audit trail; its script is Python, not
@@ -63,10 +69,13 @@ ARTIFACT_KIND = "mcp_build"
 #: Every kind the supervisor knows how to execute. _execute dispatches on this
 #: set and RAISES on anything else — the fall-through that used to hand an
 #: unknown kind to connector.run_script is gone on purpose.
-KINDS = (SQL_KIND, SPARK_KIND, PLATFORM_KIND, ARTIFACT_KIND)
+KINDS = (SQL_KIND, SPARK_KIND, PLATFORM_KIND, DAG_KIND, ARTIFACT_KIND)
 
 
 def init_tables():
+    # Register durable recovery handlers in every web/worker process, not only
+    # the replica that originally submitted an enrolled pipeline.
+    from . import dag_recovery
     with db.connect() as c:
         c.executescript(
             """
@@ -104,7 +113,7 @@ def classify(kind, script):
         # signature. Classifying it as SQL would read Python as "write / DDL"
         # and imply a warehouse is involved; none is.
         return "artifact"
-    if kind in (SPARK_KIND, PLATFORM_KIND):
+    if kind in (SPARK_KIND, PLATFORM_KIND, DAG_KIND):
         return "job"
     # A SQL script: 'write' if any statement is not a plain SELECT/CTE.
     for stmt in _statements(script):
@@ -121,7 +130,7 @@ def _statements(script):
 def supervise(kind, target, script, user):
     """The supervisor agent's verdict on a job. Returns
     {decision: approve|reject|needs_human, risk, reasons}."""
-    if kind == PLATFORM_KIND:
+    if kind in (PLATFORM_KIND, DAG_KIND):
         return _supervise_platform_run(target, script, user)
     reasons = []
     # RBAC first: you cannot run anything against a source you can't reach.
@@ -204,8 +213,8 @@ def _record_platform_rollout(user, target, run_ref):
     """Agent Lightning rollout for a platform trigger (lightning.py
     conventions: meta.agents names the acting agent, reward_source says where
     the score came from). The reward is unknown until the run finishes, so it
-    stays None/"pending"; a later /live poll that discovers the terminal state
-    does NOT add a second trace — one rollout per run."""
+    stays None/"pending". This is dispatch telemetry, not a training success;
+    terminal execution produces a separate, idempotent pipeline outcome."""
     try:
         db.add_trace(user, prompt=f"platform:{target}", mode="platform_run",
                      source=target, ok=True, reward=None, reward_source="pending",
@@ -301,7 +310,14 @@ def _execute(job):
     target = job["target"]
     kind = job["kind"]
 
+    if kind == DAG_KIND:
+        from . import workflow_runs
+        return workflow_runs.execute(job)
+
     if kind == PLATFORM_KIND:
+        if not job.get("human_by"):
+            raise RuntimeError("A platform run reached execution without a human approver.")
+        jobs.check_claim()
         # Adapters read their own env creds and raise RuntimeError with a clear
         # message; {"run_ref","url"} lands in the result JSON column.
         out = platforms.get_platform(target).trigger(json.loads(job["script"]))
@@ -345,11 +361,18 @@ def _execute(job):
 
 
 def _run(job):
-    """Execute with automatic retries; escalate to a human after repeated
-    failures. Mutates + persists the job as it goes."""
+    """Execute source jobs with retries, platform triggers once per approval.
+    Mutates + persists the job as it goes."""
     while True:
         try:
             result = _execute(job)
+            if job["kind"] == DAG_KIND:
+                _save(job, status="deploying", result=json.dumps(result), last_error=None)
+                try:
+                    _schedule_platform_monitor(job, result["deployment"]["dag_id"])
+                except Exception:
+                    log.warning("Could not queue DAG registration monitor for %s", job["id"], exc_info=True)
+                return job
             if job["kind"] == PLATFORM_KIND:
                 # Trigger-success only — the pipeline is now running on the
                 # platform, so the job stays "running". /live owns the terminal
@@ -357,7 +380,16 @@ def _run(job):
                 # reports one, and registers the declared output on GENUINE
                 # success. "succeeded" here would show a finished job in the
                 # list while the pipeline is still in flight.
+                context = json.loads(job.get("result") or "{}").get("studio")
+                if context:
+                    result["studio"] = context
                 _save(job, status="running", result=json.dumps(result, default=str), last_error=None)
+                # A queue failure must not retry an accepted external trigger.
+                # The reconciler repairs missing monitors after a restart/blip.
+                try:
+                    _schedule_platform_monitor(job, result.get("run_ref"))
+                except Exception:
+                    log.warning("Could not queue platform monitor for %s", job["id"], exc_info=True)
                 return job
             _save(job, status="succeeded", result=json.dumps(result, default=str), last_error=None)
             # Write→read bridge. A supervised spark_job that DECLARED an S3
@@ -367,9 +399,22 @@ def _run(job):
             if job["kind"] == SPARK_KIND:
                 _bridge_output(job, _requester(job))
             return job
+        except jobs.ClaimLost:
+            raise
         except Exception as e:
             job["attempts"] += 1
             job["last_error"] = str(e)[:500]
+            if job["kind"] in (PLATFORM_KIND, DAG_KIND):
+                # A timeout can mean that the POST succeeded remotely. Repeating
+                # a trigger would create another run; only an explicit human
+                # decision after checking the platform may authorize a retry.
+                error = ("Trigger outcome is uncertain; check the platform before "
+                         "approving another attempt. " + str(e))[:500]
+                if job["kind"] == DAG_KIND:
+                    error = ("DAG publication failed before triggering. Review the deployment configuration and plan. " + str(e))[:500]
+                _save(job, status="escalated", attempts=job["attempts"], last_error=error)
+                _email(job, "escalated", "needs a human to check the trigger outcome")
+                return job
             if job["attempts"] > job["max_retries"]:
                 _save(job, status="escalated", attempts=job["attempts"], last_error=job["last_error"])
                 _email(job, "escalated",
@@ -379,46 +424,78 @@ def _run(job):
             # immediate retry; a real deployment would back off
 
 
-def submit(kind, target, script, user):
+def submit(kind, target, script, user, *, job_id=None, notify=True, learning_context=None):
+    """Submit once per platform request ID, including across queue retries.
+
+    Caller-provided IDs are deliberately limited to human-gated platform jobs;
+    they cannot replay an automatically executed SQL job.
+    """
+    if job_id is not None:
+        if kind not in (PLATFORM_KIND, DAG_KIND) or not isinstance(job_id, str) or not job_id.strip():
+            raise HTTPException(400, "A supplied job_id is only valid for platform runs")
+        existing = _get(job_id)
+        if existing is not None:
+            return _same_submission(existing, kind, target, script, user)
     verdict = supervise(kind, target, script, user)
     risk = verdict["risk"]
     now = time.time()
     job = {
-        "id": str(uuid.uuid4()), "user_id": user["id"],
+        "id": job_id if job_id is not None else str(uuid.uuid4()), "user_id": user["id"],
         "requester_role": user["role"], "requester_email": user.get("email"),
         "kind": kind, "target": target, "script": script, "risk": risk,
         "supervisor_decision": verdict["decision"],
         "supervisor_reasons": json.dumps(verdict["reasons"]),
-        "attempts": 0, "max_retries": MAX_RETRIES, "last_error": None,
+        "attempts": 0, "max_retries": 0 if kind in (PLATFORM_KIND, DAG_KIND) else MAX_RETRIES,
+        "last_error": None,
         "result": None, "human_by": None, "created_at": now, "updated_at": now,
     }
+    if kind in (PLATFORM_KIND, DAG_KIND) and learning_context:
+        context = {k: str(learning_context[k])[:1000] for k in
+                   ("prompt", "conversation_id", "repairs_run_id") if learning_context.get(k)}
+        if kind == DAG_KIND and learning_context.get("agent_recovery"):
+            from . import dag_recovery
+            context["agent_recovery"] = dag_recovery.policy(learning_context["agent_recovery"])
+        job["result"] = json.dumps({"studio": context})
     if verdict["decision"] == "reject":
         job["status"] = "rejected"
     elif verdict["decision"] == "approve":
         job["status"] = "running"
     else:
         job["status"] = "awaiting_approval"
-    _insert(job)
+    jobs.check_claim()
+    if not _insert(job, deduplicate=job_id is not None):
+        return _same_submission(_get(job_id), kind, target, script, user)
     db.log_activity(user, "job_submit", prompt=f"{kind}/{risk}", source=target,
                     ok=job["status"] != "rejected")
 
     if job["status"] == "running":
         _run(job)
-    elif job["status"] == "awaiting_approval":
+    elif job["status"] == "awaiting_approval" and notify:
         _email(job, "awaiting_approval", "is waiting for a human to approve it")
     return job
 
 
 # ── Persistence ─────────────────────────────────────────────────────────
 
-def _insert(job):
+def _same_submission(existing, kind, target, script, user):
+    if not existing or any(existing[k] != expected for k, expected in (
+            ("kind", kind), ("target", target), ("script", script),
+            ("user_id", user["id"]))):
+        raise HTTPException(409, "Job request ID is already used for a different submission")
+    return existing
+
+
+def _insert(job, *, deduplicate=False):
     with db.connect() as c:
         cols = ("id,user_id,requester_role,requester_email,kind,target,script,risk,status,"
                 "supervisor_decision,supervisor_reasons,attempts,max_retries,last_error,"
                 "result,human_by,created_at,updated_at")
-        c.execute(f"INSERT INTO supervised_jobs ({cols}) VALUES ({','.join('?' * 18)})",
-                  tuple(job[k] for k in cols.split(",")))
+        conflict = " ON CONFLICT(id) DO NOTHING" if deduplicate else ""
+        cur = c.execute(
+            f"INSERT INTO supervised_jobs ({cols}) VALUES ({','.join('?' * 18)}){conflict}",
+            tuple(job[k] for k in cols.split(",")))
         c.commit()
+        return cur.rowcount == 1
 
 
 def _save(job, **fields):
@@ -544,17 +621,22 @@ def live_job(jid: str, user=Depends(current_user)):
         stored = {}
     run_ref = stored.get("run_ref") if isinstance(stored, dict) else None
 
-    if row["kind"] != PLATFORM_KIND or not run_ref:
+    if row["kind"] not in (PLATFORM_KIND, DAG_KIND) or not run_ref:
         # Nothing to poll — the stored job is the truth.
         return {"state": row["status"], "detail": row.get("last_error"),
                 "url": None, "metrics": {}, "logs": "", "quality": [],
                 "job": _public(row)}
 
     p = platforms.get_platform(row["target"])
-    try:
-        st = p.status(run_ref)
-    except Exception as e:
-        st = {"state": "unknown", "detail": str(e), "url": None, "metrics": {}}
+    if stored.get("state") in ("succeeded", "failed", "canceled"):
+        # Once observed, an outcome belongs to this exact external run. A
+        # corrected run gets a new identity, never relabels the failed one.
+        st = stored
+    else:
+        try:
+            st = p.status(run_ref)
+        except Exception as e:
+            st = {"state": "unknown", "detail": str(e), "url": None, "metrics": {}}
     try:
         logs = p.logs(run_ref)
     except Exception:
@@ -574,21 +656,149 @@ def live_job(jid: str, user=Depends(current_user)):
     elif st["state"] == "failed":
         fields["status"] = "failed"
         fields["last_error"] = (st.get("detail") or "platform reported failure")[:500]
-    _save(row, **fields)
+    elif st["state"] == "canceled":
+        fields["status"] = "canceled"
+    # Do not let an older in-flight poll overwrite a terminal observation or
+    # metadata another replica just committed. The monitor safely polls again.
+    fields["updated_at"] = time.time()
+    with db.connect() as c:
+        cur = c.execute("UPDATE supervised_jobs SET " + ", ".join(f"{k}=?" for k in fields)
+                        + " WHERE id=? AND result=? AND status=?",
+                        [*fields.values(), jid, row["result"], row["status"]])
+        c.commit()
+    if cur.rowcount != 1:
+        current = _public(_get(jid))
+        result = current.get("result") or {}
+        return {"state": result.get("state", current["status"]), "detail": result.get("detail"),
+                "url": result.get("url"), "metrics": result.get("metrics") or {},
+                "logs": "", "quality": [], "job": current}
+    row.update(fields)
     # Write→read bridge. On a platform_run's GENUINE terminal success (the
     # platform itself reports succeeded — not the trigger-success _run saw when
     # it submitted), register the job's declared S3 parquet output as a
     # queryable dataset. Idempotent, so repeated /live polls after success do
     # not duplicate or re-log the registration.
     if st["state"] == "succeeded":
-        _bridge_output(row, user)
-    # Deliberately NO second Agent Lightning trace when a poll discovers the
-    # terminal state — _execute already recorded this run's rollout.
+        _bridge_output(row, _requester(row))
+    if st["state"] in ("succeeded", "failed"):
+        _learn_platform_outcome(row, run_ref, st)
+        if row["kind"] == DAG_KIND and st["state"] == "failed":
+            from . import dag_recovery
+            dag_recovery.enroll(_get(row["id"]))
+            row = _get(row["id"])
 
     return {"state": st["state"], "detail": st.get("detail"),
             "url": st.get("url") or stored.get("url"),
             "metrics": st.get("metrics") or {}, "logs": logs,
             "quality": quality, "job": _public(row)}
+
+
+def _learn_platform_outcome(row, run_ref, state):
+    """Score proven execution, attributed to the requester, not the poller."""
+    from . import lightning
+    stored = json.loads(row.get("result") or "{}")
+    if stored.get("learning"):
+        return stored["learning"]
+    context = stored.get("studio") or {}
+    action = {"type": "platform_run", "target": row["target"], "payload": json.loads(row["script"])}
+    source = row["target"]
+    if row["kind"] == DAG_KIND:
+        plan = json.loads(row["script"])["plan"]
+        action = {"type": "airflow_dag", "plan": plan}
+        source = plan["source"]
+    tid = lightning.record_pipeline_outcome(
+        _requester(row), run_id=f"{row['id']}:{run_ref}",
+        prompt=context.get("prompt") or f"platform:{row['target']}",
+        source=source, action=action,
+        status=state["state"], error=state.get("detail") if state["state"] == "failed" else None,
+        conversation_id=context.get("conversation_id"),
+        repairs_run_id=context.get("repairs_run_id"))
+    if tid:
+        # Failure to persist this marker is harmless: the trace ID and delivery
+        # enqueue are idempotent, and reconciliation will repeat the recording.
+        stored["learning"] = {"trace_id": tid, "outcome": state["state"]}
+        _save(row, result=json.dumps(stored, default=str))
+        return stored["learning"]
+    return None
+
+
+def _schedule_platform_monitor(row, run_ref, *, conn=None):
+    """One durable observer per run or approved DAG lifecycle stage.
+
+    Existing-run observers are read-only. DAG publication/registration stages
+    may publish the approved file and make their single authorized first POST.
+    ``conn`` keeps a fresh approval and its publication job in one transaction.
+    """
+    if not run_ref:
+        return None
+    jid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"studio-platform-monitor:{row['id']}:{run_ref}"))
+    now = time.time()
+    statement = (
+            "INSERT INTO background_jobs (id,kind,payload,status,attempts,max_attempts,"
+            "run_after,user_id,created_at) VALUES (?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(id) DO UPDATE SET status='queued', attempts=0, error=NULL, "
+            "result=NULL, finished_at=NULL, run_after=excluded.run_after "
+            "WHERE background_jobs.status IN ('done','failed') "
+            "AND background_jobs.finished_at<=?")
+    values = (jid, "platform_monitor", json.dumps({"job_id": row["id"], "run_ref": run_ref}),
+              "queued", 0, 2, now, row["user_id"], now, now - 30)
+    if conn is not None:
+        conn.execute(statement, values)
+    else:
+        with db.connect() as connection:
+            connection.execute(statement, values)
+            connection.commit()
+    return jid
+
+
+@jobs.handler("platform_monitor")
+def _monitor_platform(payload, job=None):
+    row = _get(payload["job_id"])
+    if not row or row["kind"] not in (PLATFORM_KIND, DAG_KIND):
+        return {"skipped": "missing_job"}
+    stored = json.loads(row.get("result") or "{}")
+    if row["kind"] == DAG_KIND and row["status"] == "approved":
+        from . import workflow_runs
+        if workflow_runs.monitor_ref(row) != payload.get("run_ref"):
+            return {"skipped": "different_approval"}
+        return workflow_runs.publish(row, claim=job)
+    if row["kind"] == DAG_KIND and row["status"] in ("deploying", "launching"):
+        if (stored.get("deployment") or {}).get("dag_id") != payload.get("run_ref"):
+            return {"skipped": "different_deployment"}
+        from . import workflow_runs
+        return workflow_runs.observe(row, claim=job)
+    if stored.get("run_ref") != payload.get("run_ref"):
+        return {"skipped": "different_run"}
+    jobs.check_claim()
+    live = live_job(row["id"], _requester(row))
+    return {"job_id": row["id"], "state": live["state"]}
+
+
+@jobs.reconciler
+def _reconcile_platform_monitors():
+    """Requeue unfinished observations and terminal traces missing after a crash.
+
+    The worker runs reconcilers on its reclaim cadence. Only DB work happens
+    here; remote polling runs in a leased queue handler, never in the ticker.
+    Only an approved DAG's registration stage can perform its first trigger.
+    Existing-run monitors never trigger or retry failed external pipelines.
+    """
+    with db.connect() as c:
+        rows = c.execute(
+            "SELECT * FROM supervised_jobs WHERE kind IN (?,?) AND "
+            "(status IN ('approved','running','deploying','launching') OR (status IN ('succeeded','failed') AND "
+            "(result IS NULL OR result NOT LIKE ?))) ORDER BY updated_at",
+            (PLATFORM_KIND, DAG_KIND, '%"learning":%')).fetchall()
+    for item in rows:
+        row = dict(item)
+        stored = json.loads(row.get("result") or "{}")
+        ref = stored.get("run_ref") or (stored.get("deployment") or {}).get("dag_id")
+        if row["kind"] == DAG_KIND:
+            from . import workflow_runs
+            if workflow_runs.recover_interrupted_approval(row):
+                continue
+            ref = workflow_runs.monitor_ref(row)
+        _schedule_platform_monitor(row, ref)
 
 
 def _need_approver(jid, user):
@@ -606,23 +816,69 @@ def _need_approver(jid, user):
 @router.post("/{jid}/approve")
 def approve(jid: str, user=Depends(current_user)):
     row = _need_approver(jid, user)
-    _save(row, status="running", human_by=user.get("email"))
+    if row["kind"] in (PLATFORM_KIND, DAG_KIND):
+        requester = db.get_user(row["user_id"])
+        if (requester is None or requester.get("role") not in ("admin", "analyst")
+                or not requester.get("verified", 1)):
+            raise HTTPException(403, "Requester can no longer run pipelines")
+    _decide(row, "approved" if row["kind"] == DAG_KIND else "running", user)
     db.log_activity(user, "job_approve", prompt=row["kind"], source=row["target"])
+    if row["kind"] == DAG_KIND:
+        return _public(row)
     return _public(_run(row))
 
 
 @router.post("/{jid}/reject")
 def reject(jid: str, user=Depends(current_user)):
     row = _need_approver(jid, user)
-    _save(row, status="rejected", human_by=user.get("email"))
+    _decide(row, "rejected", user)
     db.log_activity(user, "job_reject", prompt=row["kind"], source=row["target"])
     _email(row, "rejected", "was rejected by an administrator")
     return _public(_get(jid))
 
 
+def _decide(row, status, user):
+    """Claim this exact approval revision atomically across replicas.
+
+    Matching updated_at as well as status prevents a stale approval from
+    winning after another approval already tried and escalated the job again.
+    """
+    fields = {"status": status, "human_by": user.get("email") or user["id"],
+              "updated_at": time.time()}
+    if row["kind"] == DAG_KIND and status == "approved":
+        old = json.loads(row.get("result") or "{}")
+        # A new human approval creates a new immutable publication revision.
+        # Retired queue workers cannot commit into this token's lifecycle.
+        fields["result"] = json.dumps({"studio": old.get("studio") or {},
+                                       "publication_token": uuid.uuid4().hex})
+    jobs.check_claim()
+    with db.connect() as c:
+        cur = c.execute(
+            "UPDATE supervised_jobs SET " + ", ".join(f"{key}=?" for key in fields) + " "
+            "WHERE id=? AND status=? AND updated_at=?",
+            [*fields.values(),
+             row["id"], row["status"], row["updated_at"]])
+        if cur.rowcount == 1 and row["kind"] == DAG_KIND and status == "approved":
+            from . import workflow_runs
+            revision = {**row, **fields}
+            _schedule_platform_monitor(revision, workflow_runs.monitor_ref(revision), conn=c)
+        c.commit()
+    if cur.rowcount != 1:
+        raise HTTPException(409, "Another administrator already decided this job revision")
+    row.update(fields)
+
+
 def _public(job):
     """Never leak requester internals beyond what the UI needs."""
     j = dict(job)
+    if j.get("kind") == DAG_KIND:
+        from . import dag_recovery
+        raw = dict(job)
+        if isinstance(raw.get("result"), dict):
+            raw["result"] = json.dumps(raw["result"])
+        recovery = dag_recovery.view(raw)
+        if recovery:
+            j["recovery"] = recovery
     if isinstance(j.get("supervisor_reasons"), str):
         try:
             j["supervisor_reasons"] = json.loads(j["supervisor_reasons"])

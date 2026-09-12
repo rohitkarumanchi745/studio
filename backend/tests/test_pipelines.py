@@ -26,30 +26,30 @@ configured, and the one test that exercises it monkeypatches it.
 Run from the backend directory:
     python -m pytest tests/test_pipelines.py -q
 """
-import os
-import tempfile
-
-# Throwaway SQLite BEFORE app modules compute their paths.
-_TMP = tempfile.mkdtemp(prefix="studio-pipelines-test-")
-os.environ.setdefault("STUDIO_DB_PATH", os.path.join(_TMP, "studio.db"))
-
 import pytest
 from fastapi import HTTPException
 
 from app import db, email_service, governance, grains, pipelines, queries
-from app.connectors.demo import seed
+from app.connectors import demo
 
 # viewer: demo/{sales, web_traffic} only — see app/policies.py.
 VIEWER = {"id": "u-pl-viewer", "email": "view@studio.test", "role": "viewer", "name": "V"}
 
 
 @pytest.fixture(scope="module", autouse=True)
-def _tables():
-    db.init_db()
-    queries.init_tables()
-    pipelines.init_tables()
-    seed()
-    yield
+def _tables(tmp_path_factory):
+    folder = tmp_path_factory.mktemp("pipeline-tests")
+    # Collection order cannot redirect these tests into a developer's store
+    # or demo warehouse after another module has already imported the app.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(db, "DB_PATH", str(folder / "studio.db"))
+        patch.setattr(db, "IS_PG", False)
+        patch.setattr(demo, "WAREHOUSE_PATH", str(folder / "warehouse.db"))
+        db.init_db()
+        queries.init_tables()
+        pipelines.init_tables()
+        demo.seed()
+        yield
 
 
 @pytest.fixture(autouse=True)

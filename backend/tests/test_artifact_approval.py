@@ -132,7 +132,7 @@ def test_unknown_job_kind_raises_instead_of_running_a_script(no_warehouse):
     with pytest.raises(RuntimeError, match="Unknown job kind"):
         supervisor._execute(_artifact_job(kind="some_future_kind", script="SELECT 1"))
     # ...and the closed set is what dispatch is written against.
-    assert set(supervisor.KINDS) == {"sql_script", "spark_job", "platform_run",
+    assert set(supervisor.KINDS) == {"sql_script", "spark_job", "platform_run", "airflow_dag",
                                      supervisor.ARTIFACT_KIND}
 
 

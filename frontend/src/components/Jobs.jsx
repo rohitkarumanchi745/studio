@@ -4,17 +4,34 @@
 // jobs need a human). Repeated failures escalate — an admin approves a retry
 // or rejects. Admins are the human in the loop. Platform runs expose a live
 // panel (status / metrics / logs / quality checks) via GET /jobs/{id}/live.
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { api } from "../api";
+import PipelineRecovery, { recoveryBlocksJobDecision, recoveryIsActive } from "./PipelineRecovery";
 
 const STATUS_LABEL = {
   succeeded: "✓ succeeded",
   running: "running…",
+  approved: "approved — awaiting publication worker…",
+  deploying: "published — waiting for Airflow…",
+  launching: "requesting Airflow run…",
+  queued: "queued…",
+  failed: "✕ failed",
+  canceled: "canceled",
+  cancelled: "canceled",
   retrying: "retrying…",
   awaiting_approval: "⏳ awaiting approval",
   escalated: "⚠ escalated — needs a human",
   rejected: "✕ rejected",
 };
+const ACTIVE = new Set(["awaiting_approval", "approved", "deploying", "launching", "queued", "running", "retrying"]);
+const TERMINAL = new Set(["succeeded", "failed", "canceled", "cancelled", "rejected", "escalated"]);
+
+function externalUrl(value) {
+  try {
+    const url = new URL(value);
+    return ["https:", "http:"].includes(url.protocol) ? url.href : null;
+  } catch { return null; }
+}
 
 // Payload shapes per platform — mirrors the platforms.py module docstring.
 const PAYLOAD_PLACEHOLDER = {
@@ -30,7 +47,7 @@ const PAYLOAD_PLACEHOLDER = {
 
 // Live status panel for a platform run. Polls every ~5s while the run is
 // queued/running; stops on a terminal state or unmount (card collapsed).
-function PlatformLive({ jobId }) {
+function PlatformLive({ jobId, onUnavailable }) {
   const [live, setLive] = useState(null);
   const [err, setErr] = useState("");
   const [showLogs, setShowLogs] = useState(false);
@@ -38,23 +55,35 @@ function PlatformLive({ jobId }) {
   useEffect(() => {
     let timer = null;
     let gone = false;
+    const abort = new AbortController();
+    const started = Date.now();
+    setLive(null);
+    setErr("");
+    setShowLogs(false);
     const tick = () =>
-      api(`/jobs/${jobId}/live`)
+      api(`/jobs/${encodeURIComponent(jobId)}/live`, { signal: abort.signal })
         .then((d) => {
-          if (gone) return;
+          if (gone || !d) return;
           setErr("");
           setLive(d);
-          if (d.state === "queued" || d.state === "running") {
+          if ((!TERMINAL.has(d.state) || recoveryIsActive(d.job?.recovery || d.recovery)) && Date.now() - started < 600000) {
             timer = setTimeout(tick, 5000);
           }
         })
         .catch((e) => {
-          if (!gone) setErr(e.message);
+          if (gone) return;
+          if ([403, 404].includes(e.status)) {
+            setLive(null);
+            setShowLogs(false);
+            setErr("This job is no longer available to your account.");
+            onUnavailable?.(jobId);
+          } else setErr("Could not refresh this job. Reopen live status to try again.");
         });
     tick();
     return () => {
       gone = true;
       if (timer) clearTimeout(timer);
+      abort.abort();
     };
   }, [jobId]);
 
@@ -65,7 +94,9 @@ function PlatformLive({ jobId }) {
     ([, v]) => typeof v !== "object"
   );
   const quality = Array.isArray(live.quality) ? live.quality : [];
-  const polling = live.state === "queued" || live.state === "running";
+  const recovery = live.job?.recovery || live.recovery;
+  const polling = !TERMINAL.has(live.state) || recoveryIsActive(recovery);
+  const url = externalUrl(live.url);
 
   return (
     <div className="live-panel">
@@ -74,8 +105,8 @@ function PlatformLive({ jobId }) {
         {metrics.map(([k, v]) => (
           <span key={k} className="query-tag">{k}: {String(v)}</span>
         ))}
-        {live.url && (
-          <a className="chip" href={live.url} target="_blank" rel="noreferrer">
+        {url && (
+          <a className="chip" href={url} target="_blank" rel="noreferrer">
             ↗ open run
           </a>
         )}
@@ -84,9 +115,11 @@ function PlatformLive({ jobId }) {
             {showLogs ? "▾ hide logs" : "▸ logs"}
           </button>
         )}
-        {polling && <span className="meta">refreshing every 5s…</span>}
+        {polling && <span className="meta">Refreshes every 5s for up to 10 minutes. Reopen to resume.</span>}
       </div>
       {live.detail && <div className="meta live-detail">{live.detail}</div>}
+      {live.state === "approved" && <div className="meta live-detail">Approval is recorded. DAG publication is queued for the worker; this does not mean an Airflow run has started.</div>}
+      <PipelineRecovery recovery={recovery} />
       {showLogs && <pre className="query-sql live-logs">{live.logs}</pre>}
       {quality.length > 0 && (
         <div className="qc-list">
@@ -122,26 +155,55 @@ export default function Jobs({ onClose }) {
   const [platform, setPlatform] = useState("");
   const [script, setScript] = useState("");
 
-  const load = () =>
-    api("/jobs")
+  const load = useCallback((signal) =>
+    api("/jobs", signal ? { signal } : {})
       .then((d) => {
+        if (!d || signal?.aborted) return;
         setJobs(d.jobs || []);
         setCanApprove(!!d.can_approve);
       })
-      .catch((e) => setError(e.message));
+      .catch((e) => {
+        if (signal?.aborted) return;
+        if ([403, 404].includes(e.status)) {
+          setJobs([]);
+          setCanApprove(false);
+          setOpen(null);
+          setLiveFor(null);
+        }
+        setError(e.message);
+      }), []);
 
   useEffect(() => {
-    load();
-    api("/catalog/sources").then(setSources).catch(() => {});
-    api("/jobs/platforms")
+    const abort = new AbortController();
+    load(abort.signal);
+    api("/catalog/sources", { signal: abort.signal }).then((d) => {
+      if (!abort.signal.aborted && Array.isArray(d)) setSources(d);
+    }).catch(() => {});
+    api("/jobs/platforms", { signal: abort.signal })
       .then((d) => {
+        if (!d || abort.signal.aborted) return;
         const ps = Array.isArray(d) ? d : d.platforms || [];
         setPlatforms(ps);
         const first = ps.find((p) => p.configured) || ps[0];
         if (first) setPlatform((cur) => cur || first.name);
       })
       .catch(() => {});
-  }, []);
+    return () => abort.abort();
+  }, [load]);
+
+  useEffect(() => {
+    if (!jobs?.some((job) => ACTIVE.has(job.status) || recoveryIsActive(job.recovery))) return;
+    const abort = new AbortController();
+    const timer = setTimeout(() => load(abort.signal), 5000);
+    return () => { clearTimeout(timer); abort.abort(); };
+  }, [jobs, load]);
+
+  const unavailable = (id) => {
+    setJobs((current) => current?.filter((job) => job.id !== id) || []);
+    setOpen((current) => current === id ? null : current);
+    setLiveFor((current) => current === id ? null : current);
+    setError("A job is no longer available to your account; its cached details were cleared.");
+  };
 
   async function submit() {
     const tgt = kind === "platform_run" ? platform : target;
@@ -166,9 +228,10 @@ export default function Jobs({ onClose }) {
     setBusy(id + action);
     setError("");
     try {
-      await api(`/jobs/${id}/${action}`, { method: "POST" });
+      await api(`/jobs/${encodeURIComponent(id)}/${action}`, { method: "POST" });
       load();
     } catch (e) {
+      if ([403, 404].includes(e.status)) unavailable(id);
       setError(e.message);
     } finally {
       setBusy("");
@@ -184,7 +247,7 @@ export default function Jobs({ onClose }) {
         <div>
           <div className="canvas-title">Jobs</div>
           <div className="meta">
-            Scripts, Spark jobs and platform runs against real environments. A
+            Scripts, generated Airflow DAGs, Spark jobs and platform runs against real environments. A
             supervisor agent reviews every job; writes and jobs need human
             approval, and repeated failures escalate. {canApprove ? "You can approve or reject." : "An admin approves."}
           </div>
@@ -251,7 +314,7 @@ export default function Jobs({ onClose }) {
       ) : (
         <div className="query-list">
           {jobs.map((j) => (
-            <div key={j.id} className="query-card">
+            <div key={j.id} id={`job-${j.id}`} className="query-card">
               <div className="query-head" onClick={() => setOpen(open === j.id ? null : j.id)}>
                 <div className="query-title">
                   <span className={"job-status job-" + j.status}>
@@ -259,14 +322,15 @@ export default function Jobs({ onClose }) {
                   </span>
                   <span className="query-tag">{j.kind}</span>
                   <span className="query-tag">
-                    {j.kind === "platform_run" ? platformLabel(j.target) : j.target}
+                    {["platform_run", "airflow_dag"].includes(j.kind) ? platformLabel(j.target) : j.target}
                   </span>
                   <span className={"job-risk job-risk-" + j.risk}>{j.risk}</span>
                   {j.attempts > 0 && (
                     <span className="meta">{j.attempts}/{j.max_retries + 1} attempts</span>
                   )}
+                  {recoveryIsActive(j.recovery) && <span className="meta">agent recovery: {j.recovery.state.replaceAll("_", " ")}</span>}
                 </div>
-                {canApprove && (j.status === "awaiting_approval" || j.status === "escalated") && (
+                {canApprove && !recoveryBlocksJobDecision(j.recovery, j.id) && (j.status === "awaiting_approval" || j.status === "escalated") && (
                   <div className="query-actions" onClick={(e) => e.stopPropagation()}>
                     <button className="chip chip-on" onClick={() => decide(j.id, "approve")}
                       disabled={busy === j.id + "approve"}>
@@ -290,10 +354,11 @@ export default function Jobs({ onClose }) {
                   </div>
                   <pre className="query-sql">{j.script}</pre>
                   {j.last_error && <div className="error">{j.last_error}</div>}
+                  <PipelineRecovery recovery={j.recovery} />
                   {j.result && (
                     <pre className="query-sql">{JSON.stringify(j.result, null, 2).slice(0, 1200)}</pre>
                   )}
-                  {j.kind === "platform_run" && j.result && j.result.run_ref && (
+                  {["platform_run", "airflow_dag"].includes(j.kind) && (
                     <>
                       <div className="query-actions">
                         <button className="chip"
@@ -301,7 +366,7 @@ export default function Jobs({ onClose }) {
                           {liveFor === j.id ? "✕ hide live status" : "↻ live status"}
                         </button>
                       </div>
-                      {liveFor === j.id && <PlatformLive jobId={j.id} />}
+                      {liveFor === j.id && <PlatformLive jobId={j.id} onUnavailable={unavailable} />}
                     </>
                   )}
                 </div>

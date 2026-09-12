@@ -3,20 +3,61 @@
 An agentic analytics platform. Ask your data anything in plain English — a crew
 of named agents writes the SQL, runs it (read-only, RBAC-enforced), and renders
 Power BI / Tableau-class visualizations you can pin, cross-filter, and share.
-Beyond chat it turns a request into **governed, single-source, read-only query
+Chat and the Pipelines view turn requests into **governed, read-only query
 bundles that run on demand** — **verified SQL** and **prompt-driven pipelines**
 with data lineage — and routes anything that writes (a script, a Spark job)
 through a **safe-production flow** (generate → validate → approve → deploy →
 run) with a human in the loop. What that flow deploys is the verified SQL steps,
 or a Spark payload built from them; the Python it generates is a syntax-checked
-**deliverable Studio never executes**. Around both sit **governance-as-code**
+**deliverable Studio never executes**. A separate chat workflow path builds
+dependency-aware, single-source SQL DAGs for Airflow from declarative plans,
+using a trusted compiler and administrator-approved publication and execution.
+Around these paths sit **governance-as-code**
 and a learning loop (**Agent Lightning**) that records every run as a rewarded
 rollout — and delivers it to a real Agent Lightning server when one is
-configured. Once a use case has been learned, a **self-hosted BitNet** — trained
-continuously from those rollouts — takes over the recurring work, leaving the
-frontier LLM to handle only what's genuinely new.
+configured. A separately operated trainer can use eligible rollouts to train a
+**self-hosted BitNet** adapter for recurring work. Recording a run does not
+update model weights or activate an adapter; serving and a verified training
+result must be configured before learned-scope routing can take over.
 
 **Live demo:** https://studio-production-ac35.up.railway.app
+
+Chat can build and run pipelines using the conversation. Ask a data question,
+then use the pipeline card's **Run pipeline** button or say **"run this
+pipeline"**. Use **Build pipeline** in the composer (or ask **"build a pipeline
+for monthly revenue by region"**) for a pipeline draft, then describe changes
+in follow-up messages. Each version stays attached to its chat message; a run
+uses that version and checks current permissions again. A data answer's SQL
+and multi-source panels become steps without requiring BitNet or model training.
+You can also say **"build and run a pipeline for monthly revenue by region"**
+to build, verify, save privately, and execute in one turn. Interrupted read-only
+queries may repeat during a worker retry; saved pipeline and run records are
+deduplicated per chat turn.
+These steps are independent, read-only queries; they do not pass intermediate
+outputs to one another or execute generated Python. Requests with failed
+verification remain blocked and show the reasons.
+
+Chat also submits runs to **Airflow, Databricks Jobs, dbt Cloud, and Spark on
+Kubernetes**. For example, say **"trigger Airflow DAG daily_sales"**, **"run
+Databricks job 123"**, or **"run dbt job 456"**. Supply parameters as JSON, or
+open **Run on Airflow / another platform** in the composer to choose a platform
+and enter its payload. Every external run requires an administrator's approval
+in Jobs. **"Check job status"** follows the selected run; the chat card
+also refreshes its status, logs, and quality checks. These commands address
+existing DAGs/jobs or an explicit job definition with deployed code; they do
+not publish a chat SQL bundle as an Airflow DAG or execute generated Python.
+
+For a **new dependency-aware pipeline**, ask **"build an Airflow pipeline"**
+and describe the input, transformations, duplicate key/winner rule, and explicit
+output tables. Chat drafts supported SQL tasks and their dependencies, asks
+about missing details, and offers **Submit for approval** and **Download DAG**.
+Its SQL checks are static: unlike a read-only bundle, a DAG draft has **not run**.
+Successful private recipes can be retrieved for the same or a similar prompt;
+exact reuse is revalidated, and changed requirements need model adaptation and
+fresh validation. A failed or unconfirmed adaptation is not made runnable.
+See [Natural prompts → reusable Airflow SQL DAGs](#natural-prompts--reusable-airflow-sql-dags)
+for the supported scope and deployment requirements. This path is implemented
+and locally tested; a real Airflow/container deployment has not been verified.
 
 ---
 
@@ -125,6 +166,11 @@ any `.run_query(` under `app/` outside `gateway.py` — a permission can never b
 skipped by taking a different route. Optional `STUDIO_QUERY_TIMEOUT_S` bounds a
 single warehouse query; `STUDIO_MAX_ROWS` (read by `limits.py`) is the server
 ceiling for any result.
+
+This is Studio's row-returning read plane. Approved Airflow DAG tasks execute
+outside it, through the operator-mapped warehouse connection; their separate
+static/governance checks and limitations are described below. They do not
+return result rows to chat or use a second in-process `run_query` path.
 
 **The allowlist is a namespace, not just a name.** RBAC keys on *bare* table
 names, so an allowlist entry for `sales` also admitted `secret_schema.sales` —
@@ -403,7 +449,8 @@ advancing, not as a schedule alert.
 
 ### Prompt-built pipelines + data lineage
 
-Describe a job; the **Pipeline planner** routes it to the source whose tables
+For the read-only Pipelines view and chat SQL bundles, describe a job; the
+**Pipeline planner** routes it to the source whose tables
 best match, drafts an ordered set of steps, and can pick the right **GitHub
 repo** (`repos.py`) whose scripts fit the prompt. Every drafted step is run
 through `verify_sql` (RBAC + guard + real execution) before you see it, and the
@@ -430,8 +477,173 @@ you can judge that.
 A pipeline renders a **source → table → step lineage diagram** (drawn from the
 verified steps only) so a multi-source request shows exactly where each table
 comes from; a failed step emails the requester naming the failing source/table,
-and every run is traced through Agent Lightning (into `agent_traces`; pipeline
-runs are not among the rollouts shipped to an Agent Lightning server).
+and each completed or failed run records its complete attempted recipe in
+`agent_traces` as `mode="pipeline"`. A successful execution earns `1`, a failed
+execution `0`; a corrected follow-up keeps the earlier failure and links its
+new outcome through `repairs_run_id`. These outcomes are queued for delivery to
+an Agent Lightning server when `STUDIO_AGL_URL` is configured. Recent SQL
+pipeline examples are scoped to their owner and rechecked against current
+source/table permissions and connector namespaces before they inform another
+draft. `pipeline_memory.py` ranks the caller's bounded successful history by
+prompt similarity, requiring both observed success and reward `1`; positive
+feedback cannot turn a failed run into a proven recipe, and negative feedback
+removes a success from reuse. An exact normalized request re-verifies the old
+SQL. A related request passes the matching recipe to the model for adaptation,
+with the latest prompt authoritative; no model or a failed adaptation blocks
+reuse instead of silently preserving old filters. Unchanged SQL after changed
+parameters is flagged and blocked. Drafts show the matched prompt and keep
+trace/run provenance. Every new SQL draft and execution still passes the normal
+gateway checks. This is experience retrieval, not model-weight training.
+
+### Natural prompts → reusable Airflow SQL DAGs
+
+`chat_workflows.py` connects natural requests to `pipeline_dags.py`'s typed plan,
+`airflow_dags.py`'s trusted compiler, and `workflow_runs.py`'s supervised runner.
+Analysts and admins can draft a graph of up to 12 tasks on **one selected SQL
+source**. Supported statements are read-only `SELECT`/`WITH`,
+`CREATE TABLE <output> AS SELECT`, and `INSERT INTO <output> SELECT`.
+Each materialized output must be named explicitly, permitted by the caller's
+role, and produced by one task. A downstream reader must depend on its producer;
+cycles, unknown dependencies, duplicate tasks, and cross-namespace references
+are refused. Existing output tables are never overwritten: CTAS needs a new
+destination, and append requires an existing destination and fresh approval.
+Dependencies order tasks; materialized tables carry data between them. A
+read-only SELECT does not implicitly pass its rows to the next task. Compiled
+tasks disable result XCom pushes, and learning stores recipes/outcomes, not
+copies of warehouse result rows.
+
+The planner needs a working model and the actual authorized input schema. It
+asks for missing source/output names, deduplication keys, winner rules, and
+create-versus-append intent; it does not substitute a generic SQL preview for
+an ETL request. There is **no arbitrary model-written Python, shell, MERGE,
+UPDATE, DELETE, multi-source DAG, backfill, or recurring schedule** in this
+contract. Parameter values are concrete reviewed SQL constants, not runtime
+Jinja templates or a string-replacement mechanism.
+
+**Validation is not execution.** Planning checks SQL shape, input/output RBAC,
+the connector's namespace, dependencies, and current governance without running
+the SQL. Inputs requiring Studio's masking, denied-column handling, or result
+row limits are refused on this external path because Airflow cannot apply those
+gateway transformations. Use the governed read-only path or an independently
+governed warehouse view. Static checks cannot prove database privileges,
+statement success, or the business correctness of a deduplication rule; the
+administrator must review the actual SQL and destination before approval.
+
+The execution sequence is:
+
+1. Chat returns a draft and downloadable DAG; nothing is published or running.
+2. **Submit for approval** creates an immutable supervised request. An admin
+   approves it in **Jobs**. Approval is saved together with a durable publication
+   job; `approved` means waiting for that worker, not published or running.
+3. The publication worker rechecks current requester permissions and the
+   artifact fingerprint. The trusted compiler publishes a content-addressed `.py` DAG file into the
+   configured shared folder without overwriting another file. Airflow runs that
+   generated wrapper, not arbitrary model-written code. DAGs are manual-only
+   (`schedule=None`, `catchup=False`, automatic task retries disabled).
+4. The durable worker waits for Airflow registration and an unpaused DAG, then
+   makes one trigger attempt. A lost/uncertain trigger response escalates for
+   human inspection; it is not automatically retried. Status GETs never trigger
+   a run. Chat/Jobs display publication, launch, and execution as separate states.
+5. The worker records the actual terminal outcome, even after chat closes.
+   **"Repair this pipeline"** includes the observed failure in a new plan; the
+   correction needs fresh approval. Its successful `airflow_dag` action stores
+   the complete plan and `repairs_run_id` for later prompt retrieval and optional
+   Agent Lightning delivery. A plain repair follow-up retains the original
+   business requirement as its learning prompt, so a future matching request
+   finds the corrected recipe rather than an example named only "fix it".
+   Exact recipes still need current validation;
+   similar requests need adaptation, and unchanged failed SQL is not a repair.
+
+**Example** (only if the selected PostgreSQL source really exposes these columns
+and your role permits both new outputs):
+
+> Build an Airflow pipeline on postgres. Read sales for 2026-09-10 using
+> order_date. Deduplicate by order_id: keep the greatest updated_at, breaking
+> ties with the greatest unique ingestion_id. Create sales_clean_20260910 as a
+> new table. Then create revenue_region_20260910 from that output, summing
+> revenue by region. Do not overwrite or append to any existing table.
+
+Review the SQL/dependencies, submit, approve in Jobs, then ask **"check pipeline
+status"**. For a later date, explicitly give its new date and output names;
+Studio can adapt an eligible prior success, then validates and requests approval
+again. An old CTAS output already existing can make an exact rerun need input
+without discarding that success as an adaptation example; current security and
+dependency checks still apply before it is offered to the planner.
+Re-running CTAS against its already-created output is not idempotent;
+appending the same rows can duplicate data. Neither is silently converted to an
+overwrite or an upsert.
+
+**Agent-owned recovery.** New chat pipeline executions enroll in a durable,
+two-attempt recovery policy. A known failed run queues an Agent Lightning v1
+rollout using `app.recovery_planner.PipelineRecoveryAgent`; Lightning's local
+controller launches it and injects the rollout-specific model proxy and event
+endpoints. The agent returns `retry`, a typed `repair`, or `escalate`.
+Studio does not substitute a local LLM if Lightning is unavailable. Missing
+configuration, invalid decisions, expired diagnosis, or exhausted budget stop
+automatic recovery with a visible reason. Model/queue polling does not consume
+the execution-attempt budget.
+
+Studio rechecks current permissions and the returned recipe before execution.
+Read-only SQL retries can execute automatically. Read-only Airflow corrections
+can inherit the original recorded approval only within its original read-table
+scope. Write-capable corrections require **fresh administrator approval**;
+partial CTAS/INSERT execution is not assumed rolled back. An unknown/uncertain
+trigger never enters automatic recovery, and another trigger is never sent
+just because its earlier HTTP response was lost. A recovery has separate run
+identities and retains the failed parent. Its actual execution reward is also
+posted to the **same Lightning diagnosis rollout**, not awarded merely because
+the agent produced an answer. The ordinary immutable `agent_traces` records
+and successful-recipe retrieval remain in place. No trainer or BitNet weight
+update is started by this loop.
+
+Recovery requires `STUDIO_AGL_URL`, `STUDIO_AGL_TOKEN` when the server requires
+authentication, and `STUDIO_AGL_RECOVERY_MODEL` naming a model registered with
+the Lightning gateway. `STUDIO_AGL_RECOVERY_TIMEOUT_S` defaults to 300 seconds
+(bounded to 30–900). Run a trusted Lightning **local controller** with this
+backend package importable, alongside Studio's durable worker. For example,
+from an environment with the backend on `PYTHONPATH`:
+
+```sh
+agl-controller runner_type=local agl_server.url=http://lightning:8080
+```
+
+Configure controller authentication through its deployment secrets. The
+recovery agent makes model calls only through the controller-injected
+`AGL_OPENAI_BASE_URL` and posts decisions to `AGL_EVENT_URL`; it does not need
+warehouse credentials or Studio database access. This implementation supplies
+a local-agent class, **not a Kubernetes rollout template**. See Microsoft's
+[v1 execution model](https://microsoft.github.io/agent-lightning/stable/05-basics/)
+and [controller configuration](https://microsoft.github.io/agent-lightning/stable/30-controller-configuration/).
+Tests exercise the real rollout/event routes and controller class entry point
+with a stub model; no live controller, model backend, or Airflow service was
+deployed by these tests. The frontend shows recovery separately from the failed
+parent, including the current attempt, reason, and correction job/run.
+
+**Airflow operator setup** is required before publication, independently of BitNet:
+
+- Configure the Studio source and an Airflow connection pointing to the **same
+  database/catalog/schema/search path**. Set, for example,
+  `STUDIO_AIRFLOW_CONNECTIONS_JSON='{"postgres":"studio_postgres"}'`. The mapping
+  is operator-owned; model output cannot choose credentials or connection IDs.
+  Operators must verify the endpoints really match; an ID mapping alone does
+  not prove that.
+- Set `STUDIO_AIRFLOW_DAGS_DIR` to an **existing absolute non-root directory**
+  shared with Airflow's DAG processor, writable by the Studio execution process
+  and readable by Airflow, with no symlink path components. Merely creating a
+  directory in an unrelated Railway container does not publish a DAG to Airflow.
+- Configure `AIRFLOW_URL`, its authentication, and `AIRFLOW_API_VERSION`; install
+  Airflow's common-SQL provider and the database provider for the mapped
+  connection in the Airflow runtime.
+- Keep the durable worker running (`STUDIO_WORKER_MODE=thread`, or `external`
+  with `python -m app.worker`) with the same application database, mapping, and
+  shared-folder access. No worker means no registration/trigger/terminal monitor.
+
+Local tests cover typed planning, guards, compilation, immutable publication,
+approval, mocked Airflow lifecycle, and learning/reuse. **A real Airflow runtime
+and Docker/container deployment have not been exercised for this path**;
+provider imports, shared mounts, real credentials, and execution must be smoke
+tested in the target environment. Nothing in these tests deploys a service or
+proves that the live demo has this configuration.
 
 ### The staged flow — safe production behavior
 
@@ -508,19 +720,38 @@ what is posted (`api_body()`) while the stored script keeps it for the bridge.
 Studio is read-only by default. Running a script or Spark job against a real
 environment passes a **supervisor agent** (`supervisor.py`): read-only
 statements auto-approve; writes, DDL, and jobs require a human (admin) to
-approve before anything runs. Execution failures retry, then escalate — the
-requester is emailed and an admin approves a retry or aborts. Studio *generates*
+approve before anything runs. Source execution failures retry, then escalate —
+the requester is emailed and an admin approves a retry or aborts. Platform
+trigger errors escalate after one attempt: a lost HTTP response can hide an
+already-started remote job, so an admin must check the platform before approving
+another attempt. Studio *generates*
 Python but never executes generated code in-process: running a script goes
 through this gate, and approved tool-builder servers run only inside the
 sandbox described under *Extending the agent*. Each `SELECT` / `WITH` statement
 of an approved script is executed through the gateway as the requester
 (audited `supervised_read`); the write / DDL branch stays outside the gateway
 on purpose — its authority is the admin approval, and the gateway is the read
-pipeline. A triggered **platform run** stays `running` until the live poll
-(`GET /jobs/{id}/live`) sees the platform's genuine terminal state — trigger
-success is not job success — and Spark / platform payloads are validated as
+pipeline. A triggered **platform run** stays `running` until a live poll
+(`GET /jobs/{id}/live`) or the durable worker's platform monitor sees the
+platform's genuine terminal state — trigger success is not job success — and
+Spark / platform payloads are validated as
 JSON at submit, so a malformed script is a clear 400 rather than a run-time
 retry loop.
+
+**Conversation-driven platform runs.** `chat_platforms.py` resolves explicit
+commands and the composer's platform/JSON form into the same supervised
+request. This existing-job path requires an Airflow `dag_id`; new typed SQL DAGs
+use the separate approval-gated chat workflow path above. Databricks accepts an existing
+`job_id` (`jobs/run-now`) or explicit `tasks` (`runs/submit`), dbt Cloud uses an
+existing `job_id`, and Kubernetes accepts a SparkApplication definition that
+names its image and deployed entry point. Missing or malformed identifiers, omitted
+parameters, and unconfigured credentials produce a clarification/configuration
+card; the agent does not invent a deployment. A follow-up can check status or
+submit a corrected run for fresh approval. Queue retries reuse one submission
+ID, and concurrent approve/reject requests atomically claim a decision, so
+neither repeats the external trigger. Closing chat does not stop monitoring
+while the durable worker is running. Platform success/failure becomes a
+rewarded outcome only when the platform reports that terminal state.
 
 **One job kind is an approval record, not an execution.** A tool-builder
 registration (`mcp_build`, `supervisor.ARTIFACT_KIND`) is Python, and it went
@@ -779,6 +1010,32 @@ flowchart LR
 
 ---
 
+## Data connections — connect a database from the UI
+
+An admin connects a warehouse straight from the **Data connections** screen — no
+env vars, no redeploy. Pick a type (PostgreSQL, Snowflake, Databricks SQL,
+BigQuery, Neo4j), fill the form, **Test**, **Save** — and it becomes a
+first-class source in the chat picker, served by the SAME connector classes the
+env-configured sources use, so the gateway guard, RBAC, governance masking and
+skill files all apply to it unchanged.
+
+- **Encrypted at rest.** Credentials are Fernet-encrypted with a
+  connections-specific salt (domain-separated from user API keys), never returned
+  by any endpoint and never logged — listings carry only a non-secret
+  host/account/project hint. A rotated `STUDIO_SECRET` fails closed: the row stops
+  decrypting, the source shows unconfigured, and an admin reconnects.
+- **Saved only after a live probe.** A connection is persisted only once a
+  `list_tables()` call against it succeeds, so a broken DSN can't be saved.
+- **Admin-only, governance-aware.** Create / list / delete are admin-only
+  (pointing the server at a DSN is operator power). A new source is reachable by
+  admin by default; other roles get it only through an explicit governance grant.
+- **Registry integration.** `connectors.get_connector` / `all_sources` resolve
+  stored connections lazily, so a UI-added source flows through catalog, RBAC and
+  the agent exactly like a built-in one. `connections.py` holds the encrypted
+  store and the per-type form contracts.
+
+---
+
 ## Adversarial model benchmark — choose attackers with evidence
 
 The admin-only **Red team benchmark** turns attacker-model selection into a
@@ -841,15 +1098,15 @@ the [`agentlightning`](https://github.com/microsoft/agent-lightning) package
 extra: its core deps are fastapi / httpx / pydantic / uvicorn / pyyaml / jinja2
 plus structlog, hydra-core and kr8s, **no torch** — 35 resolved packages,
 ≈17 MB on disk, `python-box` 9 MB of it) makes Studio a
-**client of a real Agent Lightning server**: set `STUDIO_AGL_URL` and every
-rollout Studio records is also delivered there in the package's own schemas, so
+**client of a real Agent Lightning server**: set `STUDIO_AGL_URL` and supported
+rollouts are queued for delivery in the package's own schemas, so
 Agent Lightning's store holds Studio's real traffic and its own tooling reads
 it back (`GET /api/rollouts/terminal`, `GET /api/rollouts/{id}/events`, the
 verl bridge) with no Studio-specific code on that side.
 
 ```mermaid
 flowchart LR
-    run["Any run<br/>chat · autopilot · crew agents"] --> roll[("agent_traces<br/>prompt · sql · reward · agents")]
+    run["Runs<br/>chat · autopilot · crew · pipeline outcomes"] --> roll[("agent_traces<br/>prompt · actions · reward · agents")]
     roll --> fb["👍 / 👎 overwrites the heuristic reward"]
     roll --> fail["recent failures → system prompt<br/>(immediate, in-context)"]
     roll --> apo["APO distills low-reward traces<br/>→ prompts/system_learned.txt"]
@@ -886,8 +1143,8 @@ is visible in `/api/health`; the answer already went out.
 | `RolloutCreate.input` | `data_id` (the trace id — the field `/api/rollouts/terminal` projects), `prompt`, `source`, `table`, `conversation_id`, `history` (the turns the model actually saw, so training conditions the way serving does) |
 | `RolloutCreate.metadata` | `studio_trace_id`, `studio_user_id`, `studio_role`, `mode`, `model`, `agents`, `created_at` — `RolloutMetadata` allows extras; the opaque user id travels, never the email |
 | `RolloutCreate.is_train` | `STUDIO_AGL_TRAIN` (default true) |
-| `EventCreate` | `studio.run` (mode · model · source · table · ok · duration · agents) · `studio.query` (sql · row_count) · `studio.chart` (type · panel_count) · `studio.errors` — row counts, chart types and SQL have no first-class fields in the package's schemas, and correctly ride as trajectory events |
-| `RewardData` | `value` = the trace's reward, `source` = `heuristic` / `user` / `per_agent`, `reason` = a machine slug, `message` = the 👍/👎 note or a compact outcome string |
+| `EventCreate` | `studio.run` (mode · model · source · table · ok · duration · agents) · `studio.query` (sql · row_count) · `studio.chart` (type · panel_count) · `studio.errors` · `studio.action` (structured pipeline recipe, run ID, and repair link when present) |
+| `RewardData` | `value` = the trace's reward, `source` = `heuristic` / `user` / `per_agent` / `pipeline_outcome`, `reason` = a machine slug, `message` = the 👍/👎 note or a compact outcome string |
 | rollout state | `queuing → running → succeeded / failed` from the run's `ok`, which is what puts the rollout in the terminal log a trainer pages through |
 
 Fallback-mode runs (no LLM key) are deliberately **unscored** — no reward event
@@ -931,9 +1188,10 @@ server on a private network. `/learning` is admin-only.
 attempts (the server down for hours) is left as a failed `background_jobs` row
 and nothing re-drives it — the sweep only reconsiders traces that already
 delivered once, because sweeping every undelivered trace would replay the whole
-history the first time `STUDIO_AGL_URL` is set. The trace INSERT and the queue
-INSERT are also two transactions, so a crash between them loses that delivery
-(never the trace). And the reward re-delivery is a sweep rather than an enqueue
+history the first time `STUDIO_AGL_URL` is set. For the older chat/per-agent
+writers, the trace INSERT and queue INSERT are two transactions, so a crash
+between them loses that delivery (never the trace). Pipeline outcome recording
+commits its trace and delivery enqueue together. And reward re-delivery is a sweep rather than an enqueue
 at the moment of the click, which is why it is seconds rather than immediate.
 The event de-duplication is read-then-post rather than atomic, so two
 deliveries of the same trace overlapping in different workers could double an
@@ -942,12 +1200,30 @@ posting into it leaves that attempt briefly empty until the retry fills it —
 both self-heal, and neither can touch the trace the answer came from.
 
 **Scope of delivery.** Chat turns (synchronous and background), autopilot
-turns, and the crew's per-agent rollouts go through this door — everything
-that calls `lightning.record_chat_trace()` / `record_agent_rollout()`. The
-four writers that call `db.add_trace()` directly — flow stages (`flow.py`),
-`/verify-sql` rollouts (`queries.py`), pipeline runs (`pipelines.py`) and
-platform runs (`supervisor.py`) — still land in `agent_traces` only and are
-**not** shipped, until they are routed through `lightning.record_*` too.
+turns, the crew's per-agent rollouts, SQL pipeline execution outcomes, and
+terminal platform execution outcomes go through `lightning.record_*` and are
+eligible for external delivery. Flow-stage traces (`flow.py`) and standalone
+`/verify-sql` traces (`queries.py`) that call `db.add_trace()` directly remain
+local. Delivery to an external Agent Lightning server requires
+`STUDIO_AGL_URL`; local recording works with it unset.
+
+**Learning from a failed pipeline and its correction.**
+`record_pipeline_outcome()` stores `mode="pipeline"`, the original prompt,
+the complete structured action (`sql_pipeline` steps, a `platform_run`
+target/payload, or an `airflow_dag` plan), the observed outcome, and reward `0` for failure or `1` for
+success. Pending approval, trigger acceptance, and uncertain trigger errors
+are not labeled successful executions. A correction is a new run linked to
+the failed one with `repairs_run_id`; it never rewrites the old run into a
+success. A stable trace ID makes repeated outcome recording idempotent, and
+the observed execution metadata is immutable even if later feedback changes
+its reward. Prompt-to-pipeline memory retrieves eligible successful recipes
+from the caller's own history, revalidates exact matches, and gives similar
+matches to the planner for adaptation; failed attempts remain diagnostic
+context, not successful templates. Platform actions retain their normal
+validation and human approval gate. This collects useful experience and improves prompt context;
+it does not start training, change hosted-model weights, or publish/load a
+BitNet adapter. Structured pipeline actions also stay out of the single-query
+`sql` field so a tool-calling trainer cannot mistake a job payload for SQL.
 
 **Is it reinforcement learning?** Yes in structure, no in the usual sense. The
 rollout + reward machinery *is* RL. But Studio runs on hosted models (Claude /
@@ -1051,8 +1327,13 @@ The trainer pulls reward-labeled rollouts (`GET /training/rollouts`), trains a
 the newest version. `GET /training/online` reports the loop status and BitNet's
 growing scope. The heavy ML deps live in `scripts/requirements-trainer.txt`
 (kept out of the lean API image); run the worker via `scripts/Dockerfile.trainer`.
-The whole path is **dormant until `STUDIO_LLM_BASE_URL` (BitNet) and
-`HARRIER_EMBED_URL` (Harrier) are configured**, so it changes nothing on its own.
+Recording rewarded chat or pipeline outcomes does not start this trainer or
+change served weights. BitNet routing requires a configured
+`STUDIO_LLM_BASE_URL` and an eligible published adapter, with the actual mounted
+adapter and tool-calling behavior verified separately. `HARRIER_EMBED_URL`
+enables semantic embeddings; unset, matching uses the documented lexical
+fallback. External Agent Lightning delivery is an independent setting,
+`STUDIO_AGL_URL`.
 
 ### Running it on your own machine
 
@@ -1625,7 +1906,8 @@ optional and falls back to the in-process cache silently.
 | **Harrier embeddings when configured, lexical signature otherwise** | Real semantic match (different-word paraphrases) with Harrier; deterministic lexical fallback keeps it working offline with zero deps | Embeddings need a Harrier endpoint stood up; the lexical fallback misses different-word paraphrases |
 | **Read-only by default; writes go through supervisor + a human** | An analytics tool must never silently mutate production | Every write is gated — latency and a human in the loop, by design |
 | **Studio generates Python but never runs it in-process** | Arbitrary code execution is the blast radius to avoid | The staged flow deploys the verified SQL steps (or a Spark payload of them) and hands the artifact over as a deliverable — a run that produced one reads `succeeded_sql_only`, and actually running it takes the supervised Jobs path or an approved, sandboxed tool |
-| **A pipeline draft returns only the steps that verified** | "Verified" has to mean it ran; a hopeful list is worse than an empty one | A prompt can legitimately come back with zero steps and a list of reasons, which the UI has to explain |
+| **A read-only SQL bundle returns only the steps that verified** | "Verified" here means it ran through the gateway | A prompt can legitimately come back with zero steps and a list of reasons; the separate Airflow DAG path reports static checks, never execution verification |
+| **New Airflow DAGs use typed SQL and a trusted compiler** | Model text cannot become arbitrary executable Python; dependencies, destinations, and approval are explicit | One source, limited SQL shapes, manual runs, and operator-managed shared storage/connection mapping; static validation does not prove runtime success |
 | **Fail the read when governance lineage is unknowable** | A denied column inside a CTE could surface in any output column — guessing is a leak | A legitimate query must be rewritten (select the column at the top level, or drop it) before it will run |
 | **Process runner by default on a laptop, docker required in production** (built tools) | Zero extra infra on dev; production must not run approved generated code with the app's own credentials by omission | A production boot now *fails* until the operator picks `STUDIO_TOOL_RUNNER=docker`, `STUDIO_TOOLBUILDER=0`, or the explicit `STUDIO_TOOL_RUNNER_ALLOW_PROCESS=1`; the process runner still cannot cut off the network or hide host files, and `RLIMIT_AS` is not enforceable on macOS |
 | **Dashboards/queries store the recipe, not rows** | RBAC evaluated at view time, not frozen at pin time | Every view re-runs SQL (mitigated by the tile cache) |
@@ -1883,7 +2165,7 @@ you in: the account is created unverified and the emailed 6-digit code
 
 | Variable | Purpose |
 |---|---|
-| `STUDIO_AGL_URL` | Base URL of an Agent Lightning server (its API is under `/api`). **The only switch**: set, every recorded rollout is queued for delivery; unset, nothing is enqueued, no bookkeeping table is created, and behaviour is exactly what it was. The chat path never imports `agentlightning` either way — only the job does, plus `/api/health` reading its `__version__` |
+| `STUDIO_AGL_URL` | Base URL of an Agent Lightning server (its API is under `/api`). **The delivery switch**: set, supported chat/per-agent and terminal pipeline rollouts are queued for delivery; unset, they are recorded locally without external delivery. The chat path never imports `agentlightning` either way — only the job does, plus `/api/health` reading its `__version__` |
 | `STUDIO_AGL_TOKEN` | The server's `AGL_KEY`, sent as `Authorization: Bearer …` (the server also accepts `x-api-key`). Omit when the server runs without a key |
 | `STUDIO_AGL_TIMEOUT_S` | Per-HTTP-call timeout for one delivery (default 10). Client-side retries are off on purpose — the durable queue owns retries |
 | `STUDIO_AGL_MAX_ATTEMPTS` | Queue attempts per delivery before the job is failed (default 5, with the queue's 5 s / 10 s / 20 s… backoff) |
@@ -1933,6 +2215,11 @@ you in: the account is created unverified and the emailed 6-digit code
 
 | Variable | Purpose |
 |---|---|
+| `AIRFLOW_URL` | Airflow base URL, without an `/api` suffix. Required for both existing DAG triggers and generated-DAG execution |
+| `AIRFLOW_TOKEN` / `AIRFLOW_USERNAME` + `AIRFLOW_PASSWORD` | Airflow authentication: bearer token, or username/password (Basic for v1; token exchange for v2). Keep these on the server, never in prompts or plans |
+| `AIRFLOW_API_VERSION` | `v1` (default, Airflow 2) or `v2` (Airflow 3) for Studio's Airflow client |
+| `STUDIO_AIRFLOW_CONNECTIONS_JSON` | Operator-owned JSON mapping of Studio source names to existing Airflow connection IDs, e.g. `{"postgres":"studio_postgres"}`. The mapped connection must reach the same database/catalog/schema/search path as Studio's connector; this is a deployment responsibility, not established by the mapping alone |
+| `STUDIO_AIRFLOW_DAGS_DIR` | Existing absolute, non-root, non-symlink shared DAG directory. Studio publishes approved immutable DAG files here; Airflow's DAG processor must read the same files. No shared mount or no credentials means no deployment |
 | `AZURE_REDIRECT_URI` | Entra SSO redirect, default `http://localhost:8000/api/auth/azure/callback` — register that exact URI in the app registration |
 | `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` / `AZURE_GROUP_ROLE_MAP` | Entra SSO + group→role mapping, **and** the Microsoft 365 → KAG extraction layer (dormant until set) |
 | `DATABRICKS_WAREHOUSE_ID` | **Required for the Spark / Jobs flow.** The SQL warehouse that runs a submitted job's `sql_task`s. Unset, a `spark_job` deployment is *refused* before the supervisor is called (`decision: "reject"`, reason naming this variable) rather than posting a body the Jobs API would `400`. Not needed for reading through the Databricks source |
@@ -2014,31 +2301,33 @@ with **React Router** URLs for every view.
 Four limits are worth stating plainly, because each is easy to read the other
 way round from the feature list above:
 
-- **Natural language produces verified, independent read-only SQL bundles — not
-  a dependency-aware ETL DAG.** A prompt becomes an ordered set of steps that
-  each ran successfully through the gateway on their own; Studio does not infer
-  data dependencies between them, schedule them as a graph, or manage
-  backfills. The lineage diagram shows where each step's tables came from, not
-  an execution order it will honour.
-- **Generated Python is compiled and delivered, never executed.** The staged
+- **Analytics SQL bundles remain independent read-only queries, not general
+  ETL.** Their lineage diagram does not imply dependent execution. The separate
+  chat workflow planner now generates dependency-aware, single-source Airflow
+  SQL DAGs, but only SELECT, CTAS, and INSERT SELECT tasks, with explicit
+  destinations, static validation, and administrator approval. It does not
+  support arbitrary Python, UPDATE/DELETE/MERGE, cross-source execution,
+  recurring scheduling, or backfills. Triggering an existing platform job and
+  compiling a new typed DAG are distinct paths; neither automatically converts
+  an arbitrary analytics bundle into ETL.
+- **Model-generated Python is compiled and delivered, never executed.** The staged
   flow's Validator only parses the artifact (`syntax_checked_not_executed`).
-  Nothing in Studio runs model-written Python in-process; the one code path
-  that runs at all is an approved tool-builder MCP server, inside the sandbox.
+  Nothing in Studio runs that model-written artifact in-process. Approved
+  tool-builder MCP servers run inside their sandbox. The new Airflow path
+  executes SQL through a trusted, fixed compiler-generated Python wrapper in
+  Airflow; it does not permit model-written operators or Python task bodies.
 - **What Flow deploys is the verified SQL steps, or a Spark payload built from
   them**, through the supervisor and its human-approval gate — with
   `artifact_deployed: false` and a run reported as `succeeded_sql_only`. The
   artifact is yours to take away and run wherever you run code.
-- **The BitNet serving path is built and unit-tested, but no one has run the
-  engine.** Studio's half is proven end to end against a stub: the routing
-  gates, the wire contract, the gateway's readiness and adapter-identity checks,
-  the bootstrap corpus, and the trainer's poll → format → publish loop. What has
-  never run anywhere is the engine itself — nobody has compiled bitnet.cpp,
-  generated a token from a 1-bit model, trained on CUDA, or converted a LoRA for
-  this architecture. The single largest risk is that `--lora` may not apply on
-  an `i2_s` base at all, in which case serving works but stays base-only and no
-  amount of training changes it. `serving/SELFHOST.md` §9 and
-  `serving/RAILWAY.md` carry the verified-versus-unverified tables, and every
-  speed and cost figure in them is arithmetic rather than measurement.
+- **A live BitNet base-model endpoint does not prove trained agent execution.**
+  The source build, base-model serving, private endpoint, and persistent model
+  storage have been exercised. That does not establish a working fine-tuned
+  tool-calling adapter: adapter conversion/mounting, tokenizer quality, and the
+  real structured tool-call contract still require end-to-end validation.
+  Collected examples and successful Agent Lightning delivery do not close
+  those gates or change model weights. Treat routing/gateway tests against a
+  stub separately from proof that the actual engine can execute Studio's tools.
 
 ### Future rollouts
 
@@ -2070,8 +2359,11 @@ default; not needed at today's volume, adopt when data/QPS justify a cluster):
 - Prune finished `background_jobs` rows and move `purge_message_rows` onto the
   worker's leased scheduler (both run best-effort at startup today); expose
   `jobs.stats()` on `/api/health`.
-- Route the pipeline flow's `deploy_execute` through the real platform adapters
-  per target (currently via `supervisor.submit`).
+- Connect the staged flow's generated deployment plan to platform-specific
+  deployment adapters. Chat already submits explicit platform payloads through
+  the supervisor and publishes supported typed SQL DAGs through the new Airflow
+  compiler; general deployment of the staged flow's generated SQL/Python to
+  arbitrary external jobs remains separate work.
 - **Actually running the generated Python artifact** — today the staged flow
   deploys only the verified SQL steps (or a Spark payload of them) and the
   artifact is a syntax-checked deliverable Studio hands over and never
