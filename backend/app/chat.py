@@ -5,12 +5,12 @@ import logging
 import os
 import time
 import uuid
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from . import (agent, db, email_service, gateway, governance, jobs, keys,
+from . import (agent, chat_pipelines, chat_platforms, chat_workflows, db, email_service, gateway, governance, jobs, keys,
                lightning, orchestrator, progress, qcache, queryguard, rbac,
                roster, router as model_router, semantic, sessions, skills)
 from .auth import current_user
@@ -72,6 +72,14 @@ class Ask(BaseModel):
     # "All sources" only: run even if the prompt names a table that exists in
     # several sources (the user chose "both, side by side" on a clarification).
     allow_ambiguous: bool = False
+    pipeline_action: Optional[Literal["build", "run", "status"]] = None
+    # A Run button selects an immutable version in THIS conversation. The
+    # client never supplies executable steps; they are recovered server-side.
+    pipeline_message_id: Optional[str] = None
+    platform_action: Optional[Literal["submit", "status"]] = None
+    platform_target: Optional[Literal["airflow", "databricks_jobs", "dbt_cloud", "k8s_spark"]] = None
+    platform_payload: Optional[dict] = None
+    platform_message_id: Optional[str] = None
 
 
 @router.get("/agents")
@@ -296,7 +304,7 @@ def remove_share(cid: str, share_user_id: str, user=Depends(current_user)):
     return {"shares": db.list_conversation_shares(cid), "can_share": True}
 
 
-def _scope(body, user):
+def _scope(body, user, before_message_id=None):
     """Validate a turn and resolve its scope: the model, and for a single
     source the connector, the tables the role may see and their schemas.
     Raises HTTPException on validation/RBAC errors so both the sync path and
@@ -305,6 +313,41 @@ def _scope(body, user):
     prompt = body.prompt.strip()
     if not prompt:
         raise HTTPException(400, "Empty prompt")
+    if body.pipeline_message_id and body.pipeline_action not in ("run", "status"):
+        raise HTTPException(400, "A pipeline version can only be selected for a run")
+    if body.platform_message_id and not body.platform_action:
+        raise HTTPException(400, "Choose a platform action for this job version")
+    if body.pipeline_action and (body.platform_action or body.platform_target or body.platform_payload is not None):
+        raise HTTPException(400, "Choose either a SQL pipeline action or a platform action")
+
+    workflow_previous = _workflow_context(body.conversation_id, user, body.pipeline_message_id, before_message_id)
+    workflow_action = chat_workflows.intent(prompt, workflow_previous)
+    if body.pipeline_action == "run" and chat_workflows.is_plan(workflow_previous):
+        workflow_action = "submit"
+    if body.pipeline_action == "status":
+        if not chat_workflows.is_plan(workflow_previous):
+            raise HTTPException(400, "Select an Airflow pipeline to inspect its status")
+        workflow_action = "status"
+    if workflow_action and not (body.platform_action or body.platform_target or body.platform_payload is not None):
+        if user["role"] not in ("admin", "analyst"):
+            raise HTTPException(403, "Your role cannot build or deploy Airflow pipelines")
+        if body.model and body.model not in {m["spec"] for m in agent.available_models(user)}:
+            raise HTTPException(400, f"Model '{body.model}' is not offered")
+        return {"mode": "workflow", "model": body.model, "prompt": prompt, "source": body.source,
+                "workflow_action": workflow_action, "workflow_previous": workflow_previous}
+
+    previous = _platform_context(body.conversation_id, user, body.platform_message_id, before_message_id)
+    platform_request = chat_platforms.intent(
+        prompt, previous, target=body.platform_target,
+        payload=body.platform_payload, action=body.platform_action)
+    if platform_request and not body.pipeline_action:
+        # Orchestration platforms are independent of the selected warehouse.
+        # Submitting a DAG must still work if the data-source picker is empty
+        # or a warehouse is offline. The platform supervisor owns this gate.
+        if user["role"] not in ("admin", "analyst"):
+            raise HTTPException(403, "Your role cannot submit or inspect platform runs")
+        return {"mode": "platform", "model": None, "prompt": prompt,
+                "platform_request": platform_request, "platform_previous": previous}
 
     model = None
     if body.model:
@@ -372,8 +415,14 @@ def _record_user_turn(body, user, scope=None):
     already ran instead of fetching schemas twice."""
     scope = scope or _scope(body, user)
     prompt = scope["prompt"]
-    cid, _history = _conversation(body.conversation_id, user, prompt)
-    if scope["mode"] == "*":
+    # Shared conversation titles must not echo private platform parameters.
+    title_prompt = "Platform pipeline" if scope["mode"] in ("platform", "workflow") else prompt
+    cid, _history = _conversation(body.conversation_id, user, title_prompt)
+    if scope["mode"] in ("platform", "workflow"):
+        mid = db.add_message(cid, "user", {"text": prompt, "source": "*",
+                                           "table": "platform run", "author_role": user["role"],
+                                           "platform_requested_by": user["id"]})
+    elif scope["mode"] == "*":
         mid = db.add_message(cid, "user", {"text": prompt, "source": "*",
                                            "table": "all sources",
                                            "author_role": user["role"],
@@ -385,16 +434,21 @@ def _record_user_turn(body, user, scope=None):
     return cid, mid
 
 
-def _build_ctx(body, user, cid, scope=None):
+def _build_ctx(body, user, cid, scope=None, user_message_id=None):
     """Execution context for _run_turn, rebuilt from ids: the connector,
     schemas and history are re-derived (the connector is a live object and
     never crosses the queue). Pure — a worker calls this after
     _record_user_turn already wrote the user message, so the history drops
     that trailing message: a turn's own prompt is not its context."""
-    scope = scope or _scope(body, user)
-    _cid, history = _conversation(cid, user, scope["prompt"], recorded=True)
+    scope = scope or _scope(body, user, before_message_id=user_message_id)
+    _cid, history = _conversation(cid, user, scope["prompt"], recorded=True,
+                                  before_message_id=user_message_id)
     ctx = dict(scope)
-    ctx.update({"cid": cid, "history": history})
+    ctx.update({"cid": cid, "history": history,
+                "user_message_id": user_message_id,
+                "pipeline_action": body.pipeline_action,
+                "pipeline_message_id": body.pipeline_message_id,
+                "selected_tables": body.tables or ([body.table] if body.table != "*" else None)})
     return ctx
 
 
@@ -402,8 +456,8 @@ def _prepare(body, user):
     """Synchronous turn setup: validate, write the user message, build the
     context — kept as the one-call form for the sync endpoint."""
     scope = _scope(body, user)
-    cid, _mid = _record_user_turn(body, user, scope=scope)
-    return _build_ctx(body, user, cid, scope=scope)
+    cid, mid = _record_user_turn(body, user, scope=scope)
+    return _build_ctx(body, user, cid, scope=scope, user_message_id=mid)
 
 
 def _and(names):
@@ -493,11 +547,256 @@ def _clarify_turn(ctx, user, clash, t0):
     return result
 
 
+def _messages_before(messages, message_id):
+    """A queued turn sees only messages preceding its own recorded prompt."""
+    if not message_id:
+        return messages
+    for i, message in enumerate(messages):
+        if message["id"] == message_id:
+            return messages[:i]
+    raise HTTPException(409, "The chat turn is no longer available")
+
+
+def _workflow_context(cid, user, target=None, before_message_id=None):
+    if not cid:
+        return None
+    access = _own_or_404(cid, user, need="edit")
+    messages = _messages_before(_visible_messages(cid, user, access), before_message_id)
+    if target:
+        messages = [m for m in messages if m["id"] == target]
+    for message in reversed(messages):
+        if message["role"] != "assistant":
+            continue
+        content = message.get("content") or {}
+        if content.get("redacted"):
+            return None
+        if content.get("pipeline"):
+            return content["pipeline"]
+        if content.get("platform_run") or content.get("sql") or content.get("panels"):
+            return None
+    return None
+
+
+def _workflow_turn(ctx, user):
+    action, previous = ctx["workflow_action"], ctx.get("workflow_previous")
+    request_id = ":".join((ctx["cid"], user["id"], ctx.get("user_message_id") or str(uuid.uuid4())))
+    plan = None
+    if action in ("submit", "build_submit"):
+        plan = chat_workflows.recover(user, request_id)
+    if plan is None:
+        if action in ("build", "build_submit"):
+            progress.emit("matching successful recipes and planning task dependencies")
+            plan = chat_workflows.build(user, ctx["prompt"], source=ctx.get("source"),
+                tables=ctx.get("selected_tables"), model=ctx.get("model"), previous=previous,
+                context=ctx.get("history"))
+        elif action == "status":
+            plan = chat_workflows.refresh(user, previous)
+        else:
+            plan = previous
+        if action in ("submit", "build_submit") and plan and plan.get("status") not in ("blocked", "needs_input"):
+            progress.emit("submitting generated DAG for administrator approval")
+            plan = chat_workflows.submit(user, plan, request_id=request_id, conversation_id=ctx["cid"])
+    if not plan:
+        raise HTTPException(400, "Build an Airflow pipeline before submitting it")
+    status = plan.get("status", "needs_input")
+    texts = {
+        "ready": "Dependency-aware Airflow pipeline ready. Review the SQL and task dependencies, then submit it for administrator approval.",
+        "awaiting_approval": "The generated DAG is awaiting administrator approval. Nothing has been published or executed.",
+        "approved": "Administrator approval is recorded. The worker will publish the DAG; no Airflow run has started yet.",
+        "deploying": "The approved DAG is published. Waiting for Airflow to register it before starting a run.",
+        "launching": "The approved DAG trigger is in progress; completion is not yet known.",
+        "running": "Airflow is running this pipeline. Completion has not been reported yet.",
+        "succeeded": "Airflow reports that this pipeline succeeded.",
+        "failed": "Airflow reports failure. Ask me to repair this pipeline; the corrected version will require fresh approval.",
+        "escalated": "This deployment needs administrator review. Check Airflow before approving another attempt.",
+        "needs_configuration": "The DAG is ready to export, but Airflow deployment is not configured. Nothing was deployed.",
+        "needs_input": "I need more details before this request can become an executable pipeline.",
+        "blocked": "This pipeline did not pass validation. Review the issues before running it.",
+    }
+    result = {"text": texts.get(status, f"Pipeline status: {status}"), "mode": "pipeline", "model": ctx.get("model"),
+              "source": plan.get("source") or "*", "table": "Airflow pipeline", "pipeline": plan,
+              "author_role": user["role"], "columns": [], "rows": [], "panels": [], "sql": None}
+    _answer(ctx, result)
+    db.log_activity(user, "chat_dag_" + action, source=plan.get("source"),
+                    prompt=ctx["prompt"], ok=status not in ("failed", "blocked", "escalated"))
+    _checkpoint(user, ctx["cid"], result, ctx.get("model"), result["source"], "Airflow pipeline")
+    return result
+
+
+def _platform_context(cid, user, target=None, before_message_id=None):
+    if not cid:
+        if target:
+            raise HTTPException(404, "Platform job version not found in this conversation")
+        return None
+    access = _own_or_404(cid, user, need="edit")
+    messages = _messages_before(_visible_messages(cid, user, access), before_message_id)
+    if target:
+        message = next((m for m in messages if m["id"] == target), None)
+        if not message or message["role"] != "assistant":
+            raise HTTPException(404, "Platform job version not found in this conversation")
+        artifact = message["content"].get("platform_run")
+        if not artifact or message["content"].get("redacted"):
+            raise HTTPException(403, "This platform job is not available to you")
+        return artifact
+    for message in reversed(messages):
+        if message["role"] != "assistant":
+            continue
+        content = message.get("content") or {}
+        if content.get("redacted"):
+            return None
+        if content.get("platform_run"):
+            return content["platform_run"]
+        if content.get("pipeline") or content.get("sql") or content.get("panels"):
+            return None  # 'run it' must use the newest kind of executable artifact
+    return None
+
+
+def _platform_turn(ctx, user):
+    request = {**ctx["platform_request"], "conversation_id": ctx["cid"]}
+    progress.emit("checking platform job status" if request["action"] == "status"
+                  else "submitting platform job to the approval supervisor")
+    request_id = ":".join((ctx["cid"], user["id"], ctx.get("user_message_id") or str(uuid.uuid4())))
+    jobs.check_claim()
+    artifact = chat_platforms.submit(request, user, request_id=request_id)
+    status = artifact.get("status")
+    label = artifact.get("label") or artifact.get("target") or "platform"
+    summaries = {
+        "needs_input": f"I need more details before submitting this {label} job.",
+        "needs_configuration": f"{label} needs its connection configured before this job can be submitted.",
+        "awaiting_approval": f"Submitted to {label} for administrator approval. The external job has not started.",
+        "running": f"The {label} job has started. It has not reported completion yet.",
+        "queued": f"The {label} job is queued on the platform.",
+        "succeeded": f"{label} reports that this job succeeded.",
+        "failed": f"{label} reports that this job failed. A corrected run still needs administrator approval.",
+        "rejected": f"The {label} job was rejected and was not triggered.",
+        "escalated": f"The {label} trigger needs administrator review. Check its status before submitting another run.",
+        "canceled": f"The {label} job was canceled.",
+    }
+    text = summaries.get(status, f"The {label} job status is {status or 'unknown'}.")
+    missing = artifact.get("missing") or []
+    if missing:
+        text += " " + "; ".join(str(item) for item in missing)
+    result = {"text": text, "mode": "platform_run", "model": None,
+              "source": "*", "table": "platform run", "platform_run": artifact,
+              "author_role": user["role"], "columns": [], "rows": [], "panels": [], "sql": None}
+    _answer(ctx, result)
+    db.log_activity(user, "chat_platform_" + request["action"], prompt=ctx["prompt"],
+                    source=artifact.get("target"), ok=status not in ("failed", "rejected", "escalated"))
+    _checkpoint(user, ctx["cid"], result, None, "*", "platform run")
+    return result
+
+
+def _pipeline_context(ctx, user):
+    access = _own_or_404(ctx["cid"], user, need="edit")
+    messages = _messages_before(_visible_messages(ctx["cid"], user, access),
+                                ctx.get("user_message_id"))
+    target = ctx.get("pipeline_message_id")
+    if target:
+        message = next((m for m in messages if m["id"] == target), None)
+        if not message or message["role"] != "assistant":
+            raise HTTPException(404, "Pipeline version not found in this conversation")
+        content = message["content"]
+        if content.get("redacted") or not content.get("pipeline"):
+            raise HTTPException(403, "This pipeline is not available to your role")
+        return content["pipeline"]
+    for message in reversed(messages):
+        if message["role"] != "assistant":
+            continue
+        content = message.get("content") or {}
+        # Never fall back to an older version if the latest version is hidden
+        # or failed verification: 'run it' must not silently run other SQL.
+        if content.get("redacted"):
+            return None
+        if content.get("platform_run"):
+            return None
+        if content.get("pipeline"):
+            return content["pipeline"]
+        if content.get("sql") or content.get("panels"):
+            return chat_pipelines.from_result(user, content.get("text", ""), content)
+    return None
+
+
+def _pipeline_turn(ctx, user, action, previous):
+    """Pipeline commands share the durable chat queue and its answer fence."""
+    request_id = ":".join((ctx["cid"], user["id"],
+                           ctx.get("user_message_id") or ctx.get("reply_to") or str(uuid.uuid4())))
+
+    def execute(draft):
+        progress.emit("running this pipeline with your current data permissions")
+        return chat_pipelines.run(user, {**draft, "conversation_id": ctx["cid"]}, request_id=request_id)
+
+    def run_summary(draft):
+        run = draft.get("run") or {}
+        if run.get("status") == "success":
+            return f"Pipeline completed: {len(run.get('steps_result') or [])} read-only SQL step(s) ran against fresh data."
+        if run.get("status") == "failed":
+            return "Pipeline failed. The step results below show where execution stopped."
+        return "This pipeline could not run. Review the verification details below."
+
+    draft = None
+    if action == "run" and previous is None:
+        text = "There is no runnable pipeline in this conversation yet. Ask a data question or describe a pipeline to build first."
+    else:
+        jobs.check_claim()
+        if action == "run":
+            draft = execute(previous)
+            text = run_summary(draft)
+        else:
+            progress.emit("building a pipeline from this conversation")
+            # An interrupted combined build/run already saved its recipe.
+            # Recover that exact recipe before consulting a model again.
+            draft = chat_pipelines.recover(user, request_id=request_id) if action == "build_run" else None
+            if draft is not None and previous:
+                draft["repairs_run_id"] = draft.get("repairs_run_id") or chat_pipelines._repair_run_id(previous)
+            if draft is None:
+                draft = chat_pipelines.build(
+                    user, ctx["prompt"], context=ctx["history"],
+                    source=ctx.get("source"), tables=ctx.get("selected_tables"),
+                    model=ctx.get("model"), previous=previous)
+            if draft.get("status") == "ready" and draft.get("steps"):
+                if action == "build_run":
+                    draft = execute(draft)
+                    text = run_summary(draft)
+                else:
+                    text = (f"Pipeline ready: {len(draft['steps'])} verified read-only SQL step(s). "
+                            "Say 'run this pipeline' to execute it, or describe a change.")
+            else:
+                text = "The pipeline needs changes before it can run. Review the verification details below."
+    source = (draft or {}).get("source") or ctx.get("source") or "*"
+    tables = sorted({t for step in (draft or {}).get("steps", [])
+                     for t in queryguard.base_tables(step.get("sql") or "")})
+    result = {"text": text, "mode": "pipeline", "model": ctx.get("model"),
+              "source": source, "table": ", ".join(tables) or ctx.get("table_label") or "*",
+              "columns": [], "rows": [], "panels": [], "sql": None,
+              "author_role": user["role"]}
+    if draft is not None:
+        result["pipeline"] = draft
+    _answer(ctx, result)
+    db.log_activity(user, "chat_pipeline_" + action, prompt=ctx["prompt"], source=source,
+                    ok=bool(draft and (draft.get("run") or {}).get("status", draft.get("status")) in ("ready", "success")))
+    _checkpoint(user, ctx["cid"], result, ctx.get("model"), source, result["table"])
+    return result
+
+
+def _attach_pipeline(ctx, user, result):
+    draft = chat_pipelines.from_result(user, ctx["prompt"], result)
+    if draft is not None:
+        result["pipeline"] = draft
+
+
 def _run_turn(ctx, user):
     """Heavy half of a turn: run the agent, append the assistant message, trace,
     and checkpoint. Pure work off the prepared context — safe in a thread."""
     cid, model, prompt = ctx["cid"], ctx["model"], ctx["prompt"]
     t0 = time.time()
+    if ctx["mode"] == "platform":
+        return _platform_turn(ctx, user)
+    if ctx["mode"] == "workflow":
+        return _workflow_turn(ctx, user)
+    previous = _pipeline_context(ctx, user)
+    action = ctx.get("pipeline_action") or chat_pipelines.intent(prompt, previous)
+    if action:
+        return _pipeline_turn(ctx, user, action, previous)
 
     if ctx["mode"] == "*":
         # Same-named table in several sources? Don't guess — ask, unless the
@@ -519,6 +818,7 @@ def _run_turn(ctx, user):
         result["table"] = "all sources"
         result["matched_tables"] = []
         result["inputs"] = _query_inputs(result)
+        _attach_pipeline(ctx, user, result)
         tid = lightning.record_chat_trace(user, cid, prompt, result, int((time.time() - t0) * 1000),
                                           history=ctx["history"])
         if tid:
@@ -626,6 +926,7 @@ def _run_turn(ctx, user):
     except Exception:
         result["matched_tables"] = []
     result["inputs"] = _query_inputs(result)
+    _attach_pipeline(ctx, user, result)
     tid = lightning.record_chat_trace(user, cid, prompt, result, int((time.time() - t0) * 1000),
                                       history=ctx["history"])
     if tid:
@@ -837,8 +1138,8 @@ def _chat_turn_job(payload, job):
     progress.bind(tid)   # this thread's emits feed the task's live activity
     try:
         body = Ask(**payload["body"])
-        ctx = _build_ctx(body, user, cid)
         turn = _task_turn(tid)
+        ctx = _build_ctx(body, user, cid, user_message_id=turn[1] if turn else None)
         # Stamp the answer with the user message this task answers, so the
         # guard above recognises it on a retry (and never another turn's).
         ctx["reply_to"] = turn[1] if turn else None
@@ -1225,14 +1526,16 @@ def _canvas_source(body, user):
     return connector, allowed, schemas
 
 
-def _conversation(cid, user, prompt, recorded=False):
+def _conversation(cid, user, prompt, recorded=False, before_message_id=None):
     """Resolve/create the conversation and return (cid, recent history).
     recorded=True means this turn's user message is already the newest row
     (a background job rebuilding its context) and must not count as history."""
     if cid:
         access = _own_or_404(cid, user, need="edit")
         msgs = _visible_messages(cid, user, access)
-        if recorded and msgs and msgs[-1]["role"] == "user":
+        if before_message_id:
+            msgs = _messages_before(msgs, before_message_id)
+        elif recorded and msgs and msgs[-1]["role"] == "user":
             msgs = msgs[:-1]
         # A clarification ("which source?") and the question that triggered it
         # are not conversation for the model: the re-ask repeats the question,
@@ -1248,10 +1551,29 @@ def _conversation(cid, user, prompt, recorded=False):
                     and nxt["content"].get("mode") == "clarify"):
                 continue
             keep.append(m)
-        history = [
-            {"role": m["role"], "text": m["content"].get("text", "")}
-            for m in keep if m["content"].get("text")
-        ][-int(os.getenv("STUDIO_HISTORY_TURNS", "8")):]
+        history = []
+        for m in keep:
+            content = m["content"]
+            if content.get("redacted"):
+                continue
+            text = content.get("text", "")
+            draft = content.get("pipeline")
+            if chat_workflows.is_plan(draft):
+                text += "\nCurrent Airflow pipeline: " + json.dumps({k: draft.get(k) for k in
+                    ("source", "prompt", "tasks", "parameters", "status", "job_id")})
+            if draft and draft.get("steps"):
+                # The model receives the actual prior recipe, including its
+                # filters and grouping, so a follow-up can revise that recipe.
+                recipe = [{k: step.get(k) for k in ("name", "source", "table", "sql")}
+                          for step in draft.get("steps", [])]
+                text += "\nCurrent pipeline (read-only SQL): " + json.dumps(recipe)
+            platform_run = content.get("platform_run")
+            if platform_run:
+                text += "\nPlatform job (requires approval): " + json.dumps(
+                    {k: platform_run.get(k) for k in ("target", "payload", "status", "job_id")})
+            if text:
+                history.append({"role": m["role"], "text": text})
+        history = history[-int(os.getenv("STUDIO_HISTORY_TURNS", "8")):]
         return cid, history
     return db.create_conversation(user["id"], prompt), []
 
@@ -1342,6 +1664,55 @@ def _sql_tables_allowed(role, source, content):
     return True
 
 
+def _stored_pipeline_step_allowed(role, step, source=None):
+    """Read-time policy/namespace checks without contacting warehouse catalogs.
+
+    Execution still derives its allowlist from the live catalog through the
+    gateway. History only needs today's policy and the connector's declared
+    namespace; a temporarily offline warehouse must not erase a conversation.
+    """
+    if not isinstance(step, dict) or not step.get("sql"):
+        return False
+    source = step.get("source") or source
+    if not source or source == "*":
+        return False
+    policy = rbac._role_policy(role, source)
+    if not policy:
+        return False
+    try:
+        from .connectors import get_connector
+        connector = get_connector(source)
+        dialect = getattr(connector, "dialect", None)
+        # RBAC matches table policies case-insensitively; SQL resolution is
+        # dialect-specific. Derive catalog spellings from each reference and
+        # keep only names the policy grants, just as the live catalog filter
+        # does. Passing ['sales'] as a Snowflake catalog would wrongly hide
+        # an allowed bare `sales`, whose stored name is SALES.
+        tokens, _ = queryguard._tokens(step["sql"].strip().rstrip(";"))
+        references = [queryguard._canon(parts[-1], dialect)
+                      for parts, _ in queryguard._table_refs(tokens)]
+        allowed = [name for name in references if rbac.can_access(role, source, name)]
+        queryguard.validate(step["sql"], allowed, qualifiers=connector.qualifiers(), dialect=dialect)
+        return True
+    except Exception:
+        return False
+
+
+def _pipeline_diagnostics(content, role):
+    """Failed step SQL/error text can also contain data the reader lost access to."""
+    draft = content.get("pipeline")
+    if not isinstance(draft, dict) or not draft.get("dropped"):
+        return content
+    dropped = []
+    for step in draft["dropped"]:
+        if _stored_pipeline_step_allowed(role, step, draft.get("source")):
+            dropped.append(step)
+        else:
+            dropped.append({"name": "Excluded step", "verified": False,
+                            "error": "This step is unavailable under your current data permissions."})
+    return {**content, "pipeline": {**draft, "dropped": dropped}}
+
+
 def _msg_allowed(role, content, msg_role=None):
     """May this role see a stored message's results? Messages carry result
     ROWS, so this is the RBAC boundary for anyone who is not the owner.
@@ -1353,6 +1724,18 @@ def _msg_allowed(role, content, msg_role=None):
     references, because the label alone is not trusted.
     """
     content = content or {}
+    draft = content.get("pipeline")
+    if draft:
+        # Pipeline messages carry executable recipes outside the ordinary
+        # top-level SQL/panels. Apply today's table and namespace policy to
+        # every nested statement before sharing it or feeding it to a model.
+        # No result rows are stored inside this attachment.
+        if not isinstance(draft, dict):
+            return False
+        steps = list(draft.get("steps") or []) + list((draft.get("run") or {}).get("steps_result") or [])
+        for step in steps:
+            if not _stored_pipeline_step_allowed(role, step, draft.get("source")):
+                return False
     # A message carrying no data — a user's question, a clarification, an
     # agent error — has nothing the whole-source / table rules protect: they
     # exist for result ROWS. Without this, every prompt in a shared
@@ -1371,6 +1754,11 @@ def _msg_allowed(role, content, msg_role=None):
     author = content.get("author_role")
     if author and _ROLE_RANK.get(role, 0) < _ROLE_RANK.get(author, 0):
         return False
+    if draft and content.get("mode") == "pipeline" and not (
+            content.get("rows") or content.get("panels") or content.get("sql")):
+        # This metadata-only result has already been checked step by step,
+        # including each source of a multi-source pipeline.
+        return True
     source = content.get("source")
     if not source:
         # No provenance and no source: only safe for a message carrying no data.
@@ -1441,7 +1829,32 @@ def _visible_messages(cid, user, access):
     out = []
     for m in db.list_messages(cid):
         content = m.get("content") or {}
-        if not _msg_allowed(user["role"], content, m.get("role")):
+        artifact = content.get("platform_run")
+        workflow = content.get("pipeline")
+        if chat_workflows.is_plan(workflow):
+            allowed = (workflow.get("requested_by") == user["id"] or user["role"] == "admin") and user["role"] in ("admin", "analyst")
+            if allowed:
+                allowed = all(_stored_pipeline_step_allowed(user["role"], {
+                    "source": task.get("source") or workflow.get("source"),
+                    "sql": task.get("read_sql") or task.get("sql")}, workflow.get("source"))
+                    for task in workflow.get("tasks", []) if isinstance(task, dict))
+        elif content.get("platform_requested_by"):
+            allowed = content["platform_requested_by"] == user["id"] or user["role"] == "admin"
+        elif artifact:
+            # External job payloads/logs belong to the submitting identity,
+            # not everyone with the same role or shared-chat edit access.
+            platform_allowed = isinstance(artifact, dict) and (
+                artifact.get("requested_by") == user["id"] or user["role"] == "admin")
+            if platform_allowed and artifact.get("job_id"):
+                from . import supervisor
+                try:
+                    supervisor.get_job(artifact["job_id"], user)
+                except HTTPException:
+                    platform_allowed = False
+            allowed = platform_allowed
+        else:
+            allowed = _msg_allowed(user["role"], content, m.get("role"))
+        if not allowed:
             m = {**m, "content": {
                 "text": _REDACTED, "redacted": True,
                 "source": content.get("source"), "table": content.get("table"),
@@ -1451,6 +1864,8 @@ def _visible_messages(cid, user, access):
             # Released, and carrying data: today's compliance rules apply to
             # rows stored under yesterday's.
             m = {**m, "content": _governed(content)}
+        if not m["content"].get("redacted") and m["content"].get("pipeline"):
+            m = {**m, "content": _pipeline_diagnostics(m["content"], user["role"])}
         out.append(m)
     return out
 

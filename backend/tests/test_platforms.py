@@ -70,6 +70,10 @@ class Handler(BaseHTTPRequestHandler):
             CAPTURE["dbx_trigger"] = {"body": self._body(),
                                       "auth": self.headers.get("Authorization")}
             return self._send(200, {"run_id": 999})
+        if path == "/api/2.1/jobs/run-now":
+            CAPTURE["dbx_run_now"] = {"body": self._body(),
+                                       "auth": self.headers.get("Authorization")}
+            return self._send(200, {"run_id": 1001})
         # K8s: create SparkApplication
         if path == "/apis/sparkoperator.k8s.io/v1beta2/namespaces/ns1/sparkapplications":
             body = self._body()
@@ -381,6 +385,30 @@ def test_dbx_trigger_roundtrip(dbx_env):
 def test_dbx_trigger_requires_tasks(dbx_env):
     with pytest.raises(RuntimeError, match="tasks"):
         get_platform("databricks_jobs").trigger({"run_name": "no tasks"})
+
+
+def test_dbx_triggers_existing_job_with_parameters(dbx_env):
+    payload = {"job_id": "123", "job_parameters": {"month": "2026-09"}}
+    out = get_platform("databricks_jobs").trigger(payload)
+    assert out == {"run_ref": "1001", "url": None}
+    assert CAPTURE["dbx_run_now"] == {
+        "body": {"job_id": 123, "job_parameters": {"month": "2026-09"}},
+        "auth": "Bearer dbxtok"}
+    assert "dbx_trigger" not in CAPTURE
+    assert payload["job_id"] == "123"  # caller's approved payload stays immutable
+
+
+@pytest.mark.parametrize("job_id", [True, False, None, 0, -1, 1.5, "abc", "1e3"])
+def test_dbx_invalid_existing_job_id_rejected_before_post(dbx_env, job_id):
+    with pytest.raises(RuntimeError, match="positive integer"):
+        get_platform("databricks_jobs").trigger({"job_id": job_id})
+    assert not CAPTURE
+
+
+def test_dbx_ambiguous_existing_and_new_job_rejected(dbx_env):
+    with pytest.raises(RuntimeError, match="not both"):
+        get_platform("databricks_jobs").trigger({"job_id": 123, "tasks": [{"task_key": "x"}]})
+    assert not CAPTURE
 
 
 @pytest.mark.parametrize("life,result,want", [

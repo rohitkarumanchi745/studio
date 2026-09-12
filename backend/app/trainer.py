@@ -90,12 +90,17 @@ def stream(since=0.0, limit=500):
                 meta = json.loads(r["meta"])
             except ValueError:
                 meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+        action = meta.get("action")
+        if not isinstance(action, dict):
+            action = {"sql": r["sql"], "chart_type": r["chart_type"]}
         out.append({
             "id": r["id"], "created_at": r["created_at"],
             "user_id": r["user_id"], "role": r["role"],
             "prompt": r["prompt"],
             # the action the decision-maker took (tool call), for tool-call training
-            "action": {"sql": r["sql"], "chart_type": r["chart_type"]},
+            "action": action,
             "reward": r["reward"], "reward_source": r["reward_source"],
             # Which warehouse this rollout came from (dialect + schema regime).
             # The trainer conditions each sample on this source's skill file so a
@@ -104,6 +109,9 @@ def stream(since=0.0, limit=500):
             "source": r["source"], "tbl": r["tbl"],
             "mode": r["mode"], "agents": meta.get("agents") or [],
             "history": meta.get("history") or [],
+            "meta": meta, "run_id": meta.get("run_id"),
+            "repairs_run_id": meta.get("repairs_run_id"),
+            "execution_status": meta.get("status"),
         })
     cursor = out[-1]["created_at"] if out else since
     return {"rollouts": out, "cursor": cursor, "count": len(out)}

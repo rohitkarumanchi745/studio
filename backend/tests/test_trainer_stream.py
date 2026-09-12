@@ -6,12 +6,7 @@ surfaces them, additively, without dropping any pre-existing key.
 
 Run from the backend directory:  python -m pytest tests/test_trainer_stream.py -q
 """
-import os
-import tempfile
-
-# Point the app at a throwaway SQLite file BEFORE app.db computes DB_PATH.
-os.environ["STUDIO_DB_PATH"] = os.path.join(
-    tempfile.mkdtemp(prefix="studio-trainer-stream-test-"), "studio.db")
+import pytest
 
 from app import db, trainer
 
@@ -23,12 +18,17 @@ LEGACY_KEYS = {"id", "created_at", "user_id", "role", "prompt", "action",
                "reward", "reward_source", "mode", "agents"}
 
 
+@pytest.fixture(autouse=True)
+def _isolated_database(tmp_path, monkeypatch):
+    # app.db may already be imported by another collected test module. Set
+    # the actual connection target, not an environment variable it no longer
+    # reads, and give each test its own database rather than clearing a table.
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "trainer-stream.db"))
+    monkeypatch.setattr(db, "IS_PG", False)
+
+
 def _seed():
     db.init_db()
-    c = db._conn()
-    c.execute("DELETE FROM agent_traces")   # isolate: tests share the DB file
-    c.commit()
-    c.close()
     # Two different warehouses with different dialects; each a rewarded rollout.
     db.add_trace(ADMIN, prompt="revenue by month", mode="agent",
                  source="databricks", table="sales",

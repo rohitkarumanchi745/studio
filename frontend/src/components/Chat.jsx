@@ -3,6 +3,9 @@ import { api } from "../api";
 import Canvas from "./Canvas";
 import ChartView from "./ChartView";
 import SqlLab from "./SqlLab";
+import ChatPipeline from "./ChatPipeline";
+import ChatWorkflow from "./ChatWorkflow";
+import ChatPlatformRun, { PlatformComposer } from "./ChatPlatformRun";
 
 // "Demo agent" for a single worker; "Snowflake agent + Databricks agent →
 // Aggregator" when a question fanned out across sources.
@@ -64,6 +67,8 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
     : sel.length === 0 ? "✳ All tables" : sel.length === 1 ? sel[0] : `${sel.length} tables`;
   const [messages, setMessages] = useState([]);
   const [prompt, setPrompt] = useState("");
+  const [buildPipeline, setBuildPipeline] = useState(false);
+  const [showPlatform, setShowPlatform] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   // Live activity: the steps the agent has emitted so far this turn, refreshed
@@ -145,7 +150,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
   async function send(e) {
     e?.preventDefault();
     const q = prompt.trim();
-    if (!q || busy || (!orchestrated && tables.length === 0)) return;
+    if (!q || busy) return;
     setPrompt("");
     setError("");
     // Optimistically show the question + a working placeholder; the answer is
@@ -164,14 +169,71 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
           tables: !orchestrated && sel.length > 1 ? sel : undefined,
           conversation_id: conversationId,
           model: model || undefined,
+          pipeline_action: buildPipeline ? "build" : undefined,
         }),
       });
+      // Building is a one-turn action; follow-ups such as "run this pipeline"
+      // must be interpreted normally after the draft has been requested.
+      setBuildPipeline(false);
       if (!conversationId) onConversationCreated(data.conversation_id);
       pollFor(data.task_id, data.conversation_id);
     } catch (err) {
       setError(err.message);
       setBusy(false);
     }
+  }
+
+  async function runPipeline(message, action = "run") {
+    const pipeline = message.pipeline;
+    const workflow = pipeline?.execution_mode === "airflow_dag";
+    if (busy || !conversationId || !message.message_id || (!workflow && pipeline?.status !== "ready")) return;
+    // Workflow cards use freshly polled state. The saved message may still
+    // say awaiting_approval after completion; the server checks the live job
+    // before deciding whether to reuse its pending request or create a rerun.
+    // Bind this action to the saved answer and its source. The current picker
+    // may have changed since this pipeline was drafted.
+    const pipelineSource = pipeline.source;
+    if (!pipelineSource || (!workflow && (pipeline.dropped?.length || !pipeline.steps?.length || pipeline.steps.some((s) => !s.verified || !s.sql)))) return;
+    const q = action === "status" ? "Check pipeline status" : workflow ? "Submit this pipeline" : "Run this pipeline";
+    setError("");
+    setMessages((ms) => [...ms, { role: "user", text: q, source: pipelineSource, table: "*" }]);
+    setBusy(true);
+    setLiveSteps([]);
+    try {
+      const data = await api("/chat/background", {
+        method: "POST",
+        body: JSON.stringify({
+          prompt: q,
+          source: pipelineSource,
+          table: "*",
+          conversation_id: conversationId,
+          model: model || undefined,
+          pipeline_action: action,
+          pipeline_message_id: message.message_id,
+        }),
+      });
+      pollFor(data.task_id, data.conversation_id);
+    } catch (err) {
+      setError(err.message);
+      setBusy(false);
+    }
+  }
+
+  async function platformAction(fields, text) {
+    if (busy) return;
+    setError("");
+    setBusy(true);
+    setLiveSteps([]);
+    setMessages((ms) => [...ms, { role: "user", text, source: "*", table: "platform run" }]);
+    try {
+      const data = await api("/chat/background", {
+        method: "POST",
+        body: JSON.stringify({ prompt: text, source: "*", table: "*", conversation_id: conversationId, ...fields }),
+      });
+      setShowPlatform(false);
+      if (!conversationId) onConversationCreated(data.conversation_id);
+      pollFor(data.task_id, data.conversation_id);
+    } catch (e) { setError(e.message); setBusy(false); }
   }
 
   // A clarification chip re-asks the same question scoped the way the user
@@ -210,7 +272,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
   }
 
   function loadMessages(ms) {
-    const loaded = ms.map((m) => ({ role: m.role, ...m.content }));
+    const loaded = ms.map((m) => ({ role: m.role, ...m.content, message_id: m.id }));
     setMessages(loaded);
     // Reopening a conversation restores its charts to the canvas — the
     // visualization is part of the saved conversation, not a transient view.
@@ -412,6 +474,11 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
               requirement={messages[i - 1]?.role === "user" ? messages[i - 1].text : ""}
               onOpenCanvas={() => setCanvas(buildCanvas(m))}
               onClarify={resend}
+              onRunPipeline={() => runPipeline(m)}
+              onPipelineStatus={() => runPipeline(m, "status")}
+              onPlatformAction={(action) => platformAction({ platform_action: action, platform_message_id: m.message_id },
+                action === "status" ? "Check this platform job's status" : "Submit this platform job again for approval")}
+              busy={busy}
             />
           )
         )}
@@ -439,7 +506,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
         <div ref={endRef} />
       </div>
 
-      <form className="composer" onSubmit={send}>
+      <form className="composer chat-composer" onSubmit={send}>
         <div className="composer-pill">
           <input
             className="pill-input"
@@ -448,7 +515,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
             placeholder={
               orchestrated
                 ? "Ask across all your databases — agents route the question…"
-                : tables.length ? `Ask about ${sel.length ? sel.join(", ") : "your data"}…` : "Pick a source first…"
+                : tables.length ? `Ask about ${sel.length ? sel.join(", ") : "your data"}…` : "Choose a data source, or ask to run a platform job…"
             }
             disabled={busy}
           />
@@ -464,17 +531,23 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
               </option>
             ))}
           </select>
-          <button className="primary send-btn" disabled={busy || !prompt.trim() || (!orchestrated && tables.length === 0)}>
+          <button className="primary send-btn" aria-label={buildPipeline ? "Build pipeline" : "Send message"} disabled={busy || !prompt.trim()}>
             ➤
           </button>
         </div>
+        <label className="composer-pipeline-option">
+          <input type="checkbox" checked={buildPipeline} disabled={busy} onChange={(e) => setBuildPipeline(e.target.checked)} />
+          Build a pipeline from this prompt
+        </label>
+        <button type="button" className="chip" disabled={busy} onClick={() => setShowPlatform((v) => !v)}>Run on Airflow / another platform</button>
+        {showPlatform && <PlatformComposer busy={busy} onSubmit={platformAction} onClose={() => setShowPlatform(false)} />}
       </form>
       </main>
     </div>
   );
 }
 
-function AssistantMessage({ m, requirement, onOpenCanvas, onClarify }) {
+function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRunPipeline, onPipelineStatus, onPlatformAction, busy }) {
   const [showSql, setShowSql] = useState(false);
   const [columns, setColumns] = useState(m.columns);
   const [rows, setRows] = useState(m.rows);
@@ -575,6 +648,10 @@ function AssistantMessage({ m, requirement, onOpenCanvas, onClarify }) {
           </span>
         </div>
         {m.text && <p className="answer">{m.text}</p>}
+        {m.pipeline?.execution_mode === "airflow_dag"
+          ? <ChatWorkflow key={m.pipeline.job_id || m.message_id} pipeline={m.pipeline} messageId={m.message_id} busy={busy} onRun={onRunPipeline} onStatus={onPipelineStatus} />
+          : m.pipeline && <ChatPipeline pipeline={m.pipeline} messageId={m.message_id} busy={busy} onRun={onRunPipeline} />}
+        {m.platform_run && <ChatPlatformRun key={m.platform_run.job_id || m.message_id} artifact={m.platform_run} messageId={m.message_id} busy={busy} onAction={onPlatformAction} />}
         {m.clarify && onClarify && (
           <div className="clarify-chips">
             {m.clarify.options.map((o) => (

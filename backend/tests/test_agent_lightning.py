@@ -577,3 +577,85 @@ def test_a_fallback_turn_is_delivered_unscored_then_scored_by_a_human(
     assert rewards[0]["data"]["value"] == 1.0 and rewards[0]["data"]["source"] == "user"
     # It stayed one rollout on attempt 0: there was no reward to supersede.
     assert keyed_get(f"{agl_secure_server}/api/rollouts/{rid}")["attempts"] == ["0"]
+
+
+@needs_agl
+@pytest.mark.parametrize("action_type", ["platform_run", "airflow_dag"])
+def test_platform_failure_and_corrected_success_reach_real_server_once(
+        env, client, monkeypatch, agl_server, action_type):
+    """Observed execution outcomes, full actions, and repair linkage survive
+    the real queue/client/server boundary; a successful trigger is not used
+    as the reward and delivery retries cannot overwrite the failed example.
+    """
+    monkeypatch.setenv("STUDIO_AGL_URL", agl_server)
+    user = env.db.get_user_by_email("analyst@studio.local")
+    failed_run = "supervisor-failed:Daily_Sales:external-failed"
+    fixed_run = "supervisor-fixed:Daily_Sales:external-fixed"
+    failed_action = {"type": "platform_run", "target": "airflow", "payload": {
+        "dag_id": "Daily_Sales", "conf": {"partition": "missing", "parameters": {"batch_size": 50}}}}
+    fixed_action = {"type": "platform_run", "target": "airflow", "payload": {
+        "dag_id": "Daily_Sales", "conf": {"partition": "2026-09-11", "parameters": {"batch_size": 50}}}}
+    if action_type == "airflow_dag":
+        def dag_action(partition):
+            return {"type": "airflow_dag", "plan": {
+                "version": 1, "name": "Daily sales", "dag_id": "daily_sales", "source": "postgres",
+                "schedule": None, "parameters": {}, "prompt": "Daily sales pipeline",
+                "tasks": [{"id": "extract", "source": "postgres", "depends_on": [],
+                           "sql": f"SELECT * FROM sales WHERE date = '{partition}'"}]}}
+        failed_action, fixed_action = dag_action("missing"), dag_action("2026-09-11")
+    failed_args = {"run_id": failed_run, "prompt": "Trigger Airflow DAG Daily_Sales",
+                   "source": "airflow", "action": failed_action, "status": "failed",
+                   "error": "extract task: partition missing", "conversation_id": "platform-conversation"}
+    fixed_args = {"run_id": fixed_run, "prompt": "Rerun it with the corrected partition",
+                  "source": "airflow", "action": fixed_action, "status": "succeeded",
+                  "repairs_run_id": failed_run, "conversation_id": "platform-conversation"}
+    failed_tid = env.lightning.record_pipeline_outcome(user, **failed_args)
+    fixed_tid = env.lightning.record_pipeline_outcome(user, **fixed_args)
+    assert failed_tid and fixed_tid and failed_tid != fixed_tid
+    assert env.lightning.record_pipeline_outcome(user, **failed_args) == failed_tid
+    assert env.lightning.record_pipeline_outcome(user, **fixed_args) == fixed_tid
+    assert len(agl_jobs(env)) == 2
+    assert env.jobs.run_one("platform-learning", kinds=["agl_emit"]) is True
+    assert env.jobs.run_one("platform-learning", kinds=["agl_emit"]) is True
+    assert env.jobs.run_one("platform-learning", kinds=["agl_emit"]) is False
+    assert all(job["status"] == "done" for job in agl_jobs(env))
+
+    rollouts = {}
+    events_before = {}
+    for tid, run_id, state, reward, action, repairs in (
+            (failed_tid, failed_run, "failed", 0.0, failed_action, None),
+            (fixed_tid, fixed_run, "succeeded", 1.0, fixed_action, failed_run)):
+        rid = env.lightning.rollout_id_for(tid)
+        rollouts[tid] = rid
+        detail = get_json(f"{agl_server}/api/rollouts/{rid}")
+        rollout = detail["rollout"]
+        assert rollout["status"]["state"] == state
+        assert rollout["input"]["conversation_id"] == "platform-conversation"
+        assert rollout["metadata"]["run_id"] == run_id
+        assert rollout["metadata"]["execution_status"] == state
+        assert rollout["metadata"]["repairs_run_id"] == repairs
+        assert rollout["metadata"]["action"] == action
+        assert "action" not in rollout["input"]  # execution labels are not model conditioning
+        events = get_json(f"{agl_server}/api/rollouts/{rid}/events")
+        events_before[tid] = events
+        actions = [event["data"] for event in events if event["event_type"] == "studio.action"]
+        assert actions == [{"action": action, "run_id": run_id, "repairs_run_id": repairs, "status": state}]
+        rewards = [event["data"] for event in events if event["event_type"] == "reward"]
+        assert len(rewards) == 1
+        assert rewards[0]["value"] == reward and rewards[0]["source"] == "pipeline_outcome"
+        assert not any(event["event_type"] == "studio.query" for event in events)
+        if state == "failed":
+            assert next(event["data"] for event in events if event["event_type"] == "studio.errors") == {
+                "errors": ["extract task: partition missing"]}
+
+    # At-least-once delivery after a worker crash keeps both immutable
+    # examples, their single rewards, and their exact structured actions.
+    for tid in (failed_tid, fixed_tid):
+        env.lightning.emit_trace(tid)
+        env.lightning.emit_trace(tid)
+        rid = rollouts[tid]
+        assert get_json(f"{agl_server}/api/rollouts/{rid}/events") == events_before[tid]
+        assert get_json(f"{agl_server}/api/rollouts/{rid}")["attempts"] == ["0"]
+    terminal = get_json(f"{agl_server}/api/rollouts/terminal")
+    assert {item["rollout_id"] for item in terminal["items"]} == set(rollouts.values())
+    assert terminal["total_terminal"] == 2
