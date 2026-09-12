@@ -1062,3 +1062,11 @@ input:focus, select:focus, .composer-pill:focus-within { box-shadow: 0 0 0 1px v
    unreachable. Pin them so content overflows and .dashboard scrolls instead. */
 .ap-create,
 .ap-list { flex-shrink: 0; }
+
+/* Panels that live directly in the .dashboard scroll column (Build tool/MCP,
+   Jobs, Queries, …) must keep their natural height so .dashboard scrolls —
+   otherwise the card shrinks and .query-item's overflow:hidden clips its
+   content (e.g. the full generated draft in the tool builder). */
+.dashboard > .query-item,
+.dashboard > .query-list,
+.dashboard > .tb-ground { flex-shrink: 0; }
