@@ -448,6 +448,21 @@ def ingest_bytes(user, collection, name, data, access_scope=None):
                 "chunk_text, embedding, metadata, access_scope, content_hash, created_at) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?)", r)
         c.commit()
+    # Graph layer: extract entities/relations from the new chunks (best-effort;
+    # portable, RBAC-scoped by the same access_scope). Never fails the ingest.
+    try:
+        from . import kag_graph
+        kag_graph.clear_source(collection, name)
+        for r in rows:
+            try:
+                rmeta = json.loads(r[6]) if r[6] else {}
+            except Exception:
+                rmeta = {}
+            kag_graph.index_chunk(collection, chunk_id=r[0], source_name=name,
+                                  text=r[4], access_scope=scope,
+                                  page=rmeta.get("page") or rmeta.get("sheet"), user=user)
+    except Exception:
+        pass
     db.log_activity(user, "kag_ingest", prompt=name, source=collection,
                     row_count=len(rows))
     return {"collection": collection, "source_name": name, "chunks": len(rows),

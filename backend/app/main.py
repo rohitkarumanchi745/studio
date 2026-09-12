@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import (auth, autopilot, catalog, chat, connections, dashboards, db, flow, freshness,
-               governance, jobs, kag, keys, mcp, migrations, pipelines, pybuild,
+               governance, jobs, kag, kag_graph, keys, mcp, migrations, pipelines, pybuild,
                qcache, queries, redteam, repos, semantic, sessions, supervisor,
                toolbuilder, trainer)
 from .agent import llm_available, llm_spec
@@ -77,6 +77,7 @@ def init_state():
     mcp.init_tables()
     toolbuilder.init_tables()
     kag.init_tables()
+    kag_graph.init_tables()
     repos.init_tables()
     sessions.init_tables()
     flow.init_tables()

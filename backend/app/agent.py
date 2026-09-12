@@ -525,9 +525,13 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         Args:
             query: What to look up in the company's own documents.
         """
-        from . import kag
+        from . import kag, kag_graph
         hits = kag.search(query, role=user["role"], k=5, user_id=user.get("id"))
-        if not hits:
+        try:
+            graph = kag_graph.graph_search(query, role=user["role"], user_id=user.get("id"))
+        except Exception:
+            graph = {}
+        if not hits and not graph.get("entities"):
             return "No matching passages in the knowledge base."
         # Surface the retrieved sources on the answer (citation chips) — the
         # passages themselves stay quoted reference in the tool return.
@@ -539,7 +543,13 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         # Framed as reference data in a labeled envelope — quoted, cited strings
         # with no privileges. The tool cannot run SQL, widen RBAC, or change the
         # guard; a data query still goes through run_sql → queryguard.
-        return json.dumps({"reference_passages": hits}, default=str)
+        envelope = {"reference_passages": hits}
+        if graph.get("entities"):
+            # Connections the documents draw between entities — quoted reference,
+            # same inert framing as the passages.
+            envelope["graph_context"] = {k: graph[k] for k in
+                                         ("entities", "relations", "sources") if graph.get(k)}
+        return json.dumps(envelope, default=str)
 
     memory_notes = db.list_memory(user["id"])
     # Stable half (cached prefix) + volatile half (below the breakpoint).

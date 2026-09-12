@@ -81,7 +81,16 @@ INTENTIONAL_LAZY_CYCLES = [
     #   connections lazily), so a UI-added source flows through every existing
     #   chokepoint. connections also reads bootstrap for its at-rest key
     #   (keys.py pattern), joining the same runtime cluster.
-    frozenset({"bootstrap", "db", "extraction", "kag", "connections", "connectors"}),
+    # kag ⇄ kag_graph: kag.ingest indexes chunks into the graph, and kag_graph
+    #   reaches kag._scope_sql / rbac / agent (LLM extraction) lazily — the graph
+    #   is built on and scoped by the same KAG machinery.
+    # agent/keys/rbac join the same runtime cluster via these deferred imports.
+    frozenset({"agent", "bootstrap", "connections", "connectors", "db",
+               "extraction", "kag", "kag_graph", "keys", "rbac"}),
+    # DAG orchestration cluster: chat_workflows sequences pipeline_dags →
+    #   airflow_dags → workflow_runs, dag_recovery/supervisor drive supervised
+    #   runs; all reach each other lazily at run time.
+    frozenset({"chat_workflows", "dag_recovery", "supervisor", "workflow_runs"}),
 ]
 
 
