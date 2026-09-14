@@ -43,6 +43,7 @@ _TMP = tempfile.mkdtemp(prefix="studio-bitnet-path-test-")
 os.environ["STUDIO_DB_PATH"] = os.path.join(_TMP, "studio.db")
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app import agent, db, qcache, trainer
@@ -156,6 +157,9 @@ def _clean(monkeypatch):
         c.execute("DELETE FROM query_cache")
         c.commit()
     for k in ("STUDIO_LLM_BASE_URL", "STUDIO_LLM_API_KEY", "STUDIO_BITNET_LLM",
+              "STUDIO_BOOTSTRAP_TOOL_ADAPTER_URI", "STUDIO_BOOTSTRAP_TOOL_ADAPTER_VERSION",
+              "STUDIO_BOOTSTRAP_TOOL_ADAPTER_SHA256",
+              "STUDIO_REQUIRE_TOOL_ADAPTER_SHA256",
               "HARRIER_EMBED_URL", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
         monkeypatch.delenv(k, raising=False)
     yield
@@ -227,6 +231,46 @@ def test_bitnet_ready_needs_a_tool_call_adapter(monkeypatch, stub):
     assert model_router.bitnet_ready(None) is True
 
 
+def test_deployment_bootstrap_registers_exact_adapter_once(monkeypatch):
+    uri = "https://models.example/tool_call-v7.gguf"
+    digest = "a" * 64
+    monkeypatch.setenv("STUDIO_BOOTSTRAP_TOOL_ADAPTER_URI", uri)
+    monkeypatch.setenv("STUDIO_BOOTSTRAP_TOOL_ADAPTER_VERSION", "7")
+    monkeypatch.setenv("STUDIO_BOOTSTRAP_TOOL_ADAPTER_SHA256", digest)
+    first = trainer.bootstrap_from_env()
+    second = trainer.bootstrap_from_env()
+    assert first == second
+    assert trainer.active_adapters(None)["tool_call"] == {
+        "uri": uri, "version": 7, "sha256": digest,
+    }
+
+    monkeypatch.setenv("STUDIO_BOOTSTRAP_TOOL_ADAPTER_URI",
+                       "https://models.example/different.gguf")
+    with pytest.raises(RuntimeError, match="does not match"):
+        trainer.bootstrap_from_env()
+
+
+def test_strict_registry_never_supersedes_with_an_unattested_adapter(monkeypatch):
+    monkeypatch.setenv("STUDIO_REQUIRE_TOOL_ADAPTER_SHA256", "1")
+    with pytest.raises(HTTPException, match="sha256 is required"):
+        trainer.publish("global", "tool_call", "https://models.example/new.gguf")
+    assert trainer.active_adapters(None) == {}
+
+    published = trainer.publish(
+        "global", "tool_call", "https://models.example/new.gguf", sha256="b" * 64)
+    assert published["sha256"] == "b" * 64
+
+
+def test_strict_bootstrap_fails_before_registering_without_digest(monkeypatch):
+    monkeypatch.setenv("STUDIO_REQUIRE_TOOL_ADAPTER_SHA256", "1")
+    monkeypatch.setenv("STUDIO_BOOTSTRAP_TOOL_ADAPTER_URI",
+                       "https://models.example/tool.gguf")
+    monkeypatch.setenv("STUDIO_BOOTSTRAP_TOOL_ADAPTER_VERSION", "1")
+    with pytest.raises(RuntimeError, match="required in strict adapter mode"):
+        trainer.bootstrap_from_env()
+    assert trainer.active_adapters(None) == {}
+
+
 def test_bitnet_ready_survives_a_broken_registry(monkeypatch, stub):
     monkeypatch.setenv("STUDIO_LLM_BASE_URL", stub.base_url)
     monkeypatch.setattr(trainer, "active_adapters",
@@ -254,6 +298,19 @@ def test_make_llm_targets_the_endpoint_with_the_adapter_body(monkeypatch, stub):
         "tool_call": {"uri": "/adapters/tool_call/v7", "version": 1},
         "user_style": {"uri": "/adapters/user/ana/v3", "version": 1},
     }
+
+
+def test_pipeline_model_alias_resolves_to_the_real_bitnet_spec(monkeypatch, stub):
+    monkeypatch.setenv("STUDIO_LLM_BASE_URL", stub.base_url)
+    _publish_tool_call("/adapters/tool_call/v7")
+    seen = _capture_init_chat_model(monkeypatch)
+
+    assert agent.llm_available("bitnet", ANALYST) is True
+    agent.make_llm("bitnet", ANALYST)
+    assert seen["spec"] == "openai:bitnet"
+    assert seen["kwargs"]["base_url"] == stub.base_url
+    assert seen["kwargs"]["extra_body"]["studio_adapters"]["tool_call"]["uri"] == \
+        "/adapters/tool_call/v7"
 
 
 def test_make_llm_uses_the_configured_gateway_key(monkeypatch, stub):
@@ -619,6 +676,148 @@ def test_a_failed_bitnet_attempt_is_never_served_as_a_bitnet_answer(monkeypatch)
                           history=[], user=ADMIN, model="openai:bitnet")
     assert out["errors"] and "bitnet unavailable" in out["errors"][0]
     assert out["mode"] == "fallback"          # a preview, not a BitNet answer
+
+
+def test_real_bitnet_json_policy_executes_the_trained_guarded_sql_contract(monkeypatch):
+    """The trainer emits plain JSON actions, not native OpenAI tool-call frames.
+    The real self-hosted path must interpret that exact narrow contract and
+    still send the SQL through Studio's gateway."""
+    pytest.importorskip("langchain")
+    engine = StubEngine(reply=json.dumps({"tool": "run_sql", "sql": LEARNED_SQL}))
+    try:
+        monkeypatch.setenv("STUDIO_LLM_BASE_URL", engine.base_url)
+        _publish_tool_call()
+        from app.connectors.demo import DemoConnector
+        conn = DemoConnector()
+        out = agent.run_agent(
+            prompt=REPEAT_PROMPT, connector=conn, table="sales",
+            allowed_tables=["sales"], schemas={"sales": conn.get_schema("sales")},
+            history=[], user=ADMIN, model="bitnet", skill_md="demo sales schema")
+        assert out["errors"] == []
+        assert out["sql"].startswith(LEARNED_SQL)
+        assert out["sql"].endswith("LIMIT 50000")
+        assert out["rows"]
+        assert out["text"].startswith("BitNet executed")
+        assert engine.requests[0]["body"]["studio_adapters"]["tool_call"]["uri"]
+    finally:
+        engine.close()
+
+
+def test_negative_feedback_demotes_the_linked_semantic_plan(monkeypatch):
+    result = {"sql": LEARNED_SQL, "text": "Revenue by region", "rows": [["West", 10]],
+              "chart": None, "panels": [], "errors": []}
+    cache_id = qcache.store(
+        ADMIN, "demo", "sales", LEARNED_PROMPT, result, reward=0.75)
+    trace_id = db.add_trace(
+        ADMIN, prompt=LEARNED_PROMPT, mode="agent", source="demo", table="sales",
+        sql=LEARNED_SQL, reward=0.75, reward_source="heuristic",
+        meta={"qcache_id": cache_id})
+
+    assert db.set_trace_reward(
+        trace_id, 0.0, user_id=ADMIN["id"], source="user") is True
+    with db.connect() as connection:
+        row = connection.execute(
+            "SELECT avg_reward FROM query_cache WHERE id=?", (cache_id,)).fetchone()
+    assert row["avg_reward"] == 0.0
+    monkeypatch.setattr(qcache, "_exec_full", lambda *args: pytest.fail(
+        "a demoted plan must not be executed"))
+    assert qcache.lookup(ADMIN, "demo", "sales", LEARNED_PROMPT) is None
+
+
+def test_feedback_on_cache_hit_adds_once_then_later_edits_replace(monkeypatch):
+    result = {"sql": LEARNED_SQL, "text": "Revenue by region", "rows": [["West", 10]],
+              "chart": None, "panels": [], "errors": []}
+    cache_id = qcache.store(
+        ADMIN, "demo", "sales", LEARNED_PROMPT, result, reward=0.75)
+    cached = qcache.lookup(ADMIN, "demo", "sales", LEARNED_PROMPT)
+    assert cached["_qcache_feedback_mode"] == "add"
+    trace_id = db.add_trace(
+        ADMIN, prompt=LEARNED_PROMPT, mode="cached", source="demo", table="sales",
+        sql=LEARNED_SQL, reward=0.75, reward_source="heuristic",
+        meta={"qcache_id": cache_id,
+              "qcache_feedback_mode": cached["_qcache_feedback_mode"]})
+
+    assert db.set_trace_reward(
+        trace_id, 0.0, user_id=ADMIN["id"], source="user") is True
+    with db.connect() as connection:
+        first = connection.execute(
+            "SELECT seen, avg_reward FROM query_cache WHERE id=?", (cache_id,)).fetchone()
+    assert first["seen"] == 2 and first["avg_reward"] == pytest.approx(0.375)
+
+    assert db.set_trace_reward(
+        trace_id, 1.0, user_id=ADMIN["id"], source="user") is True
+    with db.connect() as connection:
+        revised = connection.execute(
+            "SELECT seen, avg_reward FROM query_cache WHERE id=?", (cache_id,)).fetchone()
+    assert revised["seen"] == 2 and revised["avg_reward"] == pytest.approx(0.875)
+
+
+def test_first_feedback_on_real_cache_hit_adds_without_a_heuristic_reward():
+    result = {"sql": LEARNED_SQL, "text": "Revenue by region", "rows": [["West", 10]],
+              "chart": None, "panels": [], "errors": []}
+    cache_id = qcache.store(
+        ADMIN, "demo", "sales", LEARNED_PROMPT, result, reward=0.75)
+    cached = qcache.lookup(ADMIN, "demo", "sales", LEARNED_PROMPT)
+    assert cached["mode"] == "cached" and cached["_qcache_feedback_mode"] == "add"
+    trace_id = db.add_trace(
+        ADMIN, prompt=LEARNED_PROMPT, mode="cached", source="demo", table="sales",
+        sql=LEARNED_SQL, reward=None, reward_source="heuristic",
+        meta={"qcache_id": cache_id, "qcache_feedback_mode": "add"})
+
+    assert db.set_trace_reward(
+        trace_id, 1.0, user_id=ADMIN["id"], source="user") is True
+    with db.connect() as connection:
+        first = connection.execute(
+            "SELECT seen,avg_reward FROM query_cache WHERE id=?", (cache_id,)).fetchone()
+    assert first["seen"] == 2
+    assert first["avg_reward"] == pytest.approx(0.875)
+
+    assert db.set_trace_reward(
+        trace_id, 0.0, user_id=ADMIN["id"], source="user") is True
+    with db.connect() as connection:
+        revised = connection.execute(
+            "SELECT seen,avg_reward FROM query_cache WHERE id=?", (cache_id,)).fetchone()
+    assert revised["seen"] == 2
+    assert revised["avg_reward"] == pytest.approx(0.375)
+
+
+def test_concurrent_feedback_keeps_trace_and_cache_contribution_consistent():
+    """Two replicas editing one trace must serialize the trace/cache pair."""
+    result = {"sql": LEARNED_SQL, "text": "Revenue by region", "rows": [["West", 10]],
+              "chart": None, "panels": [], "errors": []}
+    cache_id = qcache.store(
+        ADMIN, "demo", "sales", LEARNED_PROMPT, result, reward=0.75)
+    trace_id = db.add_trace(
+        ADMIN, prompt=LEARNED_PROMPT, mode="agent", source="demo", table="sales",
+        sql=LEARNED_SQL, reward=0.75, reward_source="heuristic",
+        meta={"qcache_id": cache_id})
+    start = threading.Barrier(3)
+    errors = []
+
+    def update(score):
+        try:
+            start.wait()
+            assert db.set_trace_reward(
+                trace_id, score, user_id=ADMIN["id"], source="user")
+        except BaseException as exc:  # retain worker assertion/locking failures
+            errors.append(exc)
+
+    workers = [threading.Thread(target=update, args=(score,)) for score in (0.0, 1.0)]
+    for worker in workers:
+        worker.start()
+    start.wait()
+    for worker in workers:
+        worker.join(timeout=35)
+
+    assert not errors
+    assert all(not worker.is_alive() for worker in workers)
+    with db.connect() as connection:
+        trace = connection.execute(
+            "SELECT reward FROM agent_traces WHERE id=?", (trace_id,)).fetchone()
+        cached = connection.execute(
+            "SELECT seen,avg_reward FROM query_cache WHERE id=?", (cache_id,)).fetchone()
+    assert cached["seen"] == 1
+    assert cached["avg_reward"] == pytest.approx(trace["reward"])
 
 
 # ── Explicitly choosing BitNet picks who answers FIRST, not whether the turn

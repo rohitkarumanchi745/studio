@@ -115,6 +115,7 @@ def airflow_env(base, monkeypatch):
     for v in ("AIRFLOW_USERNAME", "AIRFLOW_PASSWORD", "AIRFLOW_API_VERSION"):
         monkeypatch.delenv(v, raising=False)
     monkeypatch.setenv("AIRFLOW_URL", base)
+    monkeypatch.setenv("AIRFLOW_PUBLIC_URL", base)
     monkeypatch.setenv("AIRFLOW_TOKEN", "tok")
     return monkeypatch
 
@@ -415,6 +416,20 @@ def test_live_polls_persists_and_flips_failed(airflow_env):
 
     # and the flip is persisted, not just in the response
     assert supervisor._get(jid)["status"] == "failed"
+
+
+def test_live_running_platform_escalates_at_immutable_deadline(airflow_env):
+    jid = approve(_submit(ANALYST)["id"], user=ADMIN)["id"]
+    current = supervisor._get(jid)
+    result = json.loads(current["result"])
+    result.update(launched_at=time.time() - 61, run_timeout_seconds=60)
+    supervisor._save(current, result=json.dumps(result))
+    SCRIPT["state"] = "running"
+
+    out = live_job(jid, user=ANALYST)
+    assert out["state"] == "escalated"
+    assert out["job"]["status"] == "escalated"
+    assert "monitoring deadline" in out["detail"]
 
 
 def test_live_succeeded_stays_succeeded(airflow_env):

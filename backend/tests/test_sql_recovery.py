@@ -76,7 +76,9 @@ def test_ordinary_pipeline_failure_does_not_enroll(monkeypatch):
 
 def test_lightning_retry_creates_new_success_and_preserves_failed_reward(monkeypatch):
     failed = _failed(monkeypatch)
-    db.set_trace_reward(failed["trace_id"], 0.25, source="user", note="Keep my feedback")
+    db.set_trace_reward(
+        failed["trace_id"], 0.25, user_id=USER["id"], source="user",
+        note="Keep my feedback")
     _recover()
     state = sql_recovery.status("root-run", USER)
     assert state["status"] == "succeeded", state

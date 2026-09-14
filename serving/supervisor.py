@@ -49,11 +49,16 @@ CONFIG (env) — every value has a working default
   STUDIO_ADAPTERS_DIR         $STUDIO_DATA_DIR/adapters
   STUDIO_BITNET_GGUF          model filename                      (ggml-model-i2_s.gguf)
   STUDIO_BITNET_GGUF_REPO     HF repo            (microsoft/bitnet-b1.58-2B-4T-gguf)
+  STUDIO_BITNET_GGUF_REVISION immutable HF commit (29f884c...)
   STUDIO_BITNET_GGUF_URL      full override URL                   (derived from repo+file)
   STUDIO_BITNET_GGUF_BYTES    expected size, 0 disables the check (1187801280)
+  STUDIO_BITNET_GGUF_SHA256   exact base-model digest             (4221b252...)
   HUGGING_FACE_HUB_TOKEN      (or HF_TOKEN) for gated/rate-limited pulls
   STUDIO_TOOLCALL_GGUF        adapter filename                    (tool_call.gguf)
   STUDIO_ADAPTER_URL          optional: fetch the adapter at boot if absent
+  STUDIO_ADAPTER_VERSION      immutable adapter release version  (1)
+  STUDIO_ADAPTER_SHA256       expected lowercase/uppercase SHA-256 (unset)
+  STUDIO_REQUIRE_ADAPTER      1 = fail closed without exact identity (0)
   STUDIO_MODEL_FETCH_RETRIES  download attempts before giving up (3)
   STUDIO_ENGINE_PORT          llama-server, loopback only         (8080)
   STUDIO_GATEWAY_PORT         gateway, loopback only              (9001)
@@ -69,6 +74,7 @@ CONFIG (env) — every value has a working default
 Stdlib only, like gateway.py — nothing to install, nothing to drift.
 """
 import json
+import hashlib
 import os
 import shlex
 import shutil
@@ -76,8 +82,10 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+from urllib.parse import urlsplit
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -143,14 +151,17 @@ def cpu_quota():
 
 def load_config():
     """(Re)read every configuration global from os.environ."""
-    global DATA_DIR, MODELS_DIR, ADAPTERS_DIR, GGUF_NAME, GGUF_REPO, GGUF_URL
-    global GGUF_BYTES, ADAPTER_NAME, ADAPTER_URL, MODEL_PATH, ADAPTER_PATH
-    global STATE_PATH, ADAPTER_URI_PATH, PUBLIC_PORT, GATEWAY_PORT, ENGINE_PORT
+    global DATA_DIR, MODELS_DIR, ADAPTERS_DIR, GGUF_NAME, GGUF_REPO, GGUF_REVISION, GGUF_URL
+    global GGUF_BYTES, GGUF_SHA256, ADAPTER_NAME, ADAPTER_URL, MODEL_PATH, ADAPTER_PATH
+    global STATE_PATH, ADAPTER_URI_PATH, ADAPTER_IDENTITY_PATH
+    global ADAPTER_VERSION, ADAPTER_SHA256, REQUIRE_ADAPTER
+    global PUBLIC_PORT, GATEWAY_PORT, ENGINE_PORT
     global BRIDGE, CTX_SIZE, PARALLEL, BASE_MODEL_NAME, ENGINE_BIN
     global POLL_SECONDS, FETCH_RETRIES, THREADS, LOCAL
+    global _VERIFIED_MODEL
 
     # ── Where this unit is running ───────────────────────────────────
-    # "platform" (the default) = a Railway/Docker service; "local" = a laptop
+    # "platform"/"cloud" (the default) = any container service; "local" = a laptop
     # under run_local.py. It changes NOTHING about what this process does — only
     # which fix a failure message tells the operator to apply, because
     # "Variables → add HUGGING_FACE_HUB_TOKEN, then redeploy" is useless advice
@@ -163,11 +174,17 @@ def load_config():
     ADAPTERS_DIR = env("STUDIO_ADAPTERS_DIR", os.path.join(DATA_DIR, "adapters"))
     GGUF_NAME = env("STUDIO_BITNET_GGUF", "ggml-model-i2_s.gguf")
     GGUF_REPO = env("STUDIO_BITNET_GGUF_REPO", "microsoft/bitnet-b1.58-2B-4T-gguf")
+    GGUF_REVISION = env(
+        "STUDIO_BITNET_GGUF_REVISION",
+        "29f884c2aefd035cd498fa0750b7781e6f269032")
     GGUF_URL = env("STUDIO_BITNET_GGUF_URL") or \
-        f"https://huggingface.co/{GGUF_REPO}/resolve/main/{GGUF_NAME}"
+        f"https://huggingface.co/{GGUF_REPO}/resolve/{GGUF_REVISION}/{GGUF_NAME}"
     # Verified with an HTTP HEAD against the repo: ggml-model-i2_s.gguf is exactly
     # 1,187,801,280 bytes. A short file means a truncated transfer, not a model.
     GGUF_BYTES = env_int("STUDIO_BITNET_GGUF_BYTES", 1187801280)
+    GGUF_SHA256 = env(
+        "STUDIO_BITNET_GGUF_SHA256",
+        "4221b252fdd5fd25e15847adfeb5ee88886506ba50b8a34548374492884c2162").lower()
     ADAPTER_NAME = env("STUDIO_TOOLCALL_GGUF", "tool_call.gguf")
     ADAPTER_URL = env("STUDIO_ADAPTER_URL")
     MODEL_PATH = os.path.join(MODELS_DIR, GGUF_NAME)
@@ -179,10 +196,17 @@ def load_config():
     # that answers; without it /health can only guess, and guessing "ok" while a
     # 1.1 GB download is in flight is how a platform routes traffic into a void.
     STATE_PATH = os.path.join(DATA_DIR, "state.json")
-    # Written beside the adapter when its provenance is known: the published uri the
-    # file came from. Without it the mounted adapter is anonymous, and an anonymous
-    # adapter can never be PROVEN to be the one Studio asked for.
+    # Written beside the adapter when its provenance is known. The legacy .uri
+    # remains for non-strict self-hosted installs; strict cloud deployments use
+    # the JSON sidecar that binds URI + release version + actual file digest.
+    # Without that binding a mounted adapter is anonymous and cannot be proven
+    # to be the one Studio asked for.
     ADAPTER_URI_PATH = ADAPTER_PATH + ".uri"
+    ADAPTER_IDENTITY_PATH = ADAPTER_PATH + ".identity.json"
+    ADAPTER_VERSION = env("STUDIO_ADAPTER_VERSION", "1")
+    ADAPTER_SHA256 = env("STUDIO_ADAPTER_SHA256").lower()
+    REQUIRE_ADAPTER = env("STUDIO_REQUIRE_ADAPTER").lower() in (
+        "1", "true", "yes", "on")
 
     # ── Ports ────────────────────────────────────────────────────────────────
     PUBLIC_PORT = env_int("PORT", 9000)          # Railway injects PORT
@@ -201,6 +225,7 @@ def load_config():
     # os.cpu_count() reports the HOST's cores; cpu_quota() is what this
     # container/box may actually use. LLAMA_THREADS overrides both.
     THREADS = env_int("LLAMA_THREADS", 0) or cpu_quota()
+    _VERIFIED_MODEL = None
 
 
 load_config()
@@ -220,24 +245,21 @@ def _hf_token():
 
 
 def _token_fix():
-    """Where to actually put HUGGING_FACE_HUB_TOKEN. Same variable, two very
-    different places: a Railway service's Variables tab, or the shell the owner
-    is standing in when run_local.py fails."""
+    """Tell local and cloud operators where to put the download credential."""
     if LOCAL:
         return (f"  FIX: make a READ token at huggingface.co/settings/tokens, accept\n"
                 f"       {GGUF_REPO}'s licence on its model page if it asks, then\n"
                 f"       export HUGGING_FACE_HUB_TOKEN=hf_... in the shell you run\n"
                 f"       serving/run_local.py from and start it again.")
-    return (f"  FIX: on this Railway service, Variables → add HUGGING_FACE_HUB_TOKEN\n"
-            f"       = a HuggingFace access token with READ access to {GGUF_REPO}\n"
-            f"       (huggingface.co/settings/tokens), accept the model's licence on\n"
-            f"       the model page if it asks, then redeploy.")
+    return (f"  FIX: add HUGGING_FACE_HUB_TOKEN to this workload through your\n"
+            f"       cloud secret manager (a HuggingFace READ token for {GGUF_REPO}),\n"
+            f"       accept the model's licence if required, then roll out again.")
 
 
 def _explain_http(code, url, what):
     """Turn an HTTP status into an instruction, not a stack trace."""
     tokened = "set" if _hf_token() else "NOT set"
-    where = "in your shell" if LOCAL else "on this Railway service"
+    where = "in your shell" if LOCAL else "through this workload's cloud secret manager"
     if code in (401, 403):
         return (
             f"{what}: HuggingFace refused the download of {url} (HTTP {code}).\n"
@@ -258,7 +280,7 @@ def _explain_http(code, url, what):
     return f"{what}: {url} returned HTTP {code}."
 
 
-def fetch(url, dest, expect_bytes=0, what="download", retries=3):
+def fetch(url, dest, expect_bytes=0, what="download", retries=3, expect_sha256=None):
     """Download to <dest>.part and rename only on success — a half-written file
     must never look like a model. Returns True, or logs WHY and returns False."""
     os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
@@ -306,6 +328,11 @@ def fetch(url, dest, expect_bytes=0, what="download", retries=3):
                     f"to skip this check.)")
                 _rm(part)
                 continue
+            if expect_sha256 and _sha256(part) != expect_sha256:
+                log(f"{what}: SHA-256 MISMATCH — refusing bytes that do not match "
+                    f"the pinned digest {expect_sha256}.")
+                _rm(part)
+                continue
             os.replace(part, dest)
             log(f"{what}: OK — {size} bytes → {dest}")
             return True
@@ -320,54 +347,257 @@ def fetch(url, dest, expect_bytes=0, what="download", retries=3):
     return False
 
 
+def _model_identity(path):
+    """Verify and identify the exact base GGUF bytes, or return ``None``."""
+    if len(GGUF_SHA256) != 64 or any(c not in "0123456789abcdef" for c in GGUF_SHA256):
+        log("model configuration invalid: STUDIO_BITNET_GGUF_SHA256 must be 64 hex characters")
+        return None
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as handle:
+            magic = handle.read(4)
+        if magic != b"GGUF" or (GGUF_BYTES and size != GGUF_BYTES):
+            return None
+        digest = _sha256(path)
+    except OSError:
+        return None
+    if digest != GGUF_SHA256:
+        return None
+    return {"repo": GGUF_REPO, "revision": GGUF_REVISION, "url": GGUF_URL,
+            "sha256": digest, "size": size, "path": path}
+
+
+_VERIFIED_MODEL = None
+
+
 def ensure_model():
     """The model must exist before the engine can start. Present on the volume →
     instant. Absent → one 1.1 GB pull, then never again for this volume."""
-    if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 1024:
-        log(f"model present: {MODEL_PATH} ({os.path.getsize(MODEL_PATH)} bytes)")
+    global _VERIFIED_MODEL
+    verified = _model_identity(MODEL_PATH)
+    if verified:
+        _VERIFIED_MODEL = verified
+        log(f"model verified: {MODEL_PATH} ({verified['size']} bytes, "
+            f"sha256={verified['sha256']})")
         return True
     free = shutil.disk_usage(os.path.dirname(MODEL_PATH) or "/").free
     need = (GGUF_BYTES or 1_200_000_000) + 200_000_000
     if free < need:
         fix = ("Free up disk, or point --dir at a drive that has room."
                if LOCAL else
-               f"Attach a Railway volume (≥5 GB) mounted at {DATA_DIR}, or the "
+               f"Attach a persistent volume (≥5 GB) mounted at {DATA_DIR}, or the "
                f"download will fail.")
         log(f"WARNING: only {free // 2**20} MiB free at {MODELS_DIR}; the model needs "
             f"~{need // 2**20} MiB. {fix}")
-    log(f"model missing — downloading it once into {MODELS_DIR} (~1.1 GB). "
-        f"This happens on the FIRST run only; every later start reuses the file.")
-    return fetch(GGUF_URL, MODEL_PATH, GGUF_BYTES, "model", FETCH_RETRIES)
+    log(f"model missing or unverified — downloading the pinned revision once into "
+        f"{MODELS_DIR} (~1.1 GB). Every later start rehashes the persisted bytes.")
+    candidate = MODEL_PATH + ".candidate"
+    if not fetch(GGUF_URL, candidate, GGUF_BYTES, "model", FETCH_RETRIES, GGUF_SHA256):
+        return False
+    verified = _model_identity(candidate)
+    if not verified:
+        _rm(candidate)
+        return False
+    os.replace(candidate, MODEL_PATH)
+    _VERIFIED_MODEL = {**verified, "path": MODEL_PATH}
+    return True
+
+
+def _read_adapter_uri():
+    try:
+        with open(ADAPTER_URI_PATH, encoding="utf-8") as handle:
+            return handle.read(4097).strip() or None
+    except OSError:
+        return None
+
+
+def _sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _configured_adapter_identity():
+    """Return the operator-pinned identity, rejecting ambiguous strict config."""
+    if not ADAPTER_URL:
+        if REQUIRE_ADAPTER:
+            raise ValueError("STUDIO_ADAPTER_URL is required in strict adapter mode")
+        return None
+    if len(ADAPTER_URL) > 2048 or any(ord(char) < 32 or ord(char) == 127
+                                      for char in ADAPTER_URL):
+        raise ValueError("STUDIO_ADAPTER_URL is invalid")
+    parsed = urlsplit(ADAPTER_URL)
+    if parsed.scheme in {"http", "https"} and (not parsed.netloc or parsed.username
+            or parsed.password or parsed.query or parsed.fragment):
+        raise ValueError("STUDIO_ADAPTER_URL must be stable and contain no credentials, query, or fragment")
+    try:
+        version = int(ADAPTER_VERSION)
+    except ValueError:
+        raise ValueError("STUDIO_ADAPTER_VERSION must be an integer") from None
+    if not 1 <= version <= 2**31 - 1:
+        raise ValueError("STUDIO_ADAPTER_VERSION is out of range")
+    sha256 = ADAPTER_SHA256.lower()
+    if sha256 and (len(sha256) != 64 or any(c not in "0123456789abcdef" for c in sha256)):
+        raise ValueError("STUDIO_ADAPTER_SHA256 must be 64 hexadecimal characters")
+    if REQUIRE_ADAPTER and not sha256:
+        raise ValueError("STUDIO_ADAPTER_SHA256 is required in strict adapter mode")
+    return {"uri": ADAPTER_URL, "version": version, "sha256": sha256 or None,
+            "base_sha256": GGUF_SHA256}
+
+
+def _read_adapter_identity(*, verify_bytes=False):
+    """Read the signed-off identity sidecar and optionally bind it to the file.
+
+    The legacy plaintext ``.uri`` file remains readable outside strict mode so
+    existing self-hosted installations keep working.  Strict mode never accepts
+    that weaker identity because it has neither a release version nor a digest.
+    """
+    try:
+        with open(ADAPTER_IDENTITY_PATH, encoding="utf-8") as handle:
+            value = json.load(handle)
+        if not isinstance(value, dict):
+            return None
+        uri = value.get("uri")
+        version = value.get("version")
+        sha256 = str(value.get("sha256") or "").lower()
+        if not isinstance(uri, str) or not uri or not isinstance(version, int) \
+                or not 1 <= version <= 2**31 - 1 or len(sha256) != 64 \
+                or any(c not in "0123456789abcdef" for c in sha256):
+            return None
+        base_sha256 = str(value.get("base_sha256") or "").lower()
+        if len(base_sha256) != 64 or any(c not in "0123456789abcdef" for c in base_sha256):
+            return None
+        identity = {"uri": uri, "version": version, "sha256": sha256,
+                    "base_sha256": base_sha256}
+        if verify_bytes and (not os.path.isfile(ADAPTER_PATH)
+                             or _sha256(ADAPTER_PATH) != sha256):
+            return None
+        return identity
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _write_adapter_uri(uri):
+    """Atomically bind downloaded bytes to the URI that produced them."""
+    directory = os.path.dirname(ADAPTER_URI_PATH) or "."
+    fd, temporary = tempfile.mkstemp(prefix=".adapter-uri-", dir=directory)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            handle.write(uri + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, ADAPTER_URI_PATH)
+        parent = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _write_adapter_identity(identity):
+    """Atomically persist the URI + release version + digest binding."""
+    directory = os.path.dirname(ADAPTER_IDENTITY_PATH) or "."
+    fd, temporary = tempfile.mkstemp(prefix=".adapter-identity-", dir=directory)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            json.dump(identity, handle, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, ADAPTER_IDENTITY_PATH)
+        parent = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
 
 
 def ensure_adapter():
-    """OPTIONAL. A Railway volume cannot be shared with the trainer's service, so
-    the trained tool_call adapter (converted to GGUF) arrives by URL if you set
-    one. No URL and no file is the NORMAL day-one state: base model, no adapter."""
-    if os.path.exists(ADAPTER_PATH):
-        return True
-    if not ADAPTER_URL:
+    """Fetch and provenance-bind the optional trained GGUF adapter.
+
+    A file alone is anonymous. When an adapter URL is configured, an existing
+    file is reused only if its sidecar names that exact URL; otherwise the URL
+    is fetched again and the sidecar is written only after the atomic download
+    succeeds. The caller must not mount the adapter when this returns false.
+    """
+    present = os.path.isfile(ADAPTER_PATH)
+    try:
+        expected = _configured_adapter_identity()
+    except ValueError as exc:
+        log(f"adapter configuration invalid: {exc}")
         return False
-    return fetch(ADAPTER_URL, ADAPTER_PATH, 0, "adapter", 2)
+    if expected is None:
+        return present
+
+    recorded = _read_adapter_identity(verify_bytes=True) if present else None
+    if recorded == expected:
+        return True
+    # Backwards compatibility for pre-attestation installs: a URI sidecar can
+    # still permit reuse when strict mode and an expected digest are both off.
+    if present and not REQUIRE_ADAPTER and not expected["sha256"] \
+            and _read_adapter_uri() == ADAPTER_URL:
+        return True
+
+    # Fetch to a candidate path.  A digest mismatch must not overwrite a known
+    # good adapter on the persistent volume.
+    candidate = ADAPTER_PATH + ".candidate"
+    if not fetch(ADAPTER_URL, candidate, 0, "adapter", 2):
+        return False
+    try:
+        actual_sha256 = _sha256(candidate)
+        if expected["sha256"] and actual_sha256 != expected["sha256"]:
+            log("adapter SHA-256 mismatch; refusing the downloaded bytes")
+            return False
+        identity = {**expected, "sha256": actual_sha256}
+        os.replace(candidate, ADAPTER_PATH)
+        _write_adapter_identity(identity)
+        _write_adapter_uri(ADAPTER_URL)
+    except OSError:
+        log("adapter downloaded but its identity could not be recorded; refusing to mount it")
+        return False
+    finally:
+        _rm(candidate)
+    return True
 
 
 # ── Shared state: what the gateway is allowed to claim ───────────────────
 
 def mounted_adapter():
     """The adapter the engine was LAUNCHED with, as an identity the gateway can
-    compare against a requested uri — or None when the engine is serving the
-    base model. `uri` is None when the file has no .uri sidecar: present but
-    anonymous, which must NOT be treated as a match for anything."""
+    compare against a requested identity — or None when the engine is serving
+    the base model. In strict mode URI/version/SHA-256 must all be present and
+    the digest must still match the file; otherwise the file is anonymous and
+    must NOT be treated as a match for anything."""
     sig = adapter_sig()
     if sig is None:
         return None
-    uri = None
-    try:
-        with open(ADAPTER_URI_PATH) as f:
-            uri = f.read().strip() or None
-    except OSError:
-        pass
-    return {"path": ADAPTER_PATH, "uri": uri, "size": sig[0], "mtime_ns": sig[1]}
+    identity = _read_adapter_identity(verify_bytes=True)
+    if identity is None and not REQUIRE_ADAPTER:
+        # Legacy installations can identify only the URI.  Strict deployments
+        # deliberately see this as anonymous and remain unready.
+        identity = {"uri": _read_adapter_uri(), "version": None, "sha256": None}
+    identity = identity or {"uri": None, "version": None, "sha256": None}
+    return {"path": ADAPTER_PATH, **identity, "size": sig[0], "mtime_ns": sig[1]}
 
 
 def write_state(stage, adapter=None, detail=None):
@@ -380,7 +610,8 @@ def write_state(stage, adapter=None, detail=None):
     health check and a torn read would be a lie of a different kind.
     """
     payload = {"stage": stage, "detail": detail, "adapter": adapter,
-               "model_path": MODEL_PATH, "engine_port": ENGINE_PORT,
+               "model_path": MODEL_PATH, "model": _VERIFIED_MODEL,
+               "engine_port": ENGINE_PORT,
                # Bumped on every engine start; the gateway drops its
                # enabled-adapter cache when it changes (see start_engine).
                "engine_epoch": _ENGINE_EPOCH,
@@ -454,10 +685,18 @@ def gateway_env():
         "STUDIO_BACKEND_URL": f"http://127.0.0.1:{ENGINE_PORT}/v1",
         "STUDIO_BACKEND_KIND": "llama",
         "STUDIO_BASE_MODEL_NAME": BASE_MODEL_NAME,
+        "STUDIO_GATEWAY_BASE_MODEL_SHA256": GGUF_SHA256,
         # CPU/llama path serves the single global tool_call adapter (README §7).
         "STUDIO_GATEWAY_ADAPTER_PRIORITY": env(
             "STUDIO_GATEWAY_ADAPTER_PRIORITY", "tool_call"),
     })
+    if REQUIRE_ADAPTER:
+        e.update({
+            "STUDIO_GATEWAY_REQUIRE_TOOL_ADAPTER": "1",
+            "STUDIO_GATEWAY_TOOL_ADAPTER_URI": ADAPTER_URL,
+            "STUDIO_GATEWAY_TOOL_ADAPTER_VERSION": ADAPTER_VERSION,
+            "STUDIO_GATEWAY_TOOL_ADAPTER_SHA256": ADAPTER_SHA256,
+        })
     if BRIDGE:
         e["STUDIO_GATEWAY_HOST"] = "127.0.0.1"
         e["STUDIO_GATEWAY_PORT"] = str(GATEWAY_PORT)
@@ -624,7 +863,7 @@ def main():
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
 
-    # 1. Public listener + gateway FIRST, so Railway's healthcheck on /health
+    # 1. Public listener + gateway FIRST, so the platform healthcheck on /health
     #    passes in seconds even while a 1.1 GB model is still downloading.
     write_state("starting")
     gateway = start_gateway()
@@ -643,15 +882,20 @@ def main():
         log("FATAL: no model file — the engine cannot start. See the message "
             "above for the fix. " + ("Exiting; fix that and run it again."
                                      if LOCAL else
-                                     "Exiting so Railway surfaces a failed deploy "
+                                     "Exiting so the platform surfaces a failed deploy "
                                      "rather than a permanently empty serving box."))
         stop(gateway, "gateway")
         return 1
 
     # 3. Engine, with --lora ONLY if an adapter is really there.
     write_state("starting_engine")
-    ensure_adapter()
-    live_sig = stable_adapter_sig()
+    adapter_ready = ensure_adapter()
+    if (ADAPTER_URL or REQUIRE_ADAPTER) and not adapter_ready:
+        write_state("adapter_failed", detail="the configured trained adapter could not be verified")
+        log("FATAL: a trained adapter URL was configured but its bytes and provenance are not ready")
+        stop(gateway, "gateway")
+        return 1
+    live_sig = stable_adapter_sig() if adapter_ready else None
     if live_sig is None:
         log(f"no adapter at {ADAPTER_PATH} — serving the BASE model. This is the "
             f"normal state for a new deployment: router.bitnet_ready() is still "
@@ -673,7 +917,7 @@ def main():
         if gateway.poll() is not None:
             log(f"FATAL: gateway exited ({gateway.returncode}); " +
                 ("exiting — start run_local.py again." if LOCAL else
-                 "exiting so Railway restarts the service."))
+                 "exiting so the platform restarts the service."))
             stop(engine, "engine")
             return 1
         if engine.poll() is not None:
@@ -687,10 +931,15 @@ def main():
                     "i2_s — it must be a bitnet.cpp build), the box ran out of "
                     "memory (needs ~2 GB at ctx 4096), or LLAMA_EXTRA_ARGS is "
                     "invalid. " + ("Exiting." if LOCAL else
-                                   "Exiting so Railway surfaces the failure."))
+                                   "Exiting so the platform surfaces the failure."))
                 stop(gateway, "gateway")
                 return 1
             time.sleep(min(60, 5 * fails))
+            adapter_ready = ensure_adapter() if REQUIRE_ADAPTER else True
+            if not adapter_ready:
+                write_state("adapter_failed", detail="the required adapter identity no longer verifies")
+                stop(gateway, "gateway")
+                return 1
             live_sig = stable_adapter_sig()
             engine = start_engine(live_sig is not None)
             if engine is None:
@@ -701,6 +950,13 @@ def main():
         fails = 0
         sig = stable_adapter_sig()
         if sig != live_sig:
+            if REQUIRE_ADAPTER and not ensure_adapter():
+                write_state("adapter_failed", detail="the required adapter identity no longer verifies")
+                log("FATAL: required adapter bytes changed and could not be restored from the pinned artifact")
+                stop(engine, "engine")
+                stop(gateway, "gateway")
+                return 1
+            sig = stable_adapter_sig()
             log(f"adapter changed ({live_sig} → {sig}) — restarting the engine to "
                 f"mount it (llama-server cannot hot-load an adapter FILE).")
             write_state("starting_engine", detail="mounting a new adapter")

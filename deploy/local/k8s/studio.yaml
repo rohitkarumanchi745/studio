@@ -1,0 +1,98 @@
+# Local Kubernetes (kind / minikube / Docker Desktop). See ../README.md for steps.
+# Build + load the image first, then: kubectl apply -f deploy/local/k8s/studio.yaml
+apiVersion: v1
+kind: Namespace
+metadata: {name: studio}
+---
+apiVersion: v1
+kind: Secret
+metadata: {name: studio-env, namespace: studio}
+stringData:
+  STUDIO_SECRET: local-dev-secret-change-me
+  STUDIO_ADMIN_EMAIL: admin@studio.local
+  STUDIO_ADMIN_PASSWORD: admin123
+  DATABASE_URL: postgresql://studio:studio@postgres:5432/studio
+  REDIS_URL: redis://redis:6379/0
+  STUDIO_DEMO_MODE: "1"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: postgres, namespace: studio}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: postgres}}
+  template:
+    metadata: {labels: {app: postgres}}
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - {name: POSTGRES_USER, value: studio}
+            - {name: POSTGRES_PASSWORD, value: studio}
+            - {name: POSTGRES_DB, value: studio}
+          ports: [{containerPort: 5432}]
+          readinessProbe:
+            exec: {command: ["pg_isready", "-U", "studio"]}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata: {name: postgres, namespace: studio}
+spec:
+  selector: {app: postgres}
+  ports: [{port: 5432, targetPort: 5432}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: redis, namespace: studio}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: redis}}
+  template:
+    metadata: {labels: {app: redis}}
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports: [{containerPort: 6379}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: redis, namespace: studio}
+spec:
+  selector: {app: redis}
+  ports: [{port: 6379, targetPort: 6379}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: studio, namespace: studio}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: studio}}
+  template:
+    metadata: {labels: {app: studio}}
+    spec:
+      containers:
+        - name: studio
+          image: studio:local          # built locally; see README (kind load / minikube image load)
+          imagePullPolicy: IfNotPresent
+          envFrom: [{secretRef: {name: studio-env}}]
+          env: [{name: PORT, value: "8000"}]
+          ports: [{containerPort: 8000}]
+          readinessProbe:
+            httpGet: {path: /api/health, port: 8000}
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /api/health, port: 8000}
+            initialDelaySeconds: 30
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata: {name: studio, namespace: studio}
+spec:
+  selector: {app: studio}
+  ports: [{port: 8000, targetPort: 8000}]

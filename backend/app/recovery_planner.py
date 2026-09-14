@@ -146,7 +146,8 @@ def _decision(reply):
     return result
 
 
-def _timeout():
+def timeout_seconds():
+    """One authoritative deadline for rollout creation and orchestration."""
     try:
         return max(30, min(900, int(os.getenv("STUDIO_AGL_RECOVERY_TIMEOUT_S", "300"))))
     except (TypeError, ValueError):
@@ -200,7 +201,7 @@ def diagnose(user, *, prompt, action, error, history=None, model=None, request_i
     try:
         schemas = lightning._schemas()
         create = schemas.RolloutCreate(rollout_id=rollout_id, input=payload, is_train=True,
-            config=schemas.RolloutConfig(timeout_seconds=_timeout(), local=schemas.RolloutLocalConfig(
+            config=schemas.RolloutConfig(timeout_seconds=timeout_seconds(), local=schemas.RolloutLocalConfig(
                 agent_class=AGENT_CLASS, env_map={"STUDIO_RECOVERY_TASK_JSON": "input"})),
             metadata={"mode": "pipeline_recovery", "studio_user_id": str(user["id"]),
                       "request_id": str(request_id or ""), "input_digest": fingerprint})
@@ -229,7 +230,7 @@ def diagnose(user, *, prompt, action, error, history=None, model=None, request_i
                 return dict(decision, rollout_id=rollout_id)
             if state not in ("queuing", "running"):
                 raise ValueError("Invalid rollout state")
-            if time.time() - float(status["created_at"]) >= _timeout():
+            if time.time() - float(status["created_at"]) >= timeout_seconds():
                 return _escalate("Agent Lightning recovery exceeded its time limit; no pipeline was retried.", rollout_id)
             return {"decision": "pending", "reason": "Agent Lightning is diagnosing the failed pipeline.", "rollout_id": rollout_id}
     except Exception:

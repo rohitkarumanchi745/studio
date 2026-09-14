@@ -2,10 +2,12 @@
 
 `scripts/train_online.py` is the **learning half** of Studio's BitNet loop. It
 polls Studio for reward-labeled rollouts, turns the good ones into tool-calling
-training samples, fine-tunes a small **LoRA adapter**, and publishes it back so
-serving hot-swaps to it. Then it does it again. Nothing here is imported by the
-API — it talks to Studio over HTTP, so it can run on a different machine, on
-your desk, with no cloud bill.
+training samples, and fine-tunes a small **LoRA adapter**. Directory-based LoRA
+serving can publish that PEFT output after the regression gate below. The strict `bitnet.cpp` runtime
+serves GGUF, so conversion, evaluation, digest publication, and rollout are a
+separate release gate. Nothing here is imported by the API — it talks to Studio
+over HTTP, so it can run on a different machine, on your desk, with no cloud
+bill.
 
 This guide is for running it on a **Windows + NVIDIA laptop**. It assumes you
 have not read the script.
@@ -108,7 +110,7 @@ python scripts\train_online.py --dry-run
 ```
 
 `--dry-run` uses **no ML dependencies at all** — pure stdlib. It pulls rollouts,
-formats samples, writes `last_samples.jsonl`, and stops. If that prints a sample
+formats samples, writes mode-0600 `last_samples.jsonl`, and stops. If that prints a sample
 count, the plumbing (auth, poll, source conditioning, cursor) is correct and any
 later failure is a machine-learning problem, not a wiring problem.
 
@@ -117,6 +119,65 @@ Then one real round:
 ```powershell
 python scripts\train_online.py --once
 ```
+
+Direct, directory-based PEFT publication is fail-closed behind an independent
+regression evaluator. Configure it before a non-strict real round:
+
+```powershell
+$env:STUDIO_TRAIN_EVALUATOR_COMMAND = '["python","C:\\studio\\eval_candidate.py"]'
+$env:STUDIO_TRAIN_EVAL_SUITE_SHA256 = "<sha256 of the fixed evaluation suite>"
+python scripts\train_online.py --once
+```
+
+The command is a JSON **argv array**, never a shell command. The trainer appends
+`--request <private-json> --report <json>`. The request binds the absolute PEFT
+directory, a deterministic digest of every path and byte in it, the exact base
+model, a random request ID, and the pinned suite digest. The evaluator must run
+that same fixed suite against the unadapted base and the candidate and write:
+
+```json
+{
+  "protocol": "studio.bitnet.promotion-eval.v1",
+  "request_id": "<copied from request>",
+  "artifact_sha256": "<copied from request>",
+  "base_model": "<copied from request>",
+  "suite_sha256": "<copied from request>",
+  "baseline":  {"cases": 100, "passed": 90, "unsafe": 0},
+  "candidate": {"cases": 100, "passed": 91, "unsafe": 0}
+}
+```
+
+Publication is refused if the process fails/times out, the report or identities
+are malformed, the two runs are not paired on the same number of cases, the
+candidate changes during evaluation, or a threshold fails. Defaults require at
+least 50 cases, no task-pass regression, and zero unsafe actions. Controlled
+exceptions are explicit and recorded in adapter metrics:
+`STUDIO_TRAIN_EVAL_MIN_CASES`, `STUDIO_TRAIN_EVAL_MAX_PASS_RATE_DROP`,
+`STUDIO_TRAIN_EVAL_MAX_UNSAFE_RATE`,
+`STUDIO_TRAIN_EVAL_MAX_UNSAFE_RATE_INCREASE`, and
+`STUDIO_TRAIN_EVAL_TIMEOUT_SECONDS`. A refusal leaves the rollout checkpoint
+pending and never calls the adapter registry. `--defer-publish` deliberately
+skips this PEFT gate because strict GGUF conversion and evaluation remain the
+separate manual release process below.
+
+When Studio reports `requires_tool_adapter_sha256: true`, use
+`--once --defer-publish`. The trainer writes PEFT output and retains the exact
+cursor batch. Convert and evaluate that artifact, upload the final GGUF, and
+publish its stable URI plus SHA-256 through Studio's admin adapter API. After
+the deployed registry shows that exact release, consume the retained batch
+without risking a cursor reset:
+
+```powershell
+python scripts\train_online.py --ack-published-release `
+  --release-uri "https://models.example/tool_call-v8.gguf" `
+  --release-version 8 `
+  --release-sha256 "<64 hex characters>"
+```
+
+The acknowledgement clears pending rows only when URI, version, and digest all
+match Studio's active `tool_call` adapter. A mismatch leaves the checkpoint
+unchanged. Deploy/restart strict serving with the same three values and run its
+completion smoke before sending recovery work to it.
 
 and finally the loop (`python scripts\train_online.py`, no flags) which polls
 every `STUDIO_TRAIN_POLL_SECONDS` (default 60) forever.
@@ -138,17 +199,15 @@ only **six distinct SQL shapes**).
 
 ## 5. Where the adapter goes — and the URI gotcha
 
-The trainer writes `C:\studio\adapters\tool_call-<timestamp>\` and then
-**publishes a URI** to Studio's adapter registry. What that URI has to be
-depends on which serving path you are on, and the two are different:
+The trainer writes `C:\studio\adapters\tool_call-<timestamp>\`. Whether it can
+publish that directory directly depends on the serving path:
 
-- **The CPU / `bitnet.cpp` path** (`serving/run_local.py`, and what this repo's
-  self-hosting guide describes) — the URI is an **identity, not a path anything
-  opens**. `llama-server` mounts `<dir>/adapters/tool_call.gguf` at startup, and
-  the gateway only ever *compares* the requested URI against the `.uri` sidecar
-  sitting beside that file. So the URI never has to resolve on the serving box —
-  but it must match the sidecar **byte for byte**, or the gateway refuses to
-  claim the adapter and serves the base model. See `serving/SELFHOST.md` §7.2.
+- **The strict `bitnet.cpp` path** (`serving/run_local.py` and the portable
+  BitNet overlay) — the PEFT directory is not the served artifact. Convert and
+  evaluate it as GGUF, publish a stable artifact URI/version/SHA-256, and deploy
+  that exact identity. The supervisor downloads and rehashes the bytes;
+  readiness also confirms llama-server applied the mounted path at scale 1.
+  A mismatch fails closed instead of serving the base model as if trained.
 - **The GPU / vLLM path** — the URI *is* opened: `gateway.py` posts it to vLLM
   as `{"lora_name", "lora_path"}` and vLLM loads that directory itself. There it
   has to be a path valid **on the serving process's filesystem**.
@@ -176,6 +235,32 @@ Optionally set `STUDIO_SERVE_URL` to the serving gateway so a fresh adapter is
 loaded immediately rather than at the next natural cache miss. If the serving
 box is down, the push is logged and ignored — it never breaks training.
 
+Low-traffic polls are accumulated in
+`<STUDIO_TRAIN_OUTPUT_DIR>/.train_cursor.json` as one atomic, mode-0600
+cursor-plus-pending checkpoint. Defaults cap it at 10,000 rows or 64 MiB
+(`STUDIO_TRAIN_MAX_PENDING_ROLLOUTS`, `STUDIO_TRAIN_MAX_PENDING_BYTES`). An
+overflow or corrupt checkpoint fails closed; no row is silently evicted and
+the cursor does not advance.
+
+Every accepted revision is also merged by trace ID into the private cumulative
+`<STUDIO_TRAIN_OUTPUT_DIR>/.training_replay.json` corpus (mode 0600, atomic;
+defaults: 50,000 rows/256 MiB). A later thumbs-up/down revision replaces the
+older reward for that trace, and every released round retrains on the cumulative
+curated corpus instead of forgetting earlier successes. Hitting a bound fails
+closed; curate/archive deliberately rather than silently evicting training data.
+
+This is a global adapter within one Studio deployment. By default, rows with
+conversation history or free-form SQL string literals are excluded, skills are
+fetched for the rollout's own role, and SFT masks every prompt/system token so
+loss applies only to the assistant action. Masking affects optimization, not
+retention: the current prompt and schema context still exist in the private
+replay and `last_samples.jsonl`/`last_pairs.jsonl` artifacts (all mode 0600), and
+may contain sensitive text. Enable
+`STUDIO_TRAIN_INCLUDE_HISTORY=1` or
+`STUDIO_TRAIN_ALLOW_SQL_LITERALS=1` only for a trusted single-organization
+deployment with an explicit retention/privacy review. The execution-time query
+guard remains authoritative regardless of model output.
+
 ---
 
 ## 6. VRAM, by card
@@ -189,7 +274,7 @@ Defaults are sized for an **8 GB** card: `max_length=1024`, batch 1, grad-accum
 | **12 GB+** | Defaults work. Go faster: `STUDIO_TRAIN_BATCH_SIZE=2` and `STUDIO_TRAIN_GRAD_ACCUM=4` (same effective batch, fewer, bigger passes). |
 | **8 GB** (RTX 4060 / 3070 laptop) | Defaults. Keep gradient checkpointing on — it is what makes it fit. Close anything else using the GPU. |
 | **6 GB** (RTX 3050 / 2060 laptop) | Tight but usually workable: keep batch 1 + checkpointing (it costs time — ~45% measured on MPS — but it is the memory you need), close other GPU users first (`nvidia-smi` shows who holds VRAM; the Windows desktop itself takes ~0.5–1 GB). If it still OOMs, `STUDIO_TRAIN_MAX_LENGTH=768`, then `512`. |
-| **4 GB or less** | The 4.8 GB of weights do not fit. `STUDIO_TRAIN_DEVICE=cpu` (overnight, but it completes and publishes a real adapter), or a smaller `STUDIO_TRAIN_BASE_MODEL`. |
+| **4 GB or less** | The 4.8 GB of weights do not fit. `STUDIO_TRAIN_DEVICE=cpu` (overnight, but it completes a real candidate for evaluation), or a smaller `STUDIO_TRAIN_BASE_MODEL`. |
 
 Two things worth being precise about, because the internet is sloppy about both:
 
@@ -199,10 +284,11 @@ Two things worth being precise about, because the internet is sloppy about both:
   automatically via `torch.cuda.is_bf16_supported()`. The dtype that *is* a
   memory decision is **fp32**: 9.6 GB instead of 4.8 GB. fp32 is the default on
   plain CPU only.
-- **Shortening `max_length` truncates the END of a sample, which is the label.**
-  Samples run ~770 tokens at the median, and the assistant tool call is the last
-  thing in them. Cutting to 512 trains on some prefixes with no answer attached.
-  Try checkpointing, batch size, and closing other GPU users before this one.
+- **Shortening `max_length` now preserves the entire assistant label.** SFT
+  reserves completion tokens first and removes prompt context from the middle,
+  retaining the source/system head and current-user tail. A label that cannot
+  fit is rejected rather than silently truncated. Less context can still hurt
+  quality, so try checkpointing, batch size, and closing other GPU users first.
 
 Every knob: `STUDIO_TRAIN_DTYPE`, `STUDIO_TRAIN_DEVICE`, `STUDIO_TRAIN_MAX_LENGTH`,
 `STUDIO_TRAIN_MAX_PROMPT_LENGTH` (DPO), `STUDIO_TRAIN_BATCH_SIZE`,
@@ -279,6 +365,7 @@ filled in for a card nobody here has.
 ...
 [trainer] peak CUDA memory this round: 6.41 GB (max_length=1024, batch=1, grad_checkpoint=True)
 [trainer] adapter written to C:\studio\adapters\tool_call-1723890000
+[trainer] promotion evaluation passed: candidate pass=0.9100 baseline=0.9000 unsafe=0.0000 cases=100 suite=<pinned sha256>
 [trainer] published global/tool_call v3 <- /mnt/c/studio/adapters/tool_call-1723890000  metrics={...}
 ```
 
@@ -297,6 +384,9 @@ longer exist, which must not be trained on.
 | A silent pause of many minutes on the **first** run | The 4.83 GB weights download | The trainer announces it first: size, destination, free space. Re-runs are cached; `HF_HUB_OFFLINE=1` guarantees no network. Move the cache to a bigger drive with `HF_HOME=D:\hf-cache`. Ctrl-C is safe — it resumes. |
 | The progress bar sits still for a minute | grad-accum 8: one tick = 8 passes | Not a hang. §7. `STUDIO_TRAIN_GRAD_ACCUM=4` makes it tick twice as often (and halves the effective batch). |
 | `not enough new experience` / 0 samples | No rollouts yet | §4, `bootstrap_rollouts.py` |
+| Strict Studio refuses a normal training round | The trainer produced PEFT, while serving requires an attested GGUF | Run `--once --defer-publish`, complete the release gate, then use `--ack-published-release` with the exact active identity. |
+| `promotion evaluation refused` | The independent evaluator is absent, failed, changed identities/weights, or crossed a regression threshold | Configure the JSON argv and pinned suite digest above; inspect the reason. The candidate is not published and its rollout checkpoint remains pending. |
+| Pending buffer limit reached | Unpairable/unused rows accumulated faster than releases | Inspect and archive the private checkpoint, correct the objective/source issue, or deliberately raise a bounded limit; do not delete it and reset the cursor. |
 | DPO mines **0 pairs** from a bootstrap corpus | Every bootstrap rollout carries the same reward, and a preference pair needs two outcomes for one prompt with a reward *gap* | Expected. Bootstrap gets you an SFT adapter; DPO waits for real traffic. |
 | `quantization method do not support training` | `STUDIO_TRAIN_BASE_MODEL` points at the packed 1-bit repo | Use the `-bf16` repo. §2 |
 | Serving never picks the adapter up | The published URI is not the path the server opens | §5. The serving gateway deliberately refuses to claim an adapter it cannot prove is mounted, so this fails loudly rather than silently serving the base model. |

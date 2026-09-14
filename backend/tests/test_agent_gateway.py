@@ -309,12 +309,24 @@ def test_viewer_run_sql_tool_on_customers_is_rejected(monkeypatch):
     outputs = {}
 
     def fake_graph(llm, tools, system, spec, volatile=None):
-        run_sql = next(t for t in tools if getattr(t, "__name__", "") == "run_sql")
+        run_sql = next(t for t in tools if (
+            getattr(t, "__name__", "") or getattr(t, "name", "")
+        ) == "run_sql")
+
+        def call_sql(sql):
+            # langchain-core wraps @tool functions as StructuredTool; the
+            # dependency-free fallback used by this test leaves them callable.
+            # Exercise the same underlying tool on either supported shape.
+            if hasattr(run_sql, "invoke"):
+                return run_sql.invoke({"sql": sql})
+            return run_sql(sql)
 
         class G:
             def invoke(self, state, config=None):
-                outputs["pii"] = run_sql("SELECT name FROM customers")
-                outputs["ok"] = run_sql("SELECT region, SUM(revenue) AS revenue FROM sales GROUP BY 1")
+                outputs["pii"] = call_sql("SELECT name FROM customers")
+                outputs["ok"] = call_sql(
+                    "SELECT region, SUM(revenue) AS revenue FROM sales GROUP BY 1"
+                )
                 return {"messages": [_Msg("done")]}
         return G()
 

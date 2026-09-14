@@ -1,0 +1,151 @@
+# Default-deny inbound traffic to Studio-owned application pods. Egress stays
+# open because databases, SMTP and model providers are operator-selected and
+# may be inside the cluster, in a VPC, or on the public Internet.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: studio-default-deny-ingress
+  labels:
+    app.kubernetes.io/part-of: studio
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: studio
+  policyTypes:
+    - Ingress
+---
+# This is the only workload accepting arbitrary inbound application traffic.
+# The Service is still ClusterIP; ingress.example.yaml is the opt-in public edge.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: studio-web-ingress
+  labels:
+    app.kubernetes.io/part-of: studio
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: studio
+      app.kubernetes.io/component: web
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 8000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: lightning-server-ingress
+  labels:
+    app.kubernetes.io/part-of: studio
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: agent-lightning
+      app.kubernetes.io/component: server
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: studio
+              app.kubernetes.io/component: worker
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: agent-lightning
+              app.kubernetes.io/component: controller
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: lightning-controller-ingress
+  labels:
+    app.kubernetes.io/part-of: studio
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: agent-lightning
+      app.kubernetes.io/component: controller
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: studio
+              app.kubernetes.io/component: worker
+      ports:
+        - protocol: TCP
+          port: 8082
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: recovery-model-ingress
+  labels:
+    app.kubernetes.io/part-of: studio
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: recovery-model
+      app.kubernetes.io/component: model-bridge
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: agent-lightning
+              app.kubernetes.io/component: server
+        # The controller init container proves one bounded model completion
+        # before LocalReconciler is allowed to start.
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: agent-lightning
+              app.kubernetes.io/component: controller
+      ports:
+        - protocol: TCP
+          port: 8081
+---
+# The official chart labels every Airflow Pod with tier=airflow and the Helm
+# release. Keep the release name `airflow` (as README.md requires) so this
+# policy selects API, scheduler/LocalExecutor, DAG processor and chart jobs.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: airflow-private-ingress
+  labels:
+    app.kubernetes.io/part-of: studio
+spec:
+  podSelector:
+    matchLabels:
+      tier: airflow
+      release: airflow
+  policyTypes:
+    - Ingress
+  ingress:
+    # Airflow components may use their private API and task-log listeners.
+    - from:
+        - podSelector:
+            matchLabels:
+              tier: airflow
+              release: airflow
+    # Studio is the only non-Airflow client. It may reach only the v2 API.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: studio
+              app.kubernetes.io/component: web
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: studio
+              app.kubernetes.io/component: worker
+      ports:
+        - protocol: TCP
+          port: 8080

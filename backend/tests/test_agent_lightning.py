@@ -207,9 +207,57 @@ def test_unconfigured_health_is_unchanged(env, client):
 
 def test_sweep_does_nothing_when_unconfigured(env, client):
     tid = ask(client)["trace_id"]
-    env.db.set_trace_reward(tid, 1.0, source="user")
+    env.db.set_trace_reward(
+        tid, 1.0, user_id=trace_row(env, tid)["user_id"], source="user")
     assert env.lightning.sweep_reward_updates() == 0
     assert agl_jobs(env) == []
+
+
+def test_feedback_cannot_mutate_another_users_trace_or_shared_cache(env, client):
+    from app import qcache
+
+    with env.db.connect() as connection:
+        owner = dict(connection.execute(
+            "SELECT id,email,role FROM users WHERE email='admin@studio.local'"
+        ).fetchone())
+    cache_id = qcache.store(
+        owner, "demo", "sales", "private owner prompt", AGENT_ANSWER, reward=0.75)
+    trace_id = env.db.add_trace(
+        owner, prompt="private owner prompt", mode="agent", source="demo",
+        table="sales", sql=AGENT_ANSWER["sql"], reward=0.75,
+        reward_source="heuristic", meta={"qcache_id": cache_id})
+
+    with env.db.connect() as connection:
+        trace_before = tuple(connection.execute(
+            "SELECT reward,reward_source,meta,updated_at,training_revision "
+            "FROM agent_traces WHERE id=?", (trace_id,)).fetchone())
+        cache_before = tuple(connection.execute(
+            "SELECT seen,avg_reward,updated_at FROM query_cache WHERE id=?",
+            (cache_id,)).fetchone())
+
+    response = client.post(
+        "/api/feedback", json={"trace_id": trace_id, "score": -1,
+                               "note": "poison another user's training"})
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Unknown trace"
+
+    with env.db.connect() as connection:
+        trace_after = tuple(connection.execute(
+            "SELECT reward,reward_source,meta,updated_at,training_revision "
+            "FROM agent_traces WHERE id=?", (trace_id,)).fetchone())
+        cache_after = tuple(connection.execute(
+            "SELECT seen,avg_reward,updated_at FROM query_cache WHERE id=?",
+            (cache_id,)).fetchone())
+    assert trace_after == trace_before
+    assert cache_after == cache_before
+
+
+@pytest.mark.parametrize("score", [-2, 0, 2, 999])
+def test_feedback_accepts_only_literal_thumb_scores(env, client, score):
+    trace_id = ask(client)["trace_id"]
+    assert client.post(
+        "/api/feedback", json={"trace_id": trace_id, "score": score}
+    ).status_code == 422
 
 
 # ── 2. Configured: the turn only enqueues ────────────────────────────────
@@ -259,6 +307,27 @@ def test_a_failing_delivery_retries_on_the_queue_then_gives_up(env, client, monk
         c.commit()
     assert env.jobs.run_one("w", kinds=["agl_emit"]) is True
     assert agl_jobs(env)[0]["status"] == "failed"
+
+
+def test_reconciler_revives_exhausted_initial_emit_without_delivery_row(
+        env, client, monkeypatch):
+    monkeypatch.setenv("STUDIO_AGL_URL", f"http://127.0.0.1:{closed_port()}")
+    monkeypatch.setenv("STUDIO_AGL_PENDING_STALE_S", "30")
+    trace_id = ask(client)["trace_id"]
+    original = agl_jobs(env)[0]
+    with env.db.connect() as connection:
+        connection.execute(
+            "UPDATE background_jobs SET status='failed',attempts=max_attempts,"
+            "finished_at=?,error=? WHERE id=?",
+            (time.time() - 31, "Agent Lightning unavailable", original["id"]))
+        connection.commit()
+
+    assert env.lightning.delivery(trace_id) is None
+    assert env.lightning.sweep_reward_updates() == 1
+    jobs_after = agl_jobs(env)
+    assert len(jobs_after) == 1 and jobs_after[0]["id"] == original["id"]
+    assert jobs_after[0]["status"] == "queued" and jobs_after[0]["attempts"] == 0
+    assert jobs_after[0]["finished_at"] is None and jobs_after[0]["error"] is None
 
 
 def test_emit_skips_a_trace_that_no_longer_exists(env, client, monkeypatch):

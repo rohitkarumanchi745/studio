@@ -60,6 +60,9 @@ class _StubEngine(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/v1/models"):
             return self._json(200, {"data": [{"id": "bitnet"}]})
+        if self.path.rstrip("/") == "/lora-adapters":
+            self.server.get_calls.append(self.path)
+            return self._json(200, self.server.adapter_rows)
         self._json(404, {})
 
     def do_POST(self):
@@ -69,6 +72,14 @@ class _StubEngine(BaseHTTPRequestHandler):
         if self.path.rstrip("/") == "/lora-adapters":
             return self._json(200, {"ok": True})
         if self.path.startswith("/v1/chat/completions"):
+            if json.loads(body or b"{}").get("stream"):
+                payload = b"data: " + b"x" * 2048 + b"\n\n"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
             return self._json(200, {"id": "x", "choices": [
                 {"index": 0, "message": {"role": "assistant", "content": "hi"},
                  "finish_reason": "stop"}]})
@@ -82,6 +93,9 @@ def engine():
     port = _free_port()
     srv = HTTPServer(("127.0.0.1", port), _StubEngine)
     srv.calls = []
+    srv.get_calls = []
+    srv.adapter_rows = [{"id": 0, "path": "/data/adapters/tool_call.gguf",
+                         "scale": 1.0}]
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
     srv.port = port
@@ -202,18 +216,30 @@ def test_health_needs_no_credential(gateway):
 
 # ── 2. The gateway cannot claim an adapter it has not got ───────────────
 
-def _chat(port, adapters):
-    body = json.dumps({"model": "bitnet", "messages": [{"role": "user", "content": "hi"}],
-                       "studio_adapters": adapters}).encode()
+def _chat(port, adapters, extra=None):
+    payload = {"model": "bitnet", "messages": [{"role": "user", "content": "hi"}],
+               "studio_adapters": adapters, **(extra or {})}
+    body = json.dumps(payload).encode()
     req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions",
                                  data=body, method="POST",
                                  headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=10) as r:
-        return r.status, json.loads(r.read())
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
 
 
 MOUNTED = {"path": "/data/adapters/tool_call.gguf", "uri": "/adapters/tool_call/v7",
            "size": 10, "mtime_ns": 1}
+STRICT_SHA = "a" * 64
+STRICT_MOUNTED = {**MOUNTED, "version": 7, "sha256": STRICT_SHA}
+STRICT_ENV = {
+    "STUDIO_GATEWAY_REQUIRE_TOOL_ADAPTER": "1",
+    "STUDIO_GATEWAY_TOOL_ADAPTER_URI": MOUNTED["uri"],
+    "STUDIO_GATEWAY_TOOL_ADAPTER_VERSION": "7",
+    "STUDIO_GATEWAY_TOOL_ADAPTER_SHA256": STRICT_SHA,
+}
 
 
 def test_a_matching_adapter_is_scaled_and_served(gateway, engine):
@@ -269,6 +295,110 @@ def test_a_plain_request_still_works(gateway, engine):
     sent = [c for c in engine.calls if c[0].startswith("/v1/chat/completions")]
     assert sent and "studio_adapters" not in sent[0][1], \
         "the private field must be stripped before the engine sees it"
+
+
+def test_strict_health_applies_and_confirms_exact_adapter(gateway, engine):
+    port, _ = gateway(state={"stage": "ready", "adapter": STRICT_MOUNTED,
+                             "engine_epoch": 1}, extra=STRICT_ENV)
+    status, body = _health(port)
+    assert status == 200
+    assert body["applied_adapter"] == {
+        "uri": MOUNTED["uri"], "version": 7, "sha256": STRICT_SHA,
+    }
+    assert ("/lora-adapters", [{"id": 0, "scale": 1.0}]) in engine.calls
+    assert "/lora-adapters" in engine.get_calls
+
+    status, _ = _chat(port, {"tool_call": {
+        "uri": MOUNTED["uri"], "version": 7, "sha256": STRICT_SHA,
+    }}, extra={"lora": [{"id": 0, "scale": 0.0}]})
+    assert status == 200
+    completion = [body for path, body in engine.calls
+                  if path.startswith("/v1/chat/completions")][-1]
+    assert "lora" not in completion
+
+
+def test_strict_health_rejects_uri_match_with_wrong_digest(gateway, engine):
+    wrong = {**STRICT_MOUNTED, "sha256": "b" * 64}
+    port, _ = gateway(state={"stage": "ready", "adapter": wrong}, extra=STRICT_ENV)
+    status, body = _health(port)
+    assert status == 503
+    assert body["stage"] == "adapter_identity_mismatch"
+    assert not [call for call in engine.calls
+                if call == ("/lora-adapters", [{"id": 0, "scale": 1.0}])]
+
+
+def test_strict_health_rejects_unconfirmed_scale(gateway, engine):
+    engine.adapter_rows = [{"id": 0, "path": MOUNTED["path"], "scale": 0.0}]
+    port, _ = gateway(state={"stage": "ready", "adapter": STRICT_MOUNTED},
+                      extra=STRICT_ENV)
+    status, body = _health(port)
+    assert status == 503
+    assert body["stage"] == "adapter_not_applied"
+
+
+def test_strict_chat_never_falls_back_to_base(gateway, engine):
+    port, _ = gateway(state={"stage": "ready", "adapter": STRICT_MOUNTED},
+                      extra=STRICT_ENV)
+    status, _ = _chat(port, {"tool_call": {
+        "uri": MOUNTED["uri"], "version": 7, "sha256": "b" * 64,
+    }})
+    assert status == 503
+    assert not [call for call in engine.calls if call[0].startswith("/v1/chat/completions")]
+
+
+def test_strict_sha_attestation_refuses_vllm_backend(gateway):
+    port, _ = gateway(state={"stage": "ready", "adapter": STRICT_MOUNTED},
+                      extra={**STRICT_ENV, "STUDIO_BACKEND_KIND": "vllm"})
+    status, body = _health(port)
+    assert status == 503
+    assert body["stage"] == "adapter_attestation_unsupported"
+
+
+def test_gateway_rejects_oversized_request_before_proxying(gateway, engine):
+    port, _ = gateway(state={"stage": "ready", "adapter": None},
+                      extra={"STUDIO_GATEWAY_MAX_REQUEST_BYTES": "1024"})
+    raw = b"x" * 1025
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/v1/chat/completions", data=raw, method="POST",
+        headers={"Content-Type": "application/json"})
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(request, timeout=10)
+    assert exc.value.code == 413
+    assert not [call for call in engine.calls if call[0].startswith("/v1/chat/completions")]
+
+
+def test_gateway_rejects_chunked_request_bodies_before_proxying(gateway, engine):
+    port, _ = gateway(state={"stage": "ready", "adapter": None})
+    request = (
+        b"POST /v1/chat/completions HTTP/1.1\r\n"
+        b"Host: 127.0.0.1\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"Connection: close\r\n\r\n"
+        b"2\r\n{}\r\n0\r\n\r\n"
+    )
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as connection:
+        connection.sendall(request)
+        response = b""
+        while True:
+            chunk = connection.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+    assert response.startswith(b"HTTP/1.1 400")
+    assert not [call for call in engine.calls if call[0].startswith("/v1/chat/completions")]
+
+
+def test_gateway_bounds_streamed_backend_responses(gateway, engine):
+    port, _ = gateway(state={"stage": "ready", "adapter": None},
+                      extra={"STUDIO_GATEWAY_MAX_RESPONSE_BYTES": "1024"})
+    body = json.dumps({"model": "bitnet", "messages": [{"role": "user", "content": "hi"}],
+                       "stream": True}).encode()
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/v1/chat/completions", data=body, method="POST",
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=10) as response:
+        assert len(response.read()) <= 1024
 
 
 # ── 3. The enabled-adapter cache must not outlive the engine ────────────

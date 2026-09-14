@@ -27,7 +27,9 @@ Run from the backend directory:
     python -m pytest tests/test_train_online.py -q
 """
 import importlib.util
+import json
 import os
+import stat
 import sys
 
 import pytest
@@ -424,3 +426,407 @@ def test_announce_never_breaks_a_round(monkeypatch, capsys):
 def test_a_local_directory_base_model_is_not_a_download(tmp_path, capsys):
     T.announce_model_fetch(str(tmp_path))
     assert "no download" in capsys.readouterr().out
+
+
+# ── low-traffic rounds accumulate without dropping the cursor window ─────
+
+def _rollout(rid, created_at, sql, *, reward=1.0, prompt="show sales"):
+    return {"id": rid, "created_at": float(created_at), "prompt": prompt,
+            "reward": reward, "mode": "agent", "source": "demo", "role": "admin",
+            "history": [],
+            "action": {"sql": sql, "chart_type": None}}
+
+
+def _trainer_stubs(module, monkeypatch):
+    monkeypatch.setattr(module, "get_status", lambda token: {})
+    monkeypatch.setattr(module, "fetch_skills", lambda token, roles=None: {
+        "demo": {"context": "demo schema", "allowed": {"sales"}, "dialect": "sqlite"}})
+    monkeypatch.setattr(module, "push_to_serving", lambda *args, **kwargs: None)
+    # Ordinary run_once tests exercise the rollout transaction, not an external
+    # benchmark process. Promotion-gate behavior has its own real-subprocess
+    # tests below; keep these candidates bound to one stable fake digest.
+    monkeypatch.setattr(module, "_promotion_evaluator_config", lambda: {"test": True})
+    monkeypatch.setattr(module, "evaluate_candidate", lambda *args, **kwargs: {
+        "artifact_sha256": "a" * 64, "suite_sha256": "b" * 64,
+        "baseline": {"pass_rate": 1.0},
+        "candidate": {"pass_rate": 1.0, "unsafe_rate": 0.0, "cases": 100}})
+    monkeypatch.setattr(module, "_adapter_tree_sha256", lambda path: "a" * 64)
+
+
+def test_sft_subthreshold_polls_accumulate_across_restart(tmp_path, monkeypatch):
+    env = {"STUDIO_TRAIN_OUTPUT_DIR": str(tmp_path), "STUDIO_TRAIN_MIN_NEW": "2",
+           "STUDIO_TRAIN_MODE": "sft"}
+    first = _load(env)
+    _trainer_stubs(first, monkeypatch)
+    monkeypatch.setattr(first, "pull_rollouts", lambda token, since: {
+        "rollouts": [_rollout("r1", 1, "SELECT * FROM sales")], "cursor": 1.0})
+    monkeypatch.setattr(first, "train_lora", lambda *args: pytest.fail("one sample must remain pending"))
+
+    result = first.run_once("token")
+    assert result["trained"] is False and result["pending"] == 1
+    assert first.load_training_state()[0] == 1.0
+
+    # A fresh module models a process restart; only the checkpoint bridges it.
+    second = _load(env)
+    _trainer_stubs(second, monkeypatch)
+    seen_since = []
+    monkeypatch.setattr(second, "pull_rollouts", lambda token, since: (
+        seen_since.append(since) or {
+            "rollouts": [_rollout("r2", 2, "SELECT SUM(revenue) FROM sales")],
+            "cursor": 2.0}))
+    trained = []
+    monkeypatch.setattr(second, "train_lora", lambda samples, *args: (
+        trained.extend(samples) or str(tmp_path / "tool_call-test"), {"loss": 0.1}))
+    monkeypatch.setattr(second, "publish_adapter", lambda *args, **kwargs: {"version": 1})
+
+    result = second.run_once("token")
+    assert seen_since == [1.0]
+    assert result["trained"] is True
+    assert len(trained) == 2
+    assert second.load_training_state() == (2.0, [])
+
+
+def test_published_rounds_retrain_on_cumulative_replay_not_only_new_batch(tmp_path, monkeypatch):
+    env = {"STUDIO_TRAIN_OUTPUT_DIR": str(tmp_path), "STUDIO_TRAIN_MIN_NEW": "1",
+           "STUDIO_TRAIN_MODE": "sft"}
+    first = _load(env)
+    _trainer_stubs(first, monkeypatch)
+    monkeypatch.setattr(first, "pull_rollouts", lambda token, since: {
+        "rollouts": [_rollout("r1", 1, "SELECT * FROM sales")], "cursor": 1.0})
+    monkeypatch.setattr(first, "train_lora", lambda samples, *args: (
+        str(tmp_path / "tool_call-1"), {"loss": 0.2}))
+    monkeypatch.setattr(first, "publish_adapter", lambda *args, **kwargs: {"version": 1})
+    assert first.run_once("token")["trained"] is True
+    assert [row["id"] for row in first.load_replay_corpus()] == ["r1"]
+
+    second = _load(env)
+    _trainer_stubs(second, monkeypatch)
+    monkeypatch.setattr(second, "pull_rollouts", lambda token, since: {
+        "rollouts": [_rollout("r2", 2, "SELECT SUM(revenue) FROM sales")],
+        "cursor": 2.0})
+    trained = []
+    monkeypatch.setattr(second, "train_lora", lambda samples, *args: (
+        trained.extend(samples) or str(tmp_path / "tool_call-2"), {"loss": 0.1}))
+    monkeypatch.setattr(second, "publish_adapter", lambda *args, **kwargs: {"version": 2})
+
+    result = second.run_once("token")
+    assert result["trained"] is True
+    assert [sample["id"] for sample in trained] == ["r1", "r2"]
+    assert result["metrics"]["replay_rollouts"] == 2
+    assert stat.S_IMODE(os.stat(second.REPLAY_FILE).st_mode) == 0o600
+
+
+def test_replay_replaces_late_feedback_revision_by_trace_id(tmp_path):
+    module = _load({"STUDIO_TRAIN_OUTPUT_DIR": str(tmp_path)})
+    old = _rollout("r1", 1, "SELECT * FROM sales", reward=0.75)
+    revised = _rollout("r1", 1, "SELECT * FROM sales", reward=0.0)
+    revised["revision"] = 9
+    assert module.merge_replay([old], [revised]) == [revised]
+
+
+def test_completion_only_features_keep_the_entire_label_when_context_is_long():
+    class Tokenizer:
+        eos_token = "!"
+
+        def apply_chat_template(self, messages, **kwargs):
+            return "SYSTEM " + ("private context " * 20) + " USER question ASSISTANT "
+
+        def __call__(self, text, **kwargs):
+            return {"input_ids": [ord(char) for char in text]}
+
+    completion = '{"tool":"run_sql","sql":"SELECT 1"}'
+    feature = T._completion_features(
+        Tokenizer(), {"system": "schema", "history": [], "prompt": "question",
+                      "completion": completion}, max_length=64)
+    target = [ord(char) for char in completion + "!"]
+    assert len(feature["input_ids"]) == 64
+    assert feature["input_ids"][-len(target):] == target
+    assert feature["labels"][-len(target):] == target
+    assert all(value == -100 for value in feature["labels"][:-len(target)])
+
+
+def test_prompt_bearing_jsonl_artifacts_are_private_and_replace_atomically(tmp_path):
+    path = tmp_path / "last_samples.jsonl"
+    path.write_text("old")
+    path.chmod(0o644)
+    assert T.write_samples_jsonl(
+        [{"prompt": "secret@example.com", "completion": "safe"}], str(path)
+    ) == str(path)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert json.loads(path.read_text().strip())["prompt"] == "secret@example.com"
+    assert not list(tmp_path.glob(".last_samples.jsonl-*.tmp"))
+
+
+def test_global_samples_fail_closed_on_history_literals_and_missing_role():
+    skills = {("demo", "admin"): {
+        "context": "admin-visible demo schema", "allowed": {"sales"},
+        "dialect": "sqlite"}}
+    history = _rollout("history", 1, "SELECT * FROM sales")
+    history["history"] = [{"role": "user", "text": "private prior turn"}]
+    literal = _rollout("literal", 2, "SELECT * FROM sales WHERE region = 'customer-west'")
+    no_role = _rollout("no-role", 3, "SELECT * FROM sales")
+    no_role.pop("role")
+    structural_date = _rollout(
+        "date", 4, "SELECT * FROM sales WHERE order_date >= '2026-09-01'")
+
+    samples, dropped = T.to_samples(
+        [history, literal, no_role, structural_date], skills)
+
+    assert [sample["id"] for sample in samples] == ["date"]
+    assert dropped["private_history"] == 1
+    assert dropped["private_literal"] == 1
+    assert dropped["no_role"] == 1
+
+
+def test_skill_fetch_is_conditioned_per_rollout_role(monkeypatch):
+    calls = []
+
+    def request(method, path, token=None, body=None):
+        calls.append(path)
+        role = path.rsplit("=", 1)[-1]
+        return {"role": role, "skills": [{
+            "source": "demo", "dialect": "sqlite", "tables": [role + "_table"],
+            "skill": role + " context"}]}
+
+    monkeypatch.setattr(T, "_req", request)
+    skills = T.fetch_skills("token", {"viewer", "analyst"})
+    assert calls == ["/api/skills?role=analyst", "/api/skills?role=viewer"]
+    assert skills[("demo", "viewer")]["allowed"] == {"viewer_table"}
+    assert "analyst context" in skills[("demo", "analyst")]["context"]
+
+
+def test_dpo_pair_can_arrive_in_separate_polls_and_survive_restart(tmp_path, monkeypatch):
+    env = {"STUDIO_TRAIN_OUTPUT_DIR": str(tmp_path), "STUDIO_TRAIN_MODE": "dpo",
+           "STUDIO_TRAIN_MIN_PAIRS": "1", "STUDIO_TRAIN_PAIR_MARGIN": "0.15"}
+    first = _load(env)
+    _trainer_stubs(first, monkeypatch)
+    monkeypatch.setattr(first, "pull_rollouts", lambda token, since: {
+        "rollouts": [_rollout("chosen", 1, "SELECT SUM(revenue) FROM sales", reward=1.0)],
+        "cursor": 1.0})
+    assert first.run_once("token")["pending"] == 1
+
+    second = _load(env)
+    _trainer_stubs(second, monkeypatch)
+    monkeypatch.setattr(second, "pull_rollouts", lambda token, since: {
+        "rollouts": [_rollout("rejected", 2, "SELECT COUNT(*) FROM sales", reward=0.0)],
+        "cursor": 2.0})
+    trained = []
+    monkeypatch.setattr(second, "train_dpo", lambda pairs, *args: (
+        trained.extend(pairs) or str(tmp_path / "tool_call-dpo-test"), {"loss": 0.2}))
+    monkeypatch.setattr(second, "publish_adapter", lambda *args, **kwargs: {"version": 1})
+
+    result = second.run_once("token")
+    assert result["trained"] is True and len(trained) == 1
+    assert json.loads(trained[0]["chosen"])["sql"] == "SELECT SUM(revenue) FROM sales"
+    assert json.loads(trained[0]["rejected"])["sql"] == "SELECT COUNT(*) FROM sales"
+    assert second.load_training_state() == (2.0, [])
+
+
+def test_dry_run_does_not_consume_cursor_or_pending_rows(tmp_path, monkeypatch):
+    env = {"STUDIO_TRAIN_OUTPUT_DIR": str(tmp_path), "STUDIO_TRAIN_MIN_NEW": "2",
+           "STUDIO_TRAIN_MODE": "sft"}
+    module = _load(env)
+    module.save_training_state(1.0, [_rollout("r1", 1, "SELECT * FROM sales")])
+    before = module.load_training_state()
+    _trainer_stubs(module, monkeypatch)
+    monkeypatch.setattr(module, "pull_rollouts", lambda token, since: {
+        "rollouts": [_rollout("r2", 2, "SELECT SUM(revenue) FROM sales")], "cursor": 2.0})
+    monkeypatch.setattr(module, "train_lora", lambda *args: pytest.fail("dry-run cannot train"))
+
+    result = module.run_once("token", dry_run=True)
+    assert result["dry_run"] is True and result["samples"] == 2
+    assert module.load_training_state() == before
+
+
+def test_pending_overflow_fails_without_advancing_or_evicting(tmp_path, monkeypatch):
+    env = {"STUDIO_TRAIN_OUTPUT_DIR": str(tmp_path), "STUDIO_TRAIN_MIN_NEW": "3",
+           "STUDIO_TRAIN_MAX_PENDING_ROLLOUTS": "1", "STUDIO_TRAIN_MODE": "sft"}
+    first = _load(env)
+    _trainer_stubs(first, monkeypatch)
+    monkeypatch.setattr(first, "pull_rollouts", lambda token, since: {
+        "rollouts": [_rollout("r1", 1, "SELECT * FROM sales")], "cursor": 1.0})
+    first.run_once("token")
+
+    second = _load(env)
+    _trainer_stubs(second, monkeypatch)
+    monkeypatch.setattr(second, "pull_rollouts", lambda token, since: {
+        "rollouts": [_rollout("r2", 2, "SELECT SUM(revenue) FROM sales")], "cursor": 2.0})
+    with pytest.raises(SystemExit, match="no rollout was silently evicted"):
+        second.run_once("token")
+    cursor, pending = second.load_training_state()
+    assert cursor == 1.0 and [row["id"] for row in pending] == ["r1"]
+
+
+def test_checkpoint_is_atomic_private_and_legacy_cursor_compatible(tmp_path):
+    module = _load({"STUDIO_TRAIN_OUTPUT_DIR": str(tmp_path)})
+    module.save_training_state(3.0, [_rollout("r1", 3, "SELECT * FROM sales")])
+    assert stat.S_IMODE(os.stat(module.CURSOR_FILE).st_mode) == 0o600
+    assert not list(tmp_path.glob(".train-cursor-*.tmp"))
+    with open(module.CURSOR_FILE, "w", encoding="utf-8") as f:
+        json.dump({"cursor": 7.0, "at": 1}, f)
+    assert module.load_training_state() == (7.0, [])
+
+
+def test_release_acknowledgement_clears_only_an_exact_published_gguf(tmp_path, monkeypatch):
+    module = _load({"STUDIO_TRAIN_OUTPUT_DIR": str(tmp_path)})
+    pending = [_rollout("r1", 3, "SELECT * FROM sales")]
+    module.save_training_state(3.0, pending)
+    identity = {"uri": "https://models.example/tool-v8.gguf", "version": 8,
+                "sha256": "a" * 64}
+    monkeypatch.setattr(module, "get_status", lambda token: {
+        "tool_call_adapter": dict(identity)})
+
+    result = module.acknowledge_published_release(
+        "token", identity["uri"], identity["version"], identity["sha256"])
+
+    assert result == {"acknowledged": True, "released": identity, "cursor": 3.0,
+                      "cleared_pending": 1}
+    assert module.load_training_state() == (3.0, [])
+
+
+def test_release_acknowledgement_mismatch_retains_pending_batch(tmp_path, monkeypatch):
+    module = _load({"STUDIO_TRAIN_OUTPUT_DIR": str(tmp_path)})
+    pending = [_rollout("r1", 3, "SELECT * FROM sales")]
+    module.save_training_state(3.0, pending)
+    monkeypatch.setattr(module, "get_status", lambda token: {
+        "tool_call_adapter": {"uri": "https://models.example/old.gguf", "version": 7,
+                              "sha256": "b" * 64}})
+
+    with pytest.raises(SystemExit, match="does not match"):
+        module.acknowledge_published_release(
+            "token", "https://models.example/new.gguf", 8, "a" * 64)
+
+    assert module.load_training_state() == (3.0, pending)
+
+
+# ── non-strict automatic publication has a fail-closed regression gate ───
+
+_EVALUATOR_PROGRAM = r"""
+import json
+import os
+import sys
+
+options = json.loads(sys.argv[1])
+request_path = sys.argv[sys.argv.index("--request") + 1]
+report_path = sys.argv[sys.argv.index("--report") + 1]
+with open(request_path, encoding="utf-8") as handle:
+    request = json.load(handle)
+if options.get("mutate"):
+    with open(os.path.join(request["adapter_dir"], "adapter.bin"), "ab") as handle:
+        handle.write(b"changed")
+report = {
+    key: request[key] for key in (
+        "protocol", "request_id", "artifact_sha256", "base_model", "suite_sha256")
+}
+if options.get("wrong_suite"):
+    report["suite_sha256"] = "f" * 64
+report["baseline"] = options.get(
+    "baseline", {"cases": 100, "passed": 90, "unsafe": 0})
+report["candidate"] = options.get(
+    "candidate", {"cases": 100, "passed": 91, "unsafe": 0})
+with open(report_path, "w", encoding="utf-8") as handle:
+    json.dump(report, handle)
+"""
+
+
+def _evaluation_config(options=None, **overrides):
+    config = {
+        "command": [sys.executable, "-c", _EVALUATOR_PROGRAM,
+                    json.dumps(options or {})],
+        "suite_sha256": "b" * 64,
+        "min_cases": 50,
+        "max_pass_rate_drop": 0.0,
+        "max_unsafe_rate": 0.0,
+        "max_unsafe_rate_increase": 0.0,
+        "timeout_seconds": 10,
+    }
+    config.update(overrides)
+    return config
+
+
+def _candidate(tmp_path):
+    path = tmp_path / "tool_call-candidate"
+    path.mkdir()
+    (path / "adapter.bin").write_bytes(b"candidate weights")
+    (path / "adapter_config.json").write_text('{"r":16}', encoding="utf-8")
+    return path
+
+
+def test_automatic_promotion_requires_explicit_argv_and_pinned_suite(monkeypatch):
+    module = _load()
+    monkeypatch.delenv("STUDIO_TRAIN_EVALUATOR_COMMAND", raising=False)
+    monkeypatch.delenv("STUDIO_TRAIN_EVAL_SUITE_SHA256", raising=False)
+    with pytest.raises(SystemExit, match="EVALUATOR_COMMAND is required"):
+        module._promotion_evaluator_config()
+
+    monkeypatch.setenv("STUDIO_TRAIN_EVALUATOR_COMMAND", json.dumps(["evaluator"]))
+    with pytest.raises(SystemExit, match="EVAL_SUITE_SHA256 must pin"):
+        module._promotion_evaluator_config()
+
+
+def test_missing_evaluator_aborts_round_before_pull_or_training(monkeypatch):
+    module = _load()
+    monkeypatch.delenv("STUDIO_TRAIN_EVALUATOR_COMMAND", raising=False)
+    monkeypatch.delenv("STUDIO_TRAIN_EVAL_SUITE_SHA256", raising=False)
+    monkeypatch.setattr(module, "get_status", lambda token: {})
+    monkeypatch.setattr(
+        module, "pull_rollouts",
+        lambda *args: pytest.fail("an unevaluable round must not consume or train data"))
+
+    with pytest.raises(SystemExit, match="EVALUATOR_COMMAND is required"):
+        module.run_once("token")
+
+
+def test_independent_evaluator_passes_only_bound_candidate_and_suite(tmp_path):
+    module = _load({"STUDIO_TRAIN_OUTPUT_DIR": str(tmp_path)})
+    result = module.evaluate_candidate(
+        str(_candidate(tmp_path)), "sft", _evaluation_config())
+
+    assert result["suite_sha256"] == "b" * 64
+    assert result["candidate"]["pass_rate"] == pytest.approx(0.91)
+    assert result["baseline"]["pass_rate"] == pytest.approx(0.90)
+    assert result["candidate"]["unsafe_rate"] == 0
+    assert result["thresholds"]["min_cases"] == 50
+    assert not list(tmp_path.glob(".promotion-eval-*"))
+
+
+@pytest.mark.parametrize("options,match", [
+    ({"candidate": {"cases": 100, "passed": 89, "unsafe": 0}}, "pass rate"),
+    ({"candidate": {"cases": 100, "passed": 91, "unsafe": 1}}, "unsafe rate"),
+    ({"wrong_suite": True}, "identity does not match"),
+])
+def test_evaluator_report_regressions_and_identity_mismatch_fail_closed(
+        tmp_path, options, match):
+    module = _load({"STUDIO_TRAIN_OUTPUT_DIR": str(tmp_path)})
+    with pytest.raises(SystemExit, match=match) as exc:
+        module.evaluate_candidate(
+            str(_candidate(tmp_path)), "sft", _evaluation_config(options))
+    assert "not published" in str(exc.value)
+
+
+def test_candidate_mutation_during_evaluation_invalidates_report(tmp_path):
+    module = _load({"STUDIO_TRAIN_OUTPUT_DIR": str(tmp_path)})
+    with pytest.raises(SystemExit, match="changed during evaluation"):
+        module.evaluate_candidate(
+            str(_candidate(tmp_path)), "sft", _evaluation_config({"mutate": True}))
+
+
+def test_rejected_evaluation_never_publishes_or_consumes_pending(
+        tmp_path, monkeypatch):
+    module = _load({"STUDIO_TRAIN_OUTPUT_DIR": str(tmp_path),
+                    "STUDIO_TRAIN_MIN_NEW": "1", "STUDIO_TRAIN_MODE": "sft"})
+    _trainer_stubs(module, monkeypatch)
+    rollout = _rollout("r1", 1, "SELECT * FROM sales")
+    monkeypatch.setattr(module, "pull_rollouts", lambda token, since: {
+        "rollouts": [rollout], "cursor": 1.0})
+    adapter = _candidate(tmp_path)
+    monkeypatch.setattr(module, "train_lora", lambda *args: (str(adapter), {"loss": 0.1}))
+    monkeypatch.setattr(module, "evaluate_candidate", lambda *args, **kwargs: (
+        (_ for _ in ()).throw(module._promotion_error("benchmark regressed"))))
+    monkeypatch.setattr(module, "publish_adapter",
+                        lambda *args, **kwargs: pytest.fail("rejected candidate was published"))
+
+    with pytest.raises(SystemExit, match="benchmark regressed"):
+        module.run_once("token")
+
+    assert module.load_training_state() == (1.0, [rollout])

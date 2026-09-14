@@ -25,7 +25,10 @@ import signal
 import sys
 import threading
 import time
+import json
+import urllib.request
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
@@ -33,6 +36,35 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 log = logging.getLogger("studio.worker")
+
+
+def _controller_claim_gate():
+    """Prove the configured controller heartbeat before claiming more work.
+
+    The controller health service is intentionally private and contains no
+    credentials.  Absence is fail-open for backwards-compatible local use;
+    portable cloud manifests always configure it and therefore fail closed.
+    """
+    raw = (os.getenv("STUDIO_WORKER_CLAIM_GATE_URL") or "").strip()
+    if not raw:
+        return True
+    parsed = urlsplit(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc \
+            or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        log.error("worker: STUDIO_WORKER_CLAIM_GATE_URL is not a safe absolute HTTP(S) URL")
+        return False
+    try:
+        timeout = min(10.0, max(0.2, float(
+            os.getenv("STUDIO_WORKER_CLAIM_GATE_TIMEOUT_S") or "3")))
+        request = urllib.request.Request(raw, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = response.read(4097)
+            if response.status != 200 or len(payload) > 4096:
+                return False
+        body = json.loads(payload or b"{}")
+        return body.get("status") == "ready"
+    except Exception:
+        return False
 
 
 def main(argv=None):
@@ -47,7 +79,8 @@ def main(argv=None):
     if not jobs.handlers():
         log.error("worker: no job handlers registered — nothing would ever run")
         return 2
-    worker = jobs.Worker(worker_id=jobs.default_worker_id("worker"))
+    worker = jobs.Worker(worker_id=jobs.default_worker_id("worker"),
+                         claim_gate=_controller_claim_gate)
     stop = threading.Event()
 
     def _signal(signum, _frame):

@@ -28,7 +28,7 @@ os.environ.setdefault("STUDIO_DB_PATH", os.path.join(_TMP, "studio.db"))
 
 import pytest
 
-from app import chat, db, mcp, migrations, qcache, redteam
+from app import chat, db, mcp, migrations, qcache, redteam, trainer
 
 # Table -> columns a migration must add. Mirrors MIGRATIONS.
 EXPECTED = {
@@ -39,6 +39,8 @@ EXPECTED = {
     "query_cache": ["seen", "avg_reward", "embedding"],
     "messages": ["reply_to"],
     "redteam_benchmarks": ["model_revision"],
+    "training_adapters": ["sha256"],
+    "agent_traces": ["updated_at", "training_revision"],
 }
 
 # Derived from the list itself, so appending a migration does not mean editing
@@ -70,6 +72,12 @@ CREATE TABLE query_cache (
 CREATE TABLE redteam_benchmarks (
     id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, name TEXT NOT NULL,
     created_at REAL NOT NULL);
+CREATE TABLE training_adapters (
+    id TEXT PRIMARY KEY, scope TEXT NOT NULL, kind TEXT NOT NULL,
+    version INTEGER NOT NULL, uri TEXT NOT NULL, base_model TEXT, metrics TEXT,
+    status TEXT NOT NULL DEFAULT 'active', created_at REAL NOT NULL);
+CREATE TABLE agent_traces (
+    id TEXT PRIMARY KEY, created_at REAL NOT NULL);
 """
 
 
@@ -180,6 +188,7 @@ def test_fresh_baseline_records_without_altering(fresh_path):
     mcp.init_tables()
     qcache.init_tables()
     redteam.init_tables()
+    trainer.init_tables()
     _assert_complete(fresh_path)                          # baseline is complete
     before = {t: _columns(fresh_path, t) for t in EXPECTED}
 
@@ -232,6 +241,40 @@ def test_fresh_baseline_already_has_the_reply_to_index(fresh_path):
     assert "idx_messages_reply_to" in _indexes(fresh_path, "messages")
     migrations.apply_pending()
     assert "idx_messages_reply_to" in _indexes(fresh_path, "messages")
+
+
+def test_adapter_active_index_repairs_an_old_publication_race(old_db):
+    raw = sqlite3.connect(old_db)
+    raw.executemany(
+        "INSERT INTO training_adapters "
+        "(id,scope,kind,version,uri,status,created_at) VALUES (?,?,?,?,?,?,?)",
+        [
+            ("old", "global", "tool_call", 1, "/old", "active", 1),
+            ("winner", "global", "tool_call", 2, "/winner", "active", 2),
+            ("style", "user-1", "user_style", 1, "/style", "active", 1),
+        ],
+    )
+    raw.commit()
+    raw.close()
+
+    migrations.apply_pending()
+    assert "idx_adapters_one_active" in _indexes(old_db, "training_adapters")
+    raw = sqlite3.connect(old_db)
+    active = raw.execute(
+        "SELECT id FROM training_adapters WHERE scope='global' "
+        "AND kind='tool_call' AND status='active'"
+    ).fetchall()
+    assert active == [("winner",)]
+    assert raw.execute(
+        "SELECT status FROM training_adapters WHERE id='old'"
+    ).fetchone()[0] == "superseded"
+    with pytest.raises(sqlite3.IntegrityError):
+        raw.execute(
+            "INSERT INTO training_adapters "
+            "(id,scope,kind,version,uri,status,created_at,sha256) "
+            "VALUES ('again','global','tool_call',3,'/again','active',3,NULL)"
+        )
+    raw.close()
 
 
 def test_missing_table_is_skipped_not_created(fresh_path):

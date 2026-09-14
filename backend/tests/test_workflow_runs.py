@@ -50,6 +50,7 @@ class FakeAirflow:
         self.triggered = []
         self.readiness_checks = []
         self.state = "running"
+        self.diagnostic = ""
 
     def configured(self):
         return self.available
@@ -70,6 +71,9 @@ class FakeAirflow:
 
     def logs(self, run_ref):
         return "No warehouse rows in these logs"
+
+    def failure_diagnostic(self, run_ref):
+        return self.diagnostic
 
     def quality(self, run_ref):
         return []
@@ -283,6 +287,91 @@ def test_nonterminal_or_canceled_pipeline_does_not_receive_training_reward(plan,
     airflow.state = state
     supervisor.live_job(row["id"], ANALYST)
     assert _traces() == []
+
+
+def test_permanent_registration_fault_escalates_without_trigger(plan, isolated,
+                                                                 monkeypatch):
+    airflow, _ = isolated
+    row = _submit(plan)
+    _approve_and_publish(row)
+    monkeypatch.setattr(airflow, "dag_ready", lambda _dag: {
+        "ready": False, "permanent": True, "detail": "DAG has import errors"})
+    assert workflow_runs.observe(supervisor._get(row["id"]))["state"] == "escalated"
+    current = supervisor._get(row["id"])
+    assert current["status"] == "escalated"
+    assert "operator action" in current["last_error"]
+    assert airflow.triggered == []
+
+
+def test_invalid_run_deadline_escalates_before_trigger(plan, isolated,
+                                                        monkeypatch):
+    airflow, _ = isolated
+    row = _submit(plan)
+    _approve_and_publish(row)
+    airflow.registered = True
+    monkeypatch.setenv("STUDIO_AIRFLOW_RUN_TIMEOUT_SECONDS", "not-an-integer")
+    assert workflow_runs.observe(supervisor._get(row["id"]))["state"] == "escalated"
+    assert "nothing was triggered" in supervisor._get(row["id"])["last_error"]
+    assert airflow.triggered == []
+
+
+def test_legacy_published_row_uses_immutable_created_at_for_deadline(plan, isolated,
+                                                                    monkeypatch):
+    airflow, _ = isolated
+    monkeypatch.setenv("STUDIO_AIRFLOW_REGISTRATION_TIMEOUT_SECONDS", "30")
+    row = _submit(plan)
+    _approve_and_publish(row)
+    current = supervisor._get(row["id"])
+    result = json.loads(current["result"])
+    result.pop("published_at", None)
+    result.pop("registration_timeout_seconds", None)
+    with db.connect() as connection:
+        connection.execute(
+            "UPDATE supervised_jobs SET result=?,created_at=?,updated_at=? WHERE id=?",
+            (json.dumps(result), time.time() - 31, time.time(), row["id"]))
+        connection.commit()
+    assert workflow_runs.observe(supervisor._get(row["id"]))["state"] == "escalated"
+    assert airflow.triggered == []
+
+
+def test_legacy_running_row_has_finite_monitoring_deadline(plan, isolated,
+                                                           monkeypatch):
+    airflow, _ = isolated
+    monkeypatch.setenv("STUDIO_AIRFLOW_RUN_TIMEOUT_SECONDS", "60")
+    row = _approve_and_launch(plan, airflow)
+    result = json.loads(row["result"])
+    result.pop("launched_at", None)
+    result.pop("run_timeout_seconds", None)
+    with db.connect() as connection:
+        connection.execute(
+            "UPDATE supervised_jobs SET result=?,created_at=?,updated_at=? WHERE id=?",
+            (json.dumps(result), time.time() - 61, time.time(), row["id"]))
+        connection.commit()
+    live = supervisor.live_job(row["id"], ANALYST)
+    assert live["state"] == "escalated"
+    assert live["job"]["status"] == "escalated"
+    assert "monitoring deadline" in live["detail"]
+
+
+def test_failed_airflow_diagnostic_is_persisted_for_recovery(plan, isolated):
+    airflow, _ = isolated
+    row = _approve_and_launch(plan, airflow)
+    airflow.state = "failed"
+    airflow.diagnostic = "task=summarize state=failed\nUndefinedColumn: amountx"
+    live = supervisor.live_job(row["id"], ANALYST)
+    assert live["state"] == "failed"
+    current = supervisor._get(row["id"])
+    result = json.loads(current["result"])
+    assert result["failure_diagnostic"] == airflow.diagnostic
+    assert current["last_error"] == airflow.diagnostic
+
+    # Terminal state is served from the stored observation. A later log outage
+    # must not erase the evidence before the recovery worker consumes it.
+    airflow.diagnostic = ""
+    supervisor.live_job(row["id"], ANALYST)
+    current = supervisor._get(row["id"])
+    assert json.loads(current["result"])["failure_diagnostic"] == result["failure_diagnostic"]
+    assert current["last_error"] == result["failure_diagnostic"]
 
 
 def test_lost_launching_worker_escalates_without_repeating_post(plan, isolated):

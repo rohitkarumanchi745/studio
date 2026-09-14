@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: studio-system
+  labels:
+    app.kubernetes.io/part-of: studio
+    # Every workload in this bundle is compatible with the restricted profile.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

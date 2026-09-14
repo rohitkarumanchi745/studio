@@ -74,7 +74,9 @@ def test_proven_success_keeps_complete_structured_action(status):
 def test_replay_preserves_failure_feedback_and_stream_cursor():
     failed = record(status="failed", error="missing column")
     original = lightning._trace(failed)
-    db.set_trace_reward(failed, 0.2, source="user", note="Needs a different column")
+    db.set_trace_reward(
+        failed, 0.2, user_id=USER["id"], source="user",
+        note="Needs a different column")
     # Even a contradictory later callback must not rewrite this attempt.
     assert record(status="success") == failed
     current = lightning._trace(failed)

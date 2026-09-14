@@ -60,6 +60,18 @@ EXTERNAL_FN = re.compile(
     re.IGNORECASE,
 )
 
+# Built-in functions that can block, mutate session/database state, signal
+# other backends, or touch server files despite appearing inside SELECT. SQL's
+# top-level statement class is not a sufficient read-only boundary by itself.
+UNSAFE_FN = re.compile(
+    r"pg_sleep\w*|pg_(?:try_)?advisory_\w+|pg_notify|set_config|nextval|setval|"
+    r"lo_(?:import|export|unlink|put)|dblink\w*|"
+    r"pg_(?:read_file|read_binary_file|ls_dir|stat_file|terminate_backend|"
+    r"cancel_backend|reload_conf|rotate_logfile|log_backend_memory_contexts|"
+    r"create_restore_point|switch_wal|backup_start|backup_stop)",
+    re.IGNORECASE,
+)
+
 _WS = " \t\r\n\f\v"
 _QUOTES = {'"': '"', "`": "`", "[": "]"}
 # A FROM/JOIN target starting with one of these is a subquery or an inline row
@@ -476,6 +488,9 @@ def validate(sql, allowed_tables, qualifiers=None, dialect=None):
         if call and EXTERNAL_FN.fullmatch(text):
             # Quoted too: "read_text"('/etc/passwd') is the same function.
             raise QueryRejected(f"Function '{text}' reads outside the warehouse")
+        if call and UNSAFE_FN.fullmatch(text):
+            raise QueryRejected(
+                f"Function '{text}' is not allowed in a read-only query")
         if kind == "ident":
             continue                                # a quoted name is never a keyword
         if i and toks[i - 1] == ("punct", "."):

@@ -57,7 +57,10 @@ exact reuse is revalidated, and changed requirements need model adaptation and
 fresh validation. A failed or unconfirmed adaptation is not made runnable.
 See [Natural prompts → reusable Airflow SQL DAGs](#natural-prompts--reusable-airflow-sql-dags)
 for the supported scope and deployment requirements. This path is implemented
-and locally tested; a real Airflow/container deployment has not been verified.
+and locally tested. The [portable runtime guide](deploy/portable/README.md)
+packages the required Studio worker, Airflow 3, Agent Lightning, recovery-model,
+storage, and cloud/Kubernetes contracts; its target-cloud build and live smoke
+tests remain operator acceptance gates.
 
 ---
 
@@ -600,18 +603,25 @@ Recovery requires `STUDIO_AGL_URL`, `STUDIO_AGL_TOKEN` when the server requires
 authentication, and `STUDIO_AGL_RECOVERY_MODEL` naming a model registered with
 the Lightning gateway. `STUDIO_AGL_RECOVERY_TIMEOUT_S` defaults to 300 seconds
 (bounded to 30–900). Run a trusted Lightning **local controller** with this
-backend package importable, alongside Studio's durable worker. For example,
-from an environment with the backend on `PYTHONPATH`:
+backend package importable, alongside Studio's durable worker. The portable
+single-server wrapper registers the configured recovery model, restores and
+snapshots Agent Lightning 1.0.1's process-local history, and fails closed if a
+second server tries to own the same state:
 
 ```sh
-agl-controller runner_type=local agl_server.url=http://lightning:8080
+python scripts/run_agent_lightning.py server
+python scripts/run_agent_lightning.py controller
+python scripts/run_agent_lightning.py check
+python scripts/run_agent_lightning.py controller-check
 ```
 
 Configure controller authentication through its deployment secrets. The
 recovery agent makes model calls only through the controller-injected
 `AGL_OPENAI_BASE_URL` and posts decisions to `AGL_EVENT_URL`; it does not need
 warehouse credentials or Studio database access. This implementation supplies
-a local-agent class, **not a Kubernetes rollout template**. See Microsoft's
+a local-agent class and a single-server/local-controller deployment, not a
+distributed controller or horizontally scalable Lightning store. See the
+[portable runtime guide](deploy/portable/README.md), Microsoft's
 [v1 execution model](https://microsoft.github.io/agent-lightning/stable/05-basics/)
 and [controller configuration](https://microsoft.github.io/agent-lightning/stable/30-controller-configuration/).
 Tests exercise the real rollout/event routes and controller class entry point
@@ -622,11 +632,18 @@ parent, including the current attempt, reason, and correction job/run.
 **Airflow operator setup** is required before publication, independently of BitNet:
 
 - Configure the Studio source and an Airflow connection pointing to the **same
-  database/catalog/schema/search path**. Set, for example,
+  database/catalog**, with distinct least-privilege identities. Set, for example,
   `STUDIO_AIRFLOW_CONNECTIONS_JSON='{"postgres":"studio_postgres"}'`. The mapping
   is operator-owned; model output cannot choose credentials or connection IDs.
   Operators must verify the endpoints really match; an ID mapping alone does
-  not prove that.
+  not prove that. For materializing PostgreSQL pipelines, set
+  `STUDIO_AIRFLOW_OUTPUT_SCHEMA=pipeline_output`, require generated destinations
+  and dependency-output reads to use that qualifier, grant only the Airflow
+  identity write access there, and give its connection a source-first
+  `public,pipeline_output` search path so stale outputs cannot shadow inputs.
+  Studio's connector remains SELECT-only and pinned to `POSTGRES_SCHEMA=public`.
+  Pin database `statement_timeout`/`lock_timeout`, revoke the writer's access to
+  unreviewed user-defined functions, and set a bounded Airflow task timeout.
 - Set `STUDIO_AIRFLOW_DAGS_DIR` to an **existing absolute non-root directory**
   shared with Airflow's DAG processor, writable by the Studio execution process
   and readable by Airflow, with no symlink path components. Merely creating a
@@ -642,8 +659,9 @@ Local tests cover typed planning, guards, compilation, immutable publication,
 approval, mocked Airflow lifecycle, and learning/reuse. **A real Airflow runtime
 and Docker/container deployment have not been exercised for this path**;
 provider imports, shared mounts, real credentials, and execution must be smoke
-tested in the target environment. Nothing in these tests deploys a service or
-proves that the live demo has this configuration.
+tested in the target environment. The [portable deployment assets and acceptance
+checks](deploy/portable/README.md) make those requirements explicit. Nothing in
+these tests deploys a service or proves that the live demo has this configuration.
 
 ### The staged flow — safe production behavior
 
@@ -1140,7 +1158,7 @@ is visible in `/api/health`; the answer already went out.
 | Agent Lightning | Studio |
 |---|---|
 | `RolloutCreate.rollout_id` | `studio-<trace id>` — stable, so a retry and a later reward address the same rollout |
-| `RolloutCreate.input` | `data_id` (the trace id — the field `/api/rollouts/terminal` projects), `prompt`, `source`, `table`, `conversation_id`, `history` (the turns the model actually saw, so training conditions the way serving does) |
+| `RolloutCreate.input` | `data_id` (the trace id — the field `/api/rollouts/terminal` projects), `prompt`, `source`, `table`, `conversation_id`, `history` (the turns the model saw; the global SQL trainer excludes non-empty history by default to reduce cross-user memorization) |
 | `RolloutCreate.metadata` | `studio_trace_id`, `studio_user_id`, `studio_role`, `mode`, `model`, `agents`, `created_at` — `RolloutMetadata` allows extras; the opaque user id travels, never the email |
 | `RolloutCreate.is_train` | `STUDIO_AGL_TRAIN` (default true) |
 | `EventCreate` | `studio.run` (mode · model · source · table · ok · duration · agents) · `studio.query` (sql · row_count) · `studio.chart` (type · panel_count) · `studio.errors` · `studio.action` (structured pipeline recipe, run ID, and repair link when present) |
@@ -1225,26 +1243,26 @@ it does not start training, change hosted-model weights, or publish/load a
 BitNet adapter. Structured pipeline actions also stay out of the single-query
 `sql` field so a tool-calling trainer cannot mistake a job payload for SQL.
 
-**Is it reinforcement learning?** Yes in structure, no in the usual sense. The
-rollout + reward machinery *is* RL. But Studio runs on hosted models (Claude /
-GPT) whose weights are frozen, so it can't do gradient/weight RL. Instead it
-optimizes the **prompt** — recent failures injected in-context (immediate) and
-APO distilling low-reward traces offline (RLAIF-style). The rollouts now live
-in a real Agent Lightning store in the shape a real RL trainer reads, so the
-day a self-hosted open-weight model is added, the same rewarded data drives
-true weight RL — nothing about collection changes.
+**Is it reinforcement learning?** The rollout/reward record has the structure
+an RL system needs, but the running recovery loop does not optimize weights.
+Hosted model weights are frozen; immediate improvement comes from revalidated
+successful-recipe retrieval and prompt context. The separate BitNet trainer
+currently performs reward-filtered SFT or DPO only on eligible single-query SQL
+actions. Structured Airflow/recovery trajectories are retained, but require a
+separate formatter, optimizer, evaluation, and model-release path before they
+can change a recovery policy.
 
-**What the verl path would consume next.** Agent Lightning's verl trainer
+**What a verl path would consume next.** Agent Lightning's verl trainer
 enqueues its own rollouts from a dataset and, for each terminal rollout, reads
 the events with `format=triplet`: prompt/response **token ids** from
 `model_request` events, plus `reward_events[-1]` as the final reward. Studio
 supplies the rollouts, their inputs and their rewards; it does not supply
-`model_request` events, because those are written by Agent Lightning's LLM
-**proxy** and Studio calls Anthropic / OpenAI directly. So today the store is a
-real, queryable corpus of rewarded Studio rollouts — enough for prompt-level
-optimization and as the dataset side of a training run — and closing the GRPO
-loop means routing Studio's model calls through the Agent Lightning gateway so
-token ids land beside the reward that is already there.
+`model_request` events for ordinary chat traces, because Studio chat calls its
+provider directly. Recovery decisions do pass through Lightning's proxy, but
+the hosted bridge and pinned bitnet.cpp runtime do not provide the required
+token-ID extension and the portable runtime includes no verl optimizer. The
+store is therefore a durable, queryable rewarded corpus—not a claim that GRPO
+or online recovery weight updates are running.
 
 **Per-agent reward shaping.** Each named agent is scored on its *own* decision,
 not a blended answer-level reward: a worker on grounded SQL + rows + a real
@@ -1279,9 +1297,9 @@ flowchart TB
     bit --> roll[("rollout + reward<br/>agent_traces")]
     fr --> roll
     roll --> grow["recurs + scores well →<br/>joins BitNet's scope"]
-    roll --> trainer["trainer (CPU worker)<br/>scripts/train_online.py"]
-    trainer -->|"publishes LoRA"| ad[("adapters · tool_call · per-user")]
-    ad -.->|"hot-swap"| bit
+    roll --> trainer["trainer (GPU recommended)<br/>scripts/train_online.py"]
+    trainer -->|"produces PEFT LoRA"| ad[("global tool_call adapter release")]
+    ad -.->|"convert + evaluate + publish GGUF"| bit
     grow -.-> tier
 ```
 
@@ -1305,30 +1323,54 @@ flowchart TB
 **Pick the engine directly.** Automatic tiering is the default, but the
 composer's model menu also surfaces the self-hosted BitNet (`🧠 BitNet — learned`)
 and your knowledge base (`📄 KAG — your documents`) as explicit choices whenever
-each is usable — choosing BitNet forces the learned engine, choosing KAG runs a
+each is eligible — choosing BitNet tries the learned engine first, choosing KAG runs a
 documents-first turn (see **Knowledge** above). Each appears only when it can
-actually serve, so no user learns another scope's engine or knowledge base exists.
+be configured for that user; the strict gateway still verifies the exact active
+adapter on every request and falls back to the frontier on failure.
 
-**Simultaneous training** (`trainer.py` + `scripts/train_online.py`). Studio is
-the concurrent **producer + adapter server**; a **CPU worker** is the trainer —
-BitNet's 1-bit base is CPU-efficient and its LoRA adapters are small, so **no GPU
-is required**. They run at the same time:
+**Concurrent collection and training** (`trainer.py` +
+`scripts/train_online.py`). Studio is the rollout producer and adapter registry;
+the separate trainer uses the trainable bf16 master weights. A CUDA GPU is
+strongly recommended; CPU training is possible but extremely slow. BitNet's
+packed 1-bit weights are for inference and cannot be fine-tuned directly.
 
 ```
-Studio agent ──rollouts──▶  trainer (CPU worker)  ──adapters──▶  Studio serving
-  (produces)                (SFT → DPO → GRPO)                   (hot-swaps)
+Studio agent ──rollouts──▶  trainer (GPU recommended)  ──release──▶  Studio serving
+  (produces)                     (SFT or DPO)                    (hot-swaps)
      ▲                                                                │
      └──────────────────── keeps serving with the newest ────────────┘
 ```
 
-The trainer pulls reward-labeled rollouts (`GET /training/rollouts`), trains a
-**global tool-calling** LoRA plus **per-user style** LoRAs, and publishes them
-(`POST /training/adapters`); serving composes both per request and hot-swaps to
-the newest version. `GET /training/online` reports the loop status and BitNet's
-growing scope. The heavy ML deps live in `scripts/requirements-trainer.txt`
-(kept out of the lean API image); run the worker via `scripts/Dockerfile.trainer`.
+The trainer pulls reward-labeled single-query rollout revisions
+(`GET /training/rollouts`) and trains a **global tool-calling** PEFT LoRA.
+Late thumbs-up/down feedback receives a new monotonic training revision, so it
+replaces the prior heuristic reward in both the cumulative replay corpus and
+the exact semantic-cache contribution instead of being skipped by a timestamp
+cursor. Replay lives at
+`STUDIO_TRAIN_OUTPUT_DIR/.training_replay.json` (mode 0600, bounded, atomic),
+making later rounds cumulative rather than base-plus-latest-batch.
+
+SFT loss is computed only on assistant completion tokens; the full action label
+is reserved before prompt truncation. Samples use the current skill for the
+rollout's own role. Non-empty conversation history and free-form SQL string
+literals are excluded by default; their opt-ins are appropriate only for one
+trusted organizational deployment because the adapter is global. The runtime
+query guard remains the final authorization boundary.
+
+Compatible directory-based serving can publish that adapter only after an
+independent, pinned-suite baseline/candidate regression evaluator passes task
+and safety thresholds. Candidate digest and evaluation evidence are bound into
+release metrics and rechecked immediately before publication. The strict
+`bitnet.cpp` deployment serves GGUF, so training must stop at
+`--defer-publish`; conversion, evaluation, stable upload, SHA-256 publication,
+and deployment are an explicit model-release gate. `GET /training/online`
+reports the loop status and BitNet's growing scope. The heavy ML deps live in
+`scripts/requirements-trainer.txt` (kept out of the lean API image); run the
+worker via `scripts/Dockerfile.trainer`.
 Recording rewarded chat or pipeline outcomes does not start this trainer or
-change served weights. BitNet routing requires a configured
+change served weights. Structured pipeline and recovery actions are retained
+as application/Lightning experience but are intentionally not mixed into this
+single-query adapter. BitNet routing requires a configured
 `STUDIO_LLM_BASE_URL` and an eligible published adapter, with the actual mounted
 adapter and tool-calling behavior verified separately. `HARRIER_EMBED_URL`
 enables semantic embeddings; unset, matching uses the documented lexical
@@ -1610,6 +1652,8 @@ erDiagram
         text id PK
         double reward
         text reward_source
+        int training_revision "monotonic feedback stream cursor"
+        double updated_at
         text meta "agents, artifact"
     }
     agent_sessions {
@@ -1663,9 +1707,9 @@ concurrent tasks*).
 **Schema migrations.** The `CREATE TABLE IF NOT EXISTS` baseline in
 `init_db()` / each module's `init_tables()` is the complete schema for a fresh
 database. `app/migrations.py` holds numbered, idempotent, dialect-aware
-migrations (currently 1–6: `users.verified`, `conversations.folder_id`,
-`chat_tasks.steps`, `mcp_servers.owner_id`, `query_cache.seen` /
-`avg_reward` / `embedding`, `chat_tasks.user_message_id`) recorded in
+migrations (currently 1–11, including verified users, folders/task progress,
+cache routing columns, fenced assistant replies, red-team model revisions,
+adapter SHA-256 attestation, and monotonic trace training revisions) recorded in
 `schema_migrations`
 (`version`, `name`, `applied_at`) and run after the last `init_tables()` at
 startup, each in its own transaction; a migration never creates a table.
@@ -1897,10 +1941,10 @@ optional and falls back to the in-process cache silently.
 | Decision | Why | Tradeoff accepted |
 |---|---|---|
 | **Hosted LLMs (Claude / GPT) via BYOK**, not self-hosted weights | No GPU fleet; users bring their own key; always the latest models | Can't do gradient/weight RL — learning is prompt-level |
-| **Agent Lightning optimizes the prompt for hosted models; weights for BitNet** | Hosted weights are frozen (prompt-opt only); a self-hosted BitNet's *are* trainable from the same rollouts | Two learning modes to reason about — but the rollout data is identical |
+| **Agent Lightning stores recovery trajectories and rewards; Studio reuses proven recipes** | Hosted weights are frozen and retries need durable evidence | Weight optimization is a separate ML release; structured recovery data is not consumed by the SQL adapter trainer |
 | **BitNet serves the learned scope, frontier serves the new** (scope grows) | Recurring work shouldn't keep paying the frontier; the frontier bootstraps data and handles novelty | Runs two models; needs a BitNet + Harrier endpoint stood up; a training lag (covered by escalation) |
 | **Learned scope centralized + access-gated** | One user's learned patterns benefit everyone with the same access | The *cache* tier stays role-scoped (it reuses stored insight text) — only the routing is centralized |
-| **BitNet / LoRA trains on CPU** (no GPU) | 1-bit base + small adapters are CPU-feasible; deployable without a GPU fleet | Coarser (batch) cadence than a GPU; trainer's heavy deps live in a separate worker image |
+| **BitNet serves on CPU; LoRA training uses bf16 master weights** | Keeps inference inexpensive while retaining a trainable source model | A GPU trainer is strongly recommended; CPU/MPS training is a slow fallback and final GGUF conversion/evaluation is a release gate |
 | **Prompt/KV caching via provider `cache_control`** | Hosted APIs don't expose the raw attention KV cache | You cache the *prefix* (server-side, TTL-bound), not tensors |
 | **Semantic cache re-executes the SQL** (never returns stored rows) | Fresh data + RBAC/guard/governance re-checked on every hit | A hit still pays the warehouse round-trip (but skips the LLM) |
 | **Harrier embeddings when configured, lexical signature otherwise** | Real semantic match (different-word paraphrases) with Harrier; deterministic lexical fallback keeps it working offline with zero deps | Embeddings need a Harrier endpoint stood up; the lexical fallback misses different-word paraphrases |
@@ -2067,6 +2111,11 @@ To watch rollouts land in a real Agent Lightning store, run its server from the
 installed package and point Studio at it — the worker delivers, the turn does
 not wait:
 
+The bare development server below is sufficient as a rollout trace sink. It is
+not the agent-owned recovery runtime: model registration, durable state, the
+local controller, and recovery-model smoke are covered by the
+[portable runtime guide](deploy/portable/README.md).
+
 ```bash
 # its own CLI (hydra; add hydra.run.dir=. to keep it from making an outputs/ tree)
 python -m agentlightning.server host=127.0.0.1 port=9099 key=$AGL_KEY
@@ -2216,9 +2265,15 @@ you in: the account is created unverified and the emailed 6-digit code
 | Variable | Purpose |
 |---|---|
 | `AIRFLOW_URL` | Airflow base URL, without an `/api` suffix. Required for both existing DAG triggers and generated-DAG execution |
+| `AIRFLOW_PUBLIC_URL` | Optional browser-facing Airflow base. Operational calls always use private `AIRFLOW_URL`; when this is unset Studio omits grid links rather than returning private DNS names |
 | `AIRFLOW_TOKEN` / `AIRFLOW_USERNAME` + `AIRFLOW_PASSWORD` | Airflow authentication: bearer token, or username/password (Basic for v1; token exchange for v2). Keep these on the server, never in prompts or plans |
 | `AIRFLOW_API_VERSION` | `v1` (default, Airflow 2) or `v2` (Airflow 3) for Studio's Airflow client |
-| `STUDIO_AIRFLOW_CONNECTIONS_JSON` | Operator-owned JSON mapping of Studio source names to existing Airflow connection IDs, e.g. `{"postgres":"studio_postgres"}`. The mapped connection must reach the same database/catalog/schema/search path as Studio's connector; this is a deployment responsibility, not established by the mapping alone |
+| `STUDIO_AIRFLOW_CONNECTIONS_JSON` | Operator-owned JSON mapping of Studio source names to existing Airflow connection IDs, e.g. `{"postgres":"studio_postgres"}`. The mapped connection must reach the same database/catalog as Studio's connector; this is a deployment responsibility, not established by the mapping alone |
+| `STUDIO_AIRFLOW_OUTPUT_SCHEMA` | Optional operator-owned plain schema identifier for materialized DAG outputs. When set, every CREATE/INSERT destination and dependency-output read must explicitly use it. The Airflow writer must own/write only that schema and keep the read schema first in its search path; Studio's public connector stays read-only |
+| `STUDIO_AIRFLOW_TASK_TIMEOUT_SECONDS` | Immutable generated-task execution timeout included in the DAG approval fingerprint (default 900; allowed 1–86400). Keep a shorter database-side statement/lock timeout on each Airflow warehouse connection too |
+| `STUDIO_AIRFLOW_REGISTRATION_TIMEOUT_SECONDS` | Maximum wait after immutable publication for Airflow to register and unpause the DAG (default 900; allowed 30–86400). Expiry escalates without triggering |
+| `STUDIO_AIRFLOW_RUN_TIMEOUT_SECONDS` | Maximum autonomous observation window for an accepted Airflow run (default 86400; allowed 60–2592000). Expiry escalates for inspection; Studio does not cancel or retry an uncertain external run |
+| `STUDIO_PLATFORM_RUN_TIMEOUT_SECONDS` | Equivalent observation deadline for non-Airflow platform runs when no Airflow-specific value applies (default 86400; allowed 60–2592000) |
 | `STUDIO_AIRFLOW_DAGS_DIR` | Existing absolute, non-root, non-symlink shared DAG directory. Studio publishes approved immutable DAG files here; Airflow's DAG processor must read the same files. No shared mount or no credentials means no deployment |
 | `AZURE_REDIRECT_URI` | Entra SSO redirect, default `http://localhost:8000/api/auth/azure/callback` — register that exact URI in the app registration |
 | `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` / `AZURE_GROUP_ROLE_MAP` | Entra SSO + group→role mapping, **and** the Microsoft 365 → KAG extraction layer (dormant until set) |
@@ -2258,7 +2313,7 @@ Data-Formulator** reskin with an encoding-shelf chart builder; the **pipeline-fl
 visualization** (source → transforms → target, per-step pass/fail + email digest);
 the **lakehouse write→read bridge** (S3 → Spark → S3 Parquet → auto-registered
 dataset → viz); **Autopilot agents** (schedule / threshold / event / manual, act-
-with-approval); and the self-hosted **BitNet** pipeline — the CPU **trainer**
+with-approval); and the self-hosted **BitNet** pipeline — the separate **trainer**
 (reward-filtered SFT + DPO), **source-conditioned** training (per-source
 schema/dialect), and the **serving unit** (adapter-aware gateway + vLLM/BitNet.cpp). Also shipped:
 the **Knowledge (KAG)** layer — RBAC-scoped RAG over Excel / PDF / Word / PowerPoint
@@ -2321,8 +2376,9 @@ way round from the feature list above:
   `artifact_deployed: false` and a run reported as `succeeded_sql_only`. The
   artifact is yours to take away and run wherever you run code.
 - **A live BitNet base-model endpoint does not prove trained agent execution.**
-  The source build, base-model serving, private endpoint, and persistent model
-  storage have been exercised. That does not establish a working fine-tuned
+  The source build and container image have not been exercised on this machine;
+  the gateway/supervisor contracts are tested against stub engines. Even a
+  successful base-model deployment would not establish a working fine-tuned
   tool-calling adapter: adapter conversion/mounting, tokenizer quality, and the
   real structured tool-call contract still require end-to-end validation.
   Collected examples and successful Agent Lightning delivery do not close
@@ -2348,11 +2404,14 @@ default; not needed at today's volume, adopt when data/QPS justify a cluster):
 - **On-policy best-of-N preference generation** — sample N completions per prompt
   from the current policy, score + pair them, so DPO/GRPO have real preference
   data (the passive rollout log yields ~0 pairs today; verified against prod).
-- **Eval-gate / shadow promotion** — promote a freshly trained adapter to
-  `active` only if it beats the current one on a holdout, instead of publish=live.
-- **Full train≈serve fidelity** — condition each sample on the rollout's own role
-  and reproduce the complete serving system-prompt wrapper (today: skill sub-block
-  only, guard-covered).
+- **Shadow/canary promotion** — the fail-closed independent regression gate is
+  implemented for direct PEFT publication; add traffic shadowing and staged
+  canaries before making a candidate globally active. Strict GGUF remains a
+  manual convert/evaluate/digest release.
+- **Full train≈serve wrapper fidelity** — role-specific skills and completion-only
+  loss are implemented; reproduce the remaining complete serving-system wrapper
+  in the evaluator/trainer (today the skill sub-block is learned and the query
+  guard covers execution).
 - Decision-level (per-tool-call) rollouts for finer-grained training data.
 
 **Platform / scale:**

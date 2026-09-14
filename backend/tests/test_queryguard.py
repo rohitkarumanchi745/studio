@@ -74,6 +74,15 @@ def test_external_functions_rejected_outside_from(sql):
     rejected(sql)
 
 
+@pytest.mark.parametrize("fn", [
+    "pg_sleep", "pg_sleep_for", "pg_advisory_lock", "pg_try_advisory_xact_lock",
+    "pg_notify", "set_config", "nextval", "setval", "pg_read_file",
+    "pg_terminate_backend", "lo_import", "dblink_connect",
+])
+def test_select_functions_with_blocking_mutating_or_external_effects_are_rejected(fn):
+    rejected(f"SELECT {fn}('x') FROM sales")
+
+
 # ── Quoting / comment / comma-join escapes from the table allowlist ─────
 
 @pytest.mark.parametrize("sql", [

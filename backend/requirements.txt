@@ -36,7 +36,9 @@ redis>=5.0
 # --dry-run report). Needs Python >=3.12; the image is 3.12-slim.
 # Delivery still only happens when STUDIO_AGL_URL is set, and the module
 # imports the package lazily, so an image built without it still boots.
-agentlightning>=1.0.1,<2
+# The portable runtime persists Agent Lightning's private in-memory store and
+# invokes its local reconciler API. Those internals are version-specific.
+agentlightning==1.0.1
 
 # KAG (Knowledge-Augmented Generation) document parsers — pure-Python, no
 # torch/pandas: cosine lives in embed.py, csv+email are stdlib.

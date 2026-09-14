@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: studio-worker
+spec:
+  template:
+    spec:
+      containers:
+        - name: studio-worker
+          env:
+            - name: STUDIO_LLM_BASE_URL
+              value: http://bitnet-serving:9000/v1
+            - name: STUDIO_LLM_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: bitnet-auth
+                  key: token
+            - name: STUDIO_BITNET_LLM
+              value: openai:bitnet
+            - name: STUDIO_BOOTSTRAP_TOOL_ADAPTER_URI
+              valueFrom:
+                configMapKeyRef:
+                  name: bitnet-adapter-config
+                  key: url
+            - name: STUDIO_BOOTSTRAP_TOOL_ADAPTER_VERSION
+              valueFrom:
+                configMapKeyRef:
+                  name: bitnet-adapter-config
+                  key: version
+            - name: STUDIO_BOOTSTRAP_TOOL_ADAPTER_SHA256
+              valueFrom:
+                configMapKeyRef:
+                  name: bitnet-adapter-config
+                  key: sha256
+            - name: STUDIO_REQUIRE_TOOL_ADAPTER_SHA256
+              value: "1"

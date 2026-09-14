@@ -1,0 +1,746 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: studio-runtime
+  labels:
+    app.kubernetes.io/part-of: studio
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: studio-web
+  labels:
+    app.kubernetes.io/name: studio
+    app.kubernetes.io/component: web
+    app.kubernetes.io/part-of: studio
+spec:
+  # Keep one replica until the process-local SSO handoff is externalized or the
+  # ingress is configured for sticky sessions. All durable application state is
+  # already in PostgreSQL/Redis.
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    # The 60-second SSO handoff map is process-local. Recreate prevents a
+    # rollout from briefly running two maps behind one Service.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: studio
+      app.kubernetes.io/component: web
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: studio
+        app.kubernetes.io/component: web
+        app.kubernetes.io/part-of: studio
+    spec:
+      serviceAccountName: studio-runtime
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: studio-web
+          image: studio:portable
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: studio-runtime-config
+            - secretRef:
+                name: studio-app-secrets
+          env:
+            - name: PORT
+              value: "8000"
+            - name: AIRFLOW_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: airflow-api-user
+                  key: username
+            - name: AIRFLOW_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: airflow-api-user
+                  key: password
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 36
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: outbox
+              mountPath: /app/outbox
+            - name: skills-cache
+              mountPath: /app/skills
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+        - name: outbox
+          emptyDir:
+            sizeLimit: 128Mi
+        - name: skills-cache
+          emptyDir:
+            sizeLimit: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: studio-web
+  labels:
+    app.kubernetes.io/name: studio
+    app.kubernetes.io/component: web
+    app.kubernetes.io/part-of: studio
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: studio
+    app.kubernetes.io/component: web
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: studio-worker
+  labels:
+    app.kubernetes.io/name: studio
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/part-of: studio
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: studio
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: studio
+        app.kubernetes.io/component: worker
+        app.kubernetes.io/part-of: studio
+    spec:
+      serviceAccountName: studio-runtime
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 300
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        # Airflow's image runs as uid 50000, gid 0. Publishing files with gid 0
+        # and mode 0640 lets Airflow read them without granting it write access.
+        runAsGroup: 0
+        fsGroup: 0
+        # Always is deliberate: a freshly provisioned PVC is commonly already
+        # root:root, so OnRootMismatch would skip the chmod that grants gid 0
+        # write access to its root directory.
+        fsGroupChangePolicy: Always
+        seccompProfile:
+          type: RuntimeDefault
+      # Exec probes do not delay a container from consuming queue rows. Run the
+      # same dependency check as an init container so no job is claimed before
+      # database, Airflow, Lightning, and shared-DAG readiness are proven.
+      initContainers:
+        - name: dependencies-ready
+          image: studio:portable
+          imagePullPolicy: IfNotPresent
+          command: ["python", "/opt/studio-probes/readiness.py"]
+          envFrom:
+            - configMapRef:
+                name: studio-runtime-config
+            - secretRef:
+                name: studio-app-secrets
+          env:
+            - name: AIRFLOW_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: airflow-api-user
+                  key: username
+            - name: AIRFLOW_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: airflow-api-user
+                  key: password
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: dags
+              mountPath: /opt/airflow/dags
+              readOnly: false
+            - name: probes
+              mountPath: /opt/studio-probes
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      containers:
+        - name: studio-worker
+          image: studio:portable
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "app.worker"]
+          envFrom:
+            - configMapRef:
+                name: studio-runtime-config
+            - secretRef:
+                name: studio-app-secrets
+          env:
+            - name: STUDIO_AGL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: agent-lightning-auth
+                  key: token
+            - name: AIRFLOW_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: airflow-api-user
+                  key: username
+            - name: AIRFLOW_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: airflow-api-user
+                  key: password
+          startupProbe:
+            exec:
+              command: ["python", "/opt/studio-probes/readiness.py"]
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command: ["python", "/opt/studio-probes/readiness.py"]
+            periodSeconds: 15
+            timeoutSeconds: 8
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["python", "/opt/studio-probes/liveness.py"]
+            periodSeconds: 30
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: dags
+              mountPath: /opt/airflow/dags
+              readOnly: false
+            - name: probes
+              mountPath: /opt/studio-probes
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: outbox
+              mountPath: /app/outbox
+            - name: skills-cache
+              mountPath: /app/skills
+      volumes:
+        - name: dags
+          persistentVolumeClaim:
+            claimName: studio-airflow-dags
+            readOnly: false
+        - name: probes
+          configMap:
+            name: studio-worker-probes
+            defaultMode: 0555
+        - name: tmp
+          emptyDir:
+            sizeLimit: 512Mi
+        - name: outbox
+          emptyDir:
+            sizeLimit: 128Mi
+        - name: skills-cache
+          emptyDir:
+            sizeLimit: 256Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: recovery-model
+  labels:
+    app.kubernetes.io/name: recovery-model
+    app.kubernetes.io/component: model-bridge
+    app.kubernetes.io/part-of: studio
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: recovery-model
+      app.kubernetes.io/component: model-bridge
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: recovery-model
+        app.kubernetes.io/component: model-bridge
+        app.kubernetes.io/part-of: studio
+    spec:
+      serviceAccountName: studio-runtime
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: recovery-model
+          image: studio:portable
+          imagePullPolicy: IfNotPresent
+          command:
+            - uvicorn
+            - app.recovery_model_gateway:app
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8081"
+          envFrom:
+            - configMapRef:
+                name: recovery-model-config
+            - secretRef:
+                name: recovery-model-secrets
+          ports:
+            - name: http
+              containerPort: 8081
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 4
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: recovery-model
+  labels:
+    app.kubernetes.io/name: recovery-model
+    app.kubernetes.io/component: model-bridge
+    app.kubernetes.io/part-of: studio
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: recovery-model
+    app.kubernetes.io/component: model-bridge
+  ports:
+    - name: http
+      port: 8081
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lightning-server
+  labels:
+    app.kubernetes.io/name: agent-lightning
+    app.kubernetes.io/component: server
+    app.kubernetes.io/part-of: studio
+spec:
+  # The wrapper takes an exclusive lifetime lock on its JSON snapshot. A second
+  # replica is rejected by design until Agent Lightning has an external store.
+  replicas: 1
+  revisionHistoryLimit: 2
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agent-lightning
+      app.kubernetes.io/component: server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: agent-lightning
+        app.kubernetes.io/component: server
+        app.kubernetes.io/part-of: studio
+    spec:
+      serviceAccountName: studio-runtime
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: lightning-server
+          image: studio:portable
+          imagePullPolicy: IfNotPresent
+          command: ["python", "scripts/run_agent_lightning.py", "server"]
+          env:
+            - name: PORT
+              value: "8080"
+            - name: AGL_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: agent-lightning-auth
+                  key: token
+            - name: STUDIO_AGL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: agent-lightning-auth
+                  key: token
+            - name: STUDIO_AGL_URL
+              value: http://lightning-server:8080
+            - name: STUDIO_AGL_RECOVERY_MODEL
+              value: studio-recovery
+            - name: STUDIO_AGL_MODEL_ENDPOINT
+              value: http://recovery-model:8081/v1
+            - name: STUDIO_AGL_MODEL_VERSION
+              value: "0"
+            - name: STUDIO_AGL_STATE_PATH
+              value: /var/lib/agent-lightning/state.json
+            - name: STUDIO_AGL_MAX_STATE_BYTES
+              value: "268435456"
+            - name: STUDIO_AGL_UPSTREAM_HEALTH_TIMEOUT_S
+              value: "10"
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: HOME
+              value: /tmp
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 4
+            failureThreshold: 120
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # Liveness deliberately does not depend on the model upstream. A
+          # provider outage should remove readiness, not erase in-memory state
+          # by restart-looping the server.
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: state
+              mountPath: /var/lib/agent-lightning
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: agent-lightning-state
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lightning-server
+  labels:
+    app.kubernetes.io/name: agent-lightning
+    app.kubernetes.io/component: server
+    app.kubernetes.io/part-of: studio
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: agent-lightning
+    app.kubernetes.io/component: server
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lightning-controller
+  labels:
+    app.kubernetes.io/name: agent-lightning
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/part-of: studio
+spec:
+  # LocalReconciler must have exactly one owner; two controllers can race the
+  # same rollout. Its child receives only the task payload and AGL endpoint.
+  replicas: 1
+  revisionHistoryLimit: 2
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agent-lightning
+      app.kubernetes.io/component: controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: agent-lightning
+        app.kubernetes.io/component: controller
+        app.kubernetes.io/part-of: studio
+    spec:
+      serviceAccountName: studio-runtime
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      # Refuse to start the reconciler until its configured model can satisfy
+      # the same bounded recovery-decision contract used for live retries.
+      # This harmless completion never executes SQL or contacts a warehouse.
+      initContainers:
+        - name: recovery-model-smoke
+          image: studio:portable
+          imagePullPolicy: IfNotPresent
+          command: ["python", "scripts/smoke_recovery_model.py"]
+          env:
+            - name: STUDIO_AGL_MODEL_ENDPOINT
+              value: http://recovery-model:8081/v1
+            - name: STUDIO_AGL_RECOVERY_MODEL
+              value: studio-recovery
+            - name: STUDIO_RECOVERY_SMOKE_TIMEOUT_S
+              value: "300"
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: HOME
+              value: /tmp
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      containers:
+        - name: lightning-controller
+          image: studio:portable
+          imagePullPolicy: IfNotPresent
+          command: ["python", "scripts/run_agent_lightning.py", "controller"]
+          env:
+            - name: AGL_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: agent-lightning-auth
+                  key: token
+            - name: STUDIO_AGL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: agent-lightning-auth
+                  key: token
+            - name: STUDIO_AGL_URL
+              value: http://lightning-server:8080
+            - name: STUDIO_AGL_CONTROLLER_MAXIMUM_SIZE
+              value: "4"
+            - name: STUDIO_AGL_CONTROLLER_POLL_INTERVAL_S
+              value: "2"
+            - name: STUDIO_AGL_CONTROLLER_HEALTH_PORT
+              value: "8082"
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: HOME
+              value: /tmp
+          ports:
+            - name: health
+              containerPort: 8082
+              protocol: TCP
+          startupProbe:
+            exec:
+              command: ["python", "scripts/run_agent_lightning.py", "controller-check"]
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 120
+          readinessProbe:
+            exec:
+              command: ["python", "scripts/run_agent_lightning.py", "controller-check"]
+            periodSeconds: 15
+            timeoutSeconds: 8
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["python", "scripts/run_agent_lightning.py", "controller-check"]
+            periodSeconds: 30
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lightning-controller
+  labels:
+    app.kubernetes.io/name: agent-lightning
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/part-of: studio
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: agent-lightning
+    app.kubernetes.io/component: controller
+  ports:
+    - name: health
+      port: 8082
+      targetPort: health
+      protocol: TCP
