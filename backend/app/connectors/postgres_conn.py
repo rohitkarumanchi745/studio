@@ -156,6 +156,27 @@ class PostgresConnector(Connector):
                 return [{"name": r[0], "type": r[1]} for r in cur.fetchall()]
         return self._execute(go)
 
+    def relation_kind(self, namespace, table):
+        """Inspect pg_catalog without selecting any output-table data."""
+        if not isinstance(namespace, str) or not isinstance(table, str) \
+                or not namespace or not table or len(namespace) > 128 \
+                or len(table) > 128 or "\x00" in namespace or "\x00" in table:
+            raise ValueError("Invalid relation identity")
+
+        def go(con):
+            with con.cursor() as cur:
+                cur.execute(
+                    "SELECT c.relkind FROM pg_catalog.pg_class c "
+                    "JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace "
+                    "WHERE n.nspname=%s AND c.relname=%s LIMIT 1",
+                    (namespace, table),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return "missing"
+                return "table" if row[0] in ("r", "p") else "other"
+        return self._execute(go)
+
     def run_query(self, sql):
         def go(con):
             with con.cursor() as cur:

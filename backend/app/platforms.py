@@ -35,10 +35,44 @@ import ssl
 import urllib.error
 import urllib.request
 import uuid
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 
-def _http(method, url, headers=None, body=None, timeout=30, context=None):
+_MAX_HTTP_BODY = 8 * 1024 * 1024
+_MAX_FAILURE_LOG_PAGE = 64 * 1024
+_MAX_FAILURE_LOG_PAGES = 8
+_MAX_FAILURE_DIAGNOSTIC = 4000
+
+
+def _redact_diagnostic(value, limit=_MAX_FAILURE_DIAGNOSTIC):
+    """Bound and redact platform text before it becomes durable recovery input."""
+    value = str(value or "")
+    value = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", value)
+    value = re.sub(
+        r"(?is)-----BEGIN [^-\r\n]{0,40}PRIVATE KEY-----.*?"
+        r"-----END [^-\r\n]{0,40}PRIVATE KEY-----",
+        "[redacted private key]", value)
+    value = re.sub(
+        r"(?i)\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+",
+        "[redacted authorization]", value)
+    value = re.sub(
+        r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
+        "[redacted jwt]", value)
+    value = re.sub(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b", "[redacted access key]", value)
+    value = re.sub(
+        r"(?i)([a-z][a-z0-9+.-]*://)[^\s/@]+(?::[^\s/@]*)?@",
+        r"\1[redacted]@", value)
+    value = re.sub(
+        r"(?i)\b(password|passwd|api[_-]?key|access[_-]?token|refresh[_-]?token|secret)"
+        r"([\"']?\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;}&]+)",
+        r"\1\2[redacted]", value)
+    # Keep the tail: SQL drivers normally put the actionable exception after
+    # connection/setup chatter. The prefix identifies the task separately.
+    return value[-limit:]
+
+
+def _http(method, url, headers=None, body=None, timeout=30, context=None,
+          max_bytes=_MAX_HTTP_BODY):
     """One HTTP round-trip; returns the response body as text. On HTTPError the
     RuntimeError carries the response body so a 403 from Airflow says WHY, not
     just '403'."""
@@ -50,10 +84,13 @@ def _http(method, url, headers=None, body=None, timeout=30, context=None):
     req = urllib.request.Request(url, data=data, method=method, headers=hdrs)
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=context) as r:
-            return r.read().decode()
+            raw = r.read(max_bytes + 1)
+            if len(raw) > max_bytes:
+                raise RuntimeError(f"{method} {url} returned an oversized response")
+            return raw.decode(errors="replace")
     except urllib.error.HTTPError as e:
         try:
-            detail = e.read().decode(errors="replace")[:1000]
+            detail = e.read(1001).decode(errors="replace")[:1000]
         except Exception:
             detail = ""
         raise RuntimeError(f"{method} {url} -> HTTP {e.code}: {detail or e.reason}")
@@ -90,17 +127,23 @@ class Platform:
         """Best-effort data-quality checks [{"name","status","detail"}]; [] when none."""
         return []
 
+    def failure_diagnostic(self, run_ref):
+        """Bounded/redacted terminal evidence suitable for durable recovery."""
+        return ""
+
 
 # ── Apache Airflow ──────────────────────────────────────────────────────
 
 class AirflowPlatform(Platform):
     """Airflow DAG runs over the stable REST API.
 
-    Env: AIRFLOW_URL (base URL, no /api suffix) plus either AIRFLOW_TOKEN
+    Env: AIRFLOW_URL (private/API base URL, no /api suffix) plus either AIRFLOW_TOKEN
     (sent as Bearer — pre-issued Airflow 3 JWT or managed deployments like
     Astronomer) or AIRFLOW_USERNAME + AIRFLOW_PASSWORD (Basic on v1;
     exchanged at /auth/token for a short-lived JWT on v2, fetched per call).
     AIRFLOW_API_VERSION: "v1" (default, Airflow 2) | "v2" (Airflow 3).
+    AIRFLOW_PUBLIC_URL is optional; without it API responses deliberately omit
+    browser links instead of leaking an unresolvable private service hostname.
     """
     name = "airflow"
     label = "Apache Airflow"
@@ -113,6 +156,7 @@ class AirflowPlatform(Platform):
     def _cfg(self):
         return {
             "url": os.getenv("AIRFLOW_URL", "").rstrip("/"),
+            "public_url": os.getenv("AIRFLOW_PUBLIC_URL", "").rstrip("/"),
             "token": os.getenv("AIRFLOW_TOKEN", ""),
             "user": os.getenv("AIRFLOW_USERNAME", ""),
             "password": os.getenv("AIRFLOW_PASSWORD", ""),
@@ -138,7 +182,9 @@ class AirflowPlatform(Platform):
         return f"{cfg['url']}/api/{cfg['version']}{path}"
 
     def _grid_url(self, cfg, dag_id, run_id):
-        return (f"{cfg['url']}/dags/{quote(dag_id, safe='')}/grid"
+        if not cfg.get("public_url"):
+            return None
+        return (f"{cfg['public_url']}/dags/{quote(dag_id, safe='')}/grid"
                 f"?dag_run_id={quote(run_id, safe='')}")
 
     @staticmethod
@@ -152,13 +198,17 @@ class AirflowPlatform(Platform):
         try:
             dag = _json("GET", self._api(cfg, f"/dags/{quote(dag_id, safe='')}"), self._headers(cfg))
         except RuntimeError as exc:
-            return {"ready": False, "detail": str(exc)[:500]}
+            detail = str(exc)[:500]
+            return {"ready": False, "detail": detail,
+                    "permanent": bool(re.search(r"HTTP (?:401|403)\b", detail))}
         if dag.get("dag_id") != dag_id:
             return {"ready": False, "detail": "Airflow has not registered the requested DAG"}
         if dag.get("is_paused", True):
-            return {"ready": False, "detail": "DAG is paused in Airflow; an administrator must unpause it"}
+            return {"ready": False, "permanent": True,
+                    "detail": "DAG is paused in Airflow; an administrator must unpause it"}
         if dag.get("has_import_errors") or dag.get("is_active") is False:
-            return {"ready": False, "detail": "Airflow reports this DAG inactive or with import errors"}
+            return {"ready": False, "permanent": True,
+                    "detail": "Airflow reports this DAG inactive or with import errors"}
         return {"ready": True}
 
     def trigger(self, payload):
@@ -189,7 +239,9 @@ class AirflowPlatform(Platform):
                 cfg, f"/dags/{quote(dag_id, safe='')}/dagRuns/{quote(run_id, safe='')}"),
                 self._headers(cfg))
         except Exception as e:  # includes 404 on a vanished run
-            return {"state": "unknown", "detail": str(e), "url": None, "metrics": {}}
+            detail = str(e)
+            return {"state": "unknown", "detail": detail, "url": None, "metrics": {},
+                    "permanent": bool(re.search(r"HTTP (?:401|403)\b", detail))}
         metrics = {k: d.get(k) for k in ("start_date", "end_date", "run_type")
                    if d.get(k) is not None}
         return {"state": self._STATES.get(d.get("state"), "unknown"),
@@ -215,6 +267,85 @@ class AirflowPlatform(Platform):
                 f"{ti.get('task_id')}  {ti.get('state')}  "
                 f"duration={ti.get('duration')}  tries={ti.get('try_number')}"
                 for ti in self._task_instances(run_ref))
+        except Exception:
+            return ""
+
+    def failure_diagnostic(self, run_ref):
+        """Return failed-task evidence, never an unbounded/raw Airflow log.
+
+        Airflow has no whole-run log endpoint. Fetch at most three failed task
+        attempts, cap every response at the HTTP layer, redact common credential
+        forms, and retain a small tail where SQL driver exceptions normally live.
+        """
+        try:
+            cfg = self._cfg()
+            dag_id, run_id = self._split(run_ref)
+            candidates = [task for task in self._task_instances(run_ref)
+                          if task.get("state") in ("failed", "upstream_failed")]
+            # Root failures carry the exception; upstream_failed dependants do
+            # not. API ordering must not use the three-item budget on dependants.
+            failed = sorted(
+                candidates, key=lambda task: task.get("state") != "failed")[:3]
+            evidence = []
+            for task in failed:
+                task_id = re.sub(
+                    r"[^A-Za-z0-9_.-]", "?",
+                    str(task.get("task_id") or "unknown")[:250])
+                state = re.sub(
+                    r"[^A-Za-z0-9_.-]", "?",
+                    str(task.get("state") or "failed")[:40])
+                try:
+                    attempt = max(1, int(task.get("try_number") or 1))
+                except (TypeError, ValueError):
+                    attempt = 1
+                summary = f"task={task_id} state={state} try={attempt}"
+                if state == "failed" and task_id != "unknown":
+                    query = {"full_content": "false"}
+                    map_index = task.get("map_index")
+                    if isinstance(map_index, int) and not isinstance(map_index, bool):
+                        query["map_index"] = str(map_index)
+                    try:
+                        parts = []
+                        token = None
+                        for _page in range(_MAX_FAILURE_LOG_PAGES):
+                            if token:
+                                query["token"] = token
+                            path = (f"/dags/{quote(dag_id, safe='')}/dagRuns/{quote(run_id, safe='')}"
+                                    f"/taskInstances/{quote(task_id, safe='')}/logs/{attempt}?"
+                                    f"{urlencode(query)}")
+                            raw = _http(
+                                "GET", self._api(cfg, path), self._headers(cfg),
+                                max_bytes=_MAX_FAILURE_LOG_PAGE)
+                            # Current Airflow APIs return a bounded JSON page
+                            # with a continuation token. Older versions may
+                            # return a bounded plain string; that is one page.
+                            try:
+                                decoded = json.loads(raw)
+                            except (TypeError, ValueError):
+                                parts.append(raw)
+                                break
+                            if not isinstance(decoded, dict):
+                                parts.append(raw)
+                                break
+                            content = decoded.get("content")
+                            if isinstance(content, list):
+                                content = "".join(str(part) for part in content)
+                            if isinstance(content, str):
+                                parts.append(content)
+                            following = decoded.get("continuation_token")
+                            if not isinstance(following, str) or not following \
+                                    or following == token:
+                                break
+                            token = following
+                        excerpt = _redact_diagnostic("".join(parts), 2500).strip()
+                        if excerpt:
+                            summary += "\n" + excerpt
+                    except Exception:
+                        # The task/state summary is still proven evidence. Log
+                        # retrieval is best effort and must not hide the failure.
+                        pass
+                evidence.append(summary)
+            return _redact_diagnostic("\n\n".join(evidence))
         except Exception:
             return ""
 

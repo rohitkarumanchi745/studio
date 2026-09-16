@@ -68,6 +68,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
   const [messages, setMessages] = useState([]);
   const [prompt, setPrompt] = useState("");
   const [buildPipeline, setBuildPipeline] = useState(false);
+  const [buildAirflow, setBuildAirflow] = useState(false);
   const [showPlatform, setShowPlatform] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -169,12 +170,14 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
           tables: !orchestrated && sel.length > 1 ? sel : undefined,
           conversation_id: conversationId,
           model: model || undefined,
-          pipeline_action: buildPipeline ? "build" : undefined,
+          pipeline_action: buildPipeline || buildAirflow ? "build" : undefined,
+          pipeline_mode: buildAirflow ? "airflow_dag" : buildPipeline ? "read_only_sql" : undefined,
         }),
       });
       // Building is a one-turn action; follow-ups such as "run this pipeline"
       // must be interpreted normally after the draft has been requested.
       setBuildPipeline(false);
+      setBuildAirflow(false);
       if (!conversationId) onConversationCreated(data.conversation_id);
       pollFor(data.task_id, data.conversation_id);
     } catch (err) {
@@ -531,13 +534,23 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
               </option>
             ))}
           </select>
-          <button className="primary send-btn" aria-label={buildPipeline ? "Build pipeline" : "Send message"} disabled={busy || !prompt.trim()}>
+          <button className="primary send-btn" aria-label={buildAirflow ? "Build Airflow DAG" : buildPipeline ? "Build pipeline" : "Send message"} disabled={busy || !prompt.trim()}>
             ➤
           </button>
         </div>
         <label className="composer-pipeline-option">
-          <input type="checkbox" checked={buildPipeline} disabled={busy} onChange={(e) => setBuildPipeline(e.target.checked)} />
-          Build a pipeline from this prompt
+          <input type="checkbox" checked={buildPipeline} disabled={busy} onChange={(e) => {
+            setBuildPipeline(e.target.checked);
+            if (e.target.checked) setBuildAirflow(false);
+          }} />
+          Build a read-only pipeline from this prompt
+        </label>
+        <label className="composer-pipeline-option">
+          <input type="checkbox" checked={buildAirflow} disabled={busy} onChange={(e) => {
+            setBuildAirflow(e.target.checked);
+            if (e.target.checked) setBuildPipeline(false);
+          }} />
+          Build an approval-gated Airflow DAG from this prompt
         </label>
         <button type="button" className="chip" disabled={busy} onClick={() => setShowPlatform((v) => !v)}>Run on Airflow / another platform</button>
         {showPlatform && <PlatformComposer busy={busy} onSubmit={platformAction} onClose={() => setShowPlatform(false)} />}

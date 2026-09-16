@@ -145,8 +145,9 @@ def lookup(user, source, table_scope, prompt):
     q_vec = _query_vec(sig)
     with db.connect() as c:
         rows = c.execute(
-            "SELECT * FROM query_cache WHERE role=? AND source=? AND table_scope=?",
-            (user["role"], source, table_scope)).fetchall()
+            "SELECT * FROM query_cache WHERE role=? AND source=? AND table_scope=? "
+            "AND avg_reward >= ?",
+            (user["role"], source, table_scope, MIN_REWARD)).fetchall()
     best, best_score = None, 0.0
     for r in rows:
         e_vec = json.loads(r["embedding"]) if r["embedding"] else None
@@ -172,6 +173,11 @@ def lookup(user, source, table_scope, prompt):
         "panels": [panel] if (chart or data) else [],
         "email": None, "errors": [], "mode": "cached", "model": None, "served_by": "cache",
         "agents": [{"name": "Query cache", "source": source, "role": "cache"}],
+        "_qcache_id": best["id"],
+        # A cache hit did not contribute to seen/avg_reward yet. Explicit
+        # feedback should add one observation; a freshly stored model answer
+        # uses "replace" because its heuristic was already counted.
+        "_qcache_feedback_mode": "add",
         "cached": {"similarity": round(best_score, 3), "from_prompt": best["prompt"],
                    "hits": best["hits"] + 1},
     }
@@ -213,6 +219,7 @@ def store(user, source, table_scope, prompt, result, reward=None):
                         "AND source=? AND table_scope=? AND signature=?",
                         (user["role"], source, table_scope, json.dumps(sig))).fetchone()
         if row:
+            cache_id = row["id"]
             seen = (row["seen"] or 0) + 1
             prev = row["avg_reward"] if row["avg_reward"] is not None else reward
             avg = (prev * (seen - 1) + reward) / seen        # running average
@@ -221,13 +228,15 @@ def store(user, source, table_scope, prompt, result, reward=None):
                       (sql, chart, text[:2000], seen, avg,
                        emb_json or row["embedding"], now, row["id"]))
         else:
+            cache_id = str(uuid.uuid4())
             c.execute(
                 "INSERT INTO query_cache (id, role, source, table_scope, prompt, signature, sql, "
                 "chart, text, hits, seen, avg_reward, embedding, created_at, updated_at) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (str(uuid.uuid4()), user["role"], source, table_scope, prompt[:500],
+                (cache_id, user["role"], source, table_scope, prompt[:500],
                  json.dumps(sig), sql, chart, text[:2000], 0, 1, reward, emb_json, now, now))
         c.commit()
+    return cache_id
 
 
 def learned(source, table_scope, prompt):

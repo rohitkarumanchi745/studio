@@ -163,6 +163,62 @@ def _m8_redteam_benchmarks_model_revision(c, is_pg):
     )
 
 
+def _m9_training_adapters_sha256(c, is_pg):
+    # A mutable URI and a human release number do not identify model bytes.
+    # New strict BitNet deployments pin this digest end to end; NULL preserves
+    # existing non-strict adapter records.
+    _add_column(c, "training_adapters", "sha256", "TEXT", is_pg)
+
+
+def _m10_agent_traces_updated_at(c, is_pg):
+    # The trainer must observe a reward revision made after its creation-time
+    # cursor passed a trace. A durable integer clock also prevents equal wall
+    # clock timestamps at a page boundary from skipping rollouts.
+    if not _table_exists(c, "agent_traces", is_pg):
+        return
+    _add_column(c, "agent_traces", "updated_at", "REAL", is_pg)
+    _add_column(c, "agent_traces", "training_revision", "INTEGER", is_pg)
+    c.execute("CREATE TABLE IF NOT EXISTS training_event_clock "
+              "(id INTEGER PRIMARY KEY, revision INTEGER NOT NULL)")
+    c.execute("INSERT INTO training_event_clock (id, revision) VALUES (1, 0) "
+              "ON CONFLICT(id) DO NOTHING")
+    c.execute("UPDATE agent_traces SET updated_at=created_at WHERE updated_at IS NULL")
+    current = int(c.execute(
+        "SELECT revision FROM training_event_clock WHERE id=1").fetchone()["revision"])
+    rows = c.execute(
+        "SELECT id FROM agent_traces WHERE training_revision IS NULL "
+        "ORDER BY created_at, id").fetchall()
+    for row in rows:
+        current += 1
+        c.execute("UPDATE agent_traces SET training_revision=? WHERE id=?",
+                  (current, row["id"]))
+    c.execute("UPDATE training_event_clock SET revision=? WHERE id=1", (current,))
+    c.execute("CREATE INDEX IF NOT EXISTS idx_traces_training_revision "
+              "ON agent_traces(training_revision)")
+
+
+def _m11_training_adapters_one_active(c, is_pg):
+    """Repair pre-fix publication races, then enforce one active identity."""
+    if not _table_exists(c, "training_adapters", is_pg):
+        return
+    rows = c.execute(
+        "SELECT id,scope,kind,version,created_at FROM training_adapters "
+        "WHERE status='active' "
+        "ORDER BY scope,kind,version DESC,created_at DESC,id DESC"
+    ).fetchall()
+    seen = set()
+    for row in rows:
+        key = (row["scope"], row["kind"])
+        if key in seen:
+            c.execute("UPDATE training_adapters SET status='superseded' WHERE id=?",
+                      (row["id"],))
+        else:
+            seen.add(key)
+    c.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_adapters_one_active "
+        "ON training_adapters(scope,kind) WHERE status='active'")
+
+
 MIGRATIONS = [
     (1, "users.verified", _m1_users_verified),
     (2, "conversations.folder_id", _m2_conversations_folder_id),
@@ -172,6 +228,9 @@ MIGRATIONS = [
     (6, "chat_tasks.user_message_id", _m6_chat_tasks_user_message_id),
     (7, "messages.reply_to + unique index", _m7_messages_reply_to),
     (8, "redteam_benchmarks.model_revision", _m8_redteam_benchmarks_model_revision),
+    (9, "training_adapters.sha256", _m9_training_adapters_sha256),
+    (10, "agent_traces.training_revision", _m10_agent_traces_updated_at),
+    (11, "training_adapters.one_active", _m11_training_adapters_one_active),
 ]
 
 

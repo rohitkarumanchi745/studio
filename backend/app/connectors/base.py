@@ -127,6 +127,17 @@ class Connector:
         """Return [{"name": col, "type": sqltype}, ...] for a table."""
         raise NotImplementedError
 
+    def relation_kind(self, namespace, table):
+        """Metadata-only lookup outside the connector's readable namespace.
+
+        Return ``"table"``, ``"other"``, or ``"missing"`` when the connector
+        can prove the result, and ``None`` when it cannot.  Prompt-generated
+        Airflow writes use this to distinguish a fresh CTAS destination from a
+        table left by a partial prior run without granting Studio permission to
+        read that output schema.
+        """
+        return None
+
     def qualifiers(self):
         """Namespace prefixes a table reference may carry in this source's SQL
         — {"public", "acme.public"} for a Postgres schema, say.

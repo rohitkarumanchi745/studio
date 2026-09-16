@@ -51,10 +51,26 @@ def intent(prompt, previous=None):
     pipeline = bool(re.search(r"\b(?:pipeline|dag|workflow|etl)\b", text))
     if pipeline and re.search(r"\bairflow\b", text) and re.match(r"^(?:build|create|generate|draft|make|deploy|run)\b", text):
         return "build_submit" if re.match(r"^(?:deploy|run)\b|^(?:build|create) and run\b", text) else "build"
-    writes = bool(re.search(r"\b(?:load|ingest|deduplicat\w*|write|insert|publish|upsert|clean)\b|remove duplicates|update .*table", text))
+    writes = bool(re.search(
+        r"\b(?:load|ingest|deduplicat\w*|writ\w*|sav(?:e|es|ing)|stor\w*|"
+        r"insert|publish|upsert|clean|materializ\w*|transform\w*|aggregat\w*|"
+        r"summariz\w*|orchestrat\w*)\b|remove duplicates|update .*table", text))
     if pipeline and writes and re.match(r"^(?:build|create|generate|draft|make|run)\b", text):
         return "build_submit" if re.match(r"^(?:run|build and run|create and run)\b", text) else "build"
     if re.match(r"^(?:load|ingest|extract)\b", text) and re.search(r"\b(?:then|deduplicat\w*|publish|write|update|clean)\b|remove duplicates", text):
+        return "build"
+    # Natural pipeline requests do not always use the word "pipeline". Keep
+    # this bounded to an imperative plus a materialization cue; ordinary
+    # analytics questions continue down the read-only chat path.
+    imperative = re.match(
+        r"^(?:build|create|generate|draft|make|design|set up|orchestrate|take|"
+        r"transform|process|aggregate|summarize)\b", text)
+    destination = re.search(
+        r"\b(?:into|to)\s+[a-z_][a-z0-9_$]*\.[a-z_][a-z0-9_$]*\b|"
+        r"\b(?:into|to|as)\s+(?:the\s+)?(?:output|destination)\s+table\b|"
+        r"\b(?:into|to|as)\s+(?:the\s+)?table\s+[a-z_][a-z0-9_$]*\b", text)
+    process = re.search(r"\b(?:process|job|flow|pipeline|dag|workflow|etl)\b", text)
+    if imperative and writes and (destination or process):
         return "build"
     return None
 

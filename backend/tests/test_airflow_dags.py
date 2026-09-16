@@ -23,6 +23,7 @@ from app import airflow_dags
 def plan(monkeypatch):
     monkeypatch.setenv("STUDIO_AIRFLOW_CONNECTIONS_JSON", json.dumps({"warehouse": "warehouse_conn"}))
     monkeypatch.delenv("STUDIO_AIRFLOW_DAGS_DIR", raising=False)
+    monkeypatch.delenv("STUDIO_AIRFLOW_TASK_TIMEOUT_SECONDS", raising=False)
     return {"version": 1, "name": "Daily sales", "dag_id": "daily_sales", "source": "warehouse",
             "schedule": None, "parameters": {"day": "2026-09-11", "minimum": 0, "flag": False},
             "tasks": [
@@ -59,7 +60,7 @@ def _calls(tree, name):
 
 def _kwargs(call):
     return {kw.arg: ast.literal_eval(kw.value) for kw in call.keywords
-            if kw.arg != "start_date"}
+            if kw.arg not in {"start_date", "execution_timeout"}}
 
 
 def test_compiler_emits_explicit_dependencies_and_safe_operator_settings(plan):
@@ -84,6 +85,9 @@ def test_compiler_emits_explicit_dependencies_and_safe_operator_settings(plan):
     assert all(operator["autocommit"] is False and operator["split_statements"] is False
                and operator["do_xcom_push"] is False for operator in operators)
     assert all(operator["trigger_rule"] == "all_success" for operator in operators)
+    assert compiled["task_timeout_seconds"] == 900
+    assert compiled["source"].count(
+        "execution_timeout=timedelta(seconds=900)") == len(operators)
     edges = [node for node in ast.walk(tree) if isinstance(node, ast.BinOp) and isinstance(node.op, ast.RShift)]
     assert len(edges) == 1
     assert ast.literal_eval(edges[0].left.slice) == "extract"
@@ -116,6 +120,17 @@ def test_source_and_connection_changes_get_new_immutable_identity(plan, monkeypa
     monkeypatch.setenv("STUDIO_AIRFLOW_CONNECTIONS_JSON", '{"warehouse":"reviewed_new_connection"}')
     third = airflow_dags.artifact(plan)
     assert second["dag_id"] != third["dag_id"]
+    monkeypatch.setenv("STUDIO_AIRFLOW_TASK_TIMEOUT_SECONDS", "120")
+    fourth = airflow_dags.artifact(plan)
+    assert third["dag_id"] != fourth["dag_id"]
+    assert fourth["task_timeout_seconds"] == 120
+
+
+@pytest.mark.parametrize("value", ["", "0", "86401", "1.5", "forever"])
+def test_task_execution_timeout_is_bounded_operator_configuration(plan, monkeypatch, value):
+    monkeypatch.setenv("STUDIO_AIRFLOW_TASK_TIMEOUT_SECONDS", value)
+    with pytest.raises(airflow_dags.AirflowConfigurationError):
+        airflow_dags.artifact(plan)
 
 
 def test_constants_cannot_escape_into_python(plan):
@@ -126,7 +141,7 @@ def test_constants_cannot_escape_into_python(plan):
     tree = ast.parse(airflow_dags.compile_dag(plan))
     called = {node.func.id for node in ast.walk(tree) if isinstance(node, ast.Call)
               and isinstance(node.func, ast.Name)}
-    assert called == {"DAG", "datetime", "SQLExecuteQueryOperator"}
+    assert called == {"DAG", "datetime", "timedelta", "SQLExecuteQueryOperator"}
     assert _kwargs(_calls(tree, "DAG")[0])["description"] == attack
 
 

@@ -1,0 +1,353 @@
+name: studio-portable
+
+x-studio-image: &studio-image
+  image: ${STUDIO_IMAGE:-studio:portable}
+  build:
+    context: ../..
+    dockerfile: Dockerfile
+
+x-airflow-image: &airflow-image
+  image: ${STUDIO_AIRFLOW_IMAGE:-studio-airflow:3.3.1}
+  build:
+    context: ../..
+    dockerfile: deploy/airflow/Dockerfile
+
+x-airflow-env: &airflow-env
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg://${AIRFLOW_DB_USER:-airflow}:${AIRFLOW_DB_PASSWORD:?set AIRFLOW_DB_PASSWORD}@airflow-db:5432/${AIRFLOW_DB_NAME:-airflow}
+  AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?set AIRFLOW_FERNET_KEY}
+  AIRFLOW__API__SECRET_KEY: ${AIRFLOW_API_SECRET:?set AIRFLOW_API_SECRET}
+  AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:?set AIRFLOW_JWT_SECRET}
+  AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-api:8080/execution/
+  AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+  AIRFLOW_CONN_STUDIO_POSTGRES: postgresql://${WAREHOUSE_PIPELINE_WRITER_USER:-warehouse_pipeline_writer}:${WAREHOUSE_PIPELINE_WRITER_PASSWORD:?set WAREHOUSE_PIPELINE_WRITER_PASSWORD}@warehouse:5432/${WAREHOUSE_DB:-warehouse}?options=-csearch_path%3Dpublic%2Cpipeline_output%20-cstatement_timeout%3D900000%20-clock_timeout%3D30000
+  STUDIO_AIRFLOW_REQUIRE_SHARED_DAGS_SENTINEL: "1"
+
+x-airflow-service: &airflow-service
+  <<: *airflow-image
+  restart: unless-stopped
+  environment: *airflow-env
+  volumes:
+    - airflow-dags:/opt/airflow/dags:ro
+
+x-studio-runtime: &studio-runtime
+  <<: *studio-image
+  restart: unless-stopped
+  environment: &studio-env
+    DATABASE_URL: postgresql://${STUDIO_DB_USER:-studio}:${STUDIO_DB_PASSWORD:?set STUDIO_DB_PASSWORD}@studio-db:5432/${STUDIO_DB_NAME:-studio}
+    REDIS_URL: redis://redis:6379/0
+    POSTGRES_DSN: postgresql://${WAREHOUSE_READER_USER:-warehouse_reader}:${WAREHOUSE_READER_PASSWORD:?set WAREHOUSE_READER_PASSWORD}@warehouse:5432/${WAREHOUSE_DB:-warehouse}
+    POSTGRES_SCHEMA: public
+    STUDIO_SECRET: ${STUDIO_SECRET:?set STUDIO_SECRET}
+    STUDIO_ADMIN_EMAIL: ${STUDIO_ADMIN_EMAIL:-admin@studio.local}
+    STUDIO_ADMIN_PASSWORD: ${STUDIO_ADMIN_PASSWORD:?set STUDIO_ADMIN_PASSWORD}
+    STUDIO_DEMO_MODE: ${STUDIO_DEMO_MODE:-0}
+    STUDIO_TOOLBUILDER: "0"
+    STUDIO_LLM: ${STUDIO_LLM:-anthropic:claude-sonnet-5}
+    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    AIRFLOW_URL: http://airflow-api:8080
+    AIRFLOW_PUBLIC_URL: ${AIRFLOW_PUBLIC_URL:-http://127.0.0.1:8080}
+    AIRFLOW_API_VERSION: v2
+    AIRFLOW_USERNAME: ${AIRFLOW_USERNAME:-studio}
+    AIRFLOW_PASSWORD: ${AIRFLOW_PASSWORD:?set AIRFLOW_PASSWORD}
+    STUDIO_AIRFLOW_DAGS_DIR: /opt/airflow/dags
+    STUDIO_AIRFLOW_CONNECTIONS_JSON: '{"postgres":"studio_postgres"}'
+    STUDIO_AIRFLOW_OUTPUT_SCHEMA: pipeline_output
+    STUDIO_AIRFLOW_TASK_TIMEOUT_SECONDS: "900"
+    STUDIO_AIRFLOW_REGISTRATION_TIMEOUT_SECONDS: "900"
+    STUDIO_AIRFLOW_RUN_TIMEOUT_SECONDS: "86400"
+    STUDIO_AGL_URL: http://lightning-server:8080
+    STUDIO_AGL_RECOVERY_MODEL: ${STUDIO_AGL_RECOVERY_MODEL:-studio-recovery}
+    STUDIO_AGL_RECOVERY_TIMEOUT_S: "300"
+    STUDIO_WORKER_CLAIM_GATE_URL: http://lightning-controller:8082/readyz
+
+services:
+  studio-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${STUDIO_DB_USER:-studio}
+      POSTGRES_PASSWORD: ${STUDIO_DB_PASSWORD:?set STUDIO_DB_PASSWORD}
+      POSTGRES_DB: ${STUDIO_DB_NAME:-studio}
+    volumes:
+      - studio-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${STUDIO_DB_USER:-studio} -d ${STUDIO_DB_NAME:-studio}"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  airflow-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${AIRFLOW_DB_USER:-airflow}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD:?set AIRFLOW_DB_PASSWORD}
+      POSTGRES_DB: ${AIRFLOW_DB_NAME:-airflow}
+    volumes:
+      - airflow-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${AIRFLOW_DB_USER:-airflow} -d ${AIRFLOW_DB_NAME:-airflow}"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  warehouse:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${WAREHOUSE_ADMIN_USER:-warehouse_admin}
+      POSTGRES_PASSWORD: ${WAREHOUSE_ADMIN_PASSWORD:?set WAREHOUSE_ADMIN_PASSWORD}
+      POSTGRES_DB: ${WAREHOUSE_DB:-warehouse}
+      WAREHOUSE_READER_USER: ${WAREHOUSE_READER_USER:-warehouse_reader}
+      WAREHOUSE_READER_PASSWORD: ${WAREHOUSE_READER_PASSWORD:?set WAREHOUSE_READER_PASSWORD}
+      WAREHOUSE_PIPELINE_WRITER_USER: ${WAREHOUSE_PIPELINE_WRITER_USER:-warehouse_pipeline_writer}
+      WAREHOUSE_PIPELINE_WRITER_PASSWORD: ${WAREHOUSE_PIPELINE_WRITER_PASSWORD:?set WAREHOUSE_PIPELINE_WRITER_PASSWORD}
+    volumes:
+      - warehouse-db:/var/lib/postgresql/data
+      - ./warehouse-init.sql:/docker-entrypoint-initdb.d/10-studio-demo.sql:ro
+      - ./warehouse-init-roles.sh:/docker-entrypoint-initdb.d/20-studio-roles.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${WAREHOUSE_ADMIN_USER:-warehouse_admin} -d ${WAREHOUSE_DB:-warehouse}"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7.2-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "60", "1"]
+    volumes:
+      - redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  airflow-volume-init:
+    image: alpine:3.22.5
+    restart: "no"
+    user: "0:0"
+    command: ["sh", "-ec", "chown 50000:0 /opt/airflow/dags && chmod 0770 /opt/airflow/dags"]
+    volumes:
+      - airflow-dags:/opt/airflow/dags
+
+  airflow-init:
+    <<: *airflow-image
+    restart: "no"
+    environment:
+      <<: *airflow-env
+      AIRFLOW_ROLE: init
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_USERNAME:-studio}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_PASSWORD:?set AIRFLOW_PASSWORD}
+      _AIRFLOW_WWW_USER_EMAIL: ${AIRFLOW_EMAIL:-studio@example.invalid}
+      # The built-in User role can trigger and inspect DAG runs without Airflow
+      # configuration/user-management privileges.
+      _AIRFLOW_WWW_USER_ROLE: User
+    user: "50000:0"
+    volumes:
+      - airflow-dags:/opt/airflow/dags
+    depends_on:
+      airflow-volume-init:
+        condition: service_completed_successfully
+      airflow-db:
+        condition: service_healthy
+      warehouse:
+        condition: service_healthy
+
+  airflow-api:
+    <<: *airflow-service
+    environment:
+      <<: *airflow-env
+      AIRFLOW_ROLE: api-server
+      PORT: "8080"
+    ports:
+      - "127.0.0.1:${AIRFLOW_PUBLIC_PORT:-8080}:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "/opt/studio-airflow/healthcheck.py"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 45s
+
+  airflow-scheduler:
+    <<: *airflow-service
+    environment:
+      <<: *airflow-env
+      AIRFLOW_ROLE: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      airflow-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "/opt/studio-airflow/healthcheck.py"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 45s
+
+  airflow-dag-processor:
+    <<: *airflow-service
+    environment:
+      <<: *airflow-env
+      AIRFLOW_ROLE: dag-processor
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      airflow-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "/opt/studio-airflow/healthcheck.py"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 45s
+
+  recovery-model:
+    <<: *studio-image
+    restart: unless-stopped
+    command: ["uvicorn", "app.recovery_model_gateway:app", "--host", "0.0.0.0", "--port", "8081"]
+    environment:
+      STUDIO_AGL_RECOVERY_MODEL: ${STUDIO_AGL_RECOVERY_MODEL:-studio-recovery}
+      STUDIO_RECOVERY_GATEWAY_MODE: ${STUDIO_RECOVERY_GATEWAY_MODE:-langchain}
+      STUDIO_RECOVERY_UPSTREAM_MODEL: ${STUDIO_RECOVERY_UPSTREAM_MODEL:-anthropic:claude-sonnet-5}
+      STUDIO_RECOVERY_UPSTREAM_BASE_URL: ${STUDIO_RECOVERY_UPSTREAM_BASE_URL:-}
+      STUDIO_RECOVERY_UPSTREAM_API_KEY: ${STUDIO_RECOVERY_UPSTREAM_API_KEY:-}
+      STUDIO_RECOVERY_UPSTREAM_TIMEOUT_S: "240"
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/readyz', timeout=5)"]
+      interval: 10s
+      timeout: 6s
+      retries: 20
+
+  recovery-model-smoke:
+    <<: *studio-image
+    restart: "no"
+    command: ["python", "scripts/smoke_recovery_model.py"]
+    environment:
+      STUDIO_AGL_MODEL_ENDPOINT: http://recovery-model:8081/v1
+      STUDIO_AGL_RECOVERY_MODEL: ${STUDIO_AGL_RECOVERY_MODEL:-studio-recovery}
+      STUDIO_RECOVERY_SMOKE_TIMEOUT_S: "300"
+    depends_on:
+      recovery-model:
+        condition: service_healthy
+
+  lightning-server:
+    <<: *studio-image
+    restart: unless-stopped
+    command: ["python", "scripts/run_agent_lightning.py", "server"]
+    environment:
+      PORT: "8080"
+      AGL_KEY: ${AGL_KEY:?set AGL_KEY}
+      STUDIO_AGL_TOKEN: ${AGL_KEY:?set AGL_KEY}
+      STUDIO_AGL_URL: http://lightning-server:8080
+      STUDIO_AGL_RECOVERY_MODEL: ${STUDIO_AGL_RECOVERY_MODEL:-studio-recovery}
+      STUDIO_AGL_MODEL_ENDPOINT: http://recovery-model:8081/v1
+      STUDIO_AGL_STATE_PATH: /var/lib/agent-lightning/state.json
+    volumes:
+      - agent-lightning-state:/var/lib/agent-lightning
+    depends_on:
+      recovery-model:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "scripts/run_agent_lightning.py", "check"]
+      interval: 10s
+      timeout: 6s
+      retries: 20
+
+  lightning-controller:
+    <<: *studio-image
+    restart: unless-stopped
+    command: ["python", "scripts/run_agent_lightning.py", "controller"]
+    environment:
+      AGL_KEY: ${AGL_KEY:?set AGL_KEY}
+      STUDIO_AGL_TOKEN: ${AGL_KEY:?set AGL_KEY}
+      STUDIO_AGL_URL: http://lightning-server:8080
+      STUDIO_AGL_CONTROLLER_MAXIMUM_SIZE: ${STUDIO_AGL_CONTROLLER_MAXIMUM_SIZE:-4}
+      STUDIO_AGL_CONTROLLER_POLL_INTERVAL_S: "2"
+      STUDIO_AGL_CONTROLLER_HEALTH_PORT: "8082"
+    depends_on:
+      lightning-server:
+        condition: service_healthy
+      recovery-model-smoke:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "scripts/run_agent_lightning.py", "controller-check"]
+      interval: 10s
+      timeout: 6s
+      retries: 6
+      start_period: 30s
+
+  studio-web:
+    <<: *studio-runtime
+    environment:
+      <<: *studio-env
+      STUDIO_WORKER_MODE: external
+      PORT: "8000"
+    ports:
+      - "${STUDIO_BIND_ADDRESS:-127.0.0.1}:${STUDIO_PUBLIC_PORT:-8000}:8000"
+    depends_on:
+      studio-db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      warehouse:
+        condition: service_healthy
+      airflow-api:
+        condition: service_healthy
+      lightning-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=5)"]
+      interval: 10s
+      timeout: 6s
+      retries: 20
+
+  studio-worker:
+    <<: *studio-runtime
+    command: ["python", "-m", "app.worker"]
+    environment:
+      <<: *studio-env
+      STUDIO_WORKER_MODE: external
+      # Only the private worker delivers traces or creates recovery rollouts.
+      # The public web process deliberately has no Lightning bearer token.
+      STUDIO_AGL_TOKEN: ${AGL_KEY:?set AGL_KEY}
+    volumes:
+      - airflow-dags:/opt/airflow/dags
+    depends_on:
+      studio-db:
+        condition: service_healthy
+      warehouse:
+        condition: service_healthy
+      airflow-api:
+        condition: service_healthy
+      airflow-scheduler:
+        condition: service_healthy
+      airflow-dag-processor:
+        condition: service_healthy
+      lightning-server:
+        condition: service_healthy
+      lightning-controller:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request; r=urllib.request.urlopen('http://lightning-controller:8082/readyz', timeout=5); assert r.status == 200 and json.load(r).get('status') == 'ready'"]
+      interval: 10s
+      timeout: 6s
+      retries: 6
+
+volumes:
+  studio-db:
+  airflow-db:
+  warehouse-db:
+  redis:
+  airflow-dags:
+  agent-lightning-state:

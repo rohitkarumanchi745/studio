@@ -35,6 +35,7 @@ from the platform and flips the job on a terminal state.
 """
 import json
 import logging
+import os
 import time
 import uuid
 
@@ -50,6 +51,26 @@ log = logging.getLogger(__name__)
 
 MAX_RETRIES = 2            # automatic retries before escalating to a human
 _WRITE = queryguard.FORBIDDEN  # DML/DDL keyword detector, reused from the guard
+
+
+def platform_run_timeout_seconds(target=None):
+    """Maximum wall time Studio will autonomously monitor one accepted run.
+
+    The external run is never canceled or retried at this boundary. It becomes
+    an explicit human-inspection state because its eventual outcome is unknown.
+    """
+    specific = "STUDIO_AIRFLOW_RUN_TIMEOUT_SECONDS" if target == "airflow" else None
+    raw = (os.getenv(specific) if specific else None) \
+        or os.getenv("STUDIO_PLATFORM_RUN_TIMEOUT_SECONDS") or "86400"
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        raise RuntimeError(
+            f"{specific or 'STUDIO_PLATFORM_RUN_TIMEOUT_SECONDS'} must be an integer") from None
+    if not 60 <= value <= 30 * 86400:
+        raise RuntimeError(
+            f"{specific or 'STUDIO_PLATFORM_RUN_TIMEOUT_SECONDS'} must be between 60 and 2592000")
+    return value
 
 #: SQL text, run statement-by-statement against a data source.
 SQL_KIND = "sql_script"
@@ -317,10 +338,13 @@ def _execute(job):
     if kind == PLATFORM_KIND:
         if not job.get("human_by"):
             raise RuntimeError("A platform run reached execution without a human approver.")
+        run_timeout = platform_run_timeout_seconds(target)
         jobs.check_claim()
         # Adapters read their own env creds and raise RuntimeError with a clear
         # message; {"run_ref","url"} lands in the result JSON column.
         out = platforms.get_platform(target).trigger(json.loads(job["script"]))
+        out["launched_at"] = time.time()
+        out["run_timeout_seconds"] = run_timeout
         _record_platform_rollout(user, target, out.get("run_ref"))
         return out
 
@@ -646,21 +670,63 @@ def live_job(jid: str, user=Depends(current_user)):
     except Exception:
         quality = []
 
+    now = time.time()
     merged = {**stored, "state": st["state"], "detail": st.get("detail"),
               "metrics": st.get("metrics") or {}}
     if st.get("url"):
         merged["url"] = st["url"]
+    # A terminal state is served from ``stored`` on later polls. Preserve the
+    # first bounded diagnostic instead of replacing it with a generic error if
+    # Airflow's log endpoint is temporarily unavailable on a subsequent GET.
+    failure_diagnostic = str(stored.get("failure_diagnostic") or "")[:4000]
+    if st["state"] == "failed" and not failure_diagnostic:
+        try:
+            failure_diagnostic = p.failure_diagnostic(run_ref)
+        except Exception:
+            failure_diagnostic = ""
+        if failure_diagnostic:
+            merged["failure_diagnostic"] = failure_diagnostic[:4000]
     fields = {"result": json.dumps(merged, default=str)}
+    reported_state = st["state"]
+    reported_detail = st.get("detail")
     if st["state"] == "succeeded":
         fields["status"] = "succeeded"      # idempotent: succeeded stays succeeded
     elif st["state"] == "failed":
         fields["status"] = "failed"
-        fields["last_error"] = (st.get("detail") or "platform reported failure")[:500]
+        fields["last_error"] = (
+            failure_diagnostic or st.get("detail") or row.get("last_error")
+            or "platform reported failure")[:4000]
     elif st["state"] == "canceled":
         fields["status"] = "canceled"
+    else:
+        try:
+            # created_at is immutable. Using updated_at for legacy rows made
+            # every status poll slide the deadline forward forever.
+            launched_at = float(stored.get("launched_at") or row["created_at"])
+            timeout = int(stored.get("run_timeout_seconds")
+                          or platform_run_timeout_seconds(row["target"]))
+            expired = now - launched_at >= timeout
+        except (TypeError, ValueError, RuntimeError):
+            expired = True
+        if st.get("permanent") or expired:
+            if st.get("permanent"):
+                reason = "Platform status cannot be observed without operator action"
+            elif st["state"] == "unknown":
+                reason = "Platform run status remained unknown past its monitoring deadline"
+            else:
+                reason = "Platform run did not reach a terminal state before its monitoring deadline"
+            if st.get("detail"):
+                reason += ": " + str(st["detail"])
+            reason = reason[:1000]
+            merged["observation_escalation"] = reason
+            fields["result"] = json.dumps(merged, default=str)
+            fields["status"] = "escalated"
+            fields["last_error"] = reason
+            reported_state = "escalated"
+            reported_detail = reason
     # Do not let an older in-flight poll overwrite a terminal observation or
     # metadata another replica just committed. The monitor safely polls again.
-    fields["updated_at"] = time.time()
+    fields["updated_at"] = now
     with db.connect() as c:
         cur = c.execute("UPDATE supervised_jobs SET " + ", ".join(f"{k}=?" for k in fields)
                         + " WHERE id=? AND result=? AND status=?",
@@ -669,7 +735,9 @@ def live_job(jid: str, user=Depends(current_user)):
     if cur.rowcount != 1:
         current = _public(_get(jid))
         result = current.get("result") or {}
-        return {"state": result.get("state", current["status"]), "detail": result.get("detail"),
+        current_state = (current["status"] if current.get("status") == "escalated"
+                         else result.get("state", current["status"]))
+        return {"state": current_state, "detail": current.get("last_error") or result.get("detail"),
                 "url": result.get("url"), "metrics": result.get("metrics") or {},
                 "logs": "", "quality": [], "job": current}
     row.update(fields)
@@ -687,7 +755,7 @@ def live_job(jid: str, user=Depends(current_user)):
             dag_recovery.enroll(_get(row["id"]))
             row = _get(row["id"])
 
-    return {"state": st["state"], "detail": st.get("detail"),
+    return {"state": reported_state, "detail": reported_detail,
             "url": st.get("url") or stored.get("url"),
             "metrics": st.get("metrics") or {}, "logs": logs,
             "quality": quality, "job": _public(row)}

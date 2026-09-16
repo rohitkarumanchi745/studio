@@ -1,0 +1,29 @@
+# EXAMPLE ONLY. The base exposes only a ClusterIP Service. Adapt the class,
+# hostname, TLS issuer/Secret and ingress-controller source policy to your cloud.
+# No Airflow, Agent Lightning, recovery-model or BitNet ingress is provided.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: studio
+  namespace: studio-system
+  annotations:
+    # Example for cert-manager; remove or replace for your controller.
+    cert-manager.io/cluster-issuer: replace-me
+spec:
+  ingressClassName: replace-me
+  tls:
+    - hosts:
+        - studio.example.invalid
+      secretName: studio-tls
+  rules:
+    - host: studio.example.invalid
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: studio-web
+                port:
+                  name: http
+

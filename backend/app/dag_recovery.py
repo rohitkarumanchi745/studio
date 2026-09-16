@@ -16,6 +16,8 @@ from . import db, jobs, queryguard
 log = logging.getLogger("studio.dag_recovery")
 MAX_ATTEMPTS = 2
 ACTIVE = {"pending", "diagnosing", "retrying", "awaiting_approval"}
+_RECONCILE_BATCH = 200
+_REWARD_REVIVE_AFTER_SECONDS = 300
 
 
 def policy(value=None):
@@ -187,13 +189,13 @@ def recover(payload, job=None):
             raise ValueError("Original recipe no longer passes current permissions")
         decision = recovery.get("decision")
         if not decision:
-            if time.time() - recovery.get("started_at", time.time()) > 600:
-                decision = {"decision": "escalate", "reason": "Lightning recovery did not finish within ten minutes."}
-            else:
-                decision = recovery_planner.diagnose(user, prompt=result.get("studio", {}).get("prompt") or old.get("prompt"),
-                    action={"type": "airflow_dag", "plan": old}, error=row.get("last_error") or result.get("detail"),
-                    request_id=_request_id(row), schema=_schema(user, old),
-                    history=[{"attempt": rules["attempt"], "status": "failed", "error": row.get("last_error")}])
+            # diagnose() owns the single STUDIO_AGL_RECOVERY_TIMEOUT_S deadline.
+            # A second orchestration timeout used to reject valid 601-900 second
+            # rollouts before their configured Agent Lightning deadline.
+            decision = recovery_planner.diagnose(user, prompt=result.get("studio", {}).get("prompt") or old.get("prompt"),
+                action={"type": "airflow_dag", "plan": old}, error=row.get("last_error") or result.get("detail"),
+                request_id=_request_id(row), schema=_schema(user, old),
+                history=[{"attempt": rules["attempt"], "status": "failed", "error": row.get("last_error")}])
             recovery.update(state="diagnosing", reason=decision.get("reason") or "Lightning agent is evaluating the failure.",
                             rollout_id=decision.get("rollout_id"))
             if decision.get("decision") == "pending":
@@ -293,28 +295,66 @@ def deliver_reward(payload, job=None):
     result, rules = _stored(row), _policy(row)
     if not result.get("run_ref") or not rules.get("decision_rollout_id"):
         return {"skipped": "no_decision_rollout"}
+    delivered = result.get("recovery_reward") or {}
+    if (isinstance(delivered, dict)
+            and delivered.get("run_ref") == result["run_ref"]
+            and delivered.get("rollout_id") == rules["decision_rollout_id"]):
+        return {"skipped": "already_delivered"}
     jobs.check_claim()
     recovery_planner.record_outcome(rules["decision_rollout_id"], run_id=f"{row['id']}:{result['run_ref']}",
                                    status=row["status"], error=row.get("last_error"))
+    # Mark the exact rollout/run pair only after the append-only external events
+    # succeed. If another status poll changed this row, fail the queue attempt;
+    # its retry rechecks the external events idempotently before marking.
+    result["recovery_reward"] = {
+        "rollout_id": rules["decision_rollout_id"], "run_ref": result["run_ref"],
+        "delivered_at": time.time(),
+    }
+    from .workflow_runs import _transition
+    if not _transition(row, claim=job, result=json.dumps(result)):
+        raise RuntimeError("Recovery reward was delivered but its durable marker raced a job update")
     return {"delivered": True}
+
+
+def _queue_reward(row, result, rules, connection):
+    identity = str(uuid.uuid5(
+        uuid.NAMESPACE_URL, f"dag-recovery-reward:{row['id']}:{result['run_ref']}"))
+    now = time.time()
+    connection.execute(
+        "INSERT INTO background_jobs (id,kind,payload,status,attempts,max_attempts,run_after,user_id,created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status='queued',attempts=0,error=NULL,"
+        "result=NULL,finished_at=NULL,locked_by=NULL,locked_at=NULL,heartbeat_at=NULL,run_after=excluded.run_after "
+        "WHERE background_jobs.status='failed' AND background_jobs.finished_at<=?",
+        (identity, "dag_recovery_reward", json.dumps({"job_id": row["id"]}), "queued", 0, 5,
+         now, row["user_id"], now, now - _REWARD_REVIVE_AFTER_SECONDS))
 
 
 @jobs.reconciler
 def reconcile():
     from . import supervisor
-    with db.connect() as connection:
-        rows = connection.execute("SELECT * FROM supervised_jobs WHERE kind=? AND status IN ('failed','succeeded') "
-                                  "AND result LIKE ? ORDER BY updated_at DESC LIMIT 200",
-                                  (supervisor.DAG_KIND, '%"agent_recovery":%')).fetchall()
-    for item in rows:
-        row = dict(item)
-        enroll(row)
-        rules, result = _policy(row), _stored(row)
-        if rules.get("decision_rollout_id") and result.get("run_ref"):
-            identity = str(uuid.uuid5(uuid.NAMESPACE_URL, f"dag-recovery-reward:{row['id']}:{result['run_ref']}"))
-            with db.connect() as connection:
-                connection.execute("INSERT INTO background_jobs (id,kind,payload,status,attempts,max_attempts,run_after,user_id,created_at) "
-                    "VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING",
-                    (identity, "dag_recovery_reward", json.dumps({"job_id": row["id"]}), "queued", 0, 5,
-                     time.time(), row["user_id"], time.time()))
-                connection.commit()
+    # Keyset through the entire candidate set. A newest-200 query permanently
+    # hid old crash-gap rows once a deployment accumulated enough terminal DAGs.
+    cursor_at, cursor_id = -1.0, ""
+    while True:
+        with db.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM supervised_jobs WHERE kind=? AND status IN ('failed','succeeded') "
+                "AND result LIKE ? AND (updated_at>? OR (updated_at=? AND id>?)) "
+                "ORDER BY updated_at,id LIMIT ?",
+                (supervisor.DAG_KIND, '%"agent_recovery":%', cursor_at, cursor_at,
+                 cursor_id, _RECONCILE_BATCH)).fetchall()
+        if not rows:
+            return
+        for item in rows:
+            row = dict(item)
+            enroll(row)
+            rules, result = _policy(row), _stored(row)
+            marker = result.get("recovery_reward") or {}
+            rewarded = (isinstance(marker, dict)
+                        and marker.get("run_ref") == result.get("run_ref")
+                        and marker.get("rollout_id") == rules.get("decision_rollout_id"))
+            if rules.get("decision_rollout_id") and result.get("run_ref") and not rewarded:
+                with db.connect() as connection:
+                    _queue_reward(row, result, rules, connection)
+                    connection.commit()
+        cursor_at, cursor_id = float(rows[-1]["updated_at"]), rows[-1]["id"]

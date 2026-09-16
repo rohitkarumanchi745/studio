@@ -184,6 +184,21 @@ class BigQueryConnector(Connector):
                  "type": f.field_type + ("[]" if f.mode == "REPEATED" else "")}
                 for f in t.schema]
 
+    def relation_kind(self, namespace, table):
+        """Use tables.get metadata; no query is submitted or bytes billed."""
+        if not isinstance(namespace, str) or not isinstance(table, str) \
+                or not namespace or not table or len(namespace) > 1024 or len(table) > 1024 \
+                or "\x00" in namespace or "\x00" in table:
+            raise ValueError("Invalid relation identity")
+        reference = f"{self._project()}.{namespace}.{table}"
+        try:
+            relation = self._client().get_table(reference)
+        except Exception as exc:
+            if getattr(exc, "code", None) == 404:
+                return "missing"
+            raise
+        return "table" if str(getattr(relation, "table_type", "")).upper() == "TABLE" else "other"
+
     def run_query(self, sql):
         c = self._client()
         it = c.query_and_wait(

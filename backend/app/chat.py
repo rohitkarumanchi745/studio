@@ -73,6 +73,9 @@ class Ask(BaseModel):
     # several sources (the user chose "both, side by side" on a clarification).
     allow_ambiguous: bool = False
     pipeline_action: Optional[Literal["build", "run", "status"]] = None
+    # Disambiguates the build control. Omitted preserves the original
+    # read-only SQL pipeline; Airflow is an explicit, typed DAG planning mode.
+    pipeline_mode: Optional[Literal["read_only_sql", "airflow_dag"]] = None
     # A Run button selects an immutable version in THIS conversation. The
     # client never supplies executable steps; they are recovered server-side.
     pipeline_message_id: Optional[str] = None
@@ -315,6 +318,8 @@ def _scope(body, user, before_message_id=None):
         raise HTTPException(400, "Empty prompt")
     if body.pipeline_message_id and body.pipeline_action not in ("run", "status"):
         raise HTTPException(400, "A pipeline version can only be selected for a run")
+    if body.pipeline_mode and body.pipeline_action != "build":
+        raise HTTPException(400, "A pipeline mode can only be selected while building")
     if body.platform_message_id and not body.platform_action:
         raise HTTPException(400, "Choose a platform action for this job version")
     if body.pipeline_action and (body.platform_action or body.platform_target or body.platform_payload is not None):
@@ -322,6 +327,12 @@ def _scope(body, user, before_message_id=None):
 
     workflow_previous = _workflow_context(body.conversation_id, user, body.pipeline_message_id, before_message_id)
     workflow_action = chat_workflows.intent(prompt, workflow_previous)
+    if body.pipeline_action == "build" and body.pipeline_mode:
+        # An explicit UI/API mode is authoritative. Airflow accepts arbitrary
+        # natural-language requirements without depending on a classifier;
+        # read_only_sql cannot be redirected into a write-capable workflow by
+        # words in the prompt or by an older Airflow draft in the conversation.
+        workflow_action = "build" if body.pipeline_mode == "airflow_dag" else None
     if body.pipeline_action == "run" and chat_workflows.is_plan(workflow_previous):
         workflow_action = "submit"
     if body.pipeline_action == "status":
@@ -912,8 +923,12 @@ def _run_turn(ctx, user):
             result = _run(model)   # frontier LLM (default, or BitNet escalation)
             result.setdefault("served_by", "frontier")
         if not ctx["history"]:   # same reason: a follow-up's plan is context-bound
-            qcache.store(user, ctx["source"], ctx["table_label"], prompt, result,
-                         reward=lightning.heuristic_reward(result))
+            cache_id = qcache.store(
+                user, ctx["source"], ctx["table_label"], prompt, result,
+                reward=lightning.heuristic_reward(result))
+            if cache_id:
+                result["_qcache_id"] = cache_id
+                result["_qcache_feedback_mode"] = "replace"
     progress.emit("finalizing the answer")
     result["source"] = ctx["source"]
     result["table"] = ctx["table_label"]
@@ -931,6 +946,10 @@ def _run_turn(ctx, user):
                                       history=ctx["history"])
     if tid:
         result["trace_id"] = tid
+    # Internal linkage is persisted on the trace for feedback reconciliation;
+    # it is not part of the chat response or stored assistant message.
+    result.pop("_qcache_id", None)
+    result.pop("_qcache_feedback_mode", None)
     result["author_role"] = user["role"]
     _answer(ctx, result)
     db.log_activity(
@@ -1363,7 +1382,7 @@ def audit(all: bool = False, limit: int = 200, user=Depends(current_user)):
 
 class Feedback(BaseModel):
     trace_id: str
-    score: int  # 1 = helpful, -1 = wrong/unhelpful
+    score: Literal[-1, 1]  # 1 = helpful, -1 = wrong/unhelpful
     note: Optional[str] = None
 
 
@@ -1372,7 +1391,8 @@ def feedback(body: Feedback, user=Depends(current_user)):
     """👍/👎 on an answer — the explicit reward signal the agent learns from
     (overwrites the heuristic reward on that run's trace)."""
     ok = db.set_trace_reward(
-        body.trace_id, 1.0 if body.score > 0 else 0.0, source="user", note=body.note)
+        body.trace_id, 1.0 if body.score > 0 else 0.0,
+        user_id=user["id"], source="user", note=body.note)
     if not ok:
         raise HTTPException(404, "Unknown trace")
     db.log_activity(user, "feedback", prompt=(body.note or "")[:300],
@@ -1433,12 +1453,22 @@ def _agent_tally(traces):
 
 
 @router.get("/skills")
-def skills_catalog(user=Depends(current_user)):
+def skills_catalog(role: Optional[str] = None, user=Depends(current_user)):
     """Every skill file this user's role can see — the RBAC-scoped briefing each
     per-source agent runs on (source, dialect, tables, schemas). This is exactly
     what the agents read, surfaced so a user can read it too."""
+    effective = user
+    if role is not None:
+        role = role.strip()
+        if user["role"] != "admin" and role != user["role"]:
+            raise HTTPException(403, "Only admins may inspect another role's skills")
+        # Unknown roles naturally resolve to no data; reject them explicitly so
+        # a typo cannot produce an empty, source-blind training context.
+        if role not in rbac._policies():
+            raise HTTPException(400, "Unknown role")
+        effective = {**user, "role": role}
     out = []
-    for s in orchestrator.accessible_sources(user):
+    for s in orchestrator.accessible_sources(effective):
         conn = s["connector"]
         out.append({
             "source": conn.name,
@@ -1447,7 +1477,7 @@ def skills_catalog(user=Depends(current_user)):
             "tables": s["allowed"],
             "skill": s["skill"],
         })
-    return {"skills": out, "role": user["role"]}
+    return {"skills": out, "role": effective["role"]}
 
 
 def _training_stats():

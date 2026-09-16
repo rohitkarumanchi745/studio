@@ -287,6 +287,19 @@ class DatabricksConnector(Connector):
             return out
         return self._execute(go)
 
+    def relation_kind(self, namespace, table):
+        """List one configured output schema without reading relation data."""
+        if not isinstance(namespace, str) or not re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_$]{0,127}", namespace):
+            raise ValueError("Invalid output schema")
+
+        def go(con):
+            cur = con.cursor()
+            cur.execute(f"SHOW TABLES IN `{namespace}`")
+            names = {str(row[1]).lower() for row in cur.fetchall()}
+            return "table" if str(table).lower() in names else "missing"
+        return self._execute(go)
+
     def run_query(self, sql_text):
         def go(con):
             cur = con.cursor()

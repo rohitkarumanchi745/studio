@@ -27,6 +27,10 @@ class Catalog:
     def get_schema(self, table):
         return [{"name": "sale_id", "type": "INTEGER"}, {"name": "revenue", "type": "FLOAT"}]
 
+    def relation_kind(self, namespace, table):
+        assert namespace == "pipeline_output"
+        return "missing"
+
     def run_query(self, *args, **kwargs):
         pytest.fail("Plan validation must not execute SQL")
 
@@ -44,6 +48,7 @@ def scope(monkeypatch):
     monkeypatch.setattr(pipeline_dags.governance, "_rules_for", lambda *args: None)
     monkeypatch.setattr(pipeline_dags.governance, "column_rules", lambda *args: {"deny": set(), "mask": set()})
     monkeypatch.setenv("STUDIO_AIRFLOW_CONNECTIONS_JSON", '{"postgres":"warehouse_pg"}')
+    monkeypatch.delenv("STUDIO_AIRFLOW_OUTPUT_SCHEMA", raising=False)
     monkeypatch.setattr(pipeline_dags.agent, "llm_available", lambda *a, **k: False)
 
 
@@ -158,6 +163,88 @@ def test_authorized_qualified_and_quoted_output_keeps_case_identity():
     assert pipeline_dags.validate(USER, raw)["status"] == "blocked"
 
 
+def test_operator_owned_output_schema_is_required_for_materialized_tasks(monkeypatch):
+    monkeypatch.setenv("STUDIO_AIRFLOW_OUTPUT_SCHEMA", "pipeline_output")
+    for target in ("daily_sales", "public.daily_sales", "other.pipeline_output.daily_sales"):
+        raw = plan()
+        raw["tasks"] = [{"id": "write",
+                         "sql": f"CREATE TABLE {target} AS SELECT * FROM sales",
+                         "produces": target, "depends_on": []}]
+        result = pipeline_dags.validate(USER, raw)
+        assert result["status"] == "blocked", (target, result)
+        assert "pipeline schema 'pipeline_output'" in result["errors"][0]
+
+    raw = plan()
+    raw["tasks"][0].update(
+        sql="CREATE TABLE pipeline_output.daily_sales AS SELECT * FROM sales",
+        produces="pipeline_output.daily_sales")
+    raw["tasks"][1]["sql"] = "SELECT SUM(revenue) FROM pipeline_output.daily_sales"
+    result = pipeline_dags.validate(USER, raw)
+    assert result["status"] == "ready", result
+    assert result["tasks"][0]["produces"] == "pipeline_output.daily_sales"
+
+    # Qualifiers are bound per object. A similarly named output cannot launder
+    # an input, and a dependency cannot drift onto the source schema.
+    spoofed_input = copy.deepcopy(raw)
+    spoofed_input["tasks"][0]["sql"] = (
+        "CREATE TABLE pipeline_output.daily_sales AS "
+        "SELECT * FROM pipeline_output.sales")
+    assert pipeline_dags.validate(USER, spoofed_input)["status"] == "blocked"
+    wrong_dependency = copy.deepcopy(raw)
+    wrong_dependency["tasks"][1]["sql"] = "SELECT * FROM public.daily_sales"
+    assert pipeline_dags.validate(USER, wrong_dependency)["status"] == "blocked"
+    bare_dependency = copy.deepcopy(raw)
+    bare_dependency["tasks"][1]["sql"] = "SELECT * FROM daily_sales"
+    assert pipeline_dags.validate(USER, bare_dependency)["status"] == "blocked"
+
+
+def test_output_schema_catalog_detects_partial_ctas_before_recovery(monkeypatch):
+    monkeypatch.setenv("STUDIO_AIRFLOW_OUTPUT_SCHEMA", "pipeline_output")
+    raw = plan()
+    raw["tasks"][0].update(
+        sql="CREATE TABLE pipeline_output.daily_sales AS SELECT * FROM sales",
+        produces="pipeline_output.daily_sales")
+    raw["tasks"][1]["sql"] = "SELECT SUM(revenue) FROM pipeline_output.daily_sales"
+    monkeypatch.setattr(
+        Catalog, "relation_kind",
+        lambda self, namespace, table: "table" if table == "daily_sales" else "missing")
+    result = pipeline_dags.validate(USER, raw)
+    assert result["status"] == "needs_input", result
+    assert "already exists" in result["missing"][0]
+
+
+def test_output_schema_catalog_must_be_provable(monkeypatch):
+    monkeypatch.setenv("STUDIO_AIRFLOW_OUTPUT_SCHEMA", "pipeline_output")
+    raw = plan()
+    raw["tasks"][0].update(
+        sql="CREATE TABLE pipeline_output.daily_sales AS SELECT * FROM sales",
+        produces="pipeline_output.daily_sales")
+    raw["tasks"][1]["sql"] = "SELECT SUM(revenue) FROM pipeline_output.daily_sales"
+    monkeypatch.setattr(Catalog, "relation_kind", lambda *args: None)
+    result = pipeline_dags.validate(USER, raw)
+    assert result["status"] == "blocked"
+    assert "cannot verify destinations" in result["errors"][0]
+
+
+def test_invalid_operator_output_schema_fails_closed(monkeypatch):
+    monkeypatch.setenv("STUDIO_AIRFLOW_OUTPUT_SCHEMA", "pipeline_output, public")
+    result = pipeline_dags.validate(USER, plan())
+    assert result["status"] == "blocked"
+    assert "plain SQL schema identifier" in result["errors"][0]
+
+
+def test_external_pipeline_rejects_schema_qualified_user_functions(monkeypatch):
+    monkeypatch.setenv("STUDIO_AIRFLOW_OUTPUT_SCHEMA", "pipeline_output")
+    raw = plan()
+    raw["tasks"] = [{
+        "id": "read", "sql": "SELECT public.operator_defined(revenue) FROM sales",
+        "depends_on": [],
+    }]
+    result = pipeline_dags.validate(USER, raw)
+    assert result["status"] == "blocked"
+    assert "Schema-qualified functions" in result["errors"][0]
+
+
 def test_output_must_be_declared_even_when_sql_is_supported():
     raw = plan()
     del raw["tasks"][0]["produces"]
@@ -244,7 +331,32 @@ def test_model_json_becomes_a_ready_validated_dag(monkeypatch):
     assert result["generation"] == "model"
     payload = json.loads(calls[0][1][1])
     assert set(payload["authorized_input_schema"]) == {"sales"}
+    assert payload["authorized_output_schema"] is None
     assert "deduplication keys" in calls[0][0][1]
+
+
+def test_sql_trained_bitnet_shape_falls_back_to_frontier_for_airflow_dag(monkeypatch):
+    monkeypatch.setenv("STUDIO_LLM_BASE_URL", "http://bitnet.internal/v1")
+    monkeypatch.setenv("STUDIO_BITNET_LLM", "openai:bitnet")
+    monkeypatch.setattr(pipeline_dags.agent, "llm_spec", lambda: "anthropic:frontier")
+    monkeypatch.setattr(pipeline_dags.agent, "llm_available", lambda *a, **k: True)
+    calls = []
+
+    def make_llm(spec, user):
+        def invoke(_messages):
+            calls.append(spec)
+            content = ({"tool": "run_sql", "sql": "SELECT * FROM sales"}
+                       if spec == "bitnet" else plan())
+            return SimpleNamespace(content=json.dumps(content))
+        return SimpleNamespace(invoke=invoke)
+
+    monkeypatch.setattr(pipeline_dags.agent, "make_llm", make_llm)
+    result = pipeline_dags.build(
+        USER, "Create daily_sales from sales then summarize revenue",
+        source="postgres", tables=["sales"], model="bitnet")
+    assert result["status"] == "ready", result
+    assert calls == ["bitnet", "anthropic:frontier"]
+    assert result["planner_served_by"] == "frontier"
 
 
 def test_model_invented_destination_requires_confirmation(monkeypatch):

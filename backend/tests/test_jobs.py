@@ -736,6 +736,23 @@ def test_worker_mode_env(monkeypatch):
     assert jobs.worker_mode() == "thread"
 
 
+def test_worker_claim_gate_fails_closed_before_queue_or_schedulers(env):
+    jobs = env
+    calls = []
+    jobs.handler("t_gated")(lambda payload, job: calls.append("job"))
+    jid = jobs.enqueue("t_gated", {})
+    schedulers = [{"name": "gated", "fn": lambda: calls.append("scheduler"),
+                   "enabled": lambda: True, "interval_s": 1}]
+    worker = jobs.Worker(worker_id="gated-worker", schedulers=schedulers,
+                         claim_gate=lambda: False)
+    worker._next_reclaim = time.time() + 3600
+    worker._next_sched = {"gated": 0}
+
+    assert worker._tick() is False
+    assert jobs.get(jid)["status"] == "queued"
+    assert calls == []
+
+
 # ── Tickers exist and run without a lease ────────────────────────────────
 
 def test_tick_once_runs_without_a_lease(client):
@@ -1080,5 +1097,20 @@ def test_spa_fallback_serves_index_files_and_api_404(spa_client):
     assert "outside dist" not in r.text
     # Unprefixed health, docs and the schema keep working ahead of the catch-all.
     assert c.get("/health").json()["status"] == "ok"
+    assert c.get("/readyz").json()["status"] == "ready"
     assert c.get("/docs").status_code == 200
     assert c.get("/openapi.json").status_code == 200
+
+
+def test_readyz_fails_closed_when_the_application_store_is_unavailable(
+        spa_client, monkeypatch):
+    import app.main as main
+
+    def unavailable():
+        raise RuntimeError("database detail that must not leak")
+
+    monkeypatch.setattr(main.db, "connect", unavailable)
+    response = spa_client.get("/readyz")
+    assert response.status_code == 503
+    assert response.json() == {"status": "not_ready", "stage": "database"}
+    assert "must not leak" not in response.text

@@ -30,6 +30,7 @@ level further out — so supervise → gateway → ready is exercised with no mo
 no bitnet.cpp build, no Docker and no network.
 """
 import importlib.util
+import hashlib
 import json
 import os
 import re
@@ -217,6 +218,91 @@ def test_the_container_defaults_still_win_with_no_local_environment(monkeypatch)
     finally:
         monkeypatch.undo()
         supervisor.load_config()
+
+
+def test_downloaded_adapter_is_atomically_bound_to_its_uri(tmp_path, monkeypatch):
+    adapters = tmp_path / "adapters"
+    adapters.mkdir()
+    adapter = adapters / "tool_call.gguf"
+    sidecar = adapters / "tool_call.gguf.uri"
+    identity_sidecar = adapters / "tool_call.gguf.identity.json"
+    uri = "https://models.example/tool_call-v7.gguf"
+    content = b"GGUF" + b"adapter"
+    digest = hashlib.sha256(content).hexdigest()
+    monkeypatch.setattr(supervisor, "ADAPTER_PATH", str(adapter))
+    monkeypatch.setattr(supervisor, "ADAPTER_URI_PATH", str(sidecar))
+    monkeypatch.setattr(supervisor, "ADAPTER_IDENTITY_PATH", str(identity_sidecar))
+    monkeypatch.setattr(supervisor, "ADAPTER_URL", uri)
+    monkeypatch.setattr(supervisor, "ADAPTER_VERSION", "7")
+    monkeypatch.setattr(supervisor, "ADAPTER_SHA256", digest)
+    monkeypatch.setattr(supervisor, "REQUIRE_ADAPTER", True)
+    calls = []
+
+    def fetched(url, destination, *_args):
+        calls.append((url, destination))
+        with open(destination, "wb") as handle:
+            handle.write(content)
+        return True
+
+    monkeypatch.setattr(supervisor, "fetch", fetched)
+    assert supervisor.ensure_adapter() is True
+    assert calls == [(uri, str(adapter) + ".candidate")]
+    assert sidecar.read_text().strip() == uri
+    assert os.stat(sidecar).st_mode & 0o077 == 0
+    assert json.loads(identity_sidecar.read_text()) == {
+        "sha256": digest, "uri": uri, "version": 7,
+    }
+    assert os.stat(identity_sidecar).st_mode & 0o077 == 0
+    mounted = supervisor.mounted_adapter()
+    assert {key: mounted[key] for key in ("uri", "version", "sha256")} == {
+        "uri": uri, "version": 7, "sha256": digest,
+    }
+
+    # A restart reuses bytes only when their provenance matches exactly.
+    assert supervisor.ensure_adapter() is True
+    assert len(calls) == 1
+
+
+def test_stale_or_anonymous_adapter_is_not_accepted_when_refetch_fails(tmp_path, monkeypatch):
+    adapter = tmp_path / "tool_call.gguf"
+    sidecar = tmp_path / "tool_call.gguf.uri"
+    adapter.write_bytes(b"GGUF-old")
+    sidecar.write_text("https://models.example/old.gguf\n")
+    monkeypatch.setattr(supervisor, "ADAPTER_PATH", str(adapter))
+    monkeypatch.setattr(supervisor, "ADAPTER_URI_PATH", str(sidecar))
+    monkeypatch.setattr(supervisor, "ADAPTER_IDENTITY_PATH",
+                        str(tmp_path / "tool_call.gguf.identity.json"))
+    monkeypatch.setattr(supervisor, "ADAPTER_URL", "https://models.example/new.gguf")
+    monkeypatch.setattr(supervisor, "ADAPTER_VERSION", "1")
+    monkeypatch.setattr(supervisor, "ADAPTER_SHA256", "")
+    monkeypatch.setattr(supervisor, "REQUIRE_ADAPTER", False)
+    monkeypatch.setattr(supervisor, "fetch", lambda *_args: False)
+
+    assert supervisor.ensure_adapter() is False
+    assert adapter.read_bytes() == b"GGUF-old"
+    assert supervisor.mounted_adapter()["uri"] != supervisor.ADAPTER_URL
+
+
+def test_strict_adapter_digest_mismatch_never_replaces_existing_bytes(tmp_path, monkeypatch):
+    adapter = tmp_path / "tool_call.gguf"
+    adapter.write_bytes(b"known-good-old-bytes")
+    monkeypatch.setattr(supervisor, "ADAPTER_PATH", str(adapter))
+    monkeypatch.setattr(supervisor, "ADAPTER_URI_PATH", str(adapter) + ".uri")
+    monkeypatch.setattr(supervisor, "ADAPTER_IDENTITY_PATH", str(adapter) + ".identity.json")
+    monkeypatch.setattr(supervisor, "ADAPTER_URL", "https://models.example/tool_call.gguf")
+    monkeypatch.setattr(supervisor, "ADAPTER_VERSION", "9")
+    monkeypatch.setattr(supervisor, "ADAPTER_SHA256", "a" * 64)
+    monkeypatch.setattr(supervisor, "REQUIRE_ADAPTER", True)
+
+    def fetched(_url, destination, *_args):
+        with open(destination, "wb") as handle:
+            handle.write(b"wrong-new-bytes")
+        return True
+
+    monkeypatch.setattr(supervisor, "fetch", fetched)
+    assert supervisor.ensure_adapter() is False
+    assert adapter.read_bytes() == b"known-good-old-bytes"
+    assert not (tmp_path / "tool_call.gguf.identity.json").exists()
 
 
 # ── 4. Finding (or not finding) the engine ───────────────────────────────
@@ -408,16 +494,18 @@ def local_unit(tmp_path):
             str(tmp_path / "bitnet-stub" / "build" / "bin" / "llama-server"),
             STUB_ENGINE.format(python=sys.executable))
         root = tmp_path / "bn"
+        fake_model = b"GGUF" + b"\0" * 4096
         if model:
-            # >1 KB and starting with the GGUF magic, which is all
-            # supervisor.ensure_model() inspects on an already-present file.
+            # Small deterministic stand-in with a real pinned digest.
             (root / "models").mkdir(parents=True)
-            (root / "models" / "ggml-model-i2_s.gguf").write_bytes(b"GGUF" + b"\0" * 4096)
+            (root / "models" / "ggml-model-i2_s.gguf").write_bytes(fake_model)
         record = tmp_path / "engine.json"
         env = {**os.environ,
                # If the runner ever DID try to download, this dead URL makes it
                # fail loudly instead of quietly pulling 1.1 GB in a test run.
                "STUDIO_BITNET_GGUF_URL": "http://127.0.0.1:1/must-not-be-fetched",
+               "STUDIO_BITNET_GGUF_BYTES": str(len(fake_model)),
+               "STUDIO_BITNET_GGUF_SHA256": hashlib.sha256(fake_model).hexdigest(),
                "STUDIO_MODEL_FETCH_RETRIES": "1",
                "STUB_ENGINE_RECORD": str(record),
                **(extra_env or {})}

@@ -88,6 +88,27 @@ def test_prompt_builds_real_dependency_plan_and_download_without_execution(clien
         assert c.execute("SELECT COUNT(*) n FROM supervised_jobs").fetchone()["n"] == 0
 
 
+def test_explicit_airflow_mode_accepts_arbitrary_natural_requirements(client):
+    result = ask(
+        client,
+        "Take sales, calculate daily totals, and keep them in daily_sales",
+        pipeline_action="build", pipeline_mode="airflow_dag",
+    )["message"]["pipeline"]
+    assert result["execution_mode"] == "airflow_dag"
+    assert result["status"] == "ready", result
+    assert not list(client.dag_dir.iterdir())
+
+
+def test_explicit_read_only_mode_cannot_be_redirected_to_airflow(client):
+    message = ask(
+        client,
+        "Build an Airflow pipeline for monthly revenue by region",
+        pipeline_action="build", pipeline_mode="read_only_sql",
+    )["message"]
+    assert message["pipeline"]["execution_mode"] == "read_only_sql"
+    assert "artifact" not in message["pipeline"]
+
+
 def test_natural_followup_submits_exact_plan_for_approval_only(client):
     first = ask(client)
     plan = ask(client, "Run this pipeline", first["conversation_id"])["message"]["pipeline"]
@@ -328,6 +349,29 @@ def test_explicit_clarifications_route_only_while_waiting_for_details(reply):
 def test_unrelated_messages_do_not_become_clarification_builds(reply):
     pending = {"execution_mode": "airflow_dag", "status": "needs_input"}
     assert chat_workflows.intent(reply, pending) is None
+
+
+@pytest.mark.parametrize("prompt", [
+    "Orchestrate yesterday's sales into pipeline_output.daily_sales",
+    "Create a process that reads sales and saves daily totals into pipeline_output.daily_sales",
+    "Take sales, aggregate daily totals, and save them to pipeline_output.daily_sales",
+])
+def test_materializing_natural_paraphrases_route_to_airflow_planning(prompt):
+    assert chat_workflows.intent(prompt) == "build"
+
+
+@pytest.mark.parametrize("prompt", [
+    "Summarize yesterday's sales",
+    "What is an ETL process?",
+    "Do not build a process that saves sales into pipeline_output.daily_sales",
+    "Create a chart and save it as PNG",
+    "Create a dashboard and save it to my workspace",
+    "Summarize yesterday sales and store it as a report",
+    "Design a visualization and publish it to Tableau",
+    "Transform this chart and save it as stacked bar",
+])
+def test_read_only_or_negated_paraphrases_do_not_route_to_airflow(prompt):
+    assert chat_workflows.intent(prompt) is None
 
 
 def test_output_clarification_rebuilds_real_chat_plan_and_preserves_objective(client):

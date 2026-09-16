@@ -527,12 +527,18 @@ class Worker:
     it took, and was abandoned mid-run by stop()."""
 
     def __init__(self, worker_id=None, concurrency=None, poll_s=None, kinds=None,
-                 schedulers=None):
+                 schedulers=None, claim_gate=None):
         self.worker_id = worker_id or default_worker_id()
         self.concurrency = int(concurrency or os.getenv("STUDIO_JOB_WORKERS") or 4)
         self.poll_s = float(poll_s or os.getenv("STUDIO_JOB_POLL_S") or 1.0)
         self.kinds = list(kinds) if kinds else None
         self.schedulers = schedulers   # None → _default_schedulers() at start()
+        # Optional deployment-level availability gate.  A cloud worker uses
+        # this to prove that its recovery controller is alive before it takes
+        # any more durable work.  Existing in-process/local workers retain the
+        # old behaviour when no gate is configured.
+        self.claim_gate = claim_gate
+        self._claim_gate_open = None
         self._stop = threading.Event()
         self._thread = None
         self._pool = None
@@ -636,6 +642,21 @@ class Worker:
                 reclaim_stale()
             except Exception:
                 log.exception("jobs: reclaim_stale failed")
+        if self.claim_gate is not None:
+            try:
+                gate_open = bool(self.claim_gate())
+            except Exception:
+                gate_open = False
+                log.exception("jobs: claim availability gate failed closed")
+            if gate_open != self._claim_gate_open:
+                log.info("jobs: claim availability gate is %s",
+                         "open" if gate_open else "closed")
+                self._claim_gate_open = gate_open
+            if not gate_open:
+                # Do not run scheduler side effects or claim queue rows while
+                # the required controller is unavailable. Already-fenced
+                # in-flight work is allowed to reach its next safe point.
+                return False
         self.run_schedulers(now)
         dispatched = False
         while not self._stop.is_set():

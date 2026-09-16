@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import (auth, autopilot, catalog, chat, connections, dashboards, db, flow, freshness,
@@ -99,6 +99,11 @@ def init_state():
     # that raises (refusing to boot) when anything is pending — see
     # migrations.run_startup().
     migrations.run_startup()
+    # Bootstrap can read columns introduced by a migration (for example the
+    # immutable adapter digest), so it must run after old databases have been
+    # brought up to the current baseline. It is create-only and idempotent,
+    # therefore web/worker replicas may still race here safely.
+    trainer.bootstrap_from_env()
 
 
 # The in-process job worker, when STUDIO_WORKER_MODE=thread (the default): it
@@ -158,6 +163,28 @@ def health():
         # passwords, and in demo mode those passwords are public by design.
         "auth": _auth_posture(),
     }
+
+
+@app.get("/readyz", include_in_schema=False)
+def readyz():
+    """Core request readiness: prove the durable application store is usable.
+
+    Optional pipeline dependencies belong to the external worker's readiness
+    probe; making the public web pod depend on Airflow or a model provider would
+    also take login, history, and administration offline during their outages.
+    """
+    try:
+        with db.connect() as connection:
+            row = connection.execute("SELECT 1 AS ready").fetchone()
+        if row is None:
+            raise RuntimeError
+    except Exception:
+        return JSONResponse(status_code=503,
+                            content={"status": "not_ready", "stage": "database"})
+    if jobs.worker_mode() == "thread" and (_worker is None or not _worker.running):
+        return JSONResponse(status_code=503,
+                            content={"status": "not_ready", "stage": "worker"})
+    return {"status": "ready", "store": "postgres" if db.IS_PG else "sqlite"}
 
 
 def _auth_posture():
