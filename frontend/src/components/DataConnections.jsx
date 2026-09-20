@@ -1,12 +1,25 @@
-// Connect Microsoft 365. Studio can sync a user's own OneDrive / SharePoint
-// files and Outlook mail into a PRIVATE, per-user knowledge collection so an
-// agent's knowledge_search can ground answers in them — retrievable by nobody
-// but that user (and admins). Nothing here ever sees a token: the OAuth grant
-// happens on Microsoft's site, the backend stores the refresh token encrypted,
-// and every response is non-secret metadata. When the deployment has no Azure
-// credentials the feature is dormant and this surface says so instead of 500ing.
-import { useEffect, useState } from "react";
+// Connect to data — the Tableau-style picker.
+//
+// One grid of source tiles; click the one you want and it asks for exactly that
+// source's credentials. The form is not hand-written per source: the backend's
+// /connections/types serves a field spec per connectable type and this renders
+// it, so a connector gained on the server shows up here with the right fields
+// and no frontend change. The tile art comes from sourceCatalog.jsx.
+//
+// The grid deliberately shows sources this screen cannot set up — object stores
+// and the marketing APIs are configured by an operator through environment
+// variables — because the useful question is "what can Studio read?", and a
+// tile that explains how it gets switched on beats a tile that isn't there.
+//
+// Nothing here ever sees a stored secret. Microsoft 365 runs its OAuth grant on
+// Microsoft's site; database credentials are posted once, encrypted at rest by
+// the backend, and only ever read back as a non-secret hint (host / account /
+// project). Creating and deleting connections is admin-only on the server —
+// this screen mirrors that instead of hiding it, so a non-admin still sees the
+// map of available sources and who to ask.
+import { useEffect, useMemo, useState } from "react";
 import { api, getUser } from "../api";
+import { CATEGORIES, SourceIcon, metaFor } from "./sourceCatalog";
 
 const STATUS_LABEL = {
   onboarding: "Onboarding — first sync running",
@@ -15,67 +28,417 @@ const STATUS_LABEL = {
   revoked: "Disconnected — reconnect to resume",
 };
 
+const NAME_RE = /^[a-z0-9][a-z0-9_-]{1,30}$/;
+
 function fmtWhen(epoch) {
   if (!epoch) return "never";
-  const d = new Date(epoch * 1000);
-  return d.toLocaleString();
+  return new Date(epoch * 1000).toLocaleString();
+}
+
+/** A free source name for a new connection of this type: pg, pg-2, pg-3… */
+export function suggestName(ctype, taken) {
+  const base = String(ctype).replace(/_/g, "-");
+  if (!taken.has(base)) return base;
+  for (let i = 2; i < 50; i++) if (!taken.has(`${base}-${i}`)) return `${base}-${i}`;
+  return "";
+}
+
+/**
+ * The grid's model. A tile is a KIND of source; its instances are the live
+ * sources of that kind — the env-configured one that shares the connector's
+ * name, plus every user connection built from it. That is why "PostgreSQL" can
+ * read "2 connected" while still offering to add a third.
+ *
+ * Exported because it is the only real logic on this screen, and a pure
+ * function is worth testing directly.
+ */
+export function buildTiles({ types = [], conns = [], sources = [], q = "" }) {
+  const byId = new Map();
+  const put = (id, extra) => {
+    if (!byId.has(id)) {
+      byId.set(id, { id, meta: metaFor(id), connectable: false, fields: null, instances: [] });
+    }
+    return Object.assign(byId.get(id), extra || {});
+  };
+
+  for (const t of types) put(t.ctype, { connectable: true, fields: t.fields });
+  put("m365");
+
+  const connByName = new Map(conns.map((c) => [c.name, c]));
+  for (const s of sources) {
+    const own = connByName.get(s.name);
+    // A user connection whose ctype this bundle doesn't know (server ahead of
+    // the frontend) still needs a home; put() gives it a fallback tile.
+    const tile = put(own ? own.ctype : s.name);
+    tile.instances.push({
+      name: s.name,
+      configured: !!s.configured,
+      allowed: !!s.allowed,
+      dialect: s.dialect,
+      kind: own ? "user" : "env",
+      connId: own?.id,
+      hint: own?.hint || "",
+    });
+  }
+
+  const list = [...byId.values()];
+  const needle = q.trim().toLowerCase();
+  return needle
+    ? list.filter((t) => (t.meta.label + " " + t.id).toLowerCase().includes(needle))
+    : list;
 }
 
 export default function DataConnections({ onClose }) {
-  const [state, setState] = useState(null); // null until first /status load
-  const [busy, setBusy] = useState("");     // "connect" | "sync" | "disconnect"
+  const user = getUser();
+  const isAdmin = user?.role === "admin";
+
+  const [sources, setSources] = useState([]);   // /catalog/sources — every source
+  const [types, setTypes] = useState([]);       // /connections/types — connectable
+  const [conns, setConns] = useState([]);       // /connections — user-created
+  const [m365, setM365] = useState(null);       // /m365/status
+  const [picked, setPicked] = useState(null);   // tile id being viewed, or null
+  const [q, setQ] = useState("");
   const [error, setError] = useState("");
   const [note, setNote] = useState("");
 
   function load() {
-    api("/m365/status")
-      .then(setState)
-      .catch((e) => setError(e.message));
+    api("/catalog/sources").then((d) => setSources(Array.isArray(d) ? d : [])).catch(() => {});
+    api("/m365/status").then(setM365).catch(() => setM365({ configured: false }));
+    if (isAdmin) {
+      api("/connections/types").then((d) => setTypes(Array.isArray(d) ? d : [])).catch(() => {});
+      api("/connections").then((d) => setConns(Array.isArray(d) ? d : [])).catch(() => {});
+    }
   }
 
-  // On mount, surface the result of an OAuth round-trip. The callback redirects
-  // back with ?m365_connected=1 or ?m365_error=… — read it, show a note, then
-  // scrub the query so a refresh doesn't replay it.
+  // Surface the result of an OAuth round-trip: the callback comes back with
+  // ?m365_connected=1 or ?m365_error=…. Read it, open the Microsoft 365 tile so
+  // the outcome is on screen, then scrub the query so a refresh can't replay it.
   useEffect(() => {
-    const q = new URLSearchParams(window.location.search);
-    if (q.has("m365_connected")) {
+    const p = new URLSearchParams(window.location.search);
+    if (p.has("m365_connected")) {
       setNote("Microsoft 365 connected — your files and mail are syncing in the background.");
-    } else if (q.has("m365_error")) {
-      setError(`Microsoft 365 connection failed: ${q.get("m365_error") || "unknown error"}`);
+      setPicked("m365");
+    } else if (p.has("m365_error")) {
+      setError(`Microsoft 365 connection failed: ${p.get("m365_error") || "unknown error"}`);
+      setPicked("m365");
     }
-    if (q.has("m365_connected") || q.has("m365_error")) {
-      q.delete("m365_connected");
-      q.delete("m365_error");
-      const rest = q.toString();
-      window.history.replaceState(
-        {},
-        "",
-        window.location.pathname + (rest ? `?${rest}` : "") + window.location.hash
-      );
+    if (p.has("m365_connected") || p.has("m365_error")) {
+      p.delete("m365_connected");
+      p.delete("m365_error");
+      const rest = p.toString();
+      window.history.replaceState({}, "", window.location.pathname +
+        (rest ? `?${rest}` : "") + window.location.hash);
     }
     load();
-  }, []);
+  }, [isAdmin]);
+
+  const tiles = useMemo(() => buildTiles({ types, conns, sources, q }),
+                        [types, conns, sources, q]);
+
+  const takenNames = useMemo(() => new Set(sources.map((s) => s.name)), [sources]);
+  const tile = picked ? tiles.find((t) => t.id === picked) : null;
+
+  function back() {
+    setPicked(null);
+    setError("");
+  }
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal connect-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <div>
+            <div className="canvas-title">
+              {tile ? (
+                <button className="conn-back" onClick={back}>← Connect to data</button>
+              ) : (
+                "Connect to data"
+              )}
+            </div>
+            <div className="meta">
+              {tile
+                ? tile.meta.blurb || `Connect Studio to ${tile.meta.label}.`
+                : "Pick a source. Connected sources appear in the chat picker, and credentials are encrypted at rest — never shown again."}
+            </div>
+          </div>
+          <div className="conn-head-right">
+            {!tile && (
+              <input
+                className="conn-search"
+                placeholder="Search sources…"
+                value={q}
+                onChange={(e) => setQ(e.target.value)}
+              />
+            )}
+            <button className="chip" onClick={onClose}>✕ close</button>
+          </div>
+        </div>
+
+        {error && <div className="error">{error}</div>}
+        {note && <div className="meta share-notice">{note}</div>}
+
+        <div className="conn-body">
+          {!tile ? (
+            <Grid tiles={tiles} onPick={(id) => { setPicked(id); setError(""); setNote(""); }} />
+          ) : tile.id === "m365" ? (
+            <M365Panel
+              state={m365}
+              reload={load}
+              onNote={setNote}
+              onError={setError}
+            />
+          ) : tile.connectable && isAdmin ? (
+            <ConnectForm
+              tile={tile}
+              defaultName={suggestName(tile.id, takenNames)}
+              takenNames={takenNames}
+              onDone={(msg) => { setNote(msg); setPicked(null); load(); }}
+              onError={setError}
+              onRemoved={load}
+            />
+          ) : (
+            <DetailPanel tile={tile} isAdmin={isAdmin} />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── The grid ────────────────────────────────────────────────────────────
+
+function Grid({ tiles, onPick }) {
+  const groups = CATEGORIES
+    .map((c) => ({ ...c, items: tiles.filter((t) => t.meta.category === c.key) }))
+    .filter((g) => g.items.length);
+
+  if (!groups.length) {
+    return <div className="meta conn-empty">No source matches that search.</div>;
+  }
+
+  return (
+    <>
+      {groups.map((g) => (
+        <section key={g.key} className="conn-group">
+          <div className="conn-group-title">{g.label}</div>
+          <div className="conn-grid">
+            {g.items
+              .slice()
+              .sort((a, b) => a.meta.label.localeCompare(b.meta.label))
+              .map((t) => <Tile key={t.id} tile={t} onPick={onPick} />)}
+          </div>
+        </section>
+      ))}
+    </>
+  );
+}
+
+function Tile({ tile, onPick }) {
+  const live = tile.instances.filter((i) => i.configured);
+  const dormant = !live.length && !tile.connectable;
+  return (
+    <button
+      className={`conn-tile${dormant ? " conn-tile-off" : ""}`}
+      onClick={() => onPick(tile.id)}
+      title={tile.meta.blurb}
+    >
+      <SourceIcon id={tile.id} size={36} />
+      <span className="conn-tile-name">{tile.meta.label}</span>
+      <span className="conn-tile-status">
+        {live.length
+          ? `${live.length} connected`
+          : tile.connectable
+            ? "Connect"
+            : "Not configured"}
+      </span>
+      {live.length > 0 && <span className="conn-dot" aria-hidden="true" />}
+    </button>
+  );
+}
+
+// ── Connect: the field spec from the backend, rendered ───────────────────
+
+function ConnectForm({ tile, defaultName, takenNames, onDone, onError, onRemoved }) {
+  const fields = tile.fields || [];
+  const [name, setName] = useState(defaultName);
+  const [cfg, setCfg] = useState(() =>
+    Object.fromEntries(fields.filter((f) => f.default).map((f) => [f.key, f.default])));
+  const [test, setTest] = useState(null);   // null | {ok, tables?, sample?, error?}
+  const [busy, setBusy] = useState("");
+
+  function setField(k, v) {
+    setCfg((c) => ({ ...c, [k]: v }));
+    setTest(null);
+  }
+
+  async function runTest() {
+    setBusy("test");
+    setTest(null);
+    try {
+      setTest(await api("/connections/test", {
+        method: "POST",
+        body: JSON.stringify({ ctype: tile.id, config: cfg }),
+      }));
+    } catch (e) {
+      setTest({ ok: false, error: e.message });
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function save() {
+    setBusy("save");
+    onError("");
+    try {
+      await api("/connections", {
+        method: "POST",
+        body: JSON.stringify({ name: name.trim(), ctype: tile.id, config: cfg }),
+      });
+      onDone(`Connected — “${name.trim()}” is now a source in the chat picker (open a new chat or refresh to see it).`);
+    } catch (e) {
+      onError(e.message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function remove(inst) {
+    if (!confirm(`Remove the “${inst.name}” connection? Queries against it will stop working.`)) return;
+    try {
+      await api(`/connections/${inst.connId}`, { method: "DELETE" });
+      onRemoved();
+    } catch (e) {
+      onError(e.message);
+    }
+  }
+
+  const trimmed = name.trim();
+  const nameOk = NAME_RE.test(trimmed) && !takenNames.has(trimmed);
+  const filled = fields.every((f) => !f.required || (cfg[f.key] || "").trim());
+
+  return (
+    <div className="conn-detail">
+      <Instances tile={tile} onRemove={remove} />
+
+      <div className="conn-form">
+        {fields.map((f) => (
+          <label key={f.key} className={`conn-field${f.key === "dsn" || f.key === "credentials_json" ? " conn-field-wide" : ""}`}>
+            <span className="conn-label">
+              {f.label}{f.required && <b className="conn-req"> *</b>}
+            </span>
+            <input
+              type={f.secret ? "password" : "text"}
+              placeholder={f.placeholder || ""}
+              value={cfg[f.key] ?? ""}
+              onChange={(e) => setField(f.key, e.target.value)}
+              autoComplete="off"
+            />
+          </label>
+        ))}
+        <label className="conn-field">
+          <span className="conn-label">Name it in Studio</span>
+          <input value={name} onChange={(e) => { setName(e.target.value); }} autoComplete="off" />
+        </label>
+      </div>
+
+      {trimmed && !nameOk && (
+        <div className="meta conn-warn">
+          {takenNames.has(trimmed)
+            ? `A source named “${trimmed}” already exists — pick another name.`
+            : "Name must be 2–31 characters: lowercase letters, digits, - or _."}
+        </div>
+      )}
+
+      {test && (test.ok
+        ? <div className="meta share-notice">
+            ✓ Connected — {test.tables} tables{test.sample?.length ? `: ${test.sample.join(", ")}` : ""}
+          </div>
+        : <div className="error">{test.error}</div>)}
+
+      <div className="m365-actions">
+        <button className="chip" onClick={runTest} disabled={!!busy || !filled}>
+          {busy === "test" ? "testing…" : "⚡ Test connection"}
+        </button>
+        <button className="primary" onClick={save} disabled={!!busy || !filled || !nameOk}>
+          {busy === "save" ? "connecting…" : "✓ Connect"}
+        </button>
+      </div>
+      <div className="meta">
+        Credentials are encrypted at rest and never displayed again. The new source is
+        visible to admins; grant it to other roles in Governance.
+      </div>
+    </div>
+  );
+}
+
+// ── Detail: sources this screen can't set up, and the non-admin view ─────
+
+function DetailPanel({ tile, isAdmin }) {
+  // A non-admin cannot read /connections/types, so `tile.connectable` is false
+  // for every tile in their session — it says nothing about the source and must
+  // not drive the copy. What is true for them is the same either way: someone
+  // with the admin role has to set this up. Admins fall through to the env
+  // explanation, since the only tiles that reach here are the ones this screen
+  // cannot configure; the rows above already show which are live.
+  return (
+    <div className="conn-detail">
+      <Instances tile={tile} />
+      <div className="meta">
+        {isAdmin
+          ? "This source is configured by an operator through environment variables on the deployment (see .env.example), not from this screen. Once its keys are set it appears in the chat picker like any other source."
+          : "An administrator connects sources. Sources your role may use appear in the chat picker automatically — ask an admin to connect this one and grant it to your role."}
+      </div>
+    </div>
+  );
+}
+
+function Instances({ tile, onRemove }) {
+  if (!tile.instances.length) return null;
+  return (
+    <div className="conn-instances">
+      {tile.instances.map((i) => (
+        <div key={i.name} className="dbconn-row">
+          <SourceIcon id={tile.id} size={20} />
+          <b>{i.name}</b>
+          {i.hint && <span className="meta">{i.hint}</span>}
+          <span className={`m365-badge${i.configured ? " m365-badge-on" : " m365-badge-off"}`}>
+            {i.configured ? (i.kind === "env" ? "configured by environment" : "connected") : "needs reconnect"}
+          </span>
+          {onRemove && i.kind === "user" && (
+            <button className="chip ctx-danger" onClick={() => onRemove(i)}>✕</button>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── Microsoft 365: OAuth, not a credential form ──────────────────────────
+
+function M365Panel({ state, reload, onNote, onError }) {
+  const [busy, setBusy] = useState("");
+  const configured = state?.configured;
+  const connected = state?.connected;
 
   async function connect() {
     setBusy("connect");
-    setError("");
-    setNote("");
+    onError("");
+    onNote("");
     try {
       const d = await api("/m365/connect", { method: "POST" });
       if (d.configured === false) {
-        // Dormant — refresh so the not-configured notice shows.
-        setState(d);
+        reload();
       } else if (d.authorize_url) {
         // Delegated OAuth: hand off to Microsoft; we come back via the callback.
         window.location.href = d.authorize_url;
         return;
       } else {
         // App mode: provisioned server-side, no redirect needed.
-        setNote("Microsoft 365 connected — syncing in the background.");
-        load();
+        onNote("Microsoft 365 connected — syncing in the background.");
+        reload();
       }
     } catch (e) {
-      setError(e.message);
+      onError(e.message);
     } finally {
       setBusy("");
     }
@@ -83,14 +446,14 @@ export default function DataConnections({ onClose }) {
 
   async function sync() {
     setBusy("sync");
-    setError("");
-    setNote("");
+    onError("");
+    onNote("");
     try {
       await api("/m365/sync", { method: "POST" });
-      setNote("Sync queued — new and changed items will appear shortly.");
-      load();
+      onNote("Sync queued — new and changed items will appear shortly.");
+      reload();
     } catch (e) {
-      setError(e.message);
+      onError(e.message);
     } finally {
       setBusy("");
     }
@@ -99,239 +462,73 @@ export default function DataConnections({ onClose }) {
   async function disconnect() {
     if (!confirm("Disconnect Microsoft 365? Synced documents stop grounding agent answers until you reconnect.")) return;
     setBusy("disconnect");
-    setError("");
-    setNote("");
+    onError("");
+    onNote("");
     try {
       await api("/m365/connect", { method: "DELETE" });
-      setNote("Disconnected. Your tokens were wiped.");
-      load();
+      onNote("Disconnected. Your tokens were wiped.");
+      reload();
     } catch (e) {
-      setError(e.message);
+      onError(e.message);
     } finally {
       setBusy("");
     }
   }
 
-  const configured = state?.configured;
-  const connected = state?.connected;
+  if (state == null) return <div className="meta conn-empty">Loading connection status…</div>;
 
-  return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal m365-modal" onClick={(e) => e.stopPropagation()}>
-        <div className="modal-head">
-          <div>
-            <div className="canvas-title">Data connections</div>
-            <div className="meta">
-              Connect Microsoft 365 to sync your files and mail into your private
-              knowledge collection — and connect databases (Postgres, Snowflake,
-              Databricks, BigQuery, Neo4j) so they appear as sources in the chat
-              picker. Credentials are stored encrypted and never shown again.
-            </div>
-          </div>
-          <button className="chip" onClick={onClose}>✕ close</button>
-        </div>
-
-        {error && <div className="error">{error}</div>}
-        {note && <div className="meta share-notice">{note}</div>}
-
-        <div className="m365-card">
-          <div className="m365-head">
-            <div className="m365-title">
-              <span className="m365-glyph" aria-hidden="true">▦</span>
-              Microsoft 365
-            </div>
-            {state == null ? (
-              <span className="m365-badge">checking…</span>
-            ) : configured === false ? (
-              <span className="m365-badge m365-badge-off">not configured</span>
-            ) : connected ? (
-              <span className="m365-badge m365-badge-on">
-                {STATUS_LABEL[state.status] || "Connected"}
-              </span>
-            ) : (
-              <span className="m365-badge">not connected</span>
-            )}
-          </div>
-
-          {state == null ? (
-            <div className="meta">Loading connection status…</div>
-          ) : configured === false ? (
-            <div className="meta">
-              Microsoft 365 isn't set up on this deployment. An administrator needs to
-              configure the Azure app credentials before this connection is available.
-            </div>
-          ) : connected ? (
-            <>
-              <div className="m365-facts">
-                {state.mode && (
-                  <span className="query-tag" title="how Studio authenticates to Graph">
-                    {state.mode === "app" ? "app (tenant-wide)" : "delegated (your account)"}
-                  </span>
-                )}
-                <span className="query-tag">{state.item_count ?? 0} items synced</span>
-                <span className="meta">last sync {fmtWhen(state.last_sync)}</span>
-              </div>
-              <div className="m365-actions">
-                <button
-                  className="chip chip-on"
-                  onClick={sync}
-                  disabled={!!busy || state.status === "revoked"}
-                >
-                  {busy === "sync" ? "queuing…" : "↻ Sync now"}
-                </button>
-                {state.status === "revoked" && (
-                  <button className="chip" onClick={connect} disabled={!!busy}>
-                    {busy === "connect" ? "connecting…" : "↗ Reconnect"}
-                  </button>
-                )}
-                <button
-                  className="chip ctx-danger"
-                  onClick={disconnect}
-                  disabled={!!busy}
-                >
-                  {busy === "disconnect" ? "disconnecting…" : "✕ Disconnect"}
-                </button>
-              </div>
-            </>
-          ) : (
-            <>
-              <div className="meta">
-                Connect your account to let Studio index your files and mail. You'll be
-                sent to Microsoft to sign in and grant read-only access — Studio only
-                ever receives an access token it stores encrypted, never your password.
-              </div>
-              <div className="m365-actions">
-                <button className="primary" onClick={connect} disabled={!!busy}>
-                  {busy === "connect" ? "connecting…" : "↗ Connect Microsoft 365"}
-                </button>
-              </div>
-            </>
-          )}
-        </div>
-
-        <Databases onNote={setNote} onError={setError} />
-      </div>
-    </div>
-  );
-}
-
-// ── Databases: admin connects a warehouse; it becomes a source in the picker ──
-
-function Databases({ onNote, onError }) {
-  const user = getUser();
-  const isAdmin = user?.role === "admin";
-  const [conns, setConns] = useState([]);
-  const [types, setTypes] = useState([]);
-  const [open, setOpen] = useState(false);
-  const [ctype, setCtype] = useState("postgres");
-  const [name, setName] = useState("");
-  const [cfg, setCfg] = useState({});
-  const [test, setTest] = useState(null);   // null | {ok, tables?, error?}
-  const [busy, setBusy] = useState("");
-
-  function load() {
-    api("/connections").then(setConns).catch(() => {});
-    api("/connections/types").then(setTypes).catch(() => {});
-  }
-  useEffect(() => { if (isAdmin) load(); }, [isAdmin]);
-
-  if (!isAdmin) {
+  if (configured === false) {
     return (
-      <div className="m365-card">
-        <div className="m365-head">
-          <div className="m365-title"><span className="m365-glyph" aria-hidden="true">◫</span>Databases</div>
+      <div className="conn-detail">
+        <div className="meta">
+          Microsoft 365 isn't set up on this deployment. An administrator needs to
+          configure the Azure app credentials before this connection is available.
         </div>
-        <div className="meta">An administrator can connect databases here; sources your role may use appear in the chat picker automatically.</div>
       </div>
     );
   }
 
-  const t = types.find((x) => x.ctype === ctype);
-
-  function setField(k, v) { setCfg((c) => ({ ...c, [k]: v })); setTest(null); }
-
-  function reset() { setName(""); setCfg({}); setTest(null); setOpen(false); }
-
-  async function runTest() {
-    setBusy("test"); setTest(null);
-    try { setTest(await api("/connections/test", { method: "POST", body: JSON.stringify({ ctype, config: cfg }) })); }
-    catch (e) { setTest({ ok: false, error: e.message }); }
-    finally { setBusy(""); }
-  }
-
-  async function save() {
-    setBusy("save"); onError(""); onNote("");
-    try {
-      await api("/connections", { method: "POST", body: JSON.stringify({ name: name.trim(), ctype, config: cfg }) });
-      onNote(`Connected — “${name.trim()}” is now a source in the chat picker (open a new chat or refresh to see it).`);
-      reset(); load();
-    } catch (e) { onError(e.message); }
-    finally { setBusy(""); }
-  }
-
-  async function remove(c) {
-    if (!confirm(`Remove the “${c.name}” connection? Queries against it will stop working.`)) return;
-    try { await api(`/connections/${c.id}`, { method: "DELETE" }); load(); }
-    catch (e) { onError(e.message); }
-  }
-
-  const canSave = /^[a-z0-9][a-z0-9_-]{1,30}$/.test(name.trim()) &&
-    (t?.fields || []).every((f) => !f.required || (cfg[f.key] || "").trim());
-
   return (
-    <div className="m365-card">
-      <div className="m365-head">
-        <div className="m365-title"><span className="m365-glyph" aria-hidden="true">◫</span>Databases</div>
-        <span className="m365-badge">{conns.length} connected</span>
-      </div>
-
-      {conns.map((c) => (
-        <div key={c.id} className="dbconn-row">
-          <span className="query-tag">{c.type_label}</span>
-          <b>{c.name}</b>
-          <span className="meta">{c.hint}</span>
-          {!c.configured && <span className="m365-badge m365-badge-off">needs reconnect</span>}
-          <button className="chip ctx-danger" onClick={() => remove(c)}>✕</button>
-        </div>
-      ))}
-
-      {!open ? (
-        <div className="m365-actions">
-          <button className="chip chip-on" onClick={() => { setOpen(true); setTest(null); }}>+ Connect a database</button>
-        </div>
-      ) : (
-        <div className="dbconn-form">
-          <div className="dbconn-grid">
-            <select value={ctype} onChange={(e) => { setCtype(e.target.value); setCfg({}); setTest(null); }}>
-              {types.map((x) => <option key={x.ctype} value={x.ctype}>{x.label}</option>)}
-            </select>
-            <input placeholder="source name — e.g. sales-pg" value={name}
-                   onChange={(e) => setName(e.target.value)} />
+    <div className="conn-detail">
+      {connected ? (
+        <>
+          <div className="m365-facts">
+            <span className="m365-badge m365-badge-on">{STATUS_LABEL[state.status] || "Connected"}</span>
+            {state.mode && (
+              <span className="query-tag" title="how Studio authenticates to Graph">
+                {state.mode === "app" ? "app (tenant-wide)" : "delegated (your account)"}
+              </span>
+            )}
+            <span className="query-tag">{state.item_count ?? 0} items synced</span>
+            <span className="meta">last sync {fmtWhen(state.last_sync)}</span>
           </div>
-          <div className="dbconn-grid">
-            {(t?.fields || []).map((f) => (
-              <input key={f.key} type={f.secret ? "password" : "text"}
-                     placeholder={f.label + (f.required ? " *" : "") + (f.placeholder ? ` — ${f.placeholder}` : "")}
-                     value={cfg[f.key] ?? ""} onChange={(e) => setField(f.key, e.target.value)} />
-            ))}
-          </div>
-          {test && (test.ok
-            ? <div className="meta share-notice">✓ Connected — {test.tables} tables{test.sample?.length ? `: ${test.sample.join(", ")}` : ""}</div>
-            : <div className="error">{test.error}</div>)}
           <div className="m365-actions">
-            <button className="chip" onClick={runTest} disabled={!!busy}>
-              {busy === "test" ? "testing…" : "⚡ Test connection"}
+            <button className="chip chip-on" onClick={sync} disabled={!!busy || state.status === "revoked"}>
+              {busy === "sync" ? "queuing…" : "↻ Sync now"}
             </button>
-            <button className="primary" onClick={save} disabled={!!busy || !canSave}>
-              {busy === "save" ? "saving…" : "✓ Save connection"}
+            {state.status === "revoked" && (
+              <button className="chip" onClick={connect} disabled={!!busy}>
+                {busy === "connect" ? "connecting…" : "↗ Reconnect"}
+              </button>
+            )}
+            <button className="chip ctx-danger" onClick={disconnect} disabled={!!busy}>
+              {busy === "disconnect" ? "disconnecting…" : "✕ Disconnect"}
             </button>
-            <button className="chip" onClick={reset} disabled={!!busy}>cancel</button>
           </div>
+        </>
+      ) : (
+        <>
           <div className="meta">
-            Credentials are encrypted at rest and never displayed again. The new source is
-            visible to admins; grant it to other roles in Governance.
+            Connect your account to let Studio index your files and mail. You'll be sent to
+            Microsoft to sign in and grant read-only access — Studio only ever receives an
+            access token it stores encrypted, never your password.
           </div>
-        </div>
+          <div className="m365-actions">
+            <button className="primary" onClick={connect} disabled={!!busy}>
+              {busy === "connect" ? "connecting…" : "↗ Connect Microsoft 365"}
+            </button>
+          </div>
+        </>
       )}
     </div>
   );
