@@ -251,11 +251,14 @@ def test_downloaded_adapter_is_atomically_bound_to_its_uri(tmp_path, monkeypatch
     assert os.stat(sidecar).st_mode & 0o077 == 0
     assert json.loads(identity_sidecar.read_text()) == {
         "sha256": digest, "uri": uri, "version": 7,
+        "base_sha256": supervisor.GGUF_SHA256,
     }
     assert os.stat(identity_sidecar).st_mode & 0o077 == 0
     mounted = supervisor.mounted_adapter()
-    assert {key: mounted[key] for key in ("uri", "version", "sha256")} == {
+    assert {key: mounted[key] for key in
+            ("uri", "version", "sha256", "base_sha256")} == {
         "uri": uri, "version": 7, "sha256": digest,
+        "base_sha256": supervisor.GGUF_SHA256,
     }
 
     # A restart reuses bytes only when their provenance matches exactly.
@@ -609,16 +612,15 @@ def test_an_existing_model_is_not_downloaded_again(local_unit):
     proc, root, _ = local_unit()
     lines = []
     base = _await_base_url(proc, lines)
-    _await_ready(base, lines)
-    for _ in range(20):                    # drain what the supervisor logged
-        line = proc.stdout.readline()
-        lines.append(line)
-        if "model present" in line or not line:
-            break
-    log = "".join(lines)
-    assert "model present" in log
-    assert "downloading" not in log
+    body = _await_ready(base, lines)
+    assert body["ok"] is True and body["stage"] == "ready"
+    assert proc.poll() is None
+    # The configured fetch URL points at a deliberately dead port. Reaching
+    # ready proves the verified local file was reused; attempting a download
+    # would make the supervisor fail before this point. Avoid a blocking read
+    # from the still-running process's stdout just to assert a log spelling.
     assert not list((root / "models").glob("*.part"))
+    assert not list((root / "models").glob("*.candidate"))
 
 
 @POSIX_ONLY

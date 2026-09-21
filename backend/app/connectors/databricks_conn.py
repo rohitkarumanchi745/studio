@@ -288,16 +288,33 @@ class DatabricksConnector(Connector):
         return self._execute(go)
 
     def relation_kind(self, namespace, table):
-        """List one configured output schema without reading relation data."""
-        if not isinstance(namespace, str) or not re.fullmatch(
-                r"[A-Za-z_][A-Za-z0-9_$]{0,127}", namespace):
-            raise ValueError("Invalid output schema")
+        """Classify an output relation from metadata without reading its data.
+
+        ``SHOW TABLES`` includes views, so its presence bit is not sufficient
+        for deciding whether an ``INSERT SELECT`` destination is writable.
+        Information schema exposes the relation type and lets this gate fail
+        closed for views and every newer/unknown Databricks relation kind.
+        """
+        identifier = re.compile(r"[A-Za-z_][A-Za-z0-9_$]{0,127}")
+        if not isinstance(namespace, str) or not identifier.fullmatch(namespace) \
+                or not isinstance(table, str) or not identifier.fullmatch(table):
+            raise ValueError("Invalid relation identity")
 
         def go(con):
             cur = con.cursor()
-            cur.execute(f"SHOW TABLES IN `{namespace}`")
-            names = {str(row[1]).lower() for row in cur.fetchall()}
-            return "table" if str(table).lower() in names else "missing"
+            cur.execute(
+                "SELECT table_type FROM information_schema.tables "
+                "WHERE table_schema = ? AND table_name = ? LIMIT 1",
+                (namespace, table),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return "missing"
+            # Unity Catalog reports MANAGED/EXTERNAL, while some Spark SQL
+            # deployments expose the standard BASE TABLE spelling.
+            return "table" if str(row[0]).upper() in {
+                "BASE TABLE", "MANAGED", "EXTERNAL",
+            } else "other"
         return self._execute(go)
 
     def run_query(self, sql_text):
