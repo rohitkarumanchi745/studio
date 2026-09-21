@@ -133,6 +133,7 @@ TYPES = {
     "postgres": {
         "label": "PostgreSQL", "dialect": "postgres", "build": _DynPostgres,
         "hint_key": "dsn",
+        "ns": {"schema": "schema", "database": ""},
         "fields": [
             _field("dsn", "Connection string (DSN)", required=True, secret=True,
                    placeholder="postgresql://user:password@host:5432/dbname"),
@@ -142,6 +143,7 @@ TYPES = {
     "snowflake": {
         "label": "Snowflake", "dialect": "snowflake", "build": _DynSnowflake,
         "hint_key": "account",
+        "ns": {"schema": "schema", "database": "database"},
         "fields": [
             _field("account", "Account", required=True, placeholder="org-account"),
             _field("user", "User", required=True),
@@ -154,6 +156,7 @@ TYPES = {
     "databricks": {
         "label": "Databricks SQL", "dialect": "databricks", "build": _DynDatabricks,
         "hint_key": "server_hostname",
+        "ns": {"schema": "schema", "database": "catalog"},
         "fields": [
             _field("server_hostname", "Server hostname", required=True,
                    placeholder="dbc-xxxx.cloud.databricks.com"),
@@ -167,6 +170,7 @@ TYPES = {
     "bigquery": {
         "label": "BigQuery", "dialect": "bigquery", "build": _DynBigQuery,
         "hint_key": "project",
+        "ns": {"schema": "dataset", "database": "project"},
         "fields": [
             _field("project", "Project", required=True),
             _field("dataset", "Dataset", required=True),
@@ -255,9 +259,32 @@ def source_entries():
         t = TYPES.get(row["ctype"])
         if not t:
             continue
+        cfg = _decrypt(row["config"])
         out.append({"name": row["name"], "dialect": t["dialect"],
-                    "configured": _decrypt(row["config"]) is not None})
+                    "configured": cfg is not None,
+                    "type_label": t["label"], "ctype": row["ctype"],
+                    "namespace": _namespace(row["ctype"], cfg) if cfg else ""})
     return out
+
+
+def _namespace(ctype, cfg):
+    """The one namespace this connection is pinned to, as the engine spells it
+    — "acme_db.public", or just "public" when the database is unknown. Display
+    only: qualifiers() remains the thing that enforces it."""
+    t = TYPES.get(ctype) or {}
+    cfg = cfg or {}
+    schema = (cfg.get("schema") or cfg.get("dataset") or "").strip()
+    database = (cfg.get("database") or cfg.get("catalog") or cfg.get("project") or "").strip()
+    if not schema and not database:
+        # Postgres carries its database inside the DSN and defaults the schema.
+        if ctype == "postgres":
+            schema = "public"
+        else:
+            return ""
+    for f in t.get("fields", []):
+        if f["key"] in ("schema", "dataset") and not schema:
+            schema = (f.get("default") or "").strip()
+    return f"{database}.{schema}" if database and schema else (schema or database)
 
 
 def _hint(ctype, cfg):
@@ -278,6 +305,7 @@ def _public(row):
     return {"id": row["id"], "name": row["name"], "ctype": row["ctype"],
             "type_label": t.get("label", row["ctype"]), "label": row.get("label") or "",
             "hint": _hint(row["ctype"], cfg) if cfg else "",
+            "namespace": _namespace(row["ctype"], cfg) if cfg else "",
             "configured": cfg is not None, "created_at": row.get("created_at")}
 
 
@@ -302,6 +330,37 @@ def _probe(ctype, cfg):
     return {"ok": True, "tables": len(tables), "sample": list(tables)[:8]}
 
 
+def _browse(ctype, cfg):
+    """Namespaces the given credential can see, for the connect screen's
+    picker. Shaped like _probe: errors come back as data, never a 500, because
+    "this role cannot list schemas" is a normal answer and the admin can still
+    type the name. Never saved and never cached — the throwaway connector is
+    built from the posted config and dropped."""
+    t = TYPES.get(ctype)
+    if t is None:
+        return {"ok": False, "error": f"unknown connection type '{ctype}'", "namespaces": []}
+    try:
+        conn = t["build"]("__browse__", cfg)
+        if not conn.configured():
+            return {"ok": False, "error": "the connector reports itself unconfigured "
+                                          "— check the fields", "namespaces": []}
+        found = conn.list_namespaces()
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:300], "namespaces": []}
+    # Cap the list: a metastore can hold thousands, and the picker is a picker,
+    # not a catalog browser. Deduplicated because SHOW output can repeat a pair.
+    seen, out = set(), []
+    for n in found:
+        pair = ((n.get("database") or "").strip(), (n.get("schema") or "").strip())
+        if not pair[1] or pair in seen:
+            continue
+        seen.add(pair)
+        out.append({"database": pair[0], "schema": pair[1]})
+        if len(out) >= 500:
+            break
+    return {"ok": True, "namespaces": out, "truncated": len(found) > len(out)}
+
+
 # ── Routes (admin-only) ──────────────────────────────────────────────────
 
 def _admin(user):
@@ -324,7 +383,12 @@ class TestIn(BaseModel):
 @router.get("/types")
 def types(user=Depends(current_user)):
     _admin(user)
-    return [{"ctype": k, "label": t["label"], "dialect": t["dialect"], "fields": t["fields"]}
+    # `ns` tells the connect screen which fields a picked namespace writes
+    # into — the schema field is "dataset" on BigQuery, the database field is
+    # "catalog" on Databricks and lives inside the DSN on Postgres. Declaring
+    # it here keeps that mapping in one place instead of in the frontend.
+    return [{"ctype": k, "label": t["label"], "dialect": t["dialect"],
+             "fields": t["fields"], "ns": t.get("ns") or {}}
             for k, t in TYPES.items()]
 
 
@@ -338,6 +402,14 @@ def list_connections(user=Depends(current_user)):
 def test_connection(body: TestIn, user=Depends(current_user)):
     _admin(user)
     return _probe(body.ctype, {k: str(v) for k, v in (body.config or {}).items()})
+
+
+@router.post("/browse")
+def browse_connection(body: TestIn, user=Depends(current_user)):
+    """Which namespaces could this credential bind a source to? Admin-only for
+    the same reason /test is: it proves what an arbitrary DSN can reach."""
+    _admin(user)
+    return _browse(body.ctype, {k: str(v) for k, v in (body.config or {}).items()})
 
 
 @router.post("", status_code=201)

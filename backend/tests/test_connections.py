@@ -62,6 +62,16 @@ class _Stub:
     def get_schema(self, table):
         return [{"name": "id", "type": "int"}]
 
+    def list_namespaces(self):
+        if self.cfg.get("token") == "bad":
+            raise RuntimeError("auth failed for host " + self.cfg.get("host", ""))
+        # Duplicated and blank-schema rows on purpose: SHOW output really does
+        # repeat pairs, and the endpoint has to fold them.
+        return [{"database": "acme", "schema": "public"},
+                {"database": "acme", "schema": "public"},
+                {"database": "acme", "schema": "analytics"},
+                {"database": "acme", "schema": ""}]
+
 
 def _stub_type(monkeypatch):
     from app import connections
@@ -206,3 +216,95 @@ def test_types_endpoint_shapes_the_form(client, monkeypatch):
     assert "postgres" in types and types["postgres"]["dialect"] == "postgres"
     dsn = next(f for f in types["postgres"]["fields"] if f["key"] == "dsn")
     assert dsn["required"] is True and dsn["secret"] is True
+
+
+# ── Browsing namespaces before binding a source ──────────────────────────
+
+def test_browse_lists_namespaces_and_folds_duplicates(client, monkeypatch):
+    _stub_type(monkeypatch)
+    _login(client)
+    r = client.post("/api/connections/browse", json={
+        "ctype": "stub", "config": {"host": "crm.internal", "token": SECRET}})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    # Deduplicated, and the blank schema is dropped — it names no namespace.
+    assert body["namespaces"] == [{"database": "acme", "schema": "public"},
+                                  {"database": "acme", "schema": "analytics"}]
+
+
+def test_browse_reports_failure_as_data_not_a_500(client, monkeypatch):
+    _stub_type(monkeypatch)
+    _login(client)
+    r = client.post("/api/connections/browse", json={
+        "ctype": "stub", "config": {"host": "crm.internal", "token": "bad"}})
+    assert r.status_code == 200, r.text
+    assert r.json()["ok"] is False
+    assert r.json()["namespaces"] == []
+    # A listing failure must not block connecting — the admin can still type it.
+    assert _create(client).status_code == 201
+
+
+def test_browse_is_admin_only_and_never_echoes_the_credential(client, monkeypatch):
+    _stub_type(monkeypatch)
+    _login(client)
+    body = client.post("/api/connections/browse", json={
+        "ctype": "stub", "config": {"host": "crm.internal", "token": SECRET}}).text
+    assert SECRET not in body
+    _login(client, "analyst@studio.local", "analyst123")
+    assert client.post("/api/connections/browse", json={
+        "ctype": "stub", "config": {}}).status_code == 403
+
+
+def test_browse_never_widens_what_a_saved_source_may_read(client, monkeypatch):
+    """Browsing shows several schemas; the source that gets saved is still
+    pinned to the one it was configured with. This is the whole safety story
+    for the connect screen's schema picker."""
+    _stub_type(monkeypatch)
+    _login(client)
+    seen = {n["schema"] for n in client.post("/api/connections/browse", json={
+        "ctype": "stub", "config": {"host": "crm.internal", "token": SECRET}}).json()["namespaces"]}
+    assert seen == {"public", "analytics"}
+
+    # The invariant, on a REAL connector: qualifiers() — the set the query
+    # guard enforces — reports only the schema the connection was CONFIGURED
+    # with, no matter what browsing turned up. Reading it needs no network.
+    from app.connections import _DynPostgres
+    pinned = _DynPostgres("pg", {"dsn": "postgresql://u:p@h:5432/acme",
+                                 "schema": "public"}).qualifiers()
+    assert pinned == frozenset({"public", "acme.public"})
+    assert not any("analytics" in q for q in pinned)
+
+
+def test_each_saved_source_reports_its_own_namespace(client, monkeypatch):
+    _stub_type(monkeypatch)
+    monkeypatch.setitem(connections_types(), "stub", dict(
+        connections_types()["stub"],
+        fields=[connections_field("host", "Host", required=True),
+                connections_field("token", "Token", required=True, secret=True),
+                connections_field("schema", "Schema", default="public"),
+                connections_field("database", "Database")]))
+    _login(client)
+    for name, schema in (("crm_public", "public"), ("crm_analytics", "analytics")):
+        r = client.post("/api/connections", json={
+            "name": name, "ctype": "stub",
+            "config": {"host": "crm.internal", "token": SECRET,
+                       "database": "acme", "schema": schema}})
+        assert r.status_code == 201, r.text
+        assert r.json()["namespace"] == f"acme.{schema}"
+
+    # Two schemas of one warehouse are two sources, each independently listed.
+    by_name = {s["name"]: s for s in client.get("/api/catalog/sources").json()}
+    assert by_name["crm_public"]["namespace"] == "acme.public"
+    assert by_name["crm_analytics"]["namespace"] == "acme.analytics"
+    assert by_name["crm_public"]["type_label"] == "Stub DB"
+
+
+def connections_types():
+    from app import connections
+    return connections.TYPES
+
+
+def connections_field(*a, **kw):
+    from app import connections
+    return connections._field(*a, **kw)

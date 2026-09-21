@@ -127,6 +127,29 @@ class Connector:
         """Return [{"name": col, "type": sqltype}, ...] for a table."""
         raise NotImplementedError
 
+    def list_namespaces(self):
+        """Namespaces this credential can SEE, as [{"database", "schema"}, …].
+
+        Discovery only, for the connect screen: it answers "which schemas could
+        I bind a source to?" so an admin picks from a list instead of typing a
+        name from memory. It is NOT a widening of what this source may read —
+        a source stays pinned to the ONE namespace it was configured with, and
+        qualifiers() keeps refusing every other one. Binding a second schema
+        means a second source, which gets its own catalog and its own RBAC
+        grants. That separation is load-bearing: allowed_tables() matches BARE
+        table names, so two schemas sharing a source would let a grant for
+        `orders` admit the other schema's `orders` too.
+
+        Metadata only, like list_tables() — its own cursor, never run_query, so
+        no gateway scope is required. Unlike qualifiers() this DOES touch the
+        network, so it is never called on a query path.
+
+        Default: EMPTY. A source with no namespaces to choose between (sqlite,
+        a graph, an API-report connector) is correct to report none, and the
+        connect screen then skips the step.
+        """
+        return []
+
     def relation_kind(self, namespace, table):
         """Metadata-only lookup outside the connector's readable namespace.
 

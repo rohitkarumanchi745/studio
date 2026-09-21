@@ -61,7 +61,7 @@ export function buildTiles({ types = [], conns = [], sources = [], q = "" }) {
     return Object.assign(byId.get(id), extra || {});
   };
 
-  for (const t of types) put(t.ctype, { connectable: true, fields: t.fields });
+  for (const t of types) put(t.ctype, { connectable: true, fields: t.fields, ns: t.ns || {} });
   put("m365");
 
   const connByName = new Map(conns.map((c) => [c.name, c]));
@@ -256,29 +256,102 @@ function Tile({ tile, onPick }) {
   );
 }
 
-// ── Connect: the field spec from the backend, rendered ───────────────────
+// ── Connect: credentials, then which schemas to bind ─────────────────────
+//
+// Tableau's shape: sign in to the server, then choose what to work with. The
+// second step is the one that needs care. A Studio source is pinned to ONE
+// namespace — qualifiers() refuses every other one, and allowed_tables()
+// matches BARE table names, so a source spanning two schemas would let a grant
+// for `orders` admit the other schema's `orders` as well. So picking three
+// schemas creates three sources, each pinned, each independently grantable in
+// Governance. Browsing only decides what to bind; it never widens a binding.
+
+/** A source name for one picked namespace: sales-pg + analytics -> sales-pg-analytics. */
+function nameForNamespace(base, ns, taken) {
+  const slug = String(ns.schema).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  let candidate = `${base}-${slug}`.slice(0, 31).replace(/-$/, "");
+  if (!taken.has(candidate)) return candidate;
+  for (let i = 2; i < 50; i++) {
+    const next = `${candidate}-${i}`.slice(0, 31);
+    if (!taken.has(next)) return next;
+  }
+  return "";
+}
+
+/**
+ * What to POST for the schemas the admin picked: one source per namespace,
+ * each carrying the same credential but pinned to its own database/schema.
+ *
+ * Picking nothing (or a connector with no namespaces, like Neo4j) plans the
+ * single source the form already describes. Exported for testing — this is
+ * where "three schemas" becomes "three independently governed sources".
+ */
+export function planConnections({ cfg, ns, name, chosen = [], takenNames = new Set() }) {
+  const base = String(name || "").trim();
+  const plan = chosen.length
+    ? chosen.map((n) => ({
+        ns: n,
+        config: {
+          ...cfg,
+          [ns.schema]: n.schema,
+          ...(ns.database && n.database ? { [ns.database]: n.database } : {}),
+        },
+      }))
+    : [{ ns: null, config: cfg }];
+
+  // Names are reserved as we go, so two picked schemas cannot collide with
+  // each other any more than with a source that already exists.
+  const taken = new Set(takenNames);
+  return plan.map((p) => {
+    const sourceName = plan.length === 1 ? base : nameForNamespace(base, p.ns, taken);
+    taken.add(sourceName);
+    return { ...p, name: sourceName };
+  });
+}
 
 function ConnectForm({ tile, defaultName, takenNames, onDone, onError, onRemoved }) {
   const fields = tile.fields || [];
+  const ns = tile.ns || {};
   const [name, setName] = useState(defaultName);
   const [cfg, setCfg] = useState(() =>
     Object.fromEntries(fields.filter((f) => f.default).map((f) => [f.key, f.default])));
-  const [test, setTest] = useState(null);   // null | {ok, tables?, sample?, error?}
+  const [test, setTest] = useState(null);       // null | {ok, tables?, sample?, error?}
+  const [browse, setBrowse] = useState(null);   // null | {ok, namespaces[], error?}
+  const [picked, setPicked] = useState([]);     // "db\u0000schema" keys
   const [busy, setBusy] = useState("");
+  const [progress, setProgress] = useState("");
 
+  // A credential edit invalidates everything downstream of it.
   function setField(k, v) {
     setCfg((c) => ({ ...c, [k]: v }));
     setTest(null);
+    setBrowse(null);
+    setPicked([]);
   }
+
+  // The namespace step only exists where the connector has namespaces to offer
+  // (Neo4j does not) and the type says which fields a pick writes into.
+  const canBrowse = !!ns.schema;
+  const key = (n) => `${n.database || ""}\u0000${n.schema}`;
 
   async function runTest() {
     setBusy("test");
     setTest(null);
+    setBrowse(null);
     try {
-      setTest(await api("/connections/test", {
-        method: "POST",
-        body: JSON.stringify({ ctype: tile.id, config: cfg }),
-      }));
+      const probe = await api("/connections/test", {
+        method: "POST", body: JSON.stringify({ ctype: tile.id, config: cfg }),
+      });
+      setTest(probe);
+      // One round trip, not two: a credential that works is immediately asked
+      // what it can see. A browse failure is not a connect failure — the admin
+      // can still bind the schema they typed.
+      if (probe.ok && canBrowse) {
+        setBusy("browse");
+        setBrowse(await api("/connections/browse", {
+          method: "POST", body: JSON.stringify({ ctype: tile.id, config: cfg }),
+        }).catch((e) => ({ ok: false, error: e.message, namespaces: [] })));
+      }
     } catch (e) {
       setTest({ ok: false, error: e.message });
     } finally {
@@ -286,20 +359,41 @@ function ConnectForm({ tile, defaultName, takenNames, onDone, onError, onRemoved
     }
   }
 
+  const found = browse?.namespaces || [];
+  const chosen = found.filter((n) => picked.includes(key(n)));
+
   async function save() {
     setBusy("save");
     onError("");
-    try {
-      await api("/connections", {
-        method: "POST",
-        body: JSON.stringify({ name: name.trim(), ctype: tile.id, config: cfg }),
-      });
-      onDone(`Connected — “${name.trim()}” is now a source in the chat picker (open a new chat or refresh to see it).`);
-    } catch (e) {
-      onError(e.message);
-    } finally {
-      setBusy("");
+    const named = planConnections({ cfg, ns, name, chosen, takenNames });
+
+    // Sequential, not parallel: each POST re-probes the warehouse, and a
+    // partial failure has to name the source that failed and keep the ones
+    // that already landed rather than leaving an indeterminate set.
+    const done = [];
+    for (const p of named) {
+      setProgress(`connecting ${p.name} (${done.length + 1} of ${named.length})…`);
+      try {
+        await api("/connections", {
+          method: "POST",
+          body: JSON.stringify({ name: p.name, ctype: tile.id, config: p.config }),
+        });
+        done.push(p.name);
+      } catch (e) {
+        setBusy("");
+        setProgress("");
+        onError(done.length
+          ? `Connected ${done.join(", ")}, then “${p.name}” failed: ${e.message}`
+          : e.message);
+        if (done.length) onRemoved();   // reload so the ones that landed show
+        return;
+      }
     }
+    setBusy("");
+    setProgress("");
+    onDone(done.length === 1
+      ? `Connected — “${done[0]}” is now a source in the chat picker (open a new chat or refresh to see it).`
+      : `Connected ${done.length} sources — ${done.join(", ")} — each scoped to its own schema.`);
   }
 
   async function remove(inst) {
@@ -315,6 +409,9 @@ function ConnectForm({ tile, defaultName, takenNames, onDone, onError, onRemoved
   const trimmed = name.trim();
   const nameOk = NAME_RE.test(trimmed) && !takenNames.has(trimmed);
   const filled = fields.every((f) => !f.required || (cfg[f.key] || "").trim());
+  // With schemas picked the name is a PREFIX, so a collision on the bare name
+  // is fine — nameForNamespace suffixes each one and dodges what is taken.
+  const nameUsable = chosen.length ? NAME_RE.test(trimmed) : nameOk;
 
   return (
     <div className="conn-detail">
@@ -336,14 +433,16 @@ function ConnectForm({ tile, defaultName, takenNames, onDone, onError, onRemoved
           </label>
         ))}
         <label className="conn-field">
-          <span className="conn-label">Name it in Studio</span>
-          <input value={name} onChange={(e) => { setName(e.target.value); }} autoComplete="off" />
+          <span className="conn-label">
+            {chosen.length > 1 ? "Name these in Studio (prefix)" : "Name it in Studio"}
+          </span>
+          <input value={name} onChange={(e) => setName(e.target.value)} autoComplete="off" />
         </label>
       </div>
 
-      {trimmed && !nameOk && (
+      {trimmed && !nameUsable && (
         <div className="meta conn-warn">
-          {takenNames.has(trimmed)
+          {takenNames.has(trimmed) && !chosen.length
             ? `A source named “${trimmed}” already exists — pick another name.`
             : "Name must be 2–31 characters: lowercase letters, digits, - or _."}
         </div>
@@ -351,22 +450,85 @@ function ConnectForm({ tile, defaultName, takenNames, onDone, onError, onRemoved
 
       {test && (test.ok
         ? <div className="meta share-notice">
-            ✓ Connected — {test.tables} tables{test.sample?.length ? `: ${test.sample.join(", ")}` : ""}
+            ✓ Signed in — {test.tables} tables{test.sample?.length ? `: ${test.sample.join(", ")}` : ""}
           </div>
         : <div className="error">{test.error}</div>)}
 
+      {busy === "browse" && <div className="meta">Looking up schemas…</div>}
+      {test?.ok && browse && <Namespaces
+        browse={browse} picked={picked} setPicked={setPicked} keyOf={key} />}
+
       <div className="m365-actions">
         <button className="chip" onClick={runTest} disabled={!!busy || !filled}>
-          {busy === "test" ? "testing…" : "⚡ Test connection"}
+          {busy === "test" ? "signing in…" : busy === "browse" ? "reading schemas…"
+            : canBrowse ? "⚡ Sign in and list schemas" : "⚡ Test connection"}
         </button>
-        <button className="primary" onClick={save} disabled={!!busy || !filled || !nameOk}>
-          {busy === "save" ? "connecting…" : "✓ Connect"}
+        <button className="primary" onClick={save} disabled={!!busy || !filled || !nameUsable}>
+          {busy === "save" ? (progress || "connecting…")
+            : chosen.length > 1 ? `✓ Connect ${chosen.length} schemas` : "✓ Connect"}
         </button>
       </div>
       <div className="meta">
-        Credentials are encrypted at rest and never displayed again. The new source is
-        visible to admins; grant it to other roles in Governance.
+        Credentials are encrypted at rest and never displayed again. Each schema becomes
+        its own source, scoped and granted separately — grant them to other roles in
+        Governance.
       </div>
+    </div>
+  );
+}
+
+/** The picked-schema checklist, grouped by database / catalog / project. */
+export function Namespaces({ browse, picked, setPicked, keyOf }) {
+  if (!browse.ok) {
+    return (
+      <div className="meta conn-warn">
+        Couldn't list schemas ({browse.error}). Type the schema in the field above and
+        connect — this only affects the picker, not the connection.
+      </div>
+    );
+  }
+  if (!browse.namespaces.length) {
+    return <div className="meta">No schemas visible to this account — type one above.</div>;
+  }
+
+  const groups = [];
+  for (const n of browse.namespaces) {
+    const db = n.database || "";
+    const g = groups.find((x) => x.db === db) || (groups.push({ db, items: [] }), groups.at(-1));
+    g.items.push(n);
+  }
+
+  function toggle(k) {
+    setPicked((p) => p.includes(k) ? p.filter((x) => x !== k) : [...p, k]);
+  }
+
+  return (
+    <div className="conn-ns">
+      <div className="conn-ns-head">
+        <span className="conn-label">
+          Schemas this account can see — pick the ones to add as sources
+        </span>
+        <span className="meta">{picked.length} selected</span>
+      </div>
+      {groups.map((g) => (
+        <div key={g.db} className="conn-ns-group">
+          {g.db && <div className="conn-ns-db">{g.db}</div>}
+          <div className="conn-ns-list">
+            {g.items.map((n) => {
+              const k = keyOf(n);
+              return (
+                <label key={k} className={`conn-ns-item${picked.includes(k) ? " conn-ns-on" : ""}`}>
+                  <input type="checkbox" checked={picked.includes(k)} onChange={() => toggle(k)} />
+                  <span>{n.schema}</span>
+                </label>
+              );
+            })}
+          </div>
+        </div>
+      ))}
+      {browse.truncated && (
+        <div className="meta">Showing the first {browse.namespaces.length} — type a name above to bind one not listed.</div>
+      )}
     </div>
   );
 }

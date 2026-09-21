@@ -146,6 +146,24 @@ class PostgresConnector(Connector):
                 return [r[0] for r in cur.fetchall()]
         return self._execute(go)
 
+    def list_namespaces(self):
+        """Schemas this login can see in the connected database, for the
+        connect screen's picker. PostgreSQL cannot cross databases in a query,
+        so the database is always the connected one."""
+        database = self._database().strip()
+
+        def go(con):
+            with con.cursor() as cur:
+                cur.execute(
+                    "SELECT schema_name FROM information_schema.schemata "
+                    "WHERE schema_name NOT IN ('information_schema', 'pg_catalog', "
+                    "'pg_toast') AND schema_name NOT LIKE 'pg\\_temp\\_%' "
+                    "AND schema_name NOT LIKE 'pg\\_toast\\_temp\\_%' "
+                    "ORDER BY schema_name")
+                return [r[0] for r in cur.fetchall()]
+
+        return [{"database": database, "schema": n} for n in self._execute(go)]
+
     def get_schema(self, table):
         def go(con):
             with con.cursor() as cur:
