@@ -1,8 +1,9 @@
 """Named agents — who's who, and which one answered.
 
 Studio runs a small crew. Each connected data source gets its own WORKER agent,
-briefed by that source's skill file; a cross-source question adds the AGGREGATOR
-that synthesizes their answers; the ORCHESTRATOR is the fan-out coordinator.
+briefed by that source's skill file; independent GRAPH PLANNERS propose the
+runtime topology; a cross-source question adds the AGGREGATOR that synthesizes
+worker answers; the ORCHESTRATOR is the deterministic formation/execution gate.
 This module gives every agent a stable NAME so each run can report exactly which
 agents were called (surfaced on the answer), and the learning store
 (agent_traces.meta.agents) can attribute each rollout to the agents behind it.
@@ -24,6 +25,14 @@ def worker(source):
 
 AGGREGATOR = {"name": "Aggregator", "source": "*", "role": "aggregator"}
 ORCHESTRATOR = {"name": "Orchestrator", "source": "*", "role": "orchestrator"}
+GRAPH_PLANNERS = [
+    {"name": "Source Mapper", "role": "planner",
+     "planner_role": "source_mapper", "produces": "candidate graph"},
+    {"name": "Dependency Planner", "role": "planner",
+     "planner_role": "dependency_planner", "produces": "candidate graph"},
+    {"name": "Minimal Graph Planner", "role": "planner",
+     "planner_role": "minimalist", "produces": "candidate graph"},
+]
 
 # The staged pipeline crew (flow.py): each turns one typed JSON artifact into
 # the next, and each run is recorded as its own Agent Lightning trace.
@@ -92,6 +101,7 @@ def summary(user):
         "agents": agents,
         "orchestrator": ORCHESTRATOR,
         "aggregator": AGGREGATOR,
+        "graph_planners": GRAPH_PLANNERS,
         "pipeline_crew": STAGE_AGENTS,
         "utility_agents": [SQL_VERIFIER, SEMANTIC],
         "multi_source": len(accessible) > 1,

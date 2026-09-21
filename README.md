@@ -399,14 +399,24 @@ flowchart LR
 
 Every connected source gets its own **worker agent**, briefed by an
 auto-generated *skill file* (`skills.py`) that lists only the tables the current
-user's role may touch. For a cross-source question, a supervisor selects seed
-workers only from that RBAC-filtered roster. While executing, a worker can call
+user's role may touch. For each cross-source user prompt, three tool-less
+planning agents start concurrently and independently: a source mapper, a
+dependency planner, and a minimal-graph planner. Each gets only the same root
+prompt and RBAC-filtered source roster—never chat history, another planner's
+output, tools, or shared scratch state—and proposes a complete DAG. The server
+strictly validates every proposal and deterministically elects one whole graph
+by structural agreement. It never splices proposals, and planner-authored task
+prose is discarded before workers run. The former supervisor node is therefore
+a deterministic formation gate, not a single LLM deciding the topology.
+
+While executing the selected graph, a worker can call
 `spawn_data_agent` to request one or more specialized children. The call does
 not execute anything: it writes a narrow `{source, task, context, reason}` request
 to a node-local inbox. After the worker finishes, the server validates the
 request against the same roster and hard depth/fan-out/total-node budgets, mints
 the child id, and schedules it in the next wave. Model output can never choose a
-role, credentials, tools, dependencies, or a new source permission.
+role, credentials, tools, executable task prose, dependencies, or a new source
+permission. Planner calls have a bounded 30-second council deadline by default.
 
 Independent nodes run in parallel (with one active node per connector instance);
 a child using `context=parent_rows` starts only after its parent succeeds and
@@ -425,6 +435,11 @@ checkpointed to a second store. Synchronous chat remains request-scoped.
 Row-conditioned and runtime-spawned child prompts are redacted before trace
 persistence and excluded from shared Agent Lightning/BitNet training. Migration
 14 scrubs the same reference blocks from traces written by older DAG builds.
+Terminal Aggregator conditioning is reduced to the root prompt and blocked at
+the remote Agent Lightning boundary, including legacy queued traces, because
+worker answers and SQL may contain tenant data. Successful independent seed
+workers remain reusable training examples because they receive the exact root
+prompt—no planner rewrite—while dependent nodes remain excluded.
 
 The terminal **Aggregator** either synthesizes the workers' answers or, for a
 `combine="table"` plan, sends every verified part through the guarded in-memory
@@ -436,18 +451,25 @@ retained as `blend_sql` provenance, not ordinary replayable warehouse SQL: its
 input tables exist only inside that request's locked-down DuckDB, so chat does
 not mislabel it as a refresh action or reusable pipeline.
 
-Planning is a safe optimization, not an availability dependency: no model, a
-malformed/cyclic plan, or an unusable source selection falls back to the classic
-all-accessible-source parallel fan-out. If that safe fallback would exceed the
-12-node runtime budget, the turn asks for a narrower source scope before any
+Planning is a safe optimization, not an availability dependency: provider
+failure and malformed, cyclic, duplicate-source, or out-of-roster proposals are
+isolated to the planner that produced them. The remaining valid council members
+can still form the graph; if none survive, Studio falls back once to the classic
+all-accessible-source parallel fan-out. Formation metadata retains only planner
+identity, status, node/edge counts, selection, and agreement—never proposals,
+hidden reasoning, task prose, or provider errors. If that safe fallback would
+exceed the 12-node runtime budget, the turn asks for a narrower source scope before any
 worker runs; it never truncates sources or silently bypasses the budget.
 `STUDIO_AGENT_DYNAMIC_SPAWN=0` keeps the validated seed DAG but removes the
 delegation tool; `STUDIO_AGENT_GRAPH=0`
 forces the classic path. The current BitNet adapter deliberately does not receive
 the delegation tool because its trained action contract covers guarded SQL and
-charts only. When BitNet is selected, the configured frontier model may still
-act as supervisor and select BitNet SQL workers; BitNet itself needs a separate,
-versioned spawn-action training stream before it can delegate safely. A staged
+charts only. When BitNet is selected, the configured frontier model runs the
+independent planning council. BitNet may execute independent seed nodes because
+they receive the exact root prompt; dependency-context nodes and the terminal
+reasoner escalate to the frontier, and a failed independent BitNet worker is
+retried once on the frontier. BitNet itself needs a separate, versioned
+spawn-action training stream before it can delegate safely. A staged
 pipeline separately adds a **Pipeline planner**, **Code generator**,
 **Validator**, **Approval agent**, and a **Deployment executor**;
 the verified-SQL path is served by a **SQL verifier**. `roster.py` gives each a
@@ -456,7 +478,12 @@ rollout is attributed to it.
 
 ```mermaid
 flowchart LR
-    q["Question"] --> plan["Supervisor<br/>seed roster only"]
+    q["Question"] --> p1["Source mapper"]
+    q --> p2["Dependency planner"]
+    q --> p3["Minimal graph planner"]
+    p1 -->|"proposal"| plan{"deterministic validation<br/>+ whole-plan election"}
+    p2 -->|"proposal"| plan
+    p3 -->|"proposal"| plan
     plan --> w1["Postgres agent<br/>top accounts"]
     w1 -->|"spawn_data_agent request"| gate{"server validates<br/>roster + budgets"}
     gate -->|"bounded parent rows"| w2["Snowflake child agent<br/>spend for those accounts"]
@@ -2253,6 +2280,8 @@ you in: the account is created unverified and the emailed 6-digit code
 | `HARRIER_EMBED_MODEL` / `HARRIER_EMBED_INSTRUCT` / `HARRIER_EMBED_KEY` | Harrier model id (default `microsoft/harrier-oss-v1-0.6b`), query instruction, optional auth |
 | `HARRIER_EMBED_URL` | Harrier embedding endpoint (OpenAI-compatible `/embeddings`); unset → lexical matching |
 | `STUDIO_AGENT_GRAPH` | Cross-source planner/executor toggle (default on). Set `0`, `false`, or `no` to force the classic independent all-accessible-source fan-out |
+| `STUDIO_AGENT_GRAPH_PLANNERS` | Number of independent graph-planning agents. Defaults to 3 and is hard-clamped to 1–3; lowering it saves provider calls but reduces independent structural comparison |
+| `STUDIO_AGENT_GRAPH_PLANNER_TIMEOUT_S` | Whole-council and per-provider planning deadline in seconds (default 30, clamped to 5–60) |
 | `STUDIO_AGENT_DYNAMIC_SPAWN` | Runtime worker delegation toggle (default on). Set `0`, `false`, or `no` to keep the seed DAG but omit `spawn_data_agent` and prevent dynamic child nodes |
 | `STUDIO_HISTORY_TURNS` | Prior turns replayed to the model each turn (default 8); sessions keep the full transcript |
 | `STUDIO_LLM` | LangChain `init_chat_model` string — `anthropic:claude-sonnet-5`, `openai:gpt-4o`, … |

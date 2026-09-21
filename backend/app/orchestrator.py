@@ -4,9 +4,10 @@
    User question ──┼→ Databricks agent ┼→ Aggregator → one synthesized answer
                     └→ SAP agent ───────┘
 
-The planner selects from sources the user's role can access and may make one
-agent depend on another's bounded result. Independent nodes still run in
-parallel. The terminal either synthesizes prose or, for ``combine=table``,
+Independent planners propose only from sources the user's role can access; a
+deterministic gate selects one validated whole graph, which may make one agent
+depend on another's bounded result. Independent nodes still run in parallel.
+The terminal either synthesizes prose or, for ``combine=table``,
 uses the guarded in-memory blender to return one federated table. An unusable
 plan falls back to the original all-source fan-out.
 
@@ -19,7 +20,7 @@ import json
 import os
 import re
 
-from . import agent, agent_graph, lightning, progress, rbac, roster, skills, util
+from . import agent, agent_graph, jobs, lightning, progress, rbac, roster, skills, util
 from .connectors import all_sources, get_connector
 
 MAX_PARALLEL = 6
@@ -158,13 +159,22 @@ def run_orchestrated(prompt, user, history, model=None, conversation_id=None,
                 },
             }
         if plan.get("planned"):
-            progress.emit(f"planned {len(plan['nodes'])} agent(s): "
-                          + (plan.get("why") or "").strip())
+            formation = plan.get("formation") or {}
+            council = formation.get("planners") or []
+            if council:
+                progress.emit(
+                    f"{len(council)} independent planner(s) formed a "
+                    f"{len(plan['nodes'])}-agent graph; the server selected "
+                    f"{formation.get('selected') or 'a validated proposal'}")
+            else:
+                progress.emit(f"planned {len(plan['nodes'])} agent(s): "
+                              + (plan.get("why") or "").strip())
         else:
             progress.emit("fanning out to " + ", ".join(
                 roster.name_for(s["connector"].name) for s in sources))
         run = agent_graph.execute(plan, sources, prompt, user, model, conversation_id,
                                   history=history)
+        jobs.check_claim()
         # Workers may have requested children while executing. Every terminal
         # operation must use the server-materialized runtime plan, not the seed.
         plan = run.get("runtime_plan") or plan
@@ -193,6 +203,7 @@ def run_orchestrated(prompt, user, history, model=None, conversation_id=None,
     table_requested = bool(plan and plan.get("combine") == "table")
     blended, blend_error = None, None
     if table_requested:
+        jobs.check_claim()
         progress.emit("Aggregator: blending the agents' results into one table")
         try:
             blended = agent_graph.blend_parts(plan, run["results"], user)
@@ -205,9 +216,14 @@ def run_orchestrated(prompt, user, history, model=None, conversation_id=None,
         if blend_error:
             errors.append(f"Table combine failed: {blend_error}")
 
+    jobs.check_claim()
     progress.emit("Aggregator: synthesizing one answer from "
                   f"{len(subs)} agents' results")
-    text = _aggregate(prompt, subs, user, spec)
+    reasoner_spec = agent_graph.reasoning_model_spec(spec)
+    text = _aggregate(prompt, subs, user, reasoner_spec)
+    # The provider can block while the durable background claim is reclaimed.
+    # A stale owner may not publish a terminal answer or a training trace.
+    jobs.check_claim()
     if blend_error:
         text = f"Could not produce the requested combined table: {blend_error}.\n\n{text}"
     last = next((r for r in subs if r.get("sql")), None)
@@ -249,16 +265,24 @@ def run_orchestrated(prompt, user, history, model=None, conversation_id=None,
     # aggregator on ITS synthesis — separate rollouts, separate policies.
     reward_result = {"text": text, "sql": sql, "columns": columns, "rows": rows,
                      "chart": chart, "panels": panels, "errors": errors,
-                     "model": spec, "source": source}
+                     "model": reasoner_spec, "source": source}
     if blend_error:
         # agent_reward treats this prefix as a terminal failure.  Do not award
         # synthesis credit when the requested artifact was not produced.
         reward_result["text"] = f"(Orchestrator error: {blend_error})"
+    jobs.check_claim()
     lightning.record_agent_rollout(
         user, conversation_id, prompt, roster.AGGREGATOR["name"], "aggregator",
-        reward_result, conditioning_prompt=_aggregate_prompt(prompt, subs))
+        reward_result, conditioning_prompt=_aggregate_prompt(prompt, subs),
+        graph_meta={"aggregate": True})
 
     executed_subs = [r for r in subs if r.get("_status") != "skipped"]
+    planner_agents = [
+        {"name": p.get("agent") or p.get("role") or "Graph planner",
+         "source": "*", "role": "planner", "planner_role": p.get("role"),
+         "selected": bool(p.get("selected"))}
+        for p in (((plan or {}).get("formation") or {}).get("planners") or [])
+    ]
 
     return {
         "text": text,
@@ -270,12 +294,12 @@ def run_orchestrated(prompt, user, history, model=None, conversation_id=None,
         "email": next((r["email"] for r in subs if r.get("email")), None),
         "errors": errors,
         "mode": "orchestrated",
-        "model": spec,
+        "model": reasoner_spec,
         "source": source,
         "agents_used": [r["_source"] for r in executed_subs],
-        # The full named crew for this turn: every worker that ran + the
-        # Aggregator that synthesized them.
-        "agents": [
+        # The full named crew for this turn: independent formation planners,
+        # every worker that ran, and the Aggregator that synthesized them.
+        "agents": planner_agents + [
             {**roster.worker(r["_source"]),
              **({"node_id": r["_node"], "spawned_by": r.get("_spawned_by"),
                  "depth": r.get("_depth", 0)} if r.get("_node") else {})}
@@ -339,6 +363,17 @@ def _aggregate(prompt, subs, user, spec):
     else a deterministic per-source summary."""
     named = [s for s in subs if (s.get("text") or "").strip()]
     summary = "\n\n".join(f"**{s['_source']}** — {s['text'].strip()}" for s in named)
+
+    # The deployed self-hosted adapter emits guarded tool actions, not prose
+    # synthesis. Without a separately configured frontier, deterministic
+    # aggregation is honest; rendering action JSON as an answer is not.
+    try:
+        if agent.self_hosted(agent.concrete_model_spec(spec)):
+            heads = ", ".join(s["_source"] for s in subs)
+            return f"Combined results from {heads}:\n\n{summary}" if summary else \
+                f"Queried {heads}; see the panels for each database's result."
+    except Exception:
+        pass
 
     if not agent.llm_available(spec, user):
         heads = ", ".join(s["_source"] for s in subs)

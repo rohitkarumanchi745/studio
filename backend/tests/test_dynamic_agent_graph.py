@@ -529,7 +529,7 @@ def test_bitnet_workers_can_be_selected_by_a_frontier_supervisor(monkeypatch):
         lambda spec, user: used.append(("available", spec)) or True)
     monkeypatch.setattr(
         ag.agent, "make_llm",
-        lambda spec, user: used.append(("make", spec)) or LLM())
+        lambda spec, user, **kwargs: used.append(("make", spec)) or LLM())
 
     plan = ag.plan_graph("query postgres", SOURCES[:2], USER, model="bitnet")
 

@@ -249,6 +249,8 @@ def _safe_graph_meta(graph_meta):
             graph_meta.get("spawn_rejection_count",
                            _collection_count(graph_meta.get("spawn_rejections"))), 0, 20),
     }
+    if graph_meta.get("aggregate"):
+        safe["aggregate"] = True
     return safe
 
 
@@ -264,6 +266,11 @@ def global_training_eligible(meta):
     """
     if not isinstance(meta, dict):
         return True
+    # Aggregator conditioning contains worker-derived answers and SQL. Legacy
+    # rows predate the explicit graph.aggregate bit, so role is the durable
+    # fail-closed boundary for local replay and remote Agent Lightning emits.
+    if str(meta.get("role") or "").strip().lower() == "aggregator":
+        return False
     if meta.get("global_train_eligible") is False:
         return False
     graph = meta.get("graph")
@@ -274,7 +281,8 @@ def global_training_eligible(meta):
         except (TypeError, ValueError):
             legacy_dynamic = True
         if (str(graph.get("context_mode") or "").strip().lower() == "parent_rows"
-                or bool(graph.get("dynamic")) or legacy_dynamic):
+                or bool(graph.get("dynamic")) or legacy_dynamic
+                or bool(graph.get("aggregate"))):
             return False
     conditioning = meta.get("conditioning_prompt")
     return not (isinstance(conditioning, str)
@@ -302,7 +310,9 @@ def record_agent_rollout(user, conversation_id, prompt, agent_name, role, sub,
         or (actual_prompt != root_prompt
             and _REFERENCE_CONTEXT_MARKER in str(actual_prompt)))
     dynamic_graph_context = bool(safe_graph and safe_graph["dynamic"])
-    unsafe_graph_conditioning = private_graph_context or dynamic_graph_context
+    aggregate_graph_context = bool(safe_graph and safe_graph.get("aggregate"))
+    unsafe_graph_conditioning = (private_graph_context or dynamic_graph_context
+                                 or aggregate_graph_context)
     if unsafe_graph_conditioning:
         # Never persist the warehouse-derived context. Replacing it with the
         # root prompt also makes rollout_input() safe for diagnostics; the
@@ -319,7 +329,9 @@ def record_agent_rollout(user, conversation_id, prompt, agent_name, role, sub,
         trace_meta["global_train_eligible"] = not unsafe_graph_conditioning
     if unsafe_graph_conditioning:
         trace_meta["conditioning_redacted"] = (
-            "parent_rows" if private_graph_context else "dynamic_task")
+            "parent_rows" if private_graph_context else
+            "dynamic_task" if dynamic_graph_context else
+            "aggregate_results")
         trace_meta["global_train_eligible"] = False
     try:
         tid = db.add_trace(
