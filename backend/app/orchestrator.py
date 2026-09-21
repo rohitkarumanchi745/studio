@@ -18,9 +18,10 @@ deterministic fallback, and the aggregator falls back to a per-source summary.
 """
 import concurrent.futures
 import json
+import os
 import re
 
-from . import agent, lightning, progress, rbac, roster, skills, util
+from . import agent, agent_graph, lightning, progress, rbac, roster, skills, util
 from .connectors import all_sources, get_connector
 
 MAX_PARALLEL = 6
@@ -109,10 +110,39 @@ def run_orchestrated(prompt, user, history, model=None, conversation_id=None,
         result.setdefault("agents", [roster.worker(s["connector"].name)])
         return result
 
-    progress.emit("fanning out to " + ", ".join(
-        roster.name_for(s["connector"].name) for s in sources))
     spec = model or agent.llm_spec()
-    subs = _fanout(prompt, sources, user, model)
+
+    # Plan the shape of this turn, then run it. A planned graph lets one
+    # source's rows feed another's question ("the accounts from Postgres, then
+    # their spend in Snowflake"), which the blind fan-out below cannot express.
+    # With no LLM key, a single source, or an unusable plan, plan_graph returns
+    # the FLAT graph — every source, no dependencies — which executes as the
+    # same parallel fan-out this function always did. So the fallback path is
+    # the old behavior rather than an approximation of it, and _fanout stays
+    # for the kill switch.
+    graph = None
+    if os.getenv("STUDIO_AGENT_GRAPH", "1").lower() not in ("0", "false", "no"):
+        plan = agent_graph.plan_graph(prompt, sources, user, model)
+        if plan.get("planned"):
+            progress.emit(f"planned {len(plan['nodes'])} agent(s): "
+                          + (plan.get("why") or "").strip())
+        else:
+            progress.emit("fanning out to " + ", ".join(
+                roster.name_for(s["connector"].name) for s in sources))
+        run = agent_graph.execute(plan, sources, prompt, user, model, conversation_id)
+        graph = run["graph"]
+        # execute() already recorded each node's rollout, so the per-worker
+        # loop below is skipped for this path — scoring a worker twice would
+        # double-weight it in its own policy.
+        subs = [run["results"][nid] for nid in run["order"]]
+    else:
+        progress.emit("fanning out to " + ", ".join(
+            roster.name_for(s["connector"].name) for s in sources))
+        subs = _fanout(prompt, sources, user, model)
+        for sub in subs:
+            lightning.record_agent_rollout(
+                user, conversation_id, prompt, roster.name_for(sub["_source"]),
+                "worker", sub)
 
     panels, errors = [], []
     for sub in subs:
@@ -127,11 +157,9 @@ def run_orchestrated(prompt, user, history, model=None, conversation_id=None,
     text = _aggregate(prompt, subs, user, spec)
     last = next((r for r in subs if r.get("sql")), None)
 
-    # Per-agent reward shaping: each worker scored on ITS own answer, the
+    # Per-agent reward shaping: each worker is scored on ITS own answer (done
+    # per node in agent_graph.execute, or in the kill-switch branch above), the
     # aggregator on ITS synthesis — separate rollouts, separate policies.
-    for sub in subs:
-        lightning.record_agent_rollout(
-            user, conversation_id, prompt, roster.name_for(sub["_source"]), "worker", sub)
     lightning.record_agent_rollout(
         user, conversation_id, prompt, roster.AGGREGATOR["name"], "aggregator",
         {"text": text, "panels": panels, "model": spec})
@@ -152,6 +180,9 @@ def run_orchestrated(prompt, user, history, model=None, conversation_id=None,
         # The full named crew for this turn: every worker that ran + the
         # Aggregator that synthesized them.
         "agents": [roster.worker(r["_source"]) for r in subs] + [roster.AGGREGATOR],
+        # The topology this turn actually ran, for the UI to draw. None when
+        # the kill switch is set and the classic fan-out ran instead.
+        "graph": graph,
     }
 
 
