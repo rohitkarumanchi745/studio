@@ -98,7 +98,10 @@ def run_orchestrated(prompt, user, history, model=None, conversation_id=None,
                 "errors": [], "mode": "orchestrated", "model": None,
                 "source": "*", "agents_used": []}
 
-    if len(sources) == 1:
+    graph_enabled = os.getenv("STUDIO_AGENT_GRAPH", "1").lower() \
+        not in ("0", "false", "no")
+
+    if len(sources) == 1 and not graph_enabled:
         # One accessible source → its worker answers directly, no aggregator.
         s = sources[0]
         result = agent.run_agent(prompt, s["connector"], "*", s["allowed"], s["schemas"],
@@ -121,15 +124,50 @@ def run_orchestrated(prompt, user, history, model=None, conversation_id=None,
     graph = None
     plan = None
     run = None
-    if os.getenv("STUDIO_AGENT_GRAPH", "1").lower() not in ("0", "false", "no"):
-        plan = agent_graph.plan_graph(prompt, sources, user, model)
+    if graph_enabled:
+        try:
+            plan = agent_graph.plan_graph(prompt, sources, user, model)
+        except agent_graph.GraphLimitExceeded as exc:
+            # A planner may safely narrow a large roster. If planning is
+            # unavailable or unusable, however, the fallback would fan out to
+            # every source. Refuse that turn cleanly instead of silently
+            # dropping sources or bypassing the hard graph budget.
+            detail = str(exc)
+            return {
+                "text": detail,
+                "sql": None, "columns": [], "rows": [], "chart": None,
+                "panels": [], "email": None, "errors": [detail],
+                "mode": "orchestrated", "model": spec, "source": "*",
+                "agents_used": [], "agents": [roster.ORCHESTRATOR],
+                "graph": {
+                    "nodes": [
+                        {"id": "__supervisor__", "source": "*",
+                         "kind": "supervisor", "agent": roster.ORCHESTRATOR["name"],
+                         "task": "select a bounded source roster", "depends_on": [],
+                         "status": "failed", "rows": 0, "depth": 0,
+                         "dynamic": False, "spawned_by": None},
+                        {"id": "__reason__", "source": "*", "kind": "reasoner",
+                         "agent": roster.AGGREGATOR["name"],
+                         "task": "synthesize one answer", "depends_on": [],
+                         "status": "skipped", "rows": 0, "depth": None,
+                         "dynamic": False, "spawned_by": None},
+                    ],
+                    "edges": [], "combine": "reason", "why": detail,
+                    "planned": False, "dynamic": False,
+                    "spawn_rejections": [],
+                },
+            }
         if plan.get("planned"):
             progress.emit(f"planned {len(plan['nodes'])} agent(s): "
                           + (plan.get("why") or "").strip())
         else:
             progress.emit("fanning out to " + ", ".join(
                 roster.name_for(s["connector"].name) for s in sources))
-        run = agent_graph.execute(plan, sources, prompt, user, model, conversation_id)
+        run = agent_graph.execute(plan, sources, prompt, user, model, conversation_id,
+                                  history=history)
+        # Workers may have requested children while executing. Every terminal
+        # operation must use the server-materialized runtime plan, not the seed.
+        plan = run.get("runtime_plan") or plan
         graph = run["graph"]
         # execute() already recorded each node's rollout, so the per-worker
         # loop below is skipped for this path — scoring a worker twice would
@@ -237,9 +275,15 @@ def run_orchestrated(prompt, user, history, model=None, conversation_id=None,
         "agents_used": [r["_source"] for r in executed_subs],
         # The full named crew for this turn: every worker that ran + the
         # Aggregator that synthesized them.
-        "agents": [roster.worker(r["_source"]) for r in executed_subs] + [roster.AGGREGATOR],
-        # The topology this turn actually ran, for the UI to draw. None when
-        # the kill switch is set and the classic fan-out ran instead.
+        "agents": [
+            {**roster.worker(r["_source"]),
+             **({"node_id": r["_node"], "spawned_by": r.get("_spawned_by"),
+                 "depth": r.get("_depth", 0)} if r.get("_node") else {})}
+            for r in executed_subs
+        ] + [roster.AGGREGATOR],
+        # The topology this turn actually ran, for audit and observability.
+        # This is serialized execution state, not the mechanism that drives
+        # execution. None means the classic fan-out kill-switch path ran.
         "graph": graph,
         **({"row_count": blended["row_count"], "blend_sql": blended["sql"],
             "parts": blended["parts"],
@@ -281,7 +325,7 @@ def _fanout(prompt, sources, user, model):
     return subs
 
 
-_AGG_SYS = """You are the aggregator over independent per-database agents. Each agent answered the user's question from its own data source, in isolation. Synthesize ONE answer.
+_AGG_SYS = """You are the terminal reasoner over a runtime graph of data agents. Some agents ran independently; others were spawned as specialists or consumed bounded rows from an upstream agent. Synthesize ONE answer.
 
 Rules:
 - Use only what the agents returned — never invent numbers.
@@ -315,7 +359,9 @@ def _aggregate(prompt, subs, user, spec):
 def _aggregate_prompt(prompt, subs):
     """Exact user message supplied to the synthesis model and its trainer."""
     payload = json.dumps([{
+        "node": s.get("_node"),
         "source": s["_source"],
+        "spawned_by": s.get("_spawned_by"),
         "answer": s.get("text"),
         "sql": s.get("sql"),
         "columns": s.get("columns"),

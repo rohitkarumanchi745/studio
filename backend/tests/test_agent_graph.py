@@ -211,7 +211,7 @@ def test_a_node_with_no_upstreams_gets_no_context():
 def _fake_agent(monkeypatch, seen, fail=()):
     """Record the order and the prompt each node was asked, without a warehouse."""
     def run_agent(prompt, connector, table, allowed, schemas, history, user,
-                  model=None, skill_md=None, kag_first=False):
+                  model=None, skill_md=None, kag_first=False, **kwargs):
         seen.append({"source": connector.name, "prompt": prompt})
         if connector.name in fail:
             raise RuntimeError("warehouse unreachable")
@@ -288,7 +288,7 @@ def test_an_empty_dependency_skips_the_dependent_instead_of_querying_without_ids
     seen = []
 
     def run_agent(prompt, connector, table, allowed, schemas, history, user,
-                  model=None, skill_md=None, kag_first=False):
+                  model=None, skill_md=None, kag_first=False, **kwargs):
         seen.append(connector.name)
         return {"text": "no matches", "sql": "SELECT id FROM accounts WHERE false",
                 "columns": ["id"], "rows": [], "chart": None, "panels": [], "errors": []}
@@ -316,9 +316,9 @@ def test_independent_nodes_all_run(monkeypatch):
     assert len(out["results"]) == 3
 
 
-# ── What the UI draws ────────────────────────────────────────────────────
+# ── Runtime observability graph ──────────────────────────────────────────
 
-def test_the_drawn_graph_carries_every_edge_plus_the_reasoner():
+def test_serialized_graph_carries_actual_data_spawn_and_reasoner_edges():
     plan = ag.validate_plan({"nodes": [
         {"id": "top", "source": "postgres", "task": "x", "depends_on": []},
         {"id": "spend", "source": "snowflake", "task": "y", "depends_on": ["top"]},
@@ -326,15 +326,21 @@ def test_the_drawn_graph_carries_every_edge_plus_the_reasoner():
     ]}, SOURCES, "q")
     g = ag.describe(plan)
 
-    assert {n["id"] for n in g["nodes"]} == {"top", "spend", "inv", "__reason__"}
-    assert {(e["from"], e["to"]) for e in g["edges"]} == {
-        ("top", "spend"),            # the dependency
-        ("spend", "__reason__"),     # leaves feed the reasoner
-        ("inv", "__reason__"),
+    assert {n["id"] for n in g["nodes"]} == {
+        "__supervisor__", "top", "spend", "inv", "__reason__"}
+    assert {(e["from"], e["to"], e["kind"]) for e in g["edges"]} == {
+        ("__supervisor__", "top", "spawn"),
+        ("__supervisor__", "spend", "spawn"),
+        ("__supervisor__", "inv", "spawn"),
+        ("top", "spend", "data"),        # the dependency
+        # The aggregator receives every worker result, not only data leaves.
+        ("top", "__reason__", "result"),
+        ("spend", "__reason__", "result"),
+        ("inv", "__reason__", "result"),
     }
-    # `top` is not a leaf, so it does not feed the reasoner directly.
-    assert ("top", "__reason__") not in {(e["from"], e["to"]) for e in g["edges"]}
-    assert g["nodes"][0]["agent"] == "Postgres agent"
+    terminal = next(n for n in g["nodes"] if n["id"] == "__reason__")
+    assert terminal["depends_on"] == ["inv", "spend", "top"]
+    assert next(n for n in g["nodes"] if n["id"] == "top")["agent"] == "Postgres agent"
 
 
 def test_blend_needs_at_least_two_usable_parts():

@@ -596,6 +596,36 @@ def test_synthesis_rollouts_never_train_the_sql_tool_policy():
     ) == [malformed, _rollout("worker", 2, "SELECT 1")]
 
 
+def test_parent_row_graph_rollouts_never_enter_global_samples_pairs_or_replay():
+    skills = {("demo", "admin"): {
+        "context": "schema", "allowed": {"sales"}, "dialect": "sqlite"}}
+    explicit = _rollout("private", 1, "SELECT * FROM sales")
+    explicit["meta"] = {
+        "global_train_eligible": False,
+        "graph": {"context_mode": "parent_rows"},
+    }
+    legacy = _rollout(
+        "legacy", 2, "SELECT * FROM sales",
+        prompt="REFERENCE DATA: [[private-account]]\nQuestion: find spend")
+    dynamic_none = _rollout("dynamic", 3, "SELECT * FROM sales",
+                            prompt="look up inlined-private-account")
+    dynamic_none["meta"] = {"graph": {
+        "context_mode": "none", "dynamic": True, "depth": 1,
+        "spawned_by": "seed"}}
+    safe = _rollout("safe", 4, "SELECT * FROM sales")
+
+    rows = [explicit, legacy, dynamic_none, safe]
+    samples, sft_dropped = T.to_samples(rows, skills)
+    pairs, dpo_dropped = T.mine_preference_pairs(rows, skills)
+
+    assert [sample["id"] for sample in samples] == ["safe"]
+    assert pairs == []
+    assert sft_dropped["private_graph_context"] == 3
+    assert dpo_dropped["private_graph_context"] == 3
+    assert T.tool_policy_rollouts(rows) == [safe]
+    assert T.merge_pending([], rows) == [safe]
+
+
 def test_aggregator_cleanup_does_not_hide_malformed_rows_or_advance_cursor(tmp_path, monkeypatch):
     module = _load({"STUDIO_TRAIN_OUTPUT_DIR": str(tmp_path)})
     _trainer_stubs(module, monkeypatch)

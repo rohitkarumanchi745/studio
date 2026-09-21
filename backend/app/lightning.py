@@ -196,21 +196,131 @@ def agent_reward(role, sub):
     return round(max(0.0, min(1.0, r)), 2)
 
 
+_REFERENCE_CONTEXT_MARKER = "REFERENCE DATA"
+
+
+def _safe_graph_meta(graph_meta):
+    """Reduce runtime graph metadata to server-owned structural fields.
+
+    Spawn requests contain model-authored tasks and reasons. A worker that has
+    seen warehouse rows can repeat a cell in either field, so those payloads
+    must never cross the trace/training boundary. Counts retain useful audit
+    information without retaining the model-authored text.
+    """
+    if not isinstance(graph_meta, dict):
+        return None
+
+    context_mode = str(graph_meta.get("context_mode") or "none").strip().lower()
+    if context_mode not in {"none", "parent_rows"}:
+        context_mode = "none"
+
+    def _identifier(value):
+        return str(value or "")[:160] or None
+
+    def _bounded_int(value, default, maximum):
+        try:
+            return min(maximum, max(0, int(value)))
+        except (TypeError, ValueError):
+            return default
+
+    def _collection_count(value):
+        return len(value) if isinstance(value, (list, tuple)) else 0
+
+    spawned = graph_meta.get("spawned")
+    if not isinstance(spawned, list):
+        spawned = []
+    spawned_by = _identifier(graph_meta.get("spawned_by"))
+    depth = _bounded_int(graph_meta.get("depth"), 0, 100)
+    # The explicit bit is authoritative for new traces. The ancestry fallback
+    # recognizes runtime children written by the first graph implementation.
+    dynamic = bool(graph_meta.get("dynamic")) or (
+        depth > 0 and spawned_by not in (None, "__supervisor__"))
+    safe = {
+        "node_id": _identifier(graph_meta.get("node_id")),
+        "spawned_by": spawned_by,
+        "depth": depth,
+        "dynamic": dynamic,
+        "context_mode": context_mode,
+        "spawned": [_identifier(item) for item in spawned[:3] if _identifier(item)],
+        "spawn_request_count": _bounded_int(
+            graph_meta.get("spawn_request_count",
+                           _collection_count(graph_meta.get("spawn_requests"))), 0, 3),
+        "spawn_rejection_count": _bounded_int(
+            graph_meta.get("spawn_rejection_count",
+                           _collection_count(graph_meta.get("spawn_rejections"))), 0, 20),
+    }
+    return safe
+
+
+def global_training_eligible(meta):
+    """Whether a trace is safe input to a shared/global training policy.
+
+    The global BitNet adapter is shared across users. Every runtime-spawned
+    child's task is excluded because its parent may have copied a warehouse
+    cell into that task even when it requested ``context=none``. Static nodes
+    that explicitly consume upstream rows are excluded as well. Stripping the
+    values and training on the remainder would create an unfaithful
+    prompt/action pair. The marker/ancestry checks protect legacy traces.
+    """
+    if not isinstance(meta, dict):
+        return True
+    if meta.get("global_train_eligible") is False:
+        return False
+    graph = meta.get("graph")
+    if isinstance(graph, dict):
+        try:
+            legacy_dynamic = (int(graph.get("depth") or 0) > 0
+                              and graph.get("spawned_by") not in (None, "__supervisor__"))
+        except (TypeError, ValueError):
+            legacy_dynamic = True
+        if (str(graph.get("context_mode") or "").strip().lower() == "parent_rows"
+                or bool(graph.get("dynamic")) or legacy_dynamic):
+            return False
+    conditioning = meta.get("conditioning_prompt")
+    return not (isinstance(conditioning, str)
+                and _REFERENCE_CONTEXT_MARKER in conditioning)
+
+
 def record_agent_rollout(user, conversation_id, prompt, agent_name, role, sub,
-                         duration_ms=None, conditioning_prompt=None, history=None):
+                         duration_ms=None, conditioning_prompt=None, history=None,
+                         graph_meta=None):
     """Persist one agent's decision as its own rollout, scored by its role. Uses
     the raw user prompt (not an agent-prefixed one) so per-agent rollouts don't
     inflate the distinct-prompt count that gates training readiness.
 
-    ``conditioning_prompt`` is the exact task the worker/reasoner actually saw.
-    It can differ from the root prompt for a dependent DAG node (which receives
-    bounded upstream rows) and for the Aggregator (which receives the workers'
-    answers).  Training must replay that conditioning, while readiness still
-    counts the stable root prompt stored in the indexed ``prompt`` column.
+    ``conditioning_prompt`` is the task the worker/reasoner saw unless it
+    contains graph reference rows or was authored by a runtime parent. Those
+    prompts are deliberately ephemeral: the trace retains only the root prompt
+    plus structural graph ancestry and is excluded from shared/global training.
     """
     root_prompt = prompt or ""
     actual_prompt = conditioning_prompt if conditioning_prompt is not None else root_prompt
     is_aggregator = role == "aggregator"
+    safe_graph = _safe_graph_meta(graph_meta)
+    private_graph_context = bool(
+        (safe_graph and safe_graph["context_mode"] == "parent_rows")
+        or (actual_prompt != root_prompt
+            and _REFERENCE_CONTEXT_MARKER in str(actual_prompt)))
+    dynamic_graph_context = bool(safe_graph and safe_graph["dynamic"])
+    unsafe_graph_conditioning = private_graph_context or dynamic_graph_context
+    if unsafe_graph_conditioning:
+        # Never persist the warehouse-derived context. Replacing it with the
+        # root prompt also makes rollout_input() safe for diagnostics; the
+        # eligibility bit below prevents this unfaithful pair being trained.
+        actual_prompt = root_prompt
+    trace_meta = {
+        "agent": agent_name, "agents": [agent_name], "role": role,
+        "root_prompt": root_prompt,
+        "conditioning_prompt": actual_prompt,
+        "history": history or [],
+    }
+    if safe_graph:
+        trace_meta["graph"] = safe_graph
+        trace_meta["global_train_eligible"] = not unsafe_graph_conditioning
+    if unsafe_graph_conditioning:
+        trace_meta["conditioning_redacted"] = (
+            "parent_rows" if private_graph_context else "dynamic_task")
+        trace_meta["global_train_eligible"] = False
     try:
         tid = db.add_trace(
             user, conversation_id=conversation_id, prompt=root_prompt[:1000],
@@ -228,14 +338,14 @@ def record_agent_rollout(user, conversation_id, prompt, agent_name, role, sub,
             chart_type=(sub.get("chart") or {}).get("type"),
             panel_count=len(sub.get("panels") or []), duration_ms=duration_ms,
             reward=agent_reward(role, sub), reward_source="per_agent",
-            meta={"agent": agent_name, "agents": [agent_name], "role": role,
-                  "root_prompt": root_prompt,
-                  "conditioning_prompt": actual_prompt,
-                  "history": history or []},
+            meta=trace_meta,
         )
     except Exception:
         return None
-    _enqueue_emit(tid)
+    # Agent Lightning's remote store is another training sink. Do not ship a
+    # row-conditioned rollout merely because Studio's local trainer filters it.
+    if global_training_eligible(trace_meta):
+        _enqueue_emit(tid)
     return tid
 
 
@@ -427,6 +537,8 @@ def export_rollouts(path, limit=5000):
             if t.get("reward") is None:
                 continue
             meta = json.loads(t.get("meta") or "{}")
+            if not global_training_eligible(meta):
+                continue
             f.write(json.dumps({
                 "prompt": t["prompt"],
                 "response": (meta.get("action")
@@ -761,6 +873,11 @@ def emit_trace(trace_id):
         # The trace was deleted (or never landed): nothing to deliver, and
         # nothing a retry would fix.
         return {"skipped": "unknown_trace", "trace_id": trace_id}
+    if not global_training_eligible(t.get("meta")):
+        # Jobs written before the privacy gate may still be queued or revived
+        # by the delivery reconciler. Re-check at the final side-effect
+        # boundary so those traces can never reach the shared AGL store.
+        return {"skipped": "global_training_ineligible", "trace_id": trace_id}
     schemas = _schemas()
     _ensure_tables()
     try:

@@ -38,6 +38,7 @@ Invariants:
     to run `python -m app.migrate up` as an explicit release step.
 """
 import hashlib
+import json
 import logging
 import os
 import threading
@@ -250,6 +251,98 @@ def _m13_agent_sessions_forks(c, is_pg):
             seen.add(key)
 
 
+def _m14_scrub_private_graph_trace_context(c, is_pg):
+    """Remove warehouse reference rows stored by the pre-gate DAG tracer.
+
+    Older dependent-node rollouts persisted their exact conditioning prompt,
+    including the bounded ``REFERENCE DATA`` block. New writes redact before
+    insertion, but an upgrade also has to clean values already at rest. The
+    migration keeps root/task identity and structural lineage while removing
+    model-authored request/rejection payloads that may repeat row values.
+    """
+    if (not _table_exists(c, "agent_traces", is_pg)
+            or not _column_exists(c, "agent_traces", "prompt", is_pg)
+            or not _column_exists(c, "agent_traces", "meta", is_pg)):
+        return
+
+    def _identifier(value):
+        return str(value or "")[:160] or None
+
+    def _bounded_int(value, default, maximum):
+        try:
+            return min(maximum, max(0, int(value)))
+        except (TypeError, ValueError):
+            return default
+
+    def _safe_graph(graph):
+        if not isinstance(graph, dict):
+            return None
+        spawned_by = _identifier(graph.get("spawned_by"))
+        depth = _bounded_int(graph.get("depth"), 0, 100)
+        context_mode = str(graph.get("context_mode") or "none").strip().lower()
+        if context_mode not in {"none", "parent_rows"}:
+            context_mode = "none"
+        spawned = graph.get("spawned") if isinstance(graph.get("spawned"), list) else []
+        dynamic = bool(graph.get("dynamic")) or (
+            depth > 0 and spawned_by not in (None, "__supervisor__"))
+        requests = graph.get("spawn_requests")
+        rejections = graph.get("spawn_rejections")
+        return {
+            "node_id": _identifier(graph.get("node_id")),
+            "spawned_by": spawned_by,
+            "depth": depth,
+            "dynamic": dynamic,
+            "context_mode": context_mode,
+            "spawned": [_identifier(item) for item in spawned[:3] if _identifier(item)],
+            "spawn_request_count": _bounded_int(
+                graph.get("spawn_request_count",
+                          len(requests) if isinstance(requests, list) else 0), 0, 3),
+            "spawn_rejection_count": _bounded_int(
+                graph.get("spawn_rejection_count",
+                          len(rejections) if isinstance(rejections, list) else 0), 0, 20),
+        }
+
+    rows = c.execute("SELECT id,prompt,meta FROM agent_traces WHERE meta IS NOT NULL").fetchall()
+    for row in rows:
+        raw = row["meta"] or ""
+        try:
+            meta = json.loads(raw)
+        except (TypeError, ValueError):
+            # A malformed legacy blob cannot be inspected field-by-field. Only
+            # replace it when the private-context marker proves it is unsafe.
+            if "REFERENCE DATA" not in str(raw):
+                continue
+            meta = {}
+        if not isinstance(meta, dict):
+            if "REFERENCE DATA" not in str(raw):
+                continue
+            meta = {}
+
+        graph = meta.get("graph")
+        safe_graph = _safe_graph(graph)
+        conditioning = meta.get("conditioning_prompt")
+        marker = isinstance(conditioning, str) and "REFERENCE DATA" in conditioning
+        graph_private = bool(safe_graph and (
+            safe_graph["context_mode"] == "parent_rows" or safe_graph["dynamic"]))
+        if not (marker or graph_private or meta.get("global_train_eligible") is False):
+            continue
+
+        root = meta.get("root_prompt")
+        if not isinstance(root, str):
+            root = str(row["prompt"] or "")
+        meta["root_prompt"] = root
+        meta["conditioning_prompt"] = root
+        meta["conditioning_redacted"] = (
+            meta.get("conditioning_redacted") or "legacy_graph_context")
+        meta["global_train_eligible"] = False
+        if safe_graph is not None:
+            meta["graph"] = safe_graph
+        else:
+            meta.pop("graph", None)
+        c.execute("UPDATE agent_traces SET meta=? WHERE id=?",
+                  (json.dumps(meta, separators=(",", ":")), row["id"]))
+
+
 MIGRATIONS = [
     (1, "users.verified", _m1_users_verified),
     (2, "conversations.folder_id", _m2_conversations_folder_id),
@@ -264,6 +357,7 @@ MIGRATIONS = [
     (11, "training_adapters.one_active", _m11_training_adapters_one_active),
     (12, "agent_sessions.conversation_message_ids", _m12_agent_sessions_message_ids),
     (13, "agent_sessions.is_fork", _m13_agent_sessions_forks),
+    (14, "agent_traces.scrub_private_graph_context", _m14_scrub_private_graph_trace_context),
 ]
 
 

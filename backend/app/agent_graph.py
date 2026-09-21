@@ -1,4 +1,4 @@
-"""Agent graph — plan which sources a question needs, run them as a DAG, reason.
+"""Agent graph — let a supervisor spawn governed workers at runtime.
 
 orchestrator.py answers a cross-source question with a fixed two-layer star:
 every accessible source gets a worker, all of them run at once in isolation,
@@ -11,16 +11,18 @@ agent never learns which accounts to look at.
 
 This module makes the topology a GRAPH instead of a star:
 
-    prompt ─→ Planner ─┬→ pg:top_accounts ─→ sf:spend_for ─┐
-                       └→ dbx:inventory ──────────────────┼→ Reasoner → answer
-                                                          ┘
+    prompt ─→ Supervisor ─→ pg:top_accounts ──spawn──→ sf:spend_for ─┐
+                         └→ dbx:inventory ───────────────────────────┼→ Reasoner
+                                                                    ┘
 
-- The PLANNER decides which sources are actually needed and which node's output
-  another node depends on. Sources the question doesn't touch are not queried.
-- The EXECUTOR runs the DAG in topological levels: everything independent in a
-  level goes in parallel (same thread-per-connector shape as the old fan-out),
-  and a dependent node starts only once its upstreams are done, with their
-  results handed to it as reference data.
+- The SUPERVISOR selects seed workers. While running, a worker may call the
+  ``spawn_data_agent`` tool to request more source-specialized workers. The
+  request enters a server-owned inbox and is materialized only after the turn
+  finishes. The graph is therefore runtime execution state, not a picture of a
+  list planned completely in advance.
+- The EXECUTOR runs ready workers in parallel. A dependent worker starts only
+  once its upstreams are done, with their results handed to it as reference
+  data. Newly spawned workers enter the same governed queue.
 - The REASONER synthesizes the final answer. When the plan says the parts
   should become ONE table it hands them to blend.py, which federates them
   through the existing per-part gate; otherwise it summarizes, exactly as the
@@ -44,11 +46,17 @@ SECURITY — the graph decides WHO RUNS, never WHAT MAY BE READ:
   prompt is not a transport for a result set.
 - Cycles, self-edges, unknown dependencies and oversized plans are rejected in
   validation, which falls back to the flat graph rather than failing the turn.
+- Runtime spawning is a capability broker, not model authority: source names
+  must be in the same RBAC-filtered roster, dependencies must be completed
+  successful nodes, and delegation calls, depth, per-node fan-out and total
+  nodes all have hard server-side ceilings.
 """
 import concurrent.futures
 import json
+import os
+import threading
 
-from . import agent, blend, lightning, progress, roster
+from . import agent, blend, jobs, lightning, progress, roster
 
 #: Hard ceiling on planned nodes. The roster is already small (one per source),
 #: and a plan larger than this is a planner malfunction, not a real question.
@@ -66,13 +74,25 @@ MAX_TASK_CHARS = 2000
 #: ``blend.NAME_RE`` accepts ASCII SQL identifiers.  Keeping the same contract
 #: here avoids plans which execute successfully but can never be blended.
 MAX_NODE_ID_CHARS = 40
+#: Runtime expansion is deliberately small. These are policy ceilings, not
+#: prompt suggestions: model output cannot raise them.
+MAX_CHILDREN_PER_NODE = 3
+MAX_SPAWN_DEPTH = 2
+MAX_DELEGATION_CALLS = 3
+
+
+class GraphLimitExceeded(RuntimeError):
+    """A safe fallback would exceed the graph's execution budget."""
 
 
 # ── Planning ─────────────────────────────────────────────────────────────
 
-_PLAN_SYS = """You plan how to answer a data question that may span several databases.
+_PLAN_SYS = """You are the supervisor for a governed multi-agent data graph.
 
-You are given the question and the databases this user may query, each with the tables it holds. Return JSON only:
+Choose the seed workers to run. Each worker can request governed follow-up
+workers later, so do not speculate about work that only becomes necessary after
+seeing data. You are given the question and the databases this user may query,
+each with the tables it holds. Return JSON only:
 
 {"nodes": [{"id": "short_snake_id", "source": "<database name>", "task": "<the question THIS database should answer>", "depends_on": []}],
  "combine": "reason" | "table",
@@ -100,11 +120,20 @@ def flat_plan(sources, prompt):
     """The degenerate graph: every accessible source, nothing depending on
     anything. Identical behavior to the old fan-out, and the fallback whenever
     planning is unavailable or its output does not survive validation."""
+    if len(sources) > MAX_NODES:
+        # Truncating would silently omit data; running everything would make
+        # MAX_NODES a prompt-only fiction. Let the orchestrator return a clean
+        # clarification instead, before any warehouse/model worker is called.
+        raise GraphLimitExceeded(
+            f"The all-source request resolves to {len(sources)} data sources; "
+            f"the runtime graph limit is {MAX_NODES}. Name the sources to use.")
     taken, nodes = set(), []
     for source_entry in sources:
         source = source_entry["connector"].name
         nodes.append({"id": _unique_node_id(source, taken), "source": source,
-                      "task": prompt, "depends_on": []})
+                      "task": prompt, "depends_on": [], "kind": "agent",
+                      "dynamic": False, "spawned_by": "__supervisor__",
+                      "depth": 0})
     return {
         "nodes": nodes,
         "combine": "reason",
@@ -155,9 +184,24 @@ def _unique_node_id(raw, taken):
 
 
 def plan_graph(prompt, sources, user, model=None):
-    """Ask the model for a graph; fall back to the flat one. Never raises —
-    a planning failure must degrade to today's behavior, not lose the turn."""
+    """Ask the model for a graph; fall back to the flat one.
+
+    Planning/provider failures degrade to the classic behavior. The deliberate
+    exception is ``GraphLimitExceeded`` when that fallback itself would violate
+    the hard execution budget; the orchestrator turns it into a clarification.
+    """
     spec = model or agent.llm_spec()
+    # BitNet remains useful as the SQL worker, but its deployed adapter speaks
+    # the narrow run_sql/render_chart action contract, not supervisor JSON.
+    # When a caller explicitly selects it, keep that selection for execute()
+    # and use the configured frontier model only for the topology decision.
+    try:
+        if agent.self_hosted(agent.concrete_model_spec(spec)):
+            frontier = agent.llm_spec()
+            if not agent.self_hosted(agent.concrete_model_spec(frontier)):
+                spec = frontier
+    except Exception:
+        pass
     if not sources:
         return flat_plan(sources, prompt)
     if len(sources) == 1 or not agent.llm_available(spec, user):
@@ -263,10 +307,16 @@ def validate_plan(plan, sources, prompt):
             if dep not in resolved:
                 resolved.append(dep)
         nodes.append({"id": item["id"], "source": item["source"],
-                      "task": item["task"], "depends_on": resolved})
+                      "task": item["task"], "depends_on": resolved,
+                      "kind": "agent", "dynamic": False,
+                      "spawned_by": "__supervisor__"})
 
     if _has_cycle(nodes):
         return None
+
+    depths = _node_depths(nodes)
+    for node in nodes:
+        node["depth"] = depths[node["id"]]
 
     combine = plan.get("combine")
     # A one-node "table" needs no federation.  Treat it as the ordinary
@@ -277,8 +327,29 @@ def validate_plan(plan, sources, prompt):
     combine = "table" if combine == "table" and len(nodes) >= 2 else "reason"
     return {"nodes": nodes,
             "combine": combine,
+            # Table membership is frozen at validation time. Runtime workers
+            # may spawn diagnostic/reasoning children, but model-directed
+            # expansion cannot silently add an unrelated SQL result to a join.
+            "blend_nodes": [n["id"] for n in nodes] if combine == "table" else [],
             "why": str(plan.get("why") or "").strip()[:300],
             "planned": True}
+
+
+def _node_depths(nodes):
+    """Longest dependency distance for each node in an acyclic graph."""
+    by_id = {n["id"]: n for n in nodes}
+    memo = {}
+
+    def visit(nid):
+        if nid in memo:
+            return memo[nid]
+        deps = by_id[nid].get("depends_on") or []
+        memo[nid] = 0 if not deps else 1 + max(visit(dep) for dep in deps)
+        return memo[nid]
+
+    for node_id in by_id:
+        visit(node_id)
+    return memo
 
 
 def _has_cycle(nodes):
@@ -320,6 +391,172 @@ def levels(nodes):
         for nid in wave:
             remaining.pop(nid)
     return out
+
+
+# ── Runtime delegation broker ────────────────────────────────────────────
+
+_REQUEST_FIELDS = {"source", "task", "context", "reason"}
+_REQUEST_REQUIRED = {"source", "task", "context"}
+_CONTEXT_MODES = {"none", "parent_rows"}
+
+
+def dynamic_spawning_enabled():
+    """Operator kill switch for worker-directed runtime expansion."""
+    return os.getenv("STUDIO_AGENT_DYNAMIC_SPAWN", "1").strip().lower() \
+        not in ("0", "false", "no")
+
+
+class SpawnInbox:
+    """Node-local capability inbox exposed through ``spawn_data_agent``.
+
+    The tool can only enqueue a narrow request. It cannot execute a connector,
+    choose credentials, alter dependencies, or mint an id. The scheduler drains
+    and validates the inbox after the parent turn has completely finished.
+    """
+
+    def __init__(self, available_sources):
+        if isinstance(available_sources, dict):
+            self.source_catalog = {
+                str(name): [str(table) for table in (tables or [])[:12]]
+                for name, tables in available_sources.items()
+            }
+        else:
+            self.source_catalog = {str(name): [] for name in available_sources}
+        self.available_sources = tuple(sorted(self.source_catalog))
+        self._requests = []
+        self._rejections = []
+        self._calls = 0
+        self._lock = threading.Lock()
+
+    def propose(self, source, task, context="none", reason=""):
+        with self._lock:
+            self._calls += 1
+            if self._calls > MAX_DELEGATION_CALLS:
+                msg = f"delegation call limit ({MAX_DELEGATION_CALLS}) reached"
+                self._rejections.append({"source": str(source or ""), "reason": msg})
+                return f"Spawn request rejected: {msg}."
+            source = str(source or "").strip()
+            task = str(task or "").strip()
+            context = str(context or "none").strip().lower()
+            reason = str(reason or "").strip()
+            if source not in self.available_sources:
+                msg = "source is not in this user's accessible roster"
+                self._rejections.append({"source": source, "reason": msg})
+                return f"Spawn request rejected: {msg}."
+            if not task or len(task) > MAX_TASK_CHARS:
+                msg = f"task must contain 1-{MAX_TASK_CHARS} characters"
+                self._rejections.append({"source": source, "reason": msg})
+                return f"Spawn request rejected: {msg}."
+            if context not in _CONTEXT_MODES:
+                msg = "context must be 'none' or 'parent_rows'"
+                self._rejections.append({"source": source, "reason": msg})
+                return f"Spawn request rejected: {msg}."
+            if len(self._requests) >= MAX_CHILDREN_PER_NODE:
+                msg = f"child limit ({MAX_CHILDREN_PER_NODE}) reached"
+                self._rejections.append({"source": source, "reason": msg})
+                return f"Spawn request rejected: {msg}."
+            self._requests.append({"source": source, "task": task,
+                                   "context": context, "reason": reason[:300]})
+            return ("Spawn request queued for server validation after this turn. "
+                    "Do not claim the child has run yet.")
+
+    def drain(self):
+        with self._lock:
+            return list(self._requests), list(self._rejections)
+
+
+def _task_signature(task):
+    return " ".join(str(task or "").casefold().split())
+
+
+def validate_child_requests(parent, requests, plan, sources, parent_result):
+    """Materialize safe child nodes from one completed worker's inbox.
+
+    Returns ``(accepted_nodes, rejection_records)``. Children can only point to
+    their already-completed parent, making dynamic construction acyclic by
+    definition. All executable identity is server-derived.
+    """
+    rejected = []
+    if not isinstance(requests, list):
+        return [], [{"reason": "spawn requests must be a list"}]
+    if not requests:
+        return [], []
+    # ``run_agent`` may recover a provider exception with a deterministic
+    # preview. That preview is useful to the user, but it does not make tool
+    # requests emitted before the exception trustworthy completed decisions.
+    # Refuse those requests just like an explicit worker failure.
+    if (parent_result.get("errors") or parent_result.get("model_error")
+            or parent_result.get("_status") in ("failed", "skipped")):
+        return [], [{"reason": "failed or skipped parents cannot spawn children"}]
+    parent_depth = int(parent.get("depth", 0))
+    if parent_depth >= MAX_SPAWN_DEPTH:
+        return [], [{"reason": f"spawn depth limit ({MAX_SPAWN_DEPTH}) reached"}]
+
+    known_sources = {s["connector"].name for s in sources}
+    taken = {n["id"] for n in plan["nodes"]}
+    existing = {(n["source"], _task_signature(n.get("task")))
+                for n in plan["nodes"]}
+    capacity = max(0, MAX_NODES - len(plan["nodes"]))
+    accepted = []
+
+    # Sorting makes server-minted ids stable even if provider tool calls finish
+    # in a different order.
+    ordered = sorted(requests[:MAX_CHILDREN_PER_NODE], key=lambda item: (
+        str(item.get("source") if isinstance(item, dict) else ""),
+        _task_signature(item.get("task") if isinstance(item, dict) else ""),
+        str(item.get("context") if isinstance(item, dict) else ""),
+    ))
+    for item in ordered:
+        if not isinstance(item, dict):
+            rejected.append({"reason": "spawn request must be an object"})
+            continue
+        fields = set(item)
+        if not _REQUEST_REQUIRED <= fields or fields - _REQUEST_FIELDS:
+            rejected.append({"source": str(item.get("source") or ""),
+                             "reason": "spawn request contains unsupported fields"})
+            continue
+        source = str(item.get("source") or "").strip()
+        task = str(item.get("task") or "").strip()
+        context = str(item.get("context") or "").strip().lower()
+        reason = str(item.get("reason") or "").strip()[:300]
+        if source not in known_sources:
+            rejected.append({"source": source, "reason": "source is not accessible"})
+            continue
+        if not task or len(task) > MAX_TASK_CHARS:
+            rejected.append({"source": source, "reason": "task length is invalid"})
+            continue
+        if context not in _CONTEXT_MODES:
+            rejected.append({"source": source, "reason": "context mode is invalid"})
+            continue
+        if context == "parent_rows" and not (parent_result.get("rows") or []):
+            rejected.append({"source": source,
+                             "reason": "parent_rows requested but parent returned no rows"})
+            continue
+        signature = (source, _task_signature(task))
+        if signature in existing:
+            rejected.append({"source": source, "reason": "duplicate child request"})
+            continue
+        if len(accepted) >= capacity:
+            rejected.append({"source": source, "reason": "graph node limit reached"})
+            continue
+        node_id = _unique_node_id(f"{parent['id']}_{source}", taken)
+        node = {
+            "id": node_id,
+            "source": source,
+            "task": task,
+            "depends_on": [parent["id"]] if context == "parent_rows" else [],
+            "kind": "agent",
+            "dynamic": True,
+            "spawned_by": parent["id"],
+            "depth": parent_depth + 1,
+            "context_mode": context,
+            "spawn_reason": reason,
+        }
+        accepted.append(node)
+        existing.add(signature)
+    if len(requests) > MAX_CHILDREN_PER_NODE:
+        rejected.append({"reason": f"child limit ({MAX_CHILDREN_PER_NODE}) exceeded"})
+    return accepted, rejected
 
 
 # ── Reference data handed downstream ─────────────────────────────────────
@@ -377,35 +614,121 @@ def node_prompt(node, prompt, results):
     return f"{context}Question: {task}" if context else task
 
 
-def run_node(node, source_entry, prompt, user, model, results, ask=None):
+def run_node(node, source_entry, prompt, user, model, results, ask=None, inbox=None,
+             history=None):
     """One node: an ordinary agent turn, with upstream results prepended when
     the node has any. Everything below run_agent is unchanged, so this node is
     governed exactly like a single-source chat turn."""
     conn = source_entry["connector"]
     ask = ask if ask is not None else node_prompt(node, prompt, results)
+    extra = {}
+    if inbox is not None:
+        extra["delegation"] = inbox
+    # Every node inside the multi-agent runtime is a data worker. Giving seed
+    # nodes the ordinary chat profile would let several parallel agents send
+    # email, mutate durable memory, or invoke arbitrary MCP side effects. Those
+    # effects need a separately authorized terminal action, not fan-out.
+    extra["tool_profile"] = "graph_worker"
+    worker_history = [] if node.get("dynamic") else (history or [])
     sub = agent.run_agent(ask, conn, "*", source_entry["allowed"],
-                          source_entry["schemas"], [], user, model,
-                          skill_md=source_entry["skill"])
+                          source_entry["schemas"], worker_history, user, model,
+                          skill_md=source_entry["skill"], **extra)
     sub["_source"] = conn.name
     sub["_node"] = node["id"]
+    sub["_spawned_by"] = node.get("spawned_by")
+    sub["_depth"] = int(node.get("depth", 0))
     sub["_conditioning_prompt"] = ask
+    if inbox is not None:
+        requests, rejections = inbox.drain()
+        sub["_spawn_requests"] = requests
+        sub["_spawn_rejections"] = rejections
+        sub["_delegation_capable"] = True
+    else:
+        sub["_spawn_requests"] = []
+        sub["_spawn_rejections"] = []
+        sub["_delegation_capable"] = False
     return sub
 
 
-def execute(plan, sources, prompt, user, model=None, conversation_id=None):
-    """Run the planned DAG wave by wave. Returns {results, order, graph}.
+def execute(plan, sources, prompt, user, model=None, conversation_id=None,
+            history=None):
+    """Run a seed DAG and materialize worker-requested children between waves.
 
     Failures are contained: a node that raises is recorded with its error.
     Nodes which declared that result as an input are marked skipped rather than
     being run without required data and presented as a successful answer.
     Independent branches still run, so one unreachable warehouse degrades the
-    answer without fabricating a dependent result.
+    answer without fabricating a dependent result. A child never runs inside a
+    model tool call: the server closes the whole wave, validates the inboxes,
+    then schedules accepted children in a later wave.
     """
     by_source = {s["connector"].name: s for s in sources}
     tid = progress.current()
     results, order = {}, []
+    seed_blend_nodes = plan.get("blend_nodes")
+    if seed_blend_nodes is None:
+        seed_blend_nodes = ([n["id"] for n in plan["nodes"]]
+                            if plan.get("combine") == "table" else [])
+    runtime_plan = {**plan,
+                    "nodes": [{**n, "kind": n.get("kind", "agent"),
+                               "dynamic": bool(n.get("dynamic")),
+                               "spawned_by": n.get("spawned_by", "__supervisor__"),
+                               "depth": int(n.get("depth", 0))}
+                              for n in plan["nodes"]],
+                    "blend_nodes": list(seed_blend_nodes),
+                    "spawn_rejections": []}
+    pending = {n["id"]: n for n in runtime_plan["nodes"]}
 
-    for wave in levels(plan["nodes"]):
+    def _can_delegate(node):
+        if not dynamic_spawning_enabled() or int(node.get("depth", 0)) >= MAX_SPAWN_DEPTH:
+            return False
+        spec = model or agent.llm_spec()
+        if not agent.llm_available(spec, user):
+            return False
+        try:
+            concrete = agent.concrete_model_spec(spec)
+            return not agent.self_hosted(concrete)
+        except Exception:
+            return False
+
+    while pending:
+        # Background chat turns are fenced durable jobs. If this process lost
+        # its claim, abandon the in-memory graph at a wave boundary; the queue
+        # owner replays the read-only turn from its durable root payload.
+        jobs.check_claim()
+        ready = [node for node in pending.values()
+                 if set(node.get("depends_on") or []) <= set(results)]
+        ready.sort(key=lambda node: node["id"])
+        # A roster contains one connector object per source. Keep at most one
+        # node per source in a wave so dynamic same-source specialists never
+        # share a connector concurrently.
+        wave, active_sources = [], set()
+        for node in ready:
+            if node["source"] in active_sources:
+                continue
+            active_sources.add(node["source"])
+            wave.append(node)
+            if len(wave) >= MAX_PARALLEL:
+                break
+        if not wave:
+            # Validation should make this unreachable. Fail closed instead of
+            # looping forever if a corrupted runtime plan appears.
+            for node in sorted(pending.values(), key=lambda n: n["id"]):
+                detail = "Skipped because the runtime graph has no resolvable path."
+                results[node["id"]] = {
+                    "text": f"(agent skipped: {detail})", "sql": None,
+                    "columns": [], "rows": [], "chart": None, "panels": [],
+                    "errors": [detail], "_source": node["source"],
+                    "_node": node["id"], "_status": "skipped", "_executed": False,
+                    "_spawned_by": node.get("spawned_by"),
+                    "_depth": int(node.get("depth", 0)),
+                    "_spawn_requests": [], "_spawn_rejections": [],
+                    "_delegation_capable": False,
+                }
+                order.append(node["id"])
+            pending.clear()
+            break
+
         names = ", ".join(roster.name_for(n["source"]) for n in wave)
         progress.emit(f"running {len(wave)} agent(s): {names}")
 
@@ -425,11 +748,18 @@ def execute(plan, sources, prompt, user, model=None, conversation_id=None):
                 return {"text": f"(agent skipped: {detail})", "sql": None,
                         "columns": [], "rows": [], "chart": None, "panels": [],
                         "errors": [detail], "_source": node["source"],
-                        "_node": node["id"], "_status": "skipped", "_executed": False}
+                        "_node": node["id"], "_status": "skipped", "_executed": False,
+                        "_spawned_by": node.get("spawned_by"),
+                        "_depth": int(node.get("depth", 0)),
+                        "_spawn_requests": [], "_spawn_rejections": [],
+                        "_delegation_capable": False}
             ask = node_prompt(node, prompt, results)
+            source_catalog = {name: entry.get("allowed") or []
+                              for name, entry in by_source.items()}
+            inbox = SpawnInbox(source_catalog) if _can_delegate(node) else None
             try:
                 sub = run_node(node, by_source[node["source"]], prompt, user, model,
-                               results, ask=ask)
+                               results, ask=ask, inbox=inbox, history=history)
                 sub["_status"] = "failed" if sub.get("errors") else "ok"
                 sub["_executed"] = True
                 progress.emit_for(tid, f"{roster.name_for(node['source'])}: finished "
@@ -440,7 +770,17 @@ def execute(plan, sources, prompt, user, model=None, conversation_id=None):
                        "chart": None, "panels": [], "errors": [str(e)],
                        "_source": node["source"], "_node": node["id"],
                        "_status": "failed", "_executed": True,
-                       "_conditioning_prompt": ask}
+                       "_spawned_by": node.get("spawned_by"),
+                       "_depth": int(node.get("depth", 0)),
+                       "_conditioning_prompt": ask,
+                       "_delegation_capable": inbox is not None}
+                if inbox is not None:
+                    requests, rejections = inbox.drain()
+                    sub["_spawn_requests"] = requests
+                    sub["_spawn_rejections"] = rejections
+                else:
+                    sub["_spawn_requests"] = []
+                    sub["_spawn_rejections"] = []
             return sub
 
         if len(wave) == 1:
@@ -450,11 +790,41 @@ def execute(plan, sources, prompt, user, model=None, conversation_id=None):
                     max_workers=min(len(wave), MAX_PARALLEL)) as ex:
                 done = list(ex.map(_one, wave))
 
+        # A claim can be reclaimed while connector calls are in flight. All
+        # graph worker tools are read-only, so the calls may finish, but the
+        # stale owner must not publish topology or learning traces afterward.
+        jobs.check_claim()
+
         # Only publish a wave's results once the whole wave is in, so every
         # node in a wave sees the same upstream state regardless of finish order.
         for sub in done:
             results[sub["_node"]] = sub
             order.append(sub["_node"])
+            pending.pop(sub["_node"], None)
+
+        # Close the wave before changing topology. Parent-id ordering plus
+        # request sorting in validate_child_requests keeps allocation stable
+        # regardless of thread completion order.
+        node_by_id = {n["id"]: n for n in runtime_plan["nodes"]}
+        for sub in sorted(done, key=lambda item: item["_node"]):
+            parent = node_by_id[sub["_node"]]
+            additions, rejected = validate_child_requests(
+                parent, sub.get("_spawn_requests") or [], runtime_plan,
+                sources, sub)
+            rejected = list(sub.get("_spawn_rejections") or []) + rejected
+            sub["_spawned"] = [n["id"] for n in additions]
+            sub["_spawn_rejections"] = rejected
+            for rejection in rejected:
+                runtime_plan["spawn_rejections"].append(
+                    {"parent": parent["id"], **rejection})
+            if additions:
+                runtime_plan["nodes"].extend(additions)
+                pending.update({n["id"]: n for n in additions})
+                progress.emit_for(
+                    tid, f"{roster.name_for(parent['source'])}: spawned "
+                    f"{len(additions)} child agent(s)")
+
+        for sub in done:
             # A skipped node made no agent decision, so it must not receive a
             # reward or penalty in Agent Lightning.  Failed attempted nodes are
             # still recorded with their real failure reward.
@@ -462,42 +832,86 @@ def execute(plan, sources, prompt, user, model=None, conversation_id=None):
                 lightning.record_agent_rollout(
                     user, conversation_id, prompt,
                     roster.name_for(sub["_source"]), "worker", sub,
-                    conditioning_prompt=sub.get("_conditioning_prompt") or prompt)
+                    conditioning_prompt=sub.get("_conditioning_prompt") or prompt,
+                    history=(history or []) if not node_by_id[sub["_node"]].get("dynamic")
+                    else [],
+                    graph_meta={
+                        "node_id": sub["_node"],
+                        "spawned_by": node_by_id[sub["_node"]].get("spawned_by"),
+                        "depth": node_by_id[sub["_node"]].get("depth", 0),
+                        "dynamic": bool(node_by_id[sub["_node"]].get("dynamic")),
+                        "context_mode": (
+                            node_by_id[sub["_node"]].get("context_mode")
+                            or ("parent_rows" if node_by_id[sub["_node"]].get(
+                                "depends_on") else "none")),
+                        "spawn_requests": sub.get("_spawn_requests") or [],
+                        "spawned": sub.get("_spawned") or [],
+                        "spawn_rejections": sub.get("_spawn_rejections") or [],
+                    })
 
-    return {"results": results, "order": order, "graph": describe(plan, results)}
+    runtime_plan["dynamic"] = any(n.get("dynamic") for n in runtime_plan["nodes"])
+    return {"results": results, "order": order,
+            "runtime_plan": runtime_plan,
+            "graph": describe(runtime_plan, results)}
 
 
 def describe(plan, results=None, terminal_status=None, terminal_rows=0):
-    """The graph as the UI draws it: a node per agent, an edge per dependency.
-    Nodes carry their outcome so a failed hop is visible in the picture."""
+    """Serialize the runtime graph for observability.
+
+    Execution is driven by ``execute`` and the delegation broker, not by this
+    representation. Typed edges make data flow distinct from spawn lineage.
+    """
     results = results or {}
-    nodes = []
+    nodes = [{"id": "__supervisor__", "source": "*", "kind": "supervisor",
+              "agent": roster.ORCHESTRATOR["name"],
+              "task": "plan seed workers and validate runtime delegation",
+              "depends_on": [], "status": "ok" if results else "pending",
+              "rows": 0, "depth": 0, "dynamic": False,
+              "spawned_by": None}]
     for n in plan["nodes"]:
         r = results.get(n["id"])
         nodes.append({
             "id": n["id"],
             "source": n["source"],
+            "kind": n.get("kind", "agent"),
             "agent": roster.name_for(n["source"]),
             "task": n["task"],
             "depends_on": list(n["depends_on"]),
+            "spawned_by": n.get("spawned_by", "__supervisor__"),
+            "depth": int(n.get("depth", 0)),
+            "dynamic": bool(n.get("dynamic")),
+            "blend_member": n["id"] in set(plan.get("blend_nodes") or []),
+            "context_mode": n.get("context_mode"),
+            "delegation_capable": bool(r and r.get("_delegation_capable")),
             "status": ("pending" if r is None
                        else "skipped" if r.get("_status") == "skipped"
                        else "failed" if r.get("errors") else "ok"),
             "rows": len(r.get("rows") or []) if r else 0,
         })
-    edges = [{"from": d, "to": n["id"]} for n in plan["nodes"] for d in n["depends_on"]]
-    # The reasoner is a real node in the picture: every leaf feeds it.
-    leaves = {n["id"] for n in plan["nodes"]} - {e["from"] for e in edges}
+    edges = [{"from": d, "to": n["id"], "kind": "data"}
+             for n in plan["nodes"] for d in n["depends_on"]]
+    edges += [{"from": n.get("spawned_by", "__supervisor__"),
+               "to": n["id"], "kind": "spawn"}
+              for n in plan["nodes"]]
+    # The terminal receives every worker result, including an upstream
+    # worker's own explanation as well as a dependent's answer. Represent the
+    # actual aggregation contract rather than drawing only data-flow leaves.
+    reason_inputs = {n["id"] for n in plan["nodes"]}
     nodes.append({"id": "__reason__", "source": "*",
+                  "kind": "reasoner",
                   "agent": roster.AGGREGATOR["name"],
                   "task": ("blend into one table" if plan.get("combine") == "table"
                            else "synthesize one answer"),
-                  "depends_on": sorted(leaves),
+                  "depends_on": sorted(reason_inputs),
+                  "spawned_by": None, "depth": None, "dynamic": False,
                   "status": terminal_status or "pending", "rows": terminal_rows})
-    edges += [{"from": leaf, "to": "__reason__"} for leaf in sorted(leaves)]
+    edges += [{"from": node_id, "to": "__reason__", "kind": "result"}
+              for node_id in sorted(reason_inputs)]
     return {"nodes": nodes, "edges": edges,
             "combine": plan.get("combine", "reason"),
-            "why": plan.get("why", ""), "planned": bool(plan.get("planned"))}
+            "why": plan.get("why", ""), "planned": bool(plan.get("planned")),
+            "dynamic": bool(plan.get("dynamic")),
+            "spawn_rejections": list(plan.get("spawn_rejections") or [])}
 
 
 # ── Combining into one table ─────────────────────────────────────────────
@@ -513,8 +927,14 @@ def blend_parts(plan, results, user):
     degraded one.  Execution errors from blend.blend propagate so the caller
     can surface the real failure instead of silently returning a worker table.
     """
+    # Runtime delegation can add useful diagnostic/reasoning workers, but only
+    # the seed membership frozen by validate_plan belongs to the requested
+    # table artifact. Never let a child tool call rewrite join semantics.
+    members = plan.get("blend_nodes")
+    if members is None:
+        members = [n["id"] for n in plan["nodes"] if not n.get("dynamic")]
     parts = []
-    for nid in (n["id"] for n in plan["nodes"]):
+    for nid in members:
         r = results.get(nid)
         if not r or not r.get("sql") or r.get("errors"):
             return None

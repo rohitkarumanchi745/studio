@@ -6,12 +6,13 @@ STUDIO_LLM selects the model as a LangChain init_chat_model string:
 Any provider LangChain supports works — the graph, tools, and prompts are
 provider-neutral.
 
-ReAct loop with four tools:
+ReAct loop with core tools:
   run_sql(sql)                    — execution through gateway.execute (RBAC,
                                     query guard, row cap, governance, audit)
   render_chart(type, title, x, y) — records an ECharts-ready chart spec
   remember(note)                  — saves a durable note about this user
   email_report(subject)           — emails the current result to the user
+  spawn_data_agent(...)           — graph mode only; queues a governed child
 
 Scale model (TB-range warehouses): computation is pushed down into the
 warehouse — the agent is instructed to aggregate in SQL, every query gets a
@@ -441,7 +442,7 @@ def _single_reply_usage(reply):
 
 
 def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, model=None,
-              skill_md=None, kag_first=False):
+              skill_md=None, kag_first=False, delegation=None, tool_profile="full"):
     """One analytics turn.
 
     schemas: {table_name: [{"name","type"}, ...]} — one entry for single-table
@@ -450,8 +451,16 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
     the caller against available_models()); defaults to STUDIO_LLM.
     skill_md: this source's skill file (skills.get_skill) — the RBAC-scoped
     briefing on the database and its tables; replaces the inline schema block.
+    delegation: optional server-owned inbox. When present, the worker may
+    REQUEST a child through ``spawn_data_agent``; only the graph scheduler can
+    validate and execute that request after this turn.
+    tool_profile: ``full`` for an ordinary standalone chat worker;
+    ``graph_worker`` for every node in the multi-agent runtime, which omits
+    memory/email and unclassified MCP side effects.
     Returns {text, sql, columns, rows, chart, mode, model, email}.
     """
+    if tool_profile not in ("full", "graph_worker"):
+        raise ValueError("unknown agent tool profile")
     from . import roster
     me = roster.worker(connector.name)  # this run's named worker agent
     # Live-activity feed: capture the bound task id ONCE and emit through it
@@ -550,7 +559,11 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
             table: A table you have access to (from the schema above).
         """
         from . import freshness
-        r = freshness.for_table(connector, allowed_tables, table)
+        # The freshness service re-derives access from the acting user and
+        # source; the connector is only a schema-read optimization. Passing
+        # the old (connector, allowlist, table) tuple bypassed its public
+        # signature and made this advertised tool fail before returning.
+        r = freshness.for_table(user, connector.name, table, connector=connector)
         if r.get("error"):
             return f"Couldn't check {table}: {r['error']}"
         if not r.get("column"):
@@ -632,10 +645,43 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
                                          ("entities", "relations", "sources") if graph.get(k)}
         return json.dumps(envelope, default=str)
 
+    @tool
+    def spawn_data_agent(source: str, task: str, context: str = "none",
+                         reason: str = "") -> str:
+        """Request a source-specialized child agent in the runtime graph.
+
+        The request is queued for server validation after this turn. It does
+        not execute immediately and it cannot widen data access.
+
+        Args:
+            source: Exact name from the available source list.
+            task: The narrow data question for the child agent.
+            context: ``parent_rows`` when the child needs this worker's rows;
+                otherwise ``none``.
+            reason: Short explanation of why another agent is necessary.
+        """
+        if delegation is None:
+            return "Spawn request rejected: delegation is unavailable."
+        return delegation.propose(source, task, context, reason)
+
     memory_notes = db.list_memory(user["id"])
     # Stable half (cached prefix) + volatile half (below the breakpoint).
     system, volatile = _system_blocks(connector, table, allowed_tables, schemas,
                                       memory_notes, skill_md)
+    if delegation is not None:
+        available = json.dumps(delegation.source_catalog, ensure_ascii=False)
+        delegation_note = (
+            "RUNTIME DELEGATION: You may request a child only when another "
+            "specialized data agent is genuinely needed. Call spawn_data_agent "
+            "with one of these exact accessible sources; the values are their "
+            "RBAC-visible tables: " + available + ". "
+            "Use context='parent_rows' only when the child needs rows returned "
+            "by your run_sql call; otherwise use context='none'. A request is "
+            "only queued for server validation, so never claim the child ran or "
+            "use its result in this answer. Do not delegate work you can finish "
+            "yourself."
+        )
+        volatile = f"{volatile}\n\n{delegation_note}" if volatile else delegation_note
     if kag_first:
         # User explicitly chose the KAG engine: ground the answer in their own
         # documents first, and only touch the warehouse if the docs can't answer.
@@ -646,7 +692,14 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
 
     try:
         llm = make_llm(spec, user)
-        base_tools = [run_sql, render_chart, data_freshness, remember, email_report]
+        base_tools = [run_sql, render_chart, data_freshness]
+        if tool_profile == "full":
+            base_tools += [remember, email_report]
+        if delegation is not None and not self_hosted(spec):
+            # The current BitNet adapter is trained on run_sql/render_chart JSON
+            # only. Do not advertise delegation until it has its own action
+            # contract and training stream.
+            base_tools.append(spawn_data_agent)
         # KAG: offer knowledge_search ONLY when the user's role can reach a
         # collection that HAS content — so with no docs the tool is absent, and
         # a role never even sees that another scope's knowledge base exists.
@@ -659,7 +712,10 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         # Cache the system prompt + prior-turn prefix (KV reuse across turns).
         messages = _cache_history(history, spec) + [("user", prompt)]
         progress.emit_for(_tid, f"{_me}: reading the question and the schema")
-        mcp_cfg = mcp_servers(user)
+        # Multi-agent graph workers get a closed read-only tool profile. MCP
+        # servers may expose arbitrary side effects, so only standalone chat
+        # turns retain them.
+        mcp_cfg = mcp_servers(user) if tool_profile == "full" else {}
         if self_hosted(spec):
             # Train == serve for the SQL adapter: train_online conditions on
             # the source skill, history, and current prompt and labels one
@@ -727,13 +783,14 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         else:
             # Transient/other error — alert the user (best-effort) and let the
             # client retry with the default model if a non-default was chosen.
-            try:
-                email_service.send(
-                    user["email"], "Studio agent issue",
-                    f"<p>Your question <b>{prompt[:200]}</b> hit an agent error:</p>"
-                    f"<pre>{msg[:500]}</pre><p>A basic preview was shown instead.</p>")
-            except Exception:
-                pass
+            if tool_profile == "full":
+                try:
+                    email_service.send(
+                        user["email"], "Studio agent issue",
+                        f"<p>Your question <b>{prompt[:200]}</b> hit an agent error:</p>"
+                        f"<pre>{msg[:500]}</pre><p>A basic preview was shown instead.</p>")
+                except Exception:
+                    pass
             out["text"] = f"(Agent error: {e}) — showing a basic preview instead.\n\n" + out["text"]
             out["model_error"] = {"spec": spec, "detail": msg[:300],
                                   "retryable_with_default": spec != llm_spec()}

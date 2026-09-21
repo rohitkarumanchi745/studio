@@ -17,6 +17,7 @@ with every migration applied exactly once.
 Run from the backend directory:
     python -m pytest tests/test_migrations.py -q
 """
+import json
 import os
 import sqlite3
 import tempfile
@@ -202,6 +203,52 @@ def test_session_fork_migration_marks_only_the_oldest_row_canonical(old_db):
         "SELECT id,is_fork FROM agent_sessions ORDER BY created_at").fetchall() == [
             ("original", 0), ("fork", 1)]
     raw.close()
+
+
+def test_upgrade_scrubs_legacy_graph_reference_rows_at_rest(fresh_path):
+    db.init_db()
+    user = {"id": "u", "email": "u@example.test", "role": "admin"}
+    marker_id = db.add_trace(
+        user, prompt="root marker", mode="agent:worker", source="demo",
+        sql="SELECT 1", reward=1.0,
+        meta={"root_prompt": "root marker",
+              "conditioning_prompt":
+                  "REFERENCE DATA: [[private-account-8841]]\nQuestion: spend"})
+    dynamic_id = db.add_trace(
+        user, prompt="root dynamic", mode="agent:worker", source="demo",
+        sql="SELECT 2", reward=1.0,
+        meta={"root_prompt": "root dynamic", "conditioning_prompt": "private-921",
+              "graph": {"node_id": "child", "spawned_by": "seed", "depth": 1,
+                        "dynamic": True, "context_mode": "none",
+                        "spawn_requests": [{"task": "private-921"}],
+                        "spawn_rejections": [{"reason": "private-921"}]}})
+    safe_id = db.add_trace(
+        user, prompt="safe", mode="agent:worker", source="demo",
+        sql="SELECT 3", reward=1.0,
+        meta={"root_prompt": "safe", "conditioning_prompt": "safe task"})
+
+    migrations.apply_pending()
+    raw = sqlite3.connect(fresh_path)
+    rows = dict(raw.execute(
+        "SELECT id,meta FROM agent_traces WHERE id IN (?,?,?)",
+        (marker_id, dynamic_id, safe_id)).fetchall())
+    raw.close()
+
+    marker = json.loads(rows[marker_id])
+    assert marker["conditioning_prompt"] == "root marker"
+    assert marker["global_train_eligible"] is False
+    assert "private-account-8841" not in rows[marker_id]
+
+    dynamic = json.loads(rows[dynamic_id])
+    assert dynamic["conditioning_prompt"] == "root dynamic"
+    assert dynamic["global_train_eligible"] is False
+    assert dynamic["graph"] == {
+        "node_id": "child", "spawned_by": "seed", "depth": 1,
+        "dynamic": True, "context_mode": "none", "spawned": [],
+        "spawn_request_count": 1, "spawn_rejection_count": 1,
+    }
+    assert "private-921" not in rows[dynamic_id]
+    assert json.loads(rows[safe_id])["conditioning_prompt"] == "safe task"
 
 
 # ── Fresh baseline: nothing to alter, versions still recorded ────────────

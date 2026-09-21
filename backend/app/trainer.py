@@ -37,7 +37,7 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from . import db, qcache
+from . import db, lightning, qcache
 from .auth import current_user
 
 router = APIRouter(prefix="/training", tags=["training"])
@@ -187,6 +187,9 @@ def stream(since=0.0, limit=500):
             "ORDER BY training_revision LIMIT ?",
             (since, limit)).fetchall()
     out = []
+    # Advance across every scanned revision, including privacy-filtered rows,
+    # or a page containing only excluded graph traces would be pulled forever.
+    cursor = rows[-1]["training_revision"] if rows else since
     for r in rows:
         meta = {}
         if r["meta"]:
@@ -196,6 +199,8 @@ def stream(since=0.0, limit=500):
                 meta = {}
         if not isinstance(meta, dict):
             meta = {}
+        if not lightning.global_training_eligible(meta):
+            continue
         action = meta.get("action")
         if not isinstance(action, dict):
             action = {"sql": r["sql"], "chart_type": r["chart_type"]}
@@ -223,7 +228,6 @@ def stream(since=0.0, limit=500):
             "repairs_run_id": meta.get("repairs_run_id"),
             "execution_status": meta.get("status"),
         })
-    cursor = out[-1]["revision"] if out else since
     return {"rollouts": out, "cursor": cursor, "count": len(out)}
 
 

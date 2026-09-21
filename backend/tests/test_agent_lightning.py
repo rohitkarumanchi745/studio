@@ -495,7 +495,7 @@ def test_per_agent_rollouts_are_delivered_as_their_own_rollouts(env, client, mon
     tid = env.lightning.record_agent_rollout(
         user, "c1", "revenue by region", "Sales Analyst", "worker",
         dict(AGENT_ANSWER, _source="demo"), duration_ms=42,
-        conditioning_prompt="Question: revenue for ids\nREFERENCE DATA: [[7]]")
+        conditioning_prompt="Question: revenue by region")
     assert len(agl_jobs(env)) == 1
     assert env.jobs.run_one("w", kinds=["agl_emit"]) is True
 
@@ -503,7 +503,7 @@ def test_per_agent_rollouts_are_delivered_as_their_own_rollouts(env, client, mon
     rollout = get_json(f"{agl_server}/api/rollouts/{rid}")["rollout"]
     assert rollout["metadata"]["mode"] == "agent:worker"
     assert rollout["metadata"]["agents"] == ["Sales Analyst"]
-    assert rollout["input"]["prompt"] == "Question: revenue for ids\nREFERENCE DATA: [[7]]"
+    assert rollout["input"]["prompt"] == "Question: revenue by region"
     assert env.lightning._trace(tid)["meta"]["root_prompt"] == "revenue by region"
     reward = [e for e in get_json(f"{agl_server}/api/rollouts/{rid}/events")
               if e["event_type"] == "reward"][0]

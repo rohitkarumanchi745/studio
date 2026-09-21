@@ -685,6 +685,8 @@ def _buffer_candidate(row):
     """
     if not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"]:
         raise SystemExit("[trainer] rollout stream returned a row without a stable id; cursor did not advance")
+    if not _globally_trainable(row):
+        return False
     prompt = row.get("prompt")
     reward = row.get("reward")
     if not isinstance(prompt, str) or not prompt.strip() or not isinstance(reward, (int, float)) \
@@ -693,6 +695,33 @@ def _buffer_candidate(row):
     if (row.get("mode") or "").startswith(("fallback", "error")):
         return False
     return _completion_for(row.get("action")) is not None
+
+
+def _globally_trainable(row):
+    """Fail closed for row-conditioned graph traces, including old replays.
+
+    Current Studio streams omit these rows and carry an explicit eligibility
+    bit. The structural and marker checks clean pending/replay files produced
+    by older versions before they can be persisted again or formatted.
+    """
+    if not isinstance(row, dict):
+        return True
+    meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+    if row.get("global_train_eligible") is False \
+            or meta.get("global_train_eligible") is False:
+        return False
+    graph = meta.get("graph")
+    if isinstance(graph, dict):
+        try:
+            legacy_dynamic = (int(graph.get("depth") or 0) > 0
+                              and graph.get("spawned_by") not in (None, "__supervisor__"))
+        except (TypeError, ValueError):
+            legacy_dynamic = True
+        if (str(graph.get("context_mode") or "").strip().lower() == "parent_rows"
+                or bool(graph.get("dynamic")) or legacy_dynamic):
+            return False
+    prompt = row.get("prompt")
+    return not (isinstance(prompt, str) and "REFERENCE DATA" in prompt)
 
 
 def merge_pending(pending, incoming):
@@ -782,6 +811,9 @@ def to_samples(rollouts, skills=None):
     stale = defaultdict(int)
     samples = []
     for r in rollouts:
+        if not _globally_trainable(r):
+            stale["private_graph_context"] += 1
+            continue
         reward = r.get("reward")
         prompt = (r.get("prompt") or "").strip()
         if reward is None or reward < MIN_REWARD or not prompt:
@@ -812,7 +844,7 @@ def to_samples(rollouts, skills=None):
 
 
 def tool_policy_rollouts(rollouts):
-    """Remove synthesis-policy rows before pending/replay persistence.
+    """Remove non-tool and private-context rows before replay persistence.
 
     Older Studio versions mislabeled the Aggregator with a worker's last SQL.
     Filtering only while formatting would make those poisoned rows live in the
@@ -820,7 +852,9 @@ def tool_policy_rollouts(rollouts):
     defensive checks in SFT/DPO formatting remain for direct callers.
     """
     return [row for row in (rollouts or [])
-            if not (isinstance(row, dict) and row.get("mode") == "agent:aggregator")]
+            if not (isinstance(row, dict) and (
+                row.get("mode") == "agent:aggregator"
+                or not _globally_trainable(row)))]
 
 
 def mine_preference_pairs(rollouts, skills=None):
@@ -843,6 +877,9 @@ def mine_preference_pairs(rollouts, skills=None):
     # (source, norm-prompt) -> {completion: (best_reward, raw_prompt, context)}
     groups = defaultdict(dict)
     for r in rollouts:
+        if not _globally_trainable(r):
+            stale["private_graph_context"] += 1
+            continue
         prompt = (r.get("prompt") or "").strip()
         reward = r.get("reward")
         if not prompt or reward is None:
