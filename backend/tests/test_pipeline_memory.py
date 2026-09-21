@@ -76,7 +76,7 @@ def test_admin_does_not_get_another_owners_private_recipe():
 
 def test_failed_run_remains_ineligible_even_after_positive_feedback():
     tid = record(status="failed", error="missing column")
-    db.set_trace_reward(tid, 1, source="user")
+    db.set_trace_reward(tid, 1, user_id=USER["id"], source="user")
     assert candidates() == []
 
 

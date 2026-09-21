@@ -224,6 +224,39 @@ def test_postgres_pins_search_path_to_the_configured_schema(monkeypatch):
         PostgresConnector()._conn()
 
 
+def test_postgres_output_relation_probe_reads_metadata_not_table_rows(monkeypatch):
+    seen, returned = {}, [["r"]]
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def execute(self, sql, params):
+            seen.update(sql=sql, params=params)
+
+        def fetchone(self):
+            return returned[0]
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+    connector = PostgresConnector()
+    monkeypatch.setattr(connector, "_execute", lambda fn: fn(Connection()))
+    assert connector.relation_kind("pipeline_output", "daily_sales") == "table"
+    assert "pg_catalog.pg_class" in seen["sql"]
+    assert "SELECT *" not in seen["sql"]
+    assert seen["params"] == ("pipeline_output", "daily_sales")
+
+    returned[0] = ["v"]
+    assert connector.relation_kind("pipeline_output", "daily_sales") == "other"
+    returned[0] = None
+    assert connector.relation_kind("pipeline_output", "daily_sales") == "missing"
+
+
 def test_every_registered_connector_declares_a_cheap_arity_keyed_namespace():
     """qualifiers() runs on every query, so it must never touch the network.
     Every prefix must be a non-empty dotted string of at most three parts —

@@ -1,0 +1,231 @@
+# This identity is intentionally non-secret because it is forwarded in model
+# requests and persisted as rollout/provenance metadata. Use a stable URL with
+# no query credential; protect access through private networking or the
+# separately injected Hugging Face token.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bitnet-adapter-config
+  labels:
+    app.kubernetes.io/name: bitnet-serving
+    app.kubernetes.io/part-of: studio
+data:
+  baseRevision: "29f884c2aefd035cd498fa0750b7781e6f269032"
+  baseSha256: "4221b252fdd5fd25e15847adfeb5ee88886506ba50b8a34548374492884c2162"
+  url: https://models.example.invalid/studio/tool_call.gguf
+  version: "1"
+  # Replace with the digest of the exact GGUF bytes (sha256sum tool_call.gguf).
+  sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+---
+# The combined bitnet.cpp engine/gateway downloads the base GGUF to this claim
+# and watches /data/adapters/tool_call.gguf for a converted adapter. One replica
+# owns the RWO model volume; the Service never leaves the cluster.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: bitnet-data
+  labels:
+    app.kubernetes.io/name: bitnet-serving
+    app.kubernetes.io/part-of: studio
+spec:
+  accessModes:
+    - ReadWriteOnce
+  volumeMode: Filesystem
+  resources:
+    requests:
+      storage: 8Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bitnet-serving
+  labels:
+    app.kubernetes.io/name: bitnet-serving
+    app.kubernetes.io/component: learned-sql-model
+    app.kubernetes.io/part-of: studio
+spec:
+  replicas: 1
+  revisionHistoryLimit: 2
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: bitnet-serving
+      app.kubernetes.io/component: learned-sql-model
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: bitnet-serving
+        app.kubernetes.io/component: learned-sql-model
+        app.kubernetes.io/part-of: studio
+    spec:
+      serviceAccountName: studio-runtime
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      # deploy/serving/Dockerfile.railway is compiled for the cloud x86_64
+      # baseline. Build a separate ARM image before changing this selector.
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      terminationGracePeriodSeconds: 90
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: bitnet-serving
+          image: studio-bitnet:portable
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: STUDIO_SUPERVISOR_MODE
+              value: cloud
+            - name: STUDIO_GATEWAY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: bitnet-auth
+                  key: token
+            - name: STUDIO_DATA_DIR
+              value: /data
+            - name: STUDIO_BASE_MODEL_NAME
+              value: bitnet
+            - name: STUDIO_BITNET_GGUF_REVISION
+              valueFrom:
+                configMapKeyRef:
+                  name: bitnet-adapter-config
+                  key: baseRevision
+            - name: STUDIO_BITNET_GGUF_SHA256
+              valueFrom:
+                configMapKeyRef:
+                  name: bitnet-adapter-config
+                  key: baseSha256
+            # Studio's registry receives this same public identity so each
+            # request can compare whole-string provenance with the mounted
+            # adapter identity reported by the serving gateway.
+            - name: STUDIO_ADAPTER_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: bitnet-adapter-config
+                  key: url
+            - name: STUDIO_ADAPTER_VERSION
+              valueFrom:
+                configMapKeyRef:
+                  name: bitnet-adapter-config
+                  key: version
+            - name: STUDIO_ADAPTER_SHA256
+              valueFrom:
+                configMapKeyRef:
+                  name: bitnet-adapter-config
+                  key: sha256
+            - name: STUDIO_REQUIRE_ADAPTER
+              value: "1"
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: bitnet-auth
+                  key: hugging_face_token
+                  optional: true
+            - name: PORT
+              value: "9000"
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: HOME
+              value: /tmp
+          ports:
+            - name: http
+              containerPort: 9000
+              protocol: TCP
+          # The first boot downloads ~1.1 GB before the engine is ready.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 8
+            failureThreshold: 90
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 8
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "8"
+              memory: 8Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: bitnet-data
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bitnet-serving
+  labels:
+    app.kubernetes.io/name: bitnet-serving
+    app.kubernetes.io/component: learned-sql-model
+    app.kubernetes.io/part-of: studio
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: bitnet-serving
+    app.kubernetes.io/component: learned-sql-model
+  ports:
+    - name: http
+      port: 9000
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: bitnet-serving-ingress
+  labels:
+    app.kubernetes.io/part-of: studio
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: bitnet-serving
+      app.kubernetes.io/component: learned-sql-model
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: studio
+              app.kubernetes.io/component: web
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: studio
+              app.kubernetes.io/component: worker
+      ports:
+        - protocol: TCP
+          port: 9000

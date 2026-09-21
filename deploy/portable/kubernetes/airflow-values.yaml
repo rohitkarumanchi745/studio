@@ -1,0 +1,312 @@
+# Values for apache-airflow/airflow chart 1.22.0. Install the chart with release
+# name `airflow` in namespace `studio-system`; Studio's internal URL is pinned
+# to the resulting `airflow-api-server` ClusterIP service.
+fullnameOverride: airflow
+useStandardNaming: true
+airflowVersion: 3.3.1
+executor: LocalExecutor
+enableServiceLinks: false
+allowPodLaunching: false
+allowJobLaunching: false
+
+images:
+  airflow:
+    # Build deploy/airflow/Dockerfile, then replace this deliberately
+    # non-existent digest with the registry-reported sha256. The official
+    # chart renders repository@digest when this field is set.
+    repository: registry.example.invalid/studio-airflow
+    tag: 3.3.1-portable
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+    pullPolicy: IfNotPresent
+  useDefaultImageForMigration: false
+
+uid: 50000
+gid: 0
+securityContexts:
+  pod:
+    runAsNonRoot: true
+    runAsUser: 50000
+    runAsGroup: 0
+    fsGroup: 0
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop: ["ALL"]
+    runAsNonRoot: true
+
+config:
+  core:
+    executor: LocalExecutor
+    auth_manager: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    load_examples: "False"
+  api:
+    expose_config: "False"
+  scheduler:
+    enable_health_check: "True"
+  dag_processor:
+    bundle_refresh_check_interval: "5"
+    refresh_interval: "10"
+    min_file_process_interval: "10"
+    dag_version_inflation_check_level: error
+
+# The JWT secret is injected explicitly so the custom fail-closed launcher also
+# receives it in the standalone DAG processor. The chart's normal secret env
+# remains enabled for metadata, Fernet and API session secrets.
+enableBuiltInSecretEnvVars:
+  AIRFLOW__API_AUTH__JWT_SECRET: false
+secret:
+  - envName: AIRFLOW__API_AUTH__JWT_SECRET
+    secretName: airflow-jwt-secret
+    secretKey: jwt-secret
+env:
+  - name: AIRFLOW__CORE__EXECUTION_API_SERVER_URL
+    value: http://airflow-api-server:8080/execution/
+  - name: AIRFLOW__CORE__DAGS_FOLDER
+    value: /opt/airflow/dags
+  # The PVC binding is Kubernetes' shared-volume proof. The compose-only
+  # sentinel is disabled because the chart's migration job does not mount DAGs.
+  - name: STUDIO_AIRFLOW_REQUIRE_SHARED_DAGS_SENTINEL
+    value: "0"
+  - name: PYTHONDONTWRITEBYTECODE
+    value: "1"
+
+data:
+  metadataSecretName: airflow-metadata
+fernetKeySecretName: airflow-fernet-key
+apiSecretKeySecretName: airflow-api-secret
+jwtSecretName: airflow-jwt-secret
+
+postgresql:
+  enabled: false
+redis:
+  enabled: false
+pgbouncer:
+  enabled: false
+flower:
+  enabled: false
+statsd:
+  enabled: false
+triggerer:
+  # Studio's generated SQL DAGs contain no deferrable operators.
+  enabled: false
+webserver:
+  # Airflow 3 serves its UI and public API from api-server.
+  enabled: false
+
+dags:
+  mountPath: /opt/airflow/dags
+  persistence:
+    # The chart's built-in persistence mount is read-write when git-sync is
+    # disabled. Use component-specific mounts below so Kubernetes, rather than
+    # convention, prevents Airflow from changing Studio-generated DAGs.
+    enabled: false
+  gitSync:
+    enabled: false
+logs:
+  persistence:
+    enabled: true
+    existingClaim: airflow-logs
+
+apiServer:
+  enabled: true
+  replicas: 2
+  # Keep the upstream image entrypoint and replace only its arguments.
+  args: ["python", "/opt/studio-airflow/runtime.py", "run"]
+  env:
+    - name: AIRFLOW_ROLE
+      value: api-server
+    - name: PORT
+      value: "8080"
+  service:
+    type: ClusterIP
+  allowPodLogReading: false
+  serviceAccount:
+    automountServiceAccountToken: false
+  extraVolumes:
+    - name: studio-generated-dags
+      persistentVolumeClaim:
+        claimName: studio-airflow-dags
+        readOnly: true
+  extraVolumeMounts:
+    - name: studio-generated-dags
+      mountPath: /opt/airflow/dags
+      readOnly: true
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+  startupProbe:
+    periodSeconds: 10
+    timeoutSeconds: 10
+    failureThreshold: 30
+  readinessProbe:
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+  livenessProbe:
+    initialDelaySeconds: 30
+    periodSeconds: 20
+    timeoutSeconds: 5
+    failureThreshold: 3
+  podDisruptionBudget:
+    enabled: true
+    config:
+      minAvailable: 1
+
+scheduler:
+  enabled: true
+  replicas: 1
+  # LocalExecutor tasks run as scheduler children, so do not mark this pod as
+  # safe to evict while a pipeline may be active.
+  safeToEvict: false
+  args: ["python", "/opt/studio-airflow/runtime.py", "run"]
+  env:
+    - name: AIRFLOW_ROLE
+      value: scheduler
+    # LocalExecutor task children inherit this environment. No API server,
+    # DAG parser, migration or user-creation pod receives warehouse access.
+    - name: AIRFLOW_CONN_STUDIO_POSTGRES
+      valueFrom:
+        secretKeyRef:
+          name: airflow-connections
+          key: AIRFLOW_CONN_STUDIO_POSTGRES
+  serviceAccount:
+    automountServiceAccountToken: false
+  extraVolumes:
+    - name: studio-generated-dags
+      persistentVolumeClaim:
+        claimName: studio-airflow-dags
+        readOnly: true
+  extraVolumeMounts:
+    - name: studio-generated-dags
+      mountPath: /opt/airflow/dags
+      readOnly: true
+  terminationGracePeriodSeconds: 300
+  resources:
+    requests:
+      cpu: "1"
+      memory: 2Gi
+    limits:
+      cpu: "4"
+      memory: 4Gi
+  startupProbe:
+    periodSeconds: 10
+    timeoutSeconds: 15
+    failureThreshold: 30
+    command: ["python", "/opt/studio-airflow/healthcheck.py"]
+  livenessProbe:
+    periodSeconds: 30
+    timeoutSeconds: 15
+    failureThreshold: 3
+    command: ["python", "/opt/studio-airflow/healthcheck.py"]
+
+dagProcessor:
+  enabled: true
+  replicas: 2
+  safeToEvict: true
+  args: ["python", "/opt/studio-airflow/runtime.py", "run"]
+  env:
+    - name: AIRFLOW_ROLE
+      value: dag-processor
+  serviceAccount:
+    automountServiceAccountToken: false
+  extraVolumes:
+    - name: studio-generated-dags
+      persistentVolumeClaim:
+        claimName: studio-airflow-dags
+        readOnly: true
+  extraVolumeMounts:
+    - name: studio-generated-dags
+      mountPath: /opt/airflow/dags
+      readOnly: true
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+  livenessProbe:
+    initialDelaySeconds: 30
+    periodSeconds: 30
+    timeoutSeconds: 15
+    failureThreshold: 3
+    command: ["python", "/opt/studio-airflow/healthcheck.py"]
+  podDisruptionBudget:
+    enabled: true
+    config:
+      minAvailable: 1
+
+migrateDatabaseJob:
+  enabled: true
+  serviceAccount:
+    automountServiceAccountToken: false
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+# The command reads the same Secret that Studio uses for Airflow API login, so
+# there is no password in Helm values. Keep this job enabled on first install.
+createUserJob:
+  enabled: true
+  defaultUser:
+    enabled: true
+    username: overridden-by-secret
+    password: overridden-by-secret
+    role: User
+    email: overridden-by-secret@example.invalid
+    firstName: Studio
+    lastName: Operator
+  command: ["bash", "-c"]
+  args:
+    - >-
+      exec airflow users create
+      --username "${AIRFLOW_BOOTSTRAP_USERNAME}"
+      --password "${AIRFLOW_BOOTSTRAP_PASSWORD}"
+      --email "${AIRFLOW_BOOTSTRAP_EMAIL}"
+      --firstname Studio
+      --lastname Operator
+      --role User
+  env:
+    - name: AIRFLOW_BOOTSTRAP_USERNAME
+      valueFrom:
+        secretKeyRef:
+          name: airflow-api-user
+          key: username
+    - name: AIRFLOW_BOOTSTRAP_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: airflow-api-user
+          key: password
+    - name: AIRFLOW_BOOTSTRAP_EMAIL
+      valueFrom:
+        secretKeyRef:
+          name: airflow-api-user
+          key: email
+  serviceAccount:
+    automountServiceAccountToken: false
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+databaseCleanup:
+  enabled: true
+  retentionDays: 90
+
+ingress:
+  apiServer:
+    enabled: false

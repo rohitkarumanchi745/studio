@@ -129,6 +129,21 @@ class SnowflakeConnector(Connector):
             return [{"name": r[0], "type": r[1]} for r in cur.fetchall()]
         return self._execute(go)
 
+    def relation_kind(self, namespace, table):
+        """Check an output schema through Snowflake metadata only."""
+        def go(con):
+            cur = con.cursor()
+            cur.execute(
+                "SELECT table_type FROM information_schema.tables "
+                "WHERE table_schema = %s AND table_name = %s LIMIT 1",
+                (namespace, table),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return "missing"
+            return "table" if str(row[0]).upper() == "BASE TABLE" else "other"
+        return self._execute(go)
+
     def run_query(self, sql):
         def go(con):
             cur = con.cursor()

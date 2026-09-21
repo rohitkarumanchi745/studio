@@ -39,6 +39,21 @@ def _recover(row):
     return supervisor.get_job(row["id"], ANALYST)
 
 
+def _insert_terminal(jid, result, *, status="failed", updated_at=None):
+    now = time.time() if updated_at is None else updated_at
+    with db.connect() as connection:
+        connection.execute(
+            "INSERT INTO supervised_jobs (id,user_id,requester_role,requester_email,kind,"
+            "target,script,risk,status,supervisor_decision,supervisor_reasons,attempts,"
+            "max_retries,last_error,result,human_by,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (jid, ANALYST["id"], ANALYST["role"], ANALYST["email"],
+             supervisor.DAG_KIND, "airflow", "{}", "job", status, "needs_human",
+             "[]", 0, 0, "observed failure" if status == "failed" else None,
+             json.dumps(result), ADMIN["email"], now, now))
+        connection.commit()
+
+
 def test_known_readonly_failure_automatically_authorizes_one_new_child(plan, isolated):
     airflow, _ = isolated
     row = _failed(plan, isolated)
@@ -80,11 +95,84 @@ def test_lightning_pending_does_not_spend_execution_budget(plan, isolated, monke
     assert len(isolated[0].triggered) == 1
 
 
+def test_configured_nine_hundred_second_rollout_is_not_cut_off_at_ten_minutes(
+        plan, isolated, monkeypatch):
+    row = _failed(plan, isolated)
+    result = json.loads(row["result"])
+    result["recovery"]["started_at"] = time.time() - 650
+    supervisor._save(row, result=json.dumps(result))
+    monkeypatch.setenv("STUDIO_AGL_RECOVERY_TIMEOUT_S", "900")
+    monkeypatch.setattr(recovery_planner, "diagnose", lambda *a, **k: {
+        "decision": "retry", "reason": "Completed within the configured deadline",
+        "rollout_id": "studio-recovery-00000000-0000-0000-0000-000000000001"})
+    assert _recover(supervisor._get(row["id"]))["recovery"]["state"] == "retrying"
+
+
+def test_bounded_airflow_failure_evidence_reaches_lightning(plan, isolated,
+                                                             monkeypatch):
+    isolated[0].diagnostic = "task=total state=failed\nUndefinedColumn: amountx"
+    row = _failed(plan, isolated)
+    captured = {}
+
+    def diagnose(*args, **kwargs):
+        captured.update(kwargs)
+        return {"decision": "retry", "reason": "Transient",
+                "rollout_id": "studio-recovery-00000000-0000-0000-0000-000000000001"}
+
+    monkeypatch.setattr(recovery_planner, "diagnose", diagnose)
+    _recover(row)
+    assert "UndefinedColumn: amountx" in captured["error"]
+
+
 def test_budget_is_not_reset_by_failure_or_reconciliation(plan, isolated):
     row = _failed(plan, isolated, attempt=2)
     assert supervisor.get_job(row["id"], ANALYST)["recovery"]["state"] == "exhausted"
     dag_recovery.reconcile()
     assert not jobs.run_one("recovery", kinds=["dag_recovery"])
+
+
+def test_reconciler_keysets_past_two_hundred_terminal_rows(plan, isolated):
+    for index in range(205):
+        _insert_terminal(f"backlog-{index:03d}", {
+            "state": "failed", "run_ref": f"run-{index}",
+            "studio": {"agent_recovery": {
+                "enabled": True, "max_attempts": 2, "attempt": 0}},
+        }, updated_at=1000 + index)
+    dag_recovery.reconcile()
+    with db.connect() as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) n FROM background_jobs WHERE kind='dag_recovery'"
+        ).fetchone()["n"]
+    assert count == 205
+
+
+def test_reconciler_revives_an_exhausted_reward_delivery(plan, isolated):
+    rollout = "studio-recovery-00000000-0000-0000-0000-000000000001"
+    jid, run_ref = "reward-child", "remote-run"
+    _insert_terminal(jid, {
+        "state": "succeeded", "run_ref": run_ref,
+        "studio": {"agent_recovery": {
+            "enabled": True, "max_attempts": 2, "attempt": 1,
+            "decision_rollout_id": rollout}},
+    }, status="succeeded")
+    identity = str(dag_recovery.uuid.uuid5(
+        dag_recovery.uuid.NAMESPACE_URL,
+        f"dag-recovery-reward:{jid}:{run_ref}"))
+    with db.connect() as connection:
+        connection.execute(
+            "INSERT INTO background_jobs (id,kind,payload,status,attempts,max_attempts,"
+            "run_after,user_id,created_at,finished_at,error) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (identity, "dag_recovery_reward", json.dumps({"job_id": jid}), "failed",
+             5, 5, 0, ANALYST["id"], time.time() - 1000, time.time() - 301,
+             "temporary Agent Lightning outage"))
+        connection.commit()
+    dag_recovery.reconcile()
+    with db.connect() as connection:
+        queued = dict(connection.execute(
+            "SELECT status,attempts,finished_at,error FROM background_jobs WHERE id=?",
+            (identity,)).fetchone())
+    assert queued == {"status": "queued", "attempts": 0,
+                      "finished_at": None, "error": None}
 
 
 def test_unknown_trigger_never_enters_recovery(plan, isolated):
@@ -155,5 +243,7 @@ def test_terminal_child_rewards_original_decision_and_does_not_relabel_parent(pl
     dag_recovery.reconcile()
     assert jobs.run_one("rewards", kinds=["dag_recovery_reward"])
     assert len(delivered) == 1 and delivered[0][1]["status"] == "succeeded"
+    marker = json.loads(supervisor._get(child_id)["result"])["recovery_reward"]
+    assert marker["rollout_id"] == delivered[0][0]
     assert supervisor.get_job(row["id"], ANALYST)["recovery"]["state"] == "succeeded"
     assert supervisor._get(row["id"])["status"] == "failed"

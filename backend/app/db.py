@@ -345,9 +345,17 @@ def init_db():
             reward REAL,
             reward_source TEXT,
             meta TEXT,
+            updated_at REAL NOT NULL,
+            training_revision INTEGER NOT NULL,
             created_at REAL NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_traces_time ON agent_traces(created_at DESC);
+        CREATE TABLE IF NOT EXISTS training_event_clock (
+            id INTEGER PRIMARY KEY,
+            revision INTEGER NOT NULL
+        );
+        INSERT INTO training_event_clock (id, revision) VALUES (1, 0)
+            ON CONFLICT(id) DO NOTHING;
         """
         )
         # idx_messages_reply_to is what makes a chat turn answerable exactly
@@ -503,39 +511,93 @@ def list_activity(user_id=None, limit=200):
 
 # ── Agent traces (Agent Lightning-style rollouts: run + reward) ─────────
 
+def next_training_revision(c):
+    """Allocate a durable, cross-process rollout revision in ``c``'s txn."""
+    c.execute("UPDATE training_event_clock SET revision=revision+1 WHERE id=1")
+    return int(c.execute(
+        "SELECT revision FROM training_event_clock WHERE id=1").fetchone()["revision"])
+
 def add_trace(user, conversation_id=None, prompt=None, model=None, mode=None,
               source=None, table=None, sql=None, ok=True, error=None,
               row_count=None, chart_type=None, panel_count=None,
               duration_ms=None, reward=None, reward_source=None, meta=None):
     tid = str(uuid.uuid4())
+    now = time.time()
     with connect() as c:
+        revision = next_training_revision(c)
         c.execute(
             "INSERT INTO agent_traces (id, user_id, email, role, conversation_id, prompt, "
             "model, mode, source, tbl, sql, ok, error, row_count, chart_type, panel_count, "
-            "duration_ms, reward, reward_source, meta, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "duration_ms, reward, reward_source, meta, updated_at, training_revision, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (tid, user["id"], user["email"], user["role"], conversation_id, prompt,
              model, mode, source, table, sql, 1 if ok else 0, error, row_count,
              chart_type, panel_count, duration_ms, reward, reward_source,
-             json.dumps(meta or {}), time.time()),
+             json.dumps(meta or {}), now, revision, now),
         )
         c.commit()
     return tid
 
 
-def set_trace_reward(trace_id, reward, source="user", note=None):
-    """Overwrite a trace's reward with explicit feedback (user > heuristic)."""
+def set_trace_reward(trace_id, reward, *, user_id, source="user", note=None):
+    """Overwrite one owner's trace reward with explicit user feedback."""
     with connect() as c:
-        row = c.execute("SELECT meta FROM agent_traces WHERE id=?", (trace_id,)).fetchone()
+        # Feedback updates two coupled records: the trace and its contribution
+        # to the semantic-cache aggregate.  Serialize before reading either
+        # value so concurrent edits cannot both subtract the same old reward.
+        # SQLite has no row locks, therefore take its write reservation up
+        # front; Postgres can lock just the owned trace and linked cache row.
+        if not IS_PG:
+            c.execute("PRAGMA busy_timeout = 30000")
+            c.execute("BEGIN IMMEDIATE")
+        trace_lock = " FOR UPDATE" if IS_PG else ""
+        row = c.execute(
+            "SELECT meta, reward FROM agent_traces WHERE id=? AND user_id=?" + trace_lock,
+            (trace_id, user_id),
+        ).fetchone()
         if not row:
             return False
         meta = json.loads(row["meta"] or "{}")
         if note:
             meta["feedback_note"] = note[:500]
+        revision = next_training_revision(c)
         c.execute(
-            "UPDATE agent_traces SET reward=?, reward_source=?, meta=? WHERE id=?",
-            (reward, source, json.dumps(meta), trace_id),
+            "UPDATE agent_traces SET reward=?, reward_source=?, meta=?, updated_at=?, "
+            "training_revision=? WHERE id=? AND user_id=?",
+            (reward, source, json.dumps(meta), time.time(), revision, trace_id, user_id),
         )
+        # Replace the heuristic contribution this trace made to the semantic
+        # cache. A thumbs-down must immediately demote a wrong-but-executable
+        # cached query instead of continuing to route users to it.
+        qcache_id = meta.get("qcache_id") if isinstance(meta, dict) else None
+        qcache_mode = meta.get("qcache_feedback_mode", "replace") \
+            if isinstance(meta, dict) else "replace"
+        old_reward = row["reward"]
+        if qcache_id:
+            cache_lock = " FOR UPDATE" if IS_PG else ""
+            cached = c.execute(
+                "SELECT seen, avg_reward FROM query_cache WHERE id=?" + cache_lock,
+                (qcache_id,),
+            ).fetchone()
+            if cached and (cached["seen"] or 0) > 0 and cached["avg_reward"] is not None:
+                seen = int(cached["seen"])
+                if qcache_mode == "add":
+                    revised = ((float(cached["avg_reward"]) * seen)
+                               + float(reward)) / (seen + 1)
+                    seen += 1
+                    # A second edit to the same feedback replaces the
+                    # contribution added above rather than adding it again.
+                    meta["qcache_feedback_mode"] = "replace"
+                    c.execute("UPDATE agent_traces SET meta=? WHERE id=? AND user_id=?",
+                              (json.dumps(meta), trace_id, user_id))
+                elif isinstance(old_reward, (int, float)):
+                    revised = ((float(cached["avg_reward"]) * seen)
+                               - float(old_reward) + float(reward)) / seen
+                else:
+                    revised = None
+                if revised is not None:
+                    c.execute("UPDATE query_cache SET seen=?, avg_reward=?, updated_at=? WHERE id=?",
+                              (seen, max(0.0, min(1.0, revised)), time.time(), qcache_id))
         c.commit()
     return True
 

@@ -1,0 +1,53 @@
+# The generated DAG claim must be backed by a real shared filesystem. Block
+# storage exposed as ReadWriteOnce is not a substitute: Studio publishes on one
+# pod while Airflow parses and executes on other pods.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: studio-airflow-dags
+  labels:
+    app.kubernetes.io/part-of: studio
+    app.kubernetes.io/component: airflow-dags
+spec:
+  accessModes:
+    - ReadWriteMany
+  volumeMode: Filesystem
+  resources:
+    requests:
+      storage: 2Gi
+---
+# The official Airflow chart can use this shared claim for task logs. Replace it
+# with provider-native remote logging if preferred, then disable log persistence
+# in airflow-values.yaml.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: airflow-logs
+  labels:
+    app.kubernetes.io/part-of: studio
+    app.kubernetes.io/component: airflow-logs
+spec:
+  accessModes:
+    - ReadWriteMany
+  volumeMode: Filesystem
+  resources:
+    requests:
+      storage: 20Gi
+---
+# Agent Lightning 1.0.1 uses one locked snapshot. This claim is intentionally
+# RWO and the matching Deployment is Recreate/single-replica; it is durable
+# across restarts, not an active/active store.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: agent-lightning-state
+  labels:
+    app.kubernetes.io/part-of: studio
+    app.kubernetes.io/component: lightning-state
+spec:
+  accessModes:
+    - ReadWriteOnce
+  volumeMode: Filesystem
+  resources:
+    requests:
+      storage: 2Gi

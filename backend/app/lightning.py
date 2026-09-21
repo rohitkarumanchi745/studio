@@ -248,6 +248,8 @@ def record_chat_trace(user, conversation_id, prompt, result, duration_ms, histor
             # the fan-out crew + Aggregator).
             meta={"errors": errors[:5],
                   "agents": [a.get("name") for a in (result.get("agents") or [])],
+                  "qcache_id": result.get("_qcache_id"),
+                  "qcache_feedback_mode": result.get("_qcache_feedback_mode"),
                   # trimmed to keep the trace row lean; same order the model saw
                   "history": [{"role": h["role"], "text": (h.get("text") or "")[:600]}
                               for h in (history or [])][-8:]},
@@ -312,16 +314,19 @@ def record_pipeline_outcome(user, *, run_id, prompt, source, action, status,
                 "agents": ["Pipeline executor"], "errors": [str(error)[:500]] if error else []}
         if repairs_run_id and str(repairs_run_id) != str(run_id):
             meta["repairs_run_id"] = str(repairs_run_id)
+        now = time.time()
         with db.connect() as c:
+            revision = db.next_training_revision(c)
             cur = c.execute(
                 "INSERT INTO agent_traces (id,user_id,email,role,conversation_id,prompt,"
-                "mode,source,sql,ok,error,panel_count,duration_ms,reward,reward_source,meta,created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING",
+                "mode,source,sql,ok,error,panel_count,duration_ms,reward,reward_source,meta,"
+                "updated_at,training_revision,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING",
                 (tid, user["id"], user["email"], user["role"], conversation_id,
                  str(prompt or "")[:1000], "pipeline", source, None,
                  int(success), str(error)[:500] if error else None,
                  len(action.get("steps") or []), duration_ms, 1.0 if success else 0.0,
-                 "pipeline_outcome", json.dumps(meta), time.time()))
+                 "pipeline_outcome", json.dumps(meta), now, revision, now))
             if cur.rowcount == 1:
                 # The trace and its delivery job commit together. If the
                 # queue is unavailable, the caller can retry this run id.
@@ -813,7 +818,7 @@ def _pending_stale_s():
 
 @jobs.reconciler
 def sweep_reward_updates(limit=200):
-    """Re-deliver traces whose reward CHANGED after we shipped them.
+    """Heal exhausted initial deliveries and re-deliver changed rewards.
 
     A 👍/👎 lands in chat.feedback -> db.set_trace_reward, which overwrites the
     heuristic reward on the trace row. Rather than reach into that path, this
@@ -823,21 +828,52 @@ def sweep_reward_updates(limit=200):
     Lightning server was down, or while the worker was stopped, is picked up
     on a later pass instead of being lost.
 
-    `pending` keeps one queued job per trace; a job that dies without clearing
-    it is retried after STUDIO_AGL_PENDING_STALE_S. Returns the number of
-    deliveries enqueued."""
+    `pending` keeps one queued job per delivered trace.  Before that row exists,
+    an initial `agl_emit` job can exhaust all queue attempts during an outage;
+    revive that same durable job after the stale interval rather than leaving
+    the trace invisible forever. Returns the number of deliveries queued."""
     if not emit_enabled():
         return 0
     _ensure_tables()
     stale_before = time.time() - _pending_stale_s()
+    limit = max(0, int(limit))
+    if not limit:
+        return 0
+
+    # _enqueue_emit serializes this single-key payload deterministically.  The
+    # exact equality avoids interpreting arbitrary job JSON in either SQLite
+    # or Postgres and selects only jobs that demonstrably belong to the trace.
+    with db.connect() as c:
+        initial = c.execute(
+            "SELECT j.id AS job_id,t.id AS trace_id FROM background_jobs j "
+            "JOIN agent_traces t ON j.payload=('{\"trace_id\": \"' || t.id || '\"}') "
+            "LEFT JOIN agl_deliveries d ON d.trace_id=t.id "
+            "WHERE j.kind=? AND j.status='failed' AND j.finished_at<=? "
+            "AND d.trace_id IS NULL ORDER BY j.finished_at,j.id LIMIT ?",
+            (AGL_KIND, stale_before, limit)).fetchall()
+    n = 0
+    now = time.time()
+    for row in initial:
+        with db.connect() as c:
+            cur = c.execute(
+                "UPDATE background_jobs SET status='queued',attempts=0,run_after=?,"
+                "locked_by=NULL,locked_at=NULL,heartbeat_at=NULL,result=NULL,error=NULL,"
+                "finished_at=NULL WHERE id=? AND status='failed' AND finished_at<=?",
+                (now, row["job_id"], stale_before))
+            c.commit()
+        if jobs._matched(cur):
+            n += 1
+
+    remaining = limit - n
+    if remaining <= 0:
+        return n
     with db.connect() as c:
         rows = c.execute(
             "SELECT d.trace_id FROM agl_deliveries d JOIN agent_traces t ON t.id = d.trace_id "
             "WHERE t.reward IS NOT NULL AND (d.pending = 0 OR d.updated_at < ?) AND "
             "(d.reward IS NULL OR d.reward <> t.reward OR "
             " COALESCE(d.reward_source,'') <> COALESCE(t.reward_source,'')) "
-            "ORDER BY t.created_at DESC LIMIT ?", (stale_before, int(limit))).fetchall()
-    n = 0
+            "ORDER BY t.created_at DESC LIMIT ?", (stale_before, remaining)).fetchall()
     for r in rows:
         trace_id = r["trace_id"]
         with db.connect() as c:

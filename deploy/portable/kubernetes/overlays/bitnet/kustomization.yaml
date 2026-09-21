@@ -1,0 +1,18 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: studio-system
+resources:
+  - ../../base
+  - bitnet.yaml
+patches:
+  - path: studio-web-patch.yaml
+  - path: studio-worker-patch.yaml
+
+# Replace both images with immutable digests before production use.
+images:
+  - name: studio
+    newName: studio
+    newTag: portable
+  - name: studio-bitnet
+    newName: studio-bitnet
+    newTag: portable

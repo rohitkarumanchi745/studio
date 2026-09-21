@@ -2,6 +2,7 @@
 .gitignore
 README.md
 backend/.env
+**/.env
 backend/.venv
 backend/outbox
 backend/skills

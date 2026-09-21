@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 import pytest
 
+from app import platforms as platforms_module
 from app.platforms import PLATFORMS, all_platforms, get_platform
 
 SCRIPT = {}   # scripted responses (states, error toggles) — mutated per test
@@ -167,7 +168,7 @@ def _reset():
     CAPTURE.clear()
 
 
-ALL_ENV = ["AIRFLOW_URL", "AIRFLOW_TOKEN", "AIRFLOW_USERNAME", "AIRFLOW_PASSWORD",
+ALL_ENV = ["AIRFLOW_URL", "AIRFLOW_PUBLIC_URL", "AIRFLOW_TOKEN", "AIRFLOW_USERNAME", "AIRFLOW_PASSWORD",
            "AIRFLOW_API_VERSION", "DATABRICKS_SERVER_HOSTNAME", "DATABRICKS_TOKEN",
            "DBT_CLOUD_ACCOUNT_ID", "DBT_CLOUD_API_TOKEN", "DBT_CLOUD_JOB_ID",
            "DBT_CLOUD_BASE_URL", "K8S_API_URL", "K8S_TOKEN", "K8S_NAMESPACE",
@@ -184,6 +185,7 @@ def clean_env(monkeypatch):
 @pytest.fixture
 def airflow_env(base, clean_env):
     clean_env.setenv("AIRFLOW_URL", base)
+    clean_env.setenv("AIRFLOW_PUBLIC_URL", base)
     clean_env.setenv("AIRFLOW_USERNAME", "amy")
     clean_env.setenv("AIRFLOW_PASSWORD", "pw")
     return clean_env
@@ -243,6 +245,48 @@ def test_airflow_trigger_roundtrip(airflow_env):
     assert cap["body"]["conf"] == {"day": "2026-08-16"}
     assert cap["auth"] == "Basic " + base64.b64encode(b"amy:pw").decode()
     assert "etl_daily" in out["url"] and run_id in out["url"]
+
+
+def test_airflow_suppresses_browser_link_without_public_url(airflow_env):
+    airflow_env.delenv("AIRFLOW_PUBLIC_URL")
+    out = get_platform("airflow").trigger({"dag_id": "etl_daily"})
+    assert out["url"] is None
+
+
+def test_airflow_failure_diagnostic_prioritizes_root_failure_and_pages_bounded_logs(
+        airflow_env, monkeypatch):
+    platform = get_platform("airflow")
+    monkeypatch.setattr(platform, "_task_instances", lambda _run: [
+        {"task_id": "downstream_a", "state": "upstream_failed", "try_number": 0},
+        {"task_id": "downstream_b", "state": "upstream_failed", "try_number": 0},
+        {"task_id": "downstream_c", "state": "upstream_failed", "try_number": 0},
+        {"task_id": "transform", "state": "failed", "try_number": 2, "map_index": -1},
+    ])
+    calls = []
+
+    def page(method, url, headers=None, body=None, timeout=30, context=None,
+             max_bytes=None):
+        calls.append((method, url, max_bytes))
+        query = parse_qs(urlsplit(url).query)
+        if "token" not in query:
+            return json.dumps({
+                "content": "password=hunter2\nquery started\n",
+                "continuation_token": "next-page",
+            })
+        assert query["token"] == ["next-page"]
+        return json.dumps({
+            "content": "psycopg.errors.UndefinedColumn: column amountx does not exist",
+            "continuation_token": None,
+        })
+
+    monkeypatch.setattr(platforms_module, "_http", page)
+    diagnostic = platform.failure_diagnostic("daily:run-7")
+    assert diagnostic.startswith("task=transform state=failed try=2")
+    assert "UndefinedColumn" in diagnostic and "amountx" in diagnostic
+    assert "hunter2" not in diagnostic and "password=[redacted]" in diagnostic
+    assert "task=downstream_a state=upstream_failed" in diagnostic
+    assert len(calls) == 2
+    assert all(call[2] == platforms_module._MAX_FAILURE_LOG_PAGE for call in calls)
 
 
 def test_airflow_v2_bearer_token(airflow_env, base):

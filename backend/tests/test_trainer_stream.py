@@ -6,6 +6,8 @@ surfaces them, additively, without dropping any pre-existing key.
 
 Run from the backend directory:  python -m pytest tests/test_trainer_stream.py -q
 """
+import concurrent.futures
+
 import pytest
 
 from app import db, trainer
@@ -69,3 +71,57 @@ def test_stream_shape_unchanged_for_existing_consumers():
     assert out["count"] == len(out["rollouts"]) == 2
     for r in out["rollouts"]:
         assert set(r["action"].keys()) == {"sql", "chart_type"}
+
+
+def test_feedback_after_cursor_is_emitted_as_a_new_revision():
+    db.init_db()
+    tid = db.add_trace(
+        ADMIN, prompt="show sales", mode="agent", source="demo", table="sales",
+        sql="SELECT * FROM sales", reward=0.75, reward_source="heuristic")
+    first = trainer.stream(since=0, limit=10)
+    assert first["rollouts"][0]["reward"] == 0.75
+
+    assert db.set_trace_reward(
+        tid, 0.0, user_id=ADMIN["id"], source="user") is True
+    revised = trainer.stream(since=first["cursor"], limit=10)
+    assert revised["count"] == 1
+    assert revised["rollouts"][0]["id"] == tid
+    assert revised["rollouts"][0]["reward"] == 0.0
+    assert revised["rollouts"][0]["reward_source"] == "user"
+    assert revised["cursor"] > first["cursor"]
+
+
+def test_revision_cursor_pages_rows_even_when_wall_clock_timestamps_tie(monkeypatch):
+    db.init_db()
+    monkeypatch.setattr(db.time, "time", lambda: 1234.5)
+    first_id = db.add_trace(
+        ADMIN, prompt="first", mode="agent", source="demo", table="sales",
+        sql="SELECT 1", reward=1.0)
+    second_id = db.add_trace(
+        ADMIN, prompt="second", mode="agent", source="demo", table="sales",
+        sql="SELECT 2", reward=1.0)
+
+    page_one = trainer.stream(since=0, limit=1)
+    page_two = trainer.stream(since=page_one["cursor"], limit=1)
+    assert [page_one["rollouts"][0]["id"], page_two["rollouts"][0]["id"]] == [
+        first_id, second_id]
+
+
+def test_concurrent_adapter_publishers_leave_one_monotonic_active_identity():
+    trainer.init_tables()
+
+    def publish(index):
+        return trainer.publish(
+            "global", "tool_call", f"/adapters/tool-call-{index}")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(publish, range(8)))
+
+    assert sorted(result["version"] for result in results) == list(range(1, 9))
+    with db.connect() as connection:
+        rows = connection.execute(
+            "SELECT version,status FROM training_adapters "
+            "WHERE scope='global' AND kind='tool_call' ORDER BY version"
+        ).fetchall()
+    assert [row["version"] for row in rows] == list(range(1, 9))
+    assert [row["version"] for row in rows if row["status"] == "active"] == [8]

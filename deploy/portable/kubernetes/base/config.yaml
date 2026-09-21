@@ -1,0 +1,156 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: studio-runtime-config
+  labels:
+    app.kubernetes.io/name: studio
+    app.kubernetes.io/part-of: studio
+data:
+  STUDIO_DEMO_MODE: "0"
+  STUDIO_OPEN_REGISTRATION: "0"
+  STUDIO_TOOLBUILDER: "0"
+  STUDIO_WORKER_MODE: external
+  STUDIO_AUTO_MIGRATE: "1"
+  STUDIO_LLM: anthropic:claude-sonnet-5
+  STUDIO_AGL_URL: http://lightning-server:8080
+  STUDIO_WORKER_CLAIM_GATE_URL: http://lightning-controller:8082/readyz
+  STUDIO_AGL_RECOVERY_MODEL: studio-recovery
+  STUDIO_AGL_TRAIN: "1"
+  STUDIO_AGL_MAX_ATTEMPTS: "5"
+  AIRFLOW_URL: http://airflow-api-server:8080
+  AIRFLOW_API_VERSION: v2
+  STUDIO_AIRFLOW_DAGS_DIR: /opt/airflow/dags
+  STUDIO_AIRFLOW_CONNECTIONS_JSON: '{"postgres":"studio_postgres"}'
+  STUDIO_AIRFLOW_OUTPUT_SCHEMA: pipeline_output
+  STUDIO_AIRFLOW_TASK_TIMEOUT_SECONDS: "900"
+  STUDIO_AIRFLOW_REGISTRATION_TIMEOUT_SECONDS: "900"
+  STUDIO_AIRFLOW_RUN_TIMEOUT_SECONDS: "86400"
+  STUDIO_AGL_RECOVERY_TIMEOUT_S: "300"
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONUNBUFFERED: "1"
+  HOME: /tmp
+  TMPDIR: /tmp
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: recovery-model-config
+  labels:
+    app.kubernetes.io/name: recovery-model
+    app.kubernetes.io/part-of: studio
+data:
+  STUDIO_AGL_RECOVERY_MODEL: studio-recovery
+  STUDIO_RECOVERY_GATEWAY_MODE: langchain
+  STUDIO_RECOVERY_UPSTREAM_MODEL: anthropic:claude-sonnet-5
+  # Shorter than the 300-second Lightning rollout deadline so the agent still
+  # has time to validate and post its decision after a slow provider response.
+  STUDIO_RECOVERY_UPSTREAM_TIMEOUT_S: "240"
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONUNBUFFERED: "1"
+  HOME: /tmp
+  TMPDIR: /tmp
+---
+# The worker has no HTTP listener. Its readiness probe performs authenticated
+# application-level checks against the private dependencies and proves write
+# access to the DAG share; opening a TCP socket alone is not readiness.
+# Its main process already restarts a dead queue thread; the liveness probe
+# verifies that the intended worker remains PID 1.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: studio-worker-probes
+  labels:
+    app.kubernetes.io/name: studio
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/part-of: studio
+data:
+  readiness.py: |
+    import json
+    import os
+    import tempfile
+    import urllib.request
+    from pathlib import Path
+
+    def request(method, url, body=None, token=None):
+        headers = {"Accept": "application/json"}
+        data = None
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+            data = json.dumps(body).encode()
+        if token:
+            headers["Authorization"] = "Bearer " + token
+        with urllib.request.urlopen(
+                urllib.request.Request(url, data=data, method=method, headers=headers),
+                timeout=5) as response:
+            raw = response.read(262145)
+        if len(raw) > 262144:
+            raise RuntimeError("dependency response is too large")
+        return json.loads(raw or b"{}")
+
+    def main():
+        import psycopg
+        import redis
+
+        for name in ("DATABASE_URL", "POSTGRES_DSN"):
+            with psycopg.connect(os.environ[name], connect_timeout=5) as connection:
+                assert connection.execute("SELECT 1").fetchone()[0] == 1
+        assert redis.Redis.from_url(
+            os.environ["REDIS_URL"], socket_connect_timeout=5,
+            socket_timeout=5).ping() is True
+
+        airflow = os.environ["AIRFLOW_URL"].rstrip("/")
+        token = request("POST", airflow + "/auth/token", {
+            "username": os.environ["AIRFLOW_USERNAME"],
+            "password": os.environ["AIRFLOW_PASSWORD"],
+        }).get("access_token")
+        if not token:
+            raise RuntimeError("Airflow authentication failed")
+        health = request("GET", airflow + "/api/v2/monitor/health", token=token)
+        for component in ("metadatabase", "scheduler", "dag_processor"):
+            if (health.get(component) or {}).get("status") != "healthy":
+                raise RuntimeError("Airflow is not ready")
+        request("GET", airflow + "/api/v2/dags?limit=1", token=token)
+
+        lightning = request("GET", os.environ["STUDIO_AGL_URL"].rstrip("/") + "/readyz")
+        if lightning.get("status") != "ready":
+            raise RuntimeError("Agent Lightning is not ready")
+        controller = request("GET", os.environ["STUDIO_WORKER_CLAIM_GATE_URL"])
+        if controller.get("status") != "ready":
+            raise RuntimeError("Agent Lightning controller is not ready")
+
+        dags = Path(os.environ["STUDIO_AIRFLOW_DAGS_DIR"])
+        if not dags.is_dir() or not os.access(dags, os.W_OK | os.X_OK):
+            raise RuntimeError("DAG volume is not writable")
+        # Prove the CSI driver/ACL actually permits this UID+GID to create an
+        # inode; os.access alone can lie on some network filesystems.
+        descriptor, candidate = tempfile.mkstemp(prefix=".studio-write-check-", dir=dags)
+        linked = candidate + ".link"
+        try:
+            os.write(descriptor, b"studio-dag-publication-check\n")
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = -1
+            os.link(candidate, linked)
+            with open(linked, "rb") as handle:
+                if handle.read() != b"studio-dag-publication-check\n":
+                    raise RuntimeError("DAG hard-link verification failed")
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            for path in (linked, candidate):
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+
+    try:
+        main()
+    except Exception:
+        # URLs may embed credentials. Keep probe output deliberately generic.
+        raise SystemExit("Studio worker dependencies are not ready") from None
+  liveness.py: |
+    from pathlib import Path
+
+    command = Path("/proc/1/cmdline").read_bytes().replace(b"\0", b" ")
+    if b"app.worker" not in command:
+        raise SystemExit("Studio worker is not PID 1")

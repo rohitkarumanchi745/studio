@@ -189,6 +189,14 @@ def self_hosted(spec):
     return bool(spec) and spec.strip() == (target or "").strip()
 
 
+def concrete_model_spec(spec):
+    """Resolve UI-only model aliases before calling a provider client."""
+    if (spec or "").strip() == "bitnet":
+        from . import router as model_router
+        return model_router.bitnet_spec()
+    return spec
+
+
 def llm_available(spec=None, user=None):
     """A provider is usable when the server has a key, or this user brought one.
 
@@ -196,6 +204,16 @@ def llm_available(spec=None, user=None):
     provider key (serving/README.md: the base URL + the model spec are "all
     Studio needs"), so it is available whenever an endpoint is configured."""
     spec = spec or llm_spec()
+    if spec == "bitnet":
+        try:
+            from . import router as model_router
+            return bool(model_router.bitnet_ready(user))
+        except Exception:
+            return False
+    if spec == "kag":
+        # KAG is a chat routing mode, not a provider model. Callers such as the
+        # standalone pipeline planner cannot invoke it as an LLM.
+        return False
     if self_hosted(spec):
         return True
     provider = spec.split(":", 1)[0]
@@ -222,6 +240,7 @@ def make_llm(spec, user=None, **kwargs):
     client insists on *some* credential, so an unauthenticated gateway gets a
     placeholder."""
     from langchain.chat_models import init_chat_model
+    spec = concrete_model_spec(spec)
     if self_hosted(spec):
         kwargs.setdefault("base_url", os.getenv("STUDIO_LLM_BASE_URL", "").strip())
         kwargs.setdefault("api_key", os.getenv("STUDIO_LLM_API_KEY", "").strip()
@@ -231,7 +250,8 @@ def make_llm(spec, user=None, **kwargs):
             adapters = trainer.active_adapters(user.get("id") if user else None)
             if adapters:
                 # Top-level body field the serving gateway parses to pick a LoRA
-                # ({"tool_call": {"uri","version"}, "user_style": {...}}). Passed
+                # ({"tool_call": {"uri","version","sha256"?},
+                #   "user_style": {...}}). Passed
                 # explicitly rather than through model_kwargs: langchain warns on
                 # the latter, and older releases fold an unknown kwarg into
                 # model_kwargs anyway, so this reaches the wire either way.
@@ -365,6 +385,61 @@ def _final_text(result):
     return ""
 
 
+def _reply_content(reply):
+    """Extract bounded text from a normal chat-model response."""
+    content = getattr(reply, "content", reply)
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        text = "".join(
+            block.get("text", "") for block in content
+            if isinstance(block, dict) and block.get("type") in (None, "text")
+        )
+    else:
+        raise ValueError("model returned non-text content")
+    if len(text) > 200_000:
+        raise ValueError("model response is too large")
+    return text
+
+
+def _bitnet_policy_actions(reply):
+    """Parse the exact JSON action contract used by ``train_online.py``.
+
+    The current BitNet adapter is not trained to emit provider-native OpenAI
+    tool-call frames. Treating its JSON as a final chat answer meant its SQL was
+    never executed. This deliberately tiny interpreter accepts only the two
+    actions present in the training labels; the normal gateway remains the
+    authorization and SQL safety boundary.
+    """
+    text = _reply_content(reply).strip()
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE).strip()
+    value = json.loads(text)
+    actions = value if isinstance(value, list) else [value]
+    if not 1 <= len(actions) <= 2 or any(not isinstance(item, dict) for item in actions):
+        raise ValueError("BitNet returned an invalid action list")
+    if actions[0].get("tool") != "run_sql" or set(actions[0]) != {"tool", "sql"} \
+            or not isinstance(actions[0].get("sql"), str) or not actions[0]["sql"].strip():
+        raise ValueError("BitNet did not return the trained run_sql action")
+    if len(actions) == 2:
+        chart = actions[1]
+        if chart.get("tool") != "render_chart" \
+                or set(chart) != {"tool", "chart_type"} \
+                or chart.get("chart_type") not in CHART_TYPES:
+            raise ValueError("BitNet returned an invalid render_chart action")
+    return actions
+
+
+def _single_reply_usage(reply):
+    raw = getattr(reply, "usage_metadata", None) or {}
+    details = raw.get("input_token_details") or {}
+    return {
+        "input_tokens": int(raw.get("input_tokens") or raw.get("prompt_tokens") or 0),
+        "output_tokens": int(raw.get("output_tokens") or raw.get("completion_tokens") or 0),
+        "cache_read_tokens": int(details.get("cache_read") or 0),
+        "cache_write_tokens": int(details.get("cache_creation") or 0),
+    }
+
+
 def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, model=None,
               skill_md=None, kag_first=False):
     """One analytics turn.
@@ -390,6 +465,12 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         out = _fallback(prompt, connector, table, allowed_tables, user)
         out["agents"] = [me]
         return out
+    # UI/API records use the stable ``bitnet`` alias, while the provider
+    # client and the execution policy compare the configured concrete spec
+    # (normally ``openai:bitnet``). Resolve it once here so every branch —
+    # including headless/autopilot calls that bypass chat's router — executes
+    # the trained JSON action contract instead of treating it as prose.
+    spec = concrete_model_spec(spec)
 
     ctx = {"sql": None, "columns": [], "rows": [], "chart": None, "email": None, "panels": [],
            "citations": [],
@@ -579,9 +660,34 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         messages = _cache_history(history, spec) + [("user", prompt)]
         progress.emit_for(_tid, f"{_me}: reading the question and the schema")
         mcp_cfg = mcp_servers(user)
-        if mcp_cfg:
+        if self_hosted(spec):
+            # Train == serve for the SQL adapter: train_online conditions on
+            # the source skill, history, and current prompt and labels one
+            # compact JSON run_sql action (optionally followed by chart type).
+            # Execute that bounded contract directly; do not wait for a native
+            # tool-call envelope the adapter was never trained to emit.
+            policy_system = (f"Your skill file for this database:\n\n{skill_md}"
+                             if skill_md else system)
+            reply = llm.invoke([("system", policy_system), *messages])
+            actions = _bitnet_policy_actions(reply)
+            run_sql.invoke({"sql": actions[0]["sql"]})
+            if ctx["sql"] is None or ctx["errors"]:
+                raise ValueError("BitNet SQL did not execute successfully")
+            if len(actions) == 2:
+                proposed = _auto_chart(ctx["columns"], ctx["rows"], table)
+                if proposed:
+                    proposed = {**proposed, "type": actions[1]["chart_type"]}
+                    render_chart.invoke({
+                        "chart_type": proposed["type"],
+                        "title": proposed["title"],
+                        "x": proposed["x"],
+                        "y": proposed["y"],
+                    })
+            text = "BitNet executed a guarded query against the current data."
+            usage = _single_reply_usage(reply)
+        elif mcp_cfg:
             progress.emit_for(_tid, f"{_me}: loading tools from {len(mcp_cfg)} MCP "
-                                    f"server{'s' if len(mcp_cfg) != 1 else ''}")
+                                   f"server{'s' if len(mcp_cfg) != 1 else ''}")
             # MCP tools are async — load them and run the graph on an event loop.
             import asyncio
 
@@ -594,8 +700,9 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         else:
             graph = _graph(llm, base_tools, system, spec, volatile)
             result = graph.invoke({"messages": messages}, config={"recursion_limit": 16})
-        text = _final_text(result) or "Done."
-        usage = _extract_usage(result)
+        if not self_hosted(spec):
+            text = _final_text(result) or "Done."
+            usage = _extract_usage(result)
     except Exception as e:
         # Provider/graph failure — fall back so the product keeps working.
         msg = str(e)

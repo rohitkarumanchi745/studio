@@ -4,12 +4,27 @@ Only the worker starts a published DAG. A status GET never deploys, unpauses,
 or triggers anything. An uncertain trigger is escalated, never auto-retried.
 """
 import json
+import os
 import time
 import uuid
 
 from fastapi import HTTPException
 
 from . import db, jobs, platforms
+
+
+def registration_timeout_seconds():
+    """Bound the gap between publishing a DAG and seeing it in Airflow."""
+    raw = (os.getenv("STUDIO_AIRFLOW_REGISTRATION_TIMEOUT_SECONDS") or "900").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        raise RuntimeError(
+            "STUDIO_AIRFLOW_REGISTRATION_TIMEOUT_SECONDS must be an integer") from None
+    if not 30 <= value <= 86400:
+        raise RuntimeError(
+            "STUDIO_AIRFLOW_REGISTRATION_TIMEOUT_SECONDS must be between 30 and 86400")
+    return value
 
 
 def prepare(plan, user):
@@ -34,12 +49,15 @@ def execute(job):
     checked, artifact = prepare(spec["plan"], requester)
     if artifact["digest"] != spec["digest"]:
         raise RuntimeError("DAG definition or connection mapping changed; request fresh approval")
+    registration_timeout = registration_timeout_seconds()
     jobs.check_claim()
     deployed = airflow_dags.deploy(checked, approver={"id": job["human_by"], "role": "admin"},
                                    expected_digest=spec["digest"])
     old = json.loads(job.get("result") or "{}")
     return {"deployment": deployed, "studio": old.get("studio") or {},
             "publication_token": old.get("publication_token"),
+            "published_at": time.time(),
+            "registration_timeout_seconds": registration_timeout,
             "detail": "DAG published; waiting for Airflow registration. Nothing has run yet."}
 
 
@@ -158,13 +176,39 @@ def observe(row, claim=None):
         p = platforms.get_platform("airflow")
         ready = p.dag_ready(dag_id)
     except Exception as exc:
-        # An unavailable scheduler is not a failed execution.
-        committed = _transition(row, claim=claim, last_error=str(exc)[:500])
-        return {"state": "deploying" if committed else "claimed_elsewhere"}
+        # An unavailable scheduler is not a failed execution, but it is still
+        # subject to the immutable post-publication observation deadline.
+        ready = {"ready": False, "detail": str(exc)[:500]}
     if not ready.get("ready"):
-        committed = _transition(row, claim=claim, last_error=ready.get("detail") or "Waiting for Airflow to register the DAG")
+        detail = ready.get("detail") or "Waiting for Airflow to register the DAG"
+        try:
+            published_at = float(result.get("published_at") or row["created_at"])
+            timeout = int(result.get("registration_timeout_seconds")
+                          or registration_timeout_seconds())
+            expired = time.time() - published_at >= timeout
+        except (TypeError, ValueError, RuntimeError):
+            expired = True
+            detail = "Airflow registration deadline configuration is invalid"
+        if ready.get("permanent") or expired:
+            reason = ("Airflow cannot register the approved DAG without operator action: "
+                      if ready.get("permanent") else
+                      "Airflow did not register the approved DAG before its deadline: ")
+            committed = _transition(
+                row, claim=claim, status="escalated",
+                last_error=(reason + detail)[:1000])
+            return {"state": "escalated" if committed else "claimed_elsewhere"}
+        committed = _transition(row, claim=claim, last_error=detail[:1000])
         return {"state": "deploying" if committed else "claimed_elsewhere"}
+    try:
+        run_timeout = supervisor.platform_run_timeout_seconds(row["target"])
+    except RuntimeError as exc:
+        committed = _transition(
+            row, claim=claim, status="escalated",
+            last_error=("Platform run deadline configuration is invalid; nothing was triggered. "
+                        + str(exc))[:1000])
+        return {"state": "escalated" if committed else "claimed_elsewhere"}
     result["launch_token"] = uuid.uuid4().hex
+    result["run_timeout_seconds"] = run_timeout
     if not _transition(row, claim=claim, status="launching", result=json.dumps(result)):
         return {"state": "claimed_elsewhere"}
     try:
@@ -177,6 +221,7 @@ def observe(row, claim=None):
     # Even if our queue lease expired during the POST, persist the external
     # identity so the next worker can observe it. Never perform another POST.
     result.update(launched)
+    result["launched_at"] = time.time()
     if not _transition(row, require_claim=False, status="running", result=json.dumps(result), last_error=None):
         return {"state": "claimed_elsewhere", "uncommitted_run_ref": launched.get("run_ref")}
     supervisor._schedule_platform_monitor(row, launched.get("run_ref"))

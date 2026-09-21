@@ -1,0 +1,5 @@
+# Keep these aligned with Apache Airflow's constraints-3.3.1 release set.
+# The Docker build installs them through the matching Python 3.12 constraints.
+apache-airflow-providers-common-sql==2.1.0
+apache-airflow-providers-postgres==7.0.1
+apache-airflow-providers-fab==3.8.0

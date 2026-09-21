@@ -1,0 +1,55 @@
+services:
+  bitnet-serving:
+    image: ${STUDIO_BITNET_IMAGE:-studio-bitnet:portable}
+    build:
+      context: ../../serving
+      dockerfile: Dockerfile.railway
+    restart: unless-stopped
+    environment:
+      STUDIO_GATEWAY_API_KEY: ${STUDIO_BITNET_GATEWAY_KEY:?set STUDIO_BITNET_GATEWAY_KEY}
+      STUDIO_SUPERVISOR_MODE: cloud
+      STUDIO_BASE_MODEL_NAME: bitnet
+      STUDIO_BITNET_GGUF_REVISION: ${STUDIO_BITNET_GGUF_REVISION:-29f884c2aefd035cd498fa0750b7781e6f269032}
+      STUDIO_BITNET_GGUF_SHA256: ${STUDIO_BITNET_GGUF_SHA256:-4221b252fdd5fd25e15847adfeb5ee88886506ba50b8a34548374492884c2162}
+      STUDIO_ADAPTER_URL: ${STUDIO_BITNET_ADAPTER_URL:?set STUDIO_BITNET_ADAPTER_URL to the trained GGUF artifact}
+      STUDIO_ADAPTER_VERSION: ${STUDIO_BITNET_ADAPTER_VERSION:?set STUDIO_BITNET_ADAPTER_VERSION}
+      STUDIO_ADAPTER_SHA256: ${STUDIO_BITNET_ADAPTER_SHA256:?set STUDIO_BITNET_ADAPTER_SHA256 to the artifact digest}
+      STUDIO_REQUIRE_ADAPTER: "1"
+      PORT: "9000"
+    volumes:
+      - bitnet-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:9000/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+
+  studio-web:
+    environment:
+      STUDIO_LLM_BASE_URL: http://bitnet-serving:9000/v1
+      STUDIO_LLM_API_KEY: ${STUDIO_BITNET_GATEWAY_KEY:?set STUDIO_BITNET_GATEWAY_KEY}
+      STUDIO_BITNET_LLM: openai:bitnet
+      STUDIO_BOOTSTRAP_TOOL_ADAPTER_URI: ${STUDIO_BITNET_ADAPTER_URL:?set STUDIO_BITNET_ADAPTER_URL to the trained GGUF artifact}
+      STUDIO_BOOTSTRAP_TOOL_ADAPTER_VERSION: ${STUDIO_BITNET_ADAPTER_VERSION:?set STUDIO_BITNET_ADAPTER_VERSION}
+      STUDIO_BOOTSTRAP_TOOL_ADAPTER_SHA256: ${STUDIO_BITNET_ADAPTER_SHA256:?set STUDIO_BITNET_ADAPTER_SHA256 to the artifact digest}
+      STUDIO_REQUIRE_TOOL_ADAPTER_SHA256: "1"
+    depends_on:
+      bitnet-serving:
+        condition: service_healthy
+
+  studio-worker:
+    environment:
+      STUDIO_LLM_BASE_URL: http://bitnet-serving:9000/v1
+      STUDIO_LLM_API_KEY: ${STUDIO_BITNET_GATEWAY_KEY:?set STUDIO_BITNET_GATEWAY_KEY}
+      STUDIO_BITNET_LLM: openai:bitnet
+      STUDIO_BOOTSTRAP_TOOL_ADAPTER_URI: ${STUDIO_BITNET_ADAPTER_URL:?set STUDIO_BITNET_ADAPTER_URL to the trained GGUF artifact}
+      STUDIO_BOOTSTRAP_TOOL_ADAPTER_VERSION: ${STUDIO_BITNET_ADAPTER_VERSION:?set STUDIO_BITNET_ADAPTER_VERSION}
+      STUDIO_BOOTSTRAP_TOOL_ADAPTER_SHA256: ${STUDIO_BITNET_ADAPTER_SHA256:?set STUDIO_BITNET_ADAPTER_SHA256 to the artifact digest}
+      STUDIO_REQUIRE_TOOL_ADAPTER_SHA256: "1"
+    depends_on:
+      bitnet-serving:
+        condition: service_healthy
+
+volumes:
+  bitnet-data:
