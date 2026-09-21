@@ -54,26 +54,37 @@ export default function Canvas({ state, setState, onClose, chatOpen, onToggleCha
           source: state.source,
           table: tableLabel,
           sql: cur.sql,
+          parent_message_id: state.parentMessageId,
+          parent_panel_index: selected,
         }),
       });
-      // A composed sheet returns every chart it wants shown, so it replaces
-      // the sheet. A single-chart edit still patches just the selected panel.
-      const composed = d.panels?.length > 1 || (d.panels?.length === 1 && panels.length === 1 && d.panels[0].sql);
-      const next = composed
+      // A saved version returns the complete server-bound sheet with the
+      // selected frame replaced; use it verbatim so its next parent index
+      // matches what the server persisted. Local-only edits retain the old
+      // patch/compose behavior.
+      const persisted = Boolean(conversationId && d.message_id && d.message && d.panels);
+      const composed = !persisted && (d.panels?.length > 1 || (d.panels?.length === 1 && panels.length === 1 && d.panels[0].sql));
+      const next = persisted
         ? d.panels
-        : panels.map((p, i) =>
-            i === selected ? { ...p, columns: d.columns, rows: d.rows, chart: d.chart } : p
-          );
+        : composed
+          ? d.panels
+          : panels.map((p, i) =>
+              i === selected ? { ...p, columns: d.columns, rows: d.rows, chart: d.chart } : p
+            );
+      const nextSelected = persisted ? Math.min(selected, next.length - 1) : composed ? 0 : selected;
       setState({
         ...state,
         panels: next,
-        selected: composed ? 0 : selected,
-        original: composed ? next.map((p) => ({ ...p, rows: (p.rows ?? []).map((r) => [...r]) })) : original,
+        selected: nextSelected,
+        original: (persisted || composed)
+          ? next.map((p) => ({ ...p, rows: (p.rows ?? []).map((r) => [...r]) }))
+          : original,
         note: d.note + (d.warnings?.length ? ` (${d.warnings.length} warning${d.warnings.length > 1 ? "s" : ""})` : ""),
+        parentMessageId: d.message_id || state.parentMessageId,
       });
       // Each edit is a NEW version: it appears as its own chat message, so
       // the previous chart stays intact in the history.
-      if (d.message && onNewVersion) onNewVersion(d.message);
+      if (d.message && onNewVersion) onNewVersion({ ...d.message, message_id: d.message_id });
       setInstruction("");
     } catch (err) {
       setState({ ...state, note: `Edit failed: ${err.message}` });

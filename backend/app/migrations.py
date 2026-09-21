@@ -219,6 +219,37 @@ def _m11_training_adapters_one_active(c, is_pg):
         "ON training_adapters(scope,kind) WHERE status='active'")
 
 
+def _m12_agent_sessions_message_ids(c, is_pg):
+    # Exact chat-row provenance for a serialized transcript. It lets reads
+    # re-run current governance without replacing a stable fork with later
+    # turns from the original conversation. NULL marks a legacy row, which the
+    # reader only upgrades when its text is an exact visible subsequence.
+    _add_column(c, "agent_sessions", "conversation_message_ids", "TEXT", is_pg)
+
+
+def _m13_agent_sessions_forks(c, is_pg):
+    """Keep stable forks out of the canonical auto-checkpoint lookup.
+
+    Older builds created the canonical row first and each fork later. Mark all
+    but the oldest row for each (user, conversation) as a fork while adding
+    the explicit discriminator used by new writes.
+    """
+    _add_column(c, "agent_sessions", "is_fork", "INTEGER NOT NULL DEFAULT 0", is_pg)
+    if not _table_exists(c, "agent_sessions", is_pg):
+        return
+    rows = c.execute(
+        "SELECT id,user_id,conversation_id FROM agent_sessions "
+        "WHERE conversation_id IS NOT NULL ORDER BY user_id,conversation_id,created_at,id"
+    ).fetchall()
+    seen = set()
+    for row in rows:
+        key = (row["user_id"], row["conversation_id"])
+        if key in seen:
+            c.execute("UPDATE agent_sessions SET is_fork=1 WHERE id=?", (row["id"],))
+        else:
+            seen.add(key)
+
+
 MIGRATIONS = [
     (1, "users.verified", _m1_users_verified),
     (2, "conversations.folder_id", _m2_conversations_folder_id),
@@ -231,6 +262,8 @@ MIGRATIONS = [
     (9, "training_adapters.sha256", _m9_training_adapters_sha256),
     (10, "agent_traces.training_revision", _m10_agent_traces_updated_at),
     (11, "training_adapters.one_active", _m11_training_adapters_one_active),
+    (12, "agent_sessions.conversation_message_ids", _m12_agent_sessions_message_ids),
+    (13, "agent_sessions.is_fork", _m13_agent_sessions_forks),
 ]
 
 

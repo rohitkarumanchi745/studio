@@ -73,6 +73,29 @@ def test_stream_shape_unchanged_for_existing_consumers():
         assert set(r["action"].keys()) == {"sql", "chart_type"}
 
 
+def test_stream_uses_exact_agent_conditioning_and_keeps_root_prompt():
+    db.init_db()
+    db.add_trace(
+        ADMIN, prompt="find customer spend", mode="agent:worker", source="demo",
+        table="sales", sql="SELECT 1", reward=1.0,
+        meta={"root_prompt": "find customer spend",
+              "conditioning_prompt": "REFERENCE DATA: ids [7]\nQuestion: spend for those ids"})
+
+    rollout = trainer.stream(since=0, limit=10)["rollouts"][0]
+    assert rollout["prompt"] == "REFERENCE DATA: ids [7]\nQuestion: spend for those ids"
+    assert rollout["root_prompt"] == "find customer spend"
+
+
+def test_stream_excludes_legacy_aggregator_rows_with_inherited_worker_sql():
+    db.init_db()
+    db.add_trace(
+        ADMIN, prompt="compare sources", mode="agent:aggregator", source="demo",
+        table="sales", sql="SELECT * FROM sales", reward=1.0,
+        meta={"conditioning_prompt": "Per-database answers: ..."})
+
+    assert trainer.stream(since=0, limit=10)["rollouts"] == []
+
+
 def test_feedback_after_cursor_is_emitted_as_a_new_revision():
     db.init_db()
     tid = db.add_trace(

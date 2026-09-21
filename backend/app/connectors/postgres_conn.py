@@ -136,6 +136,22 @@ class PostgresConnector(Connector):
                     if attempt == 2:
                         raise
 
+    def close(self):
+        """Close the connector-owned session, if any.
+
+        Dynamic connection probes are deliberately short-lived and saved
+        connectors are evicted on delete/replacement.  Exposing the same close
+        contract as Snowflake and Databricks lets both paths release the
+        PostgreSQL session instead of leaving it open until process exit.
+        """
+        with self._pool_lock:
+            if self._pool_conn is not None:
+                try:
+                    self._pool_conn.close()
+                except Exception:
+                    pass
+                self._pool_conn = None
+
     def list_tables(self):
         def go(con):
             with con.cursor() as cur:
@@ -145,6 +161,24 @@ class PostgresConnector(Connector):
                     "ORDER BY table_name", (self._schema(),))
                 return [r[0] for r in cur.fetchall()]
         return self._execute(go)
+
+    def list_namespaces(self):
+        """Schemas this login can see in the connected database, for the
+        connect screen's picker. PostgreSQL cannot cross databases in a query,
+        so the database is always the connected one."""
+        database = self._database().strip()
+
+        def go(con):
+            with con.cursor() as cur:
+                cur.execute(
+                    "SELECT schema_name FROM information_schema.schemata "
+                    "WHERE schema_name NOT IN ('information_schema', 'pg_catalog', "
+                    "'pg_toast') AND schema_name NOT LIKE 'pg\\_temp\\_%' "
+                    "AND schema_name NOT LIKE 'pg\\_toast\\_temp\\_%' "
+                    "ORDER BY schema_name")
+                return [r[0] for r in cur.fetchall()]
+
+        return [{"database": database, "schema": n} for n in self._execute(go)]
 
     def get_schema(self, table):
         def go(con):

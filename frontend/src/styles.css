@@ -1080,6 +1080,31 @@ input:focus, select:focus, .composer-pill:focus-within { box-shadow: 0 0 0 1px v
 .conn-field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
 .conn-field-wide { grid-column: 1 / -1; }
 .conn-label { font-size: 12px; color: var(--ink-2); }
+
+/* The schema picker: what this credential can see, grouped by database. */
+.conn-ns {
+  border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--surface); padding: 10px 12px;
+  max-height: 240px; overflow-y: auto;
+}
+.conn-ns-head {
+  display: flex; justify-content: space-between; align-items: baseline;
+  gap: 10px; margin-bottom: 8px;
+}
+.conn-ns-group + .conn-ns-group { margin-top: 10px; }
+.conn-ns-db {
+  font-size: 11px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase;
+  color: var(--ink-3); margin-bottom: 5px;
+}
+.conn-ns-list { display: flex; flex-wrap: wrap; gap: 6px; }
+.conn-ns-item {
+  display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+  font-size: 13px; padding: 5px 10px; border-radius: 999px;
+  border: 1px solid var(--line); background: var(--surface-2); color: var(--ink-2);
+}
+.conn-ns-item:hover { border-color: var(--axis); }
+.conn-ns-item input { margin: 0; accent-color: var(--accent); }
+.conn-ns-on { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
 .conn-req { color: var(--bad); }
 .conn-warn { color: var(--warn); }
 

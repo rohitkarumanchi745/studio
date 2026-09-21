@@ -182,7 +182,9 @@ def stream(since=0.0, limit=500):
             "training_revision, "
             "user_id, role, prompt, sql, chart_type, mode, reward, reward_source, source, "
             "tbl, meta FROM agent_traces WHERE training_revision > ? "
-            "AND reward IS NOT NULL ORDER BY training_revision LIMIT ?",
+            "AND reward IS NOT NULL "
+            "AND COALESCE(mode, '') != 'agent:aggregator' "
+            "ORDER BY training_revision LIMIT ?",
             (since, limit)).fetchall()
     out = []
     for r in rows:
@@ -202,7 +204,11 @@ def stream(since=0.0, limit=500):
             "updated_at": r["training_updated_at"],
             "revision": r["training_revision"],
             "user_id": r["user_id"], "role": r["role"],
-            "prompt": r["prompt"],
+            # Per-agent DAG traces retain the root prompt in the indexed DB
+            # column for readiness counting, while training replays the exact
+            # worker/reasoner message (including bounded upstream context).
+            "prompt": meta.get("conditioning_prompt") or r["prompt"],
+            "root_prompt": meta.get("root_prompt") or r["prompt"],
             # the action the decision-maker took (tool call), for tool-call training
             "action": action,
             "reward": r["reward"], "reward_source": r["reward_source"],

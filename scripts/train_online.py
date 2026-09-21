@@ -786,6 +786,11 @@ def to_samples(rollouts, skills=None):
         prompt = (r.get("prompt") or "").strip()
         if reward is None or reward < MIN_REWARD or not prompt:
             continue
+        if r.get("mode") == "agent:aggregator":
+            # The global adapter emits SQL/chart tool calls. The Aggregator is
+            # a synthesis policy whose output is prose, not a worker action.
+            stale["non_tool_policy"] += 1
+            continue
         if (r.get("mode") or "").startswith(("fallback", "error")):
             continue  # deterministic fallback / errors aren't policy to imitate
         completion = _completion_for(r.get("action"))
@@ -804,6 +809,18 @@ def to_samples(rollouts, skills=None):
                         # positions serving puts them (train == serve, multi-turn)
                         "history": r.get("history") or []})
     return samples, stale
+
+
+def tool_policy_rollouts(rollouts):
+    """Remove synthesis-policy rows before pending/replay persistence.
+
+    Older Studio versions mislabeled the Aggregator with a worker's last SQL.
+    Filtering only while formatting would make those poisoned rows live in the
+    durable pending/replay files forever. Drop them at ingestion as well; the
+    defensive checks in SFT/DPO formatting remain for direct callers.
+    """
+    return [row for row in (rollouts or [])
+            if not (isinstance(row, dict) and row.get("mode") == "agent:aggregator")]
 
 
 def mine_preference_pairs(rollouts, skills=None):
@@ -829,6 +846,9 @@ def mine_preference_pairs(rollouts, skills=None):
         prompt = (r.get("prompt") or "").strip()
         reward = r.get("reward")
         if not prompt or reward is None:
+            continue
+        if r.get("mode") == "agent:aggregator":
+            stale["non_tool_policy"] += 1
             continue
         if (r.get("mode") or "").startswith(("fallback", "error")):
             continue
@@ -1889,8 +1909,10 @@ def run_once(token, dry_run=False, defer_publish=False):
         raise SystemExit("[trainer] rollout stream cursor moved backwards or is not finite; checkpoint did not change")
     if not isinstance(incoming, list):
         raise SystemExit("[trainer] rollout stream returned no rollout list; checkpoint did not change")
+    incoming = tool_policy_rollouts(incoming)
+    pending = tool_policy_rollouts(pending)
     batch = merge_pending(pending, incoming)
-    replay_before = load_replay_corpus()
+    replay_before = tool_policy_rollouts(load_replay_corpus())
     rollouts = merge_replay(replay_before, batch)
     # Cursor + raw candidates commit together before a real round. A crash,
     # OOM, failed publish, or sub-threshold return can therefore replay every

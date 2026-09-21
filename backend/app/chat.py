@@ -1275,6 +1275,10 @@ class CanvasEdit(BaseModel):
     source: Optional[str] = None
     table: Optional[str] = None
     sql: Optional[str] = None
+    # Required for a persisted version. The server reloads this message and
+    # ignores every client-supplied data/provenance field above.
+    parent_message_id: Optional[str] = None
+    parent_panel_index: int = 0
 
 
 @router.post("/canvas/edit")
@@ -1289,6 +1293,52 @@ def canvas_edit(body: CanvasEdit, user=Depends(current_user)):
     if not instruction:
         raise HTTPException(400, "Empty instruction")
 
+    parent_content = None
+    working = body
+    if body.conversation_id:
+        # Ownership before inspecting the submitted frame: an unknown/shared
+        # conversation must not become an id oracle through a different 4xx.
+        access = _own_or_404(body.conversation_id, user, need="edit")
+        if not body.parent_message_id:
+            raise HTTPException(
+                400, "Saving a canvas version requires its server-stored parent message")
+        parent = next((m for m in _visible_messages(body.conversation_id, user, access)
+                       if m.get("id") == body.parent_message_id), None)
+        if (not parent or parent.get("role") != "assistant"
+                or (parent.get("content") or {}).get("redacted")):
+            raise HTTPException(400, "The parent canvas is unavailable under current access")
+        parent_content = parent.get("content") or {}
+        # Old canvas versions predate server-bound provenance and may contain
+        # client-asserted row/source associations. They cannot become a trusted
+        # parent for another persisted derivative.
+        if parent_content.get("mode") == "canvas_edit":
+            cp = parent_content.get("canvas_provenance")
+            if not isinstance(cp, dict) or cp.get("kind") != "canvas_v1" \
+                    or not isinstance(cp.get("parent_message_id"), str):
+                raise HTTPException(400, "This legacy canvas can only be edited locally")
+
+        frames = parent_content.get("panels") or [parent_content]
+        index = body.parent_panel_index
+        if (not isinstance(frames, list) or not frames or index < 0
+                or index >= len(frames) or not isinstance(frames[index], dict)):
+            raise HTTPException(400, "The parent canvas panel is unavailable")
+        frame = frames[index]
+        columns = frame.get("columns") or parent_content.get("columns") or []
+        rows = frame.get("rows")
+        if rows is None:
+            rows = parent_content.get("rows") or []
+        chart = frame.get("chart") if "chart" in frame else parent_content.get("chart")
+        source = frame.get("source") or parent_content.get("source")
+        sql = frame.get("sql") or parent_content.get("sql")
+        if not source or not isinstance(columns, list) or not isinstance(rows, list):
+            raise HTTPException(400, "The parent canvas has no attributable data frame")
+        # From here on, the edit is conditioned only on the governed server
+        # copy. Client rows/source/sql are deliberately ignored.
+        working = body.model_copy(update={
+            "columns": columns, "rows": rows, "chart": chart,
+            "source": source, "table": parent_content.get("table"), "sql": sql,
+        })
+
     # A sheet may hold several charts. When the source is known, composition
     # can also issue fresh RBAC-guarded SQL, so views the current result
     # aggregated away (a finer time grain, another window) are reachable.
@@ -1299,10 +1349,10 @@ def canvas_edit(body: CanvasEdit, user=Depends(current_user)):
     # single-chart editor forever. Every other LLM entry point on this path
     # (run_agent, available_models) already passes the user.
     if agent.llm_available(user=user):
-        connector, allowed, schemas = _canvas_source(body, user)
+        connector, allowed, schemas = _canvas_source(working, user)
         try:
             result = agent.compose_canvas(
-                instruction, body.columns, body.rows[:agent.MAX_ROWS], body.chart,
+                instruction, working.columns, working.rows[:agent.MAX_ROWS], working.chart,
                 connector=connector, allowed_tables=allowed, schemas=schemas, user=user)
             first = result["panels"][0]
             result = {**result, "columns": first["columns"], "rows": first["rows"],
@@ -1313,33 +1363,75 @@ def canvas_edit(body: CanvasEdit, user=Depends(current_user)):
 
     if result is None:
         result = agent.edit_canvas(
-            instruction, body.columns, body.rows[:agent.MAX_ROWS], body.chart, user=user)
-        result.setdefault("panels", [{"sql": body.sql, "columns": result["columns"],
+            instruction, working.columns, working.rows[:agent.MAX_ROWS], working.chart, user=user)
+        result.setdefault("panels", [{"sql": working.sql, "columns": result["columns"],
                                       "rows": result["rows"], "chart": result["chart"]}])
     db.log_activity(user, "canvas_edit", prompt=instruction,
                     row_count=len(result.get("rows") or []))
 
     message = None
+    message_id = None
     if body.conversation_id:
-        _own_or_404(body.conversation_id, user, need="edit")
-        panels = result.get("panels") or [{"sql": body.sql, "columns": result["columns"],
+        panels = result.get("panels") or [{"sql": working.sql, "columns": result["columns"],
                                            "rows": result["rows"], "chart": result["chart"]}]
+        # A composed panel that reuses the current rows has sql=None. Bind it
+        # to the trusted parent's replayable SQL so stored read-time checks can
+        # authorize it; a blend intentionally remains source=* / sql=None and
+        # carries its exact blend provenance below.
+        normalized_panels = []
+        for panel in panels:
+            panel = dict(panel)
+            panel.setdefault("source", working.source)
+            if not panel.get("sql") and working.source != "*":
+                panel["sql"] = working.sql
+            normalized_panels.append(panel)
+        # A persisted canvas message is the next authoritative parent, so it
+        # must contain the complete trusted sheet. Replace the selected parent
+        # frame with the edit's one-or-more frames and preserve every sibling;
+        # otherwise a second edit of panel N would point at a new message that
+        # only contains panel 0 and be rejected (or drift from what the UI
+        # still displays).
+        trusted_parent_panels = []
+        for parent_frame in frames:
+            parent_frame = dict(parent_frame)
+            parent_source = parent_frame.get("source") or parent_content.get("source")
+            parent_sql = parent_frame.get("sql") or parent_content.get("sql")
+            trusted_parent_panels.append({
+                "sql": parent_sql,
+                "columns": parent_frame.get("columns") or [],
+                "rows": parent_frame.get("rows") or [],
+                "chart": parent_frame.get("chart"),
+                "source": parent_source,
+                **({"agent": parent_frame["agent"]} if parent_frame.get("agent") else {}),
+            })
+        panels = (trusted_parent_panels[:body.parent_panel_index]
+                  + normalized_panels
+                  + trusted_parent_panels[body.parent_panel_index + 1:])
+        result = {**result, "panels": panels}
+        edited_panel = normalized_panels[0]
         message = {
             "text": f"✏️ {instruction} — {result.get('note', 'updated')}",
-            "sql": panels[0].get("sql") or body.sql,
+            "sql": edited_panel.get("sql") or working.sql,
             "columns": result["columns"],
             "rows": result["rows"],
             "chart": result["chart"],
             "panels": panels,
             "mode": "canvas_edit",
             "model": None,
-            "source": body.source,
-            "table": body.table,
+            "source": working.source,
+            "table": working.table,
             "author_role": user["role"],
+            "canvas_provenance": {
+                "kind": "canvas_v1", "parent_message_id": body.parent_message_id,
+                "parent_panel_index": body.parent_panel_index,
+            },
         }
-        db.add_message(body.conversation_id, "assistant", message)
+        if parent_content and parent_content.get("blend_provenance") is not None:
+            message["blend_provenance"] = parent_content["blend_provenance"]
+            message["blend_sql"] = parent_content.get("blend_sql")
+        message_id = db.add_message(body.conversation_id, "assistant", message)
 
-    return {**result, "message": message}
+    return {**result, "message": message, "message_id": message_id}
 
 
 class EmailReport(BaseModel):
@@ -1677,21 +1769,133 @@ def _sql_tables_allowed(role, source, content):
     from an orchestrated turn may name their own source; the message's source
     is the fallback. SQL with no attributable table (unparseable, or a file
     path) fails closed to the whole-source rule."""
-    checks = [(source, content.get("sql"))]
-    for p in content.get("panels") or []:
-        if isinstance(p, dict):
-            checks.append((p.get("source") or source, p.get("sql")))
-    for src, sql in checks:
-        if not sql or not src or src == "*":
-            continue
-        tables = queryguard.base_tables(sql)
-        if not tables:
-            if not _unrestricted(role, src):
+    def carries_data(item):
+        """A stored frame whose provenance must be attributable.
+
+        Columns and chart metadata remain after row retention, and the message
+        text can still summarize the old values, so an empty ``rows`` list is
+        not evidence that an unattributed panel is harmless.
+        """
+        return bool(item.get("rows") or item.get("columns") or item.get("chart"))
+
+    panels = content.get("panels") or []
+    if not isinstance(panels, list):
+        return False
+
+    # The top-level frame is usually the last/primary panel.  When an
+    # orchestrated result deliberately has source="*", its named panels are
+    # the provenance and the top-level duplicate is checked through them.
+    checks = []
+    top_sql = content.get("sql")
+    if source != "*" or top_sql:
+        checks.append((source, top_sql, content))
+    for panel in panels:
+        if not isinstance(panel, dict):
+            return False
+        checks.append((panel.get("source") or source, panel.get("sql"), panel))
+
+    attributed = False
+    for src, sql, item in checks:
+        if not sql:
+            if carries_data(item):
                 return False
             continue
-        if not all(rbac.can_access(role, src, t) for t in tables):
+        if not src or src == "*":
+            return False
+        if not _stored_pipeline_step_allowed(role, {"source": src, "sql": sql}, src):
+            return False
+        attributed = True
+
+    # source="*" with a data-bearing top-level frame cannot rely on a missing
+    # or empty panels list: there is no source/SQL pair to authorize its rows.
+    if source == "*" and carries_data(content) and not attributed:
+        return False
+    return True
+
+
+def _blend_provenance_allowed(role, content):
+    """Validate the server-minted provenance of a non-replayable blend.
+
+    A DuckDB blend has no warehouse SQL that can be re-run or re-filtered as a
+    whole.  Its rows are safe to release only under the exact governance
+    document that filtered every input, and while every verified input still
+    passes today's RBAC and namespace guard.  Identity is checked on both
+    sides of the per-input checks so an admin policy change racing this read
+    cannot release rows computed under the previous policy.
+    """
+    provenance = content.get("blend_provenance")
+    if not isinstance(provenance, dict) or provenance.get("kind") != "blend_v1":
+        return False
+    stored_identity = provenance.get("governance_identity")
+    inputs = provenance.get("inputs")
+    if not isinstance(stored_identity, str) or not stored_identity:
+        return False
+    if not isinstance(inputs, list) or len(inputs) < 2:
+        return False
+    # A real blended artifact is deliberately non-replayable against a source:
+    # blend_sql names transient DuckDB parts, while ordinary sql must stay null.
+    if content.get("source") != "*" or content.get("sql"):
+        return False
+    if not isinstance(content.get("blend_sql"), str) or not content["blend_sql"].strip():
+        return False
+
+    try:
+        if governance.identity() != stored_identity:
+            return False
+        for item in inputs:
+            if not isinstance(item, dict):
+                return False
+            src, sql = item.get("source"), item.get("sql")
+            table = item.get("table")
+            if (not isinstance(src, str) or not src or src == "*"
+                    or not isinstance(sql, str) or not sql.strip()
+                    or (table is not None and not isinstance(table, str))):
+                return False
+            if not _stored_pipeline_step_allowed(
+                    role, {"source": src, "table": table, "sql": sql}, src):
+                return False
+        if governance.identity() != stored_identity:
+            return False
+    except Exception:
+        # The exact governance identity is a security fact.  If its backing
+        # store cannot be read, do not reinterpret an old blended table under
+        # whatever process-local document happens to remain in memory.
+        return False
+
+    # The aggregate panel(s) must themselves be non-replayable.  Any additional
+    # ordinary panel still needs its own current source+SQL authorization.
+    panels = content.get("panels") or []
+    if not isinstance(panels, list):
+        return False
+    for panel in panels:
+        if not isinstance(panel, dict):
+            return False
+        src, sql = panel.get("source") or "*", panel.get("sql")
+        has_frame = bool(panel.get("rows") or panel.get("columns") or panel.get("chart"))
+        if src == "*" and not sql:
+            continue                       # the derived blended frame
+        if not sql:
+            if has_frame:
+                return False
+            continue
+        if src == "*" or not _stored_pipeline_step_allowed(
+                role, {"source": src, "sql": sql}, src):
             return False
     return True
+
+
+def _blend_identity_current(content):
+    """Final, exact-store identity check immediately before row release."""
+    provenance = content.get("blend_provenance")
+    if not isinstance(provenance, dict):
+        return False
+    stored = provenance.get("governance_identity")
+    if not isinstance(stored, str) or not stored:
+        return False
+    try:
+        return governance.identity() == stored
+    except Exception:
+        return False
 
 
 def _stored_pipeline_step_allowed(role, step, source=None):
@@ -1713,6 +1917,19 @@ def _stored_pipeline_step_allowed(role, step, source=None):
         from .connectors import get_connector
         connector = get_connector(source)
         dialect = getattr(connector, "dialect", None)
+        if dialect == "cypher":
+            # Stored graph results need the same dialect guard as live gateway
+            # execution.  Treating Cypher as SQL would safely hide every graph
+            # message, but would also make legitimate history unusable.
+            from . import cypherguard
+            tokens, _ = cypherguard._tokens(step["sql"].strip().rstrip(";"))
+            references = [name for name, is_rel in cypherguard._label_refs(tokens)
+                          if not is_rel]
+            allowed = [name for name in references
+                       if rbac.can_access(role, source, name)]
+            cypherguard.validate(step["sql"], allowed,
+                                 qualifiers=connector.qualifiers())
+            return True
         # RBAC matches table policies case-insensitively; SQL resolution is
         # dialect-specific. Derive catalog spellings from each reference and
         # keep only names the policy grants, just as the live catalog filter
@@ -1792,14 +2009,34 @@ def _msg_allowed(role, content, msg_role=None):
     source = content.get("source")
     if not source:
         # No provenance and no source: only safe for a message carrying no data.
-        return not (content.get("rows") or content.get("panels")) if not author else True
+        return not (content.get("rows") or content.get("columns")
+                    or content.get("panels") or content.get("sql"))
+
+    # A blended frame is not replayable against a warehouse: its blend_sql
+    # names transient in-memory DuckDB tables, and both its top-level and panel
+    # SQL are deliberately null.  Only its server-minted, version-bound input
+    # manifest can authorize it.  The marker is checked even after retention
+    # empties rows because the prose may still summarize those values.
+    non_replayable_blend = bool(
+        content.get("blend_provenance") is not None
+        or content.get("blend_sql") is not None
+        or (source == "*" and not content.get("sql")
+            and (content.get("rows") or content.get("columns")
+                 or any(isinstance(p, dict) and not p.get("sql")
+                        and (p.get("rows") or p.get("columns") or p.get("chart"))
+                        for p in (content.get("panels") or [])
+                        if isinstance(content.get("panels") or [], list)))))
+    if non_replayable_blend:
+        return _blend_provenance_allowed(role, content)
+
     label = str(content.get("table") or "*")
     if source == "*":
         sources = rbac.allowed_sources(role)
         return (bool(sources) and all(_unrestricted(role, s) for s in sources)
                 and _sql_tables_allowed(role, source, content))
     if label in ("*", "all tables", "all sources"):
-        return _unrestricted(role, source)
+        return (_unrestricted(role, source)
+                and _sql_tables_allowed(role, source, content))
     tables = [t.strip() for t in label.split(",") if t.strip()] or ["*"]
     return (all(rbac.can_access(role, source, t) for t in tables)
             and _sql_tables_allowed(role, source, content))
@@ -1894,6 +2131,17 @@ def _visible_messages(cid, user, access):
             # Released, and carrying data: today's compliance rules apply to
             # rows stored under yesterday's.
             m = {**m, "content": _governed(content)}
+        # _msg_allowed checked the identity on both sides of input validation,
+        # but a policy may change while _governed builds the returned copy.
+        # Check the exact store-backed epoch one last time immediately before
+        # append; unlike ordinary source SQL, a blend cannot be safely remasked.
+        if (not m["content"].get("redacted") and content.get("blend_provenance")
+                and not _blend_identity_current(content)):
+            m = {**m, "content": {
+                "text": _REDACTED, "redacted": True,
+                "source": content.get("source"), "table": content.get("table"),
+                "columns": [], "rows": [], "panels": [], "chart": None, "sql": None,
+            }}
         if not m["content"].get("redacted") and m["content"].get("pipeline"):
             m = {**m, "content": _pipeline_diagnostics(m["content"], user["role"])}
         out.append(m)

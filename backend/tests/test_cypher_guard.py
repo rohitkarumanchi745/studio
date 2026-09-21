@@ -19,7 +19,7 @@ os.environ.setdefault("STUDIO_DB_PATH", os.path.join(_TMP, "studio.db"))
 
 import pytest
 
-from app import cypherguard, db, gateway, governance
+from app import chat, cypherguard, db, gateway, governance
 from app.connectors.graph_conn import GraphConnector
 from app.cypherguard import enforce_limit, validate
 from app.queryguard import QueryRejected
@@ -294,3 +294,16 @@ def test_the_gateway_picks_the_guard_by_dialect(_graph):
     from app.connectors.demo import DemoConnector
     assert gateway._guard(_graph) is cypherguard
     assert gateway._guard(DemoConnector()).__name__.endswith("queryguard")
+
+
+def test_stored_graph_message_revalidates_with_the_cypher_guard(_graph):
+    governance._set(GOV_YAML, "test")
+    allowed = {
+        "text": "companies", "source": "neo4j", "table": "Company",
+        "author_role": "viewer", "sql": "MATCH (n:Company) RETURN n.name AS name",
+        "columns": ["name"], "rows": [["Acme"]], "panels": [],
+    }
+    denied = {**allowed, "table": "Person",
+              "sql": "MATCH (n:Person) RETURN n.name AS name"}
+    assert chat._msg_allowed("viewer", allowed)
+    assert not chat._msg_allowed("viewer", denied)

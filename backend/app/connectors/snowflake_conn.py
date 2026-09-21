@@ -116,6 +116,38 @@ class SnowflakeConnector(Connector):
             return [r[0] for r in cur.fetchall()]
         return self._execute(go)
 
+    def list_namespaces(self):
+        """Every database.schema pair this login can see, for the connect
+        screen's picker.
+
+        SHOW SCHEMAS IN ACCOUNT needs privileges a scoped role may not hold, so
+        it falls back to the current database's schemas. Columns are located by
+        NAME from cursor.description rather than by position: SHOW output has
+        gained columns across Snowflake releases and a fixed index silently
+        reads the wrong one."""
+        fallback_db = self._cfg()["database"]
+
+        def go(con):
+            cur = con.cursor()
+            try:
+                cur.execute("SHOW SCHEMAS IN ACCOUNT")
+            except Exception:
+                cur.execute("SHOW SCHEMAS")
+            cols = {d[0].lower(): i for i, d in enumerate(cur.description or [])}
+            name_at, db_at = cols.get("name"), cols.get("database_name")
+            if name_at is None:
+                return []
+            out = []
+            for r in cur.fetchall():
+                schema = r[name_at]
+                if not schema or schema.upper() == "INFORMATION_SCHEMA":
+                    continue
+                database = (r[db_at] if db_at is not None else "") or fallback_db
+                out.append({"database": database, "schema": schema})
+            return out
+
+        return self._execute(go)
+
     def get_schema(self, table):
         cfg = self._cfg()
 

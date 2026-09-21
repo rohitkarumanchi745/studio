@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api";
 import Canvas from "./Canvas";
 import ChartView from "./ChartView";
@@ -25,6 +25,7 @@ function buildCanvas(m) {
     panels,
     selected: 0,
     source: m.source,
+    parentMessageId: m.message_id,
     note: "",
     // `p.rows ?? []`: a panel without rows (a redacted message, a cached plan
     // that returned none) used to throw here — and the caller swallowed it and
@@ -89,6 +90,26 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
   useEffect(() => {
     api("/catalog/sources").then(setSources).catch(() => {});
   }, []);
+
+  // Group the picker by warehouse, and show each source's namespace beside it.
+  // A Studio source IS one namespace — it is pinned to the database/schema it
+  // was connected with — so "warehouse then schema" is spelled here as a group
+  // of sources rather than a second dropdown: picking `sales-sf · ACME.SALES`
+  // is picking that schema. Env-configured sources carry no namespace metadata
+  // and fall into a group of their own at the end.
+  const sourceGroups = useMemo(() => {
+    const ENV = "Built-in and environment sources";
+    const groups = [];
+    for (const s of sources) {
+      const label = s.type_label || ENV;
+      let g = groups.find((x) => x.label === label);
+      if (!g) groups.push((g = { label, items: [] }));
+      g.items.push(s);
+    }
+    for (const g of groups) g.items.sort((a, b) => a.name.localeCompare(b.name));
+    return groups.sort((a, b) =>
+      a.label === ENV ? 1 : b.label === ENV ? -1 : a.label.localeCompare(b.label));
+  }, [sources]);
 
   // An unsent draft survives a refresh / conversation switch: keyed per
   // conversation in localStorage, cleared once the prompt is sent (send()
@@ -399,11 +420,15 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
         <label>Source</label>
         <select value={source} onChange={(e) => setSource(e.target.value)}>
           <option value="*">✳ all sources — multi-agent</option>
-          {sources.map((s) => (
-            <option key={s.name} value={s.name} disabled={!s.allowed || !s.configured}>
-              {s.name}
-              {!s.configured ? " (not configured)" : !s.allowed ? " (no access)" : ""}
-            </option>
+          {sourceGroups.map((g) => (
+            <optgroup key={g.label} label={g.label}>
+              {g.items.map((s) => (
+                <option key={s.name} value={s.name} disabled={!s.allowed || !s.configured}>
+                  {s.name}{s.namespace ? ` · ${s.namespace}` : ""}
+                  {!s.configured ? " (not configured)" : !s.allowed ? " (no access)" : ""}
+                </option>
+              ))}
+            </optgroup>
           ))}
         </select>
         <label>Table</label>

@@ -1,16 +1,14 @@
-"""Cross-database orchestration — parallel fan-out + aggregator.
+"""Cross-database orchestration — dependency graph + terminal combiner.
 
                     ┌→ Snowflake agent ─┐
    User question ──┼→ Databricks agent ┼→ Aggregator → one synthesized answer
                     └→ SAP agent ───────┘
 
-Every configured source the user's role can access gets its own agent,
-briefed by that source's skill file (skills.py — RBAC-scoped tables/schemas).
-The agents are INDEPENDENT: the question is fanned out to all of them
-concurrently — each writes and runs its own SQL against its own source, with
-no knowledge of the others — and an aggregator then synthesizes their answers
-into one. Every agent's charts accumulate as panels, so a cross-database
-question renders one dashboard.
+The planner selects from sources the user's role can access and may make one
+agent depend on another's bounded result. Independent nodes still run in
+parallel. The terminal either synthesizes prose or, for ``combine=table``,
+uses the guarded in-memory blender to return one federated table. An unusable
+plan falls back to the original all-source fan-out.
 
 Fan-out is thread-safe: one thread per source, each with its own connector.
 It works with or without an LLM key — a keyless agent answers in its
@@ -18,9 +16,10 @@ deterministic fallback, and the aggregator falls back to a per-source summary.
 """
 import concurrent.futures
 import json
+import os
 import re
 
-from . import agent, lightning, progress, rbac, roster, skills, util
+from . import agent, agent_graph, lightning, progress, rbac, roster, skills, util
 from .connectors import all_sources, get_connector
 
 MAX_PARALLEL = 6
@@ -109,10 +108,41 @@ def run_orchestrated(prompt, user, history, model=None, conversation_id=None,
         result.setdefault("agents", [roster.worker(s["connector"].name)])
         return result
 
-    progress.emit("fanning out to " + ", ".join(
-        roster.name_for(s["connector"].name) for s in sources))
     spec = model or agent.llm_spec()
-    subs = _fanout(prompt, sources, user, model)
+
+    # Plan the shape of this turn, then run it. A planned graph lets one
+    # source's rows feed another's question ("the accounts from Postgres, then
+    # their spend in Snowflake"), which the blind fan-out below cannot express.
+    # With no LLM key, a single source, or an unusable plan, plan_graph returns
+    # the FLAT graph — every source, no dependencies — which executes as the
+    # same parallel fan-out this function always did. So the fallback path is
+    # the old behavior rather than an approximation of it, and _fanout stays
+    # for the kill switch.
+    graph = None
+    plan = None
+    run = None
+    if os.getenv("STUDIO_AGENT_GRAPH", "1").lower() not in ("0", "false", "no"):
+        plan = agent_graph.plan_graph(prompt, sources, user, model)
+        if plan.get("planned"):
+            progress.emit(f"planned {len(plan['nodes'])} agent(s): "
+                          + (plan.get("why") or "").strip())
+        else:
+            progress.emit("fanning out to " + ", ".join(
+                roster.name_for(s["connector"].name) for s in sources))
+        run = agent_graph.execute(plan, sources, prompt, user, model, conversation_id)
+        graph = run["graph"]
+        # execute() already recorded each node's rollout, so the per-worker
+        # loop below is skipped for this path — scoring a worker twice would
+        # double-weight it in its own policy.
+        subs = [run["results"][nid] for nid in run["order"]]
+    else:
+        progress.emit("fanning out to " + ", ".join(
+            roster.name_for(s["connector"].name) for s in sources))
+        subs = _fanout(prompt, sources, user, model)
+        for sub in subs:
+            lightning.record_agent_rollout(
+                user, conversation_id, prompt, roster.name_for(sub["_source"]),
+                "worker", sub, conditioning_prompt=prompt)
 
     panels, errors = [], []
     for sub in subs:
@@ -122,36 +152,100 @@ def run_orchestrated(prompt, user, history, model=None, conversation_id=None,
                            "agent": roster.name_for(sub["_source"])})
         errors.extend(sub.get("errors") or [])
 
+    table_requested = bool(plan and plan.get("combine") == "table")
+    blended, blend_error = None, None
+    if table_requested:
+        progress.emit("Aggregator: blending the agents' results into one table")
+        try:
+            blended = agent_graph.blend_parts(plan, run["results"], user)
+            if blended is None:
+                blend_error = ("every planned node must complete with verified SQL, "
+                               "and at least two usable parts are required")
+        except Exception as exc:
+            detail = getattr(exc, "detail", None) or str(exc) or type(exc).__name__
+            blend_error = str(detail)[:300]
+        if blend_error:
+            errors.append(f"Table combine failed: {blend_error}")
+
     progress.emit("Aggregator: synthesizing one answer from "
                   f"{len(subs)} agents' results")
     text = _aggregate(prompt, subs, user, spec)
+    if blend_error:
+        text = f"Could not produce the requested combined table: {blend_error}.\n\n{text}"
     last = next((r for r in subs if r.get("sql")), None)
 
-    # Per-agent reward shaping: each worker scored on ITS own answer, the
+    # A table plan returns the federated table itself, never the last worker's
+    # unrelated result.  The single panel also makes the canvas display that
+    # table rather than the pre-blend worker panels.  The combine statement is
+    # valid ONLY inside blend.py's throwaway DuckDB, so keep it as blend_sql;
+    # ordinary `sql` fields mean "replayable against source" and must stay null.
+    # If the blend failed, keep the worker panels for diagnosis but leave the
+    # top-level table empty.
+    if blended is not None:
+        table_chart = {"type": "table", "title": "Blended table"}
+        columns, rows, sql, chart, source = (
+            blended["columns"], blended["rows"], None, table_chart, "*")
+        panels = [{"sql": None, "columns": blended["columns"],
+                   "rows": blended["rows"], "chart": table_chart,
+                   "source": "*", "agent": roster.AGGREGATOR["name"]}]
+    elif table_requested:
+        columns, rows, sql, chart, source = [], [], None, None, "*"
+    else:
+        columns = last["columns"] if last else []
+        rows = last["rows"] if last else []
+        sql = last["sql"] if last else None
+        chart = last["chart"] if last else None
+        source = last["_source"] if last else subs[0]["_source"]
+
+    if graph is not None:
+        # The reasoner can still return a useful partial synthesis/table, but
+        # the requested graph did not complete when any planned worker failed
+        # or was skipped.  Preserve the partial artifact while marking the
+        # terminal outcome honestly for UI and learning.
+        terminal_status = "failed" if errors else "ok"
+        graph = agent_graph.describe(plan, run["results"], terminal_status,
+                                     len(rows))
+
+    # Per-agent reward shaping: each worker is scored on ITS own answer (done
+    # per node in agent_graph.execute, or in the kill-switch branch above), the
     # aggregator on ITS synthesis — separate rollouts, separate policies.
-    for sub in subs:
-        lightning.record_agent_rollout(
-            user, conversation_id, prompt, roster.name_for(sub["_source"]), "worker", sub)
+    reward_result = {"text": text, "sql": sql, "columns": columns, "rows": rows,
+                     "chart": chart, "panels": panels, "errors": errors,
+                     "model": spec, "source": source}
+    if blend_error:
+        # agent_reward treats this prefix as a terminal failure.  Do not award
+        # synthesis credit when the requested artifact was not produced.
+        reward_result["text"] = f"(Orchestrator error: {blend_error})"
     lightning.record_agent_rollout(
         user, conversation_id, prompt, roster.AGGREGATOR["name"], "aggregator",
-        {"text": text, "panels": panels, "model": spec})
+        reward_result, conditioning_prompt=_aggregate_prompt(prompt, subs))
+
+    executed_subs = [r for r in subs if r.get("_status") != "skipped"]
 
     return {
         "text": text,
-        "sql": last["sql"] if last else None,
-        "columns": last["columns"] if last else [],
-        "rows": last["rows"] if last else [],
-        "chart": last["chart"] if last else None,
+        "sql": sql,
+        "columns": columns,
+        "rows": rows,
+        "chart": chart,
         "panels": panels,
         "email": next((r["email"] for r in subs if r.get("email")), None),
         "errors": errors,
         "mode": "orchestrated",
         "model": spec,
-        "source": last["_source"] if last else subs[0]["_source"],
-        "agents_used": [r["_source"] for r in subs],
+        "source": source,
+        "agents_used": [r["_source"] for r in executed_subs],
         # The full named crew for this turn: every worker that ran + the
         # Aggregator that synthesized them.
-        "agents": [roster.worker(r["_source"]) for r in subs] + [roster.AGGREGATOR],
+        "agents": [roster.worker(r["_source"]) for r in executed_subs] + [roster.AGGREGATOR],
+        # The topology this turn actually ran, for the UI to draw. None when
+        # the kill switch is set and the classic fan-out ran instead.
+        "graph": graph,
+        **({"row_count": blended["row_count"], "blend_sql": blended["sql"],
+            "parts": blended["parts"],
+            "lineage": blended["lineage"],
+            "blend_provenance": blended["blend_provenance"]}
+           if blended is not None else {}),
     }
 
 
@@ -209,17 +303,22 @@ def _aggregate(prompt, subs, user, spec):
 
     try:
         llm = agent.make_llm(spec, user)
-        payload = json.dumps([{
-            "source": s["_source"],
-            "answer": s.get("text"),
-            "sql": s.get("sql"),
-            "columns": s.get("columns"),
-            "total_rows": len(s.get("rows") or []),
-        } for s in subs], default=str)
         reply = llm.invoke([("system", _AGG_SYS),
-                            ("user", f"Question: {prompt}\n\nPer-database answers:\n{payload}")])
+                            ("user", _aggregate_prompt(prompt, subs))])
         text = reply.content if isinstance(reply.content, str) else "".join(
             b.get("text", "") for b in reply.content if isinstance(b, dict))
         return text.strip() or summary
     except Exception:
         return summary or "Combined results — see the panels for each database."
+
+
+def _aggregate_prompt(prompt, subs):
+    """Exact user message supplied to the synthesis model and its trainer."""
+    payload = json.dumps([{
+        "source": s["_source"],
+        "answer": s.get("text"),
+        "sql": s.get("sql"),
+        "columns": s.get("columns"),
+        "total_rows": len(s.get("rows") or []),
+    } for s in subs], default=str)
+    return f"Question: {prompt}\n\nPer-database answers:\n{payload}"

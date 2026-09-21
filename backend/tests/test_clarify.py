@@ -145,7 +145,10 @@ def test_clarify_exchange_is_hidden_from_model_history_and_both_is_sticky(monkey
 
     def fake_run(prompt, user, history, model=None, conversation_id=None, sources=None):
         calls.append(prompt)
-        return {"text": "answered", "sql": "SELECT 1", "columns": ["x"], "rows": [[1]],
+        # Stored data-bearing answers need table-attributable SQL so the
+        # read-time governance gate can safely put them back in model history.
+        return {"text": "answered", "sql": "SELECT revenue FROM sales",
+                "columns": ["revenue"], "rows": [[1]],
                 "chart": None, "panels": [], "email": None, "errors": [],
                 "mode": "orchestrated", "model": None, "source": "demo",
                 "agents_used": ["demo", "snowflake"]}
@@ -173,4 +176,6 @@ def test_clarify_exchange_is_hidden_from_model_history_and_both_is_sticky(monkey
     # And the answered turns are what the model sees — no clarify text anywhere.
     hist = chat._conversation(cid, ANA, "next")[1]
     assert all("Which source" not in h["text"] for h in hist)
-    assert [h["text"] for h in hist if h["role"] == "assistant"] == ["answered", "answered"]
+    answers = [h["text"].split("\nCurrent pipeline", 1)[0]
+               for h in hist if h["role"] == "assistant"]
+    assert answers == ["answered", "answered"]

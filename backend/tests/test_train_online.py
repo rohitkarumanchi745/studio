@@ -578,6 +578,37 @@ def test_global_samples_fail_closed_on_history_literals_and_missing_role():
     assert dropped["no_role"] == 1
 
 
+def test_synthesis_rollouts_never_train_the_sql_tool_policy():
+    skills = {("demo", "admin"): {
+        "context": "schema", "allowed": {"sales"}, "dialect": "sqlite"}}
+    aggregator = _rollout("aggregate", 1, "SELECT * FROM sales", reward=1.0)
+    aggregator["mode"] = "agent:aggregator"
+
+    samples, sft_dropped = T.to_samples([aggregator], skills)
+    pairs, dpo_dropped = T.mine_preference_pairs([aggregator], skills)
+
+    assert samples == [] and pairs == []
+    assert sft_dropped["non_tool_policy"] == 1
+    assert dpo_dropped["non_tool_policy"] == 1
+    malformed = "not-a-rollout"
+    assert T.tool_policy_rollouts(
+        [aggregator, malformed, _rollout("worker", 2, "SELECT 1")]
+    ) == [malformed, _rollout("worker", 2, "SELECT 1")]
+
+
+def test_aggregator_cleanup_does_not_hide_malformed_rows_or_advance_cursor(tmp_path, monkeypatch):
+    module = _load({"STUDIO_TRAIN_OUTPUT_DIR": str(tmp_path)})
+    _trainer_stubs(module, monkeypatch)
+    monkeypatch.setattr(module, "pull_rollouts", lambda token, since: {
+        "rollouts": [{"mode": "agent", "prompt": "missing stable id"}],
+        "cursor": 9.0})
+
+    with pytest.raises(SystemExit, match="without a stable id"):
+        module.run_once("token")
+
+    assert module.load_training_state() == (0.0, [])
+
+
 def test_skill_fetch_is_conditioned_per_rollout_role(monkeypatch):
     calls = []
 

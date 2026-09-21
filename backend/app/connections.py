@@ -24,6 +24,7 @@ import re
 import threading
 import time
 import uuid
+from functools import lru_cache
 from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -48,13 +49,26 @@ _LOCK = threading.Lock()
 _CACHE = {}          # name -> ((row id, created_at), connector)
 
 
-def _fernet():
-    from . import bootstrap
-    secret = (bootstrap.jwt_secret() or "").encode()
-    if not secret:
-        raise RuntimeError("STUDIO_SECRET is not set; cannot derive the encryption key")
+@lru_cache(maxsize=2)
+def _fernet_for_secret(secret):
+    """Derive once per active Studio secret, not once per connection row.
+
+    Namespace selection can create many independently governed sources.  A
+    fresh 200k-round PBKDF2 for every row made catalog/list requests linear in
+    both source count *and* KDF cost.  Keying the small cache by the secret
+    keeps runtime rotation correct while retaining the intended derivation.
+    """
+    secret = secret.encode()
     kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=_SALT, iterations=200_000)
     return Fernet(base64.urlsafe_b64encode(kdf.derive(secret)))
+
+
+def _fernet():
+    from . import bootstrap
+    secret = bootstrap.jwt_secret() or ""
+    if not secret:
+        raise RuntimeError("STUDIO_SECRET is not set; cannot derive the encryption key")
+    return _fernet_for_secret(secret)
 
 
 # ── Dynamic connectors: the env-configured classes, fed a stored config ──
@@ -78,30 +92,36 @@ class _DynPostgres(PostgresConnector):
 
 class _DynSnowflake(SnowflakeConnector):
     def __init__(self, name, cfg):
+        super().__init__()                      # per-connection pool + lock
         self.name = name
         self._dyn = cfg
+        self._browsing = name == "__browse__"
 
     def _cfg(self):
         base = {"account": "", "user": "", "password": "", "warehouse": "",
-                "database": "", "schema": "PUBLIC"}
+                "database": "", "schema": "" if self._browsing else "PUBLIC"}
         base.update({k: v for k, v in self._dyn.items() if v})
         return base
 
 
 class _DynDatabricks(DatabricksConnector):
     def __init__(self, name, cfg):
+        super().__init__()                      # per-connection pool + lock
         self.name = name
         self._dyn = cfg
+        self._browsing = name == "__browse__"
 
     def _cfg(self):
         base = {"server_hostname": "", "http_path": "", "access_token": "",
-                "catalog": "", "schema": "default", "warehouse_id": ""}
+                "catalog": "", "schema": "" if self._browsing else "default",
+                "warehouse_id": ""}
         base.update({k: v for k, v in self._dyn.items() if v})
         return base
 
 
 class _DynBigQuery(BigQueryConnector):
     def __init__(self, name, cfg):
+        super().__init__()                      # cached client + lock
         self.name = name
         self._dyn = cfg
 
@@ -133,6 +153,7 @@ TYPES = {
     "postgres": {
         "label": "PostgreSQL", "dialect": "postgres", "build": _DynPostgres,
         "hint_key": "dsn",
+        "ns": {"schema": "schema", "database": ""},
         "fields": [
             _field("dsn", "Connection string (DSN)", required=True, secret=True,
                    placeholder="postgresql://user:password@host:5432/dbname"),
@@ -142,6 +163,7 @@ TYPES = {
     "snowflake": {
         "label": "Snowflake", "dialect": "snowflake", "build": _DynSnowflake,
         "hint_key": "account",
+        "ns": {"schema": "schema", "database": "database"},
         "fields": [
             _field("account", "Account", required=True, placeholder="org-account"),
             _field("user", "User", required=True),
@@ -154,6 +176,7 @@ TYPES = {
     "databricks": {
         "label": "Databricks SQL", "dialect": "databricks", "build": _DynDatabricks,
         "hint_key": "server_hostname",
+        "ns": {"schema": "schema", "database": "catalog"},
         "fields": [
             _field("server_hostname", "Server hostname", required=True,
                    placeholder="dbc-xxxx.cloud.databricks.com"),
@@ -167,6 +190,7 @@ TYPES = {
     "bigquery": {
         "label": "BigQuery", "dialect": "bigquery", "build": _DynBigQuery,
         "hint_key": "project",
+        "ns": {"schema": "dataset", "database": "project"},
         "fields": [
             _field("project", "Project", required=True),
             _field("dataset", "Dataset", required=True),
@@ -227,23 +251,59 @@ def _row_by_name(name):
     return dict(r) if r else None
 
 
+def _close_connector(conn):
+    if conn is not None and callable(getattr(conn, "close", None)):
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _evict_cached(name):
+    """Remove and close a cached connector without holding the registry lock
+    while a vendor SDK tears down sockets."""
+    with _LOCK:
+        hit = _CACHE.pop(name, None)
+    if hit:
+        _close_connector(hit[1])
+
+
 def resolve(name):
     """The live connector for a user-connected source, or None. Cached per row;
     a row that no longer decrypts resolves to None (fail closed)."""
     row = _row_by_name(name)
     if row is None or row["ctype"] not in TYPES:
+        _evict_cached(name)
         return None
     key = (row["id"], row["created_at"])
+    # Validate the encrypted row against the CURRENT Studio secret before a
+    # cache hit. Runtime secret rotation must fail closed immediately; an
+    # already-open vendor session is not authority to keep using credentials
+    # that this process can no longer decrypt. PBKDF derivation is cached, so
+    # this per-resolve Fernet authentication is cheap.
+    cfg = _decrypt(row["config"])
+    if cfg is None:
+        _evict_cached(name)
+        return None
     with _LOCK:
         hit = _CACHE.get(name)
         if hit and hit[0] == key:
             return hit[1]
-    cfg = _decrypt(row["config"])
-    if cfg is None:
-        return None
     conn = TYPES[row["ctype"]]["build"](row["name"], cfg)
+    old = None
+    winner = None
     with _LOCK:
-        _CACHE[name] = (key, conn)
+        hit = _CACHE.get(name)
+        if hit and hit[0] == key:
+            # Another request populated this row while we were constructing.
+            winner = hit[1]
+        else:
+            old = hit[1] if hit else None
+            _CACHE[name] = (key, conn)
+    if winner is not None:
+        _close_connector(conn)
+        return winner
+    _close_connector(old)
     return conn
 
 
@@ -255,9 +315,32 @@ def source_entries():
         t = TYPES.get(row["ctype"])
         if not t:
             continue
+        cfg = _decrypt(row["config"])
         out.append({"name": row["name"], "dialect": t["dialect"],
-                    "configured": _decrypt(row["config"]) is not None})
+                    "configured": cfg is not None,
+                    "type_label": t["label"], "ctype": row["ctype"],
+                    "namespace": _namespace(row["ctype"], cfg) if cfg else ""})
     return out
+
+
+def _namespace(ctype, cfg):
+    """The one namespace this connection is pinned to, as the engine spells it
+    — "acme_db.public", or just "public" when the database is unknown. Display
+    only: qualifiers() remains the thing that enforces it."""
+    t = TYPES.get(ctype) or {}
+    cfg = cfg or {}
+    schema = (cfg.get("schema") or cfg.get("dataset") or "").strip()
+    database = (cfg.get("database") or cfg.get("catalog") or cfg.get("project") or "").strip()
+    if not schema and not database:
+        # Postgres carries its database inside the DSN and defaults the schema.
+        if ctype == "postgres":
+            schema = "public"
+        else:
+            return ""
+    for f in t.get("fields", []):
+        if f["key"] in ("schema", "dataset") and not schema:
+            schema = (f.get("default") or "").strip()
+    return f"{database}.{schema}" if database and schema else (schema or database)
 
 
 def _hint(ctype, cfg):
@@ -278,6 +361,7 @@ def _public(row):
     return {"id": row["id"], "name": row["name"], "ctype": row["ctype"],
             "type_label": t.get("label", row["ctype"]), "label": row.get("label") or "",
             "hint": _hint(row["ctype"], cfg) if cfg else "",
+            "namespace": _namespace(row["ctype"], cfg) if cfg else "",
             "configured": cfg is not None, "created_at": row.get("created_at")}
 
 
@@ -292,14 +376,114 @@ def _probe(ctype, cfg):
     missing = [f["key"] for f in t["fields"] if f["required"] and not (cfg.get(f["key"]) or "").strip()]
     if missing:
         return {"ok": False, "error": "missing required fields: " + ", ".join(missing)}
+    conn = None
     try:
         conn = t["build"]("__probe__", cfg)
         if not conn.configured():
             return {"ok": False, "error": "the connector reports itself unconfigured — check the fields"}
         tables = conn.list_tables()
     except Exception as e:
-        return {"ok": False, "error": str(e)[:300]}
+        return {"ok": False, "error": _safe_connection_error(e, t, cfg)}
+    finally:
+        _close_connector(conn)
     return {"ok": True, "tables": len(tables), "sample": list(tables)[:8]}
+
+
+def _safe_connection_error(exc, connection_type, cfg):
+    """Return a useful connector error without reflecting submitted secrets.
+
+    Warehouse SDKs routinely include transformed connection kwargs in
+    authentication and transport errors.  Whenever a secret field was posted,
+    return a generic detail rather than trying to recognize every decoded form.
+    Credential-less errors retain their useful text, with URL user-info still
+    removed defensively.
+    """
+    # Do not attempt substring redaction when credentials were submitted. SDKs
+    # may decode URI escapes, base64 service-account JSON, PEM newlines, or
+    # nested JSON before interpolating a value into an exception, so there is
+    # no finite set of byte spellings we can safely scrub.  Preserve useful
+    # vendor details only for credential-less flows such as BigQuery ADC.
+    if any(field.get("secret") and str((cfg or {}).get(field["key"], "") or "")
+           for field in connection_type.get("fields", [])):
+        return "connection failed (credential details redacted)"
+
+    message = str(exc)
+    # Defensive catch for a driver-rendered DSN that is not byte-for-byte the
+    # submitted value (for example after percent decoding).
+    message = re.sub(
+        r"([A-Za-z][A-Za-z0-9+.-]*://)[^/@\s]+@",
+        r"\1[redacted]@",
+        message,
+    )
+    return message[:300]
+
+
+def _missing_fields(connection_type, cfg, *, for_browse=False):
+    """Required form fields absent from this operation.
+
+    Browsing authenticates first and discovers the namespace second, so the
+    schema/database fields populated by a picker are intentionally not browse
+    prerequisites.  The normal probe still requires every field; create calls
+    that probe and therefore retains the strict saved-source invariant.
+    """
+    namespace_fields = set()
+    if for_browse:
+        ns = connection_type.get("ns") or {}
+        namespace_fields = {key for key in (ns.get("schema"), ns.get("database")) if key}
+    return [field["key"] for field in connection_type["fields"]
+            if field["required"] and field["key"] not in namespace_fields
+            and not str((cfg or {}).get(field["key"], "") or "").strip()]
+
+
+def _browse(ctype, cfg):
+    """Namespaces the given credential can see, for the connect screen's
+    picker. Shaped like _probe: errors come back as data, never a 500, because
+    "this role cannot list schemas" is a normal answer and the admin can still
+    type the name. Never saved and never cached — the throwaway connector is
+    built from the posted config and dropped."""
+    t = TYPES.get(ctype)
+    if t is None:
+        return {"ok": False, "error": f"unknown connection type '{ctype}'", "namespaces": []}
+    missing = _missing_fields(t, cfg, for_browse=True)
+    if missing:
+        return {"ok": False, "error": "missing required fields: " + ", ".join(missing),
+                "namespaces": []}
+    conn = None
+    try:
+        # The leaf namespace is deliberately cleared even when its input has a
+        # UI default (PUBLIC/default).  Selecting it as the session schema can
+        # fail before SHOW/LIST has a chance to discover the schemas the role
+        # actually sees.  A database/catalog/project, when supplied, remains a
+        # useful discovery scope.
+        discovery_cfg = dict(cfg)
+        schema_field = (t.get("ns") or {}).get("schema")
+        if schema_field:
+            discovery_cfg[schema_field] = ""
+        conn = t["build"]("__browse__", discovery_cfg)
+        # Do not call configured(): for several connectors it deliberately
+        # means "credentials AND a table namespace are ready".  list_namespaces
+        # is the credential probe that discovers that namespace in the first
+        # place, and imports/connect failures are safely returned below.
+        found = conn.list_namespaces()
+        connector_truncated = bool(getattr(conn, "namespaces_truncated", False))
+    except Exception as e:
+        return {"ok": False, "error": _safe_connection_error(e, t, cfg), "namespaces": []}
+    finally:
+        _close_connector(conn)
+    # Cap the list: a metastore can hold thousands, and the picker is a picker,
+    # not a catalog browser. Deduplicated because SHOW output can repeat a pair.
+    seen, out = set(), []
+    truncated = connector_truncated
+    for n in found:
+        pair = ((n.get("database") or "").strip(), (n.get("schema") or "").strip())
+        if not pair[1] or pair in seen:
+            continue
+        seen.add(pair)
+        if len(out) >= 500:
+            truncated = True
+            continue
+        out.append({"database": pair[0], "schema": pair[1]})
+    return {"ok": True, "namespaces": out, "truncated": truncated}
 
 
 # ── Routes (admin-only) ──────────────────────────────────────────────────
@@ -324,7 +508,12 @@ class TestIn(BaseModel):
 @router.get("/types")
 def types(user=Depends(current_user)):
     _admin(user)
-    return [{"ctype": k, "label": t["label"], "dialect": t["dialect"], "fields": t["fields"]}
+    # `ns` tells the connect screen which fields a picked namespace writes
+    # into — the schema field is "dataset" on BigQuery, the database field is
+    # "catalog" on Databricks and lives inside the DSN on Postgres. Declaring
+    # it here keeps that mapping in one place instead of in the frontend.
+    return [{"ctype": k, "label": t["label"], "dialect": t["dialect"],
+             "fields": t["fields"], "ns": t.get("ns") or {}}
             for k, t in TYPES.items()]
 
 
@@ -338,6 +527,14 @@ def list_connections(user=Depends(current_user)):
 def test_connection(body: TestIn, user=Depends(current_user)):
     _admin(user)
     return _probe(body.ctype, {k: str(v) for k, v in (body.config or {}).items()})
+
+
+@router.post("/browse")
+def browse_connection(body: TestIn, user=Depends(current_user)):
+    """Which namespaces could this credential bind a source to? Admin-only for
+    the same reason /test is: it proves what an arbitrary DSN can reach."""
+    _admin(user)
+    return _browse(body.ctype, {k: str(v) for k, v in (body.config or {}).items()})
 
 
 @router.post("", status_code=201)
@@ -365,8 +562,7 @@ def create_connection(body: ConnIn, user=Depends(current_user)):
                   (row["id"], row["name"], row["ctype"], row["label"], row["config"],
                    row["created_by"], row["created_at"]))
         c.commit()
-    with _LOCK:
-        _CACHE.pop(name, None)
+    _evict_cached(name)
     db.log_activity(user, "connection_create", prompt=name, source=body.ctype)
     return _public(row)
 
@@ -380,7 +576,6 @@ def delete_connection(cid: str, user=Depends(current_user)):
             raise HTTPException(404, "Not found")
         c.execute("DELETE FROM data_connections WHERE id=?", (cid,))
         c.commit()
-    with _LOCK:
-        _CACHE.pop(r["name"], None)
+    _evict_cached(r["name"])
     db.log_activity(user, "connection_delete", prompt=r["name"], source=r["ctype"])
     return {"deleted": r["name"]}

@@ -170,6 +170,12 @@ def agent_reward(role, sub):
         return 0.0
 
     if role == "aggregator":
+        # The terminal may still provide a useful partial synthesis, but it is
+        # not a successful whole-plan example when any planned worker failed
+        # or was skipped.  A zero reward keeps incomplete runs out of positive
+        # training and leaves them available as recovery/negative examples.
+        if sub.get("errors"):
+            return 0.0
         if not text.strip():
             return 0.0
         r = 0.4
@@ -191,22 +197,41 @@ def agent_reward(role, sub):
 
 
 def record_agent_rollout(user, conversation_id, prompt, agent_name, role, sub,
-                         duration_ms=None):
+                         duration_ms=None, conditioning_prompt=None, history=None):
     """Persist one agent's decision as its own rollout, scored by its role. Uses
     the raw user prompt (not an agent-prefixed one) so per-agent rollouts don't
-    inflate the distinct-prompt count that gates training readiness."""
+    inflate the distinct-prompt count that gates training readiness.
+
+    ``conditioning_prompt`` is the exact task the worker/reasoner actually saw.
+    It can differ from the root prompt for a dependent DAG node (which receives
+    bounded upstream rows) and for the Aggregator (which receives the workers'
+    answers).  Training must replay that conditioning, while readiness still
+    counts the stable root prompt stored in the indexed ``prompt`` column.
+    """
+    root_prompt = prompt or ""
+    actual_prompt = conditioning_prompt if conditioning_prompt is not None else root_prompt
+    is_aggregator = role == "aggregator"
     try:
         tid = db.add_trace(
-            user, conversation_id=conversation_id, prompt=(prompt or "")[:1000],
+            user, conversation_id=conversation_id, prompt=root_prompt[:1000],
             model=sub.get("model"), mode=f"agent:{role}",
-            source=sub.get("_source") or sub.get("source"), sql=sub.get("sql"),
-            ok=not (sub.get("text") or "").startswith(("(agent error", "(Agent error")),
+            # A synthesis agent did not execute whichever worker query happens
+            # to back the top-level displayed table. Never label that SQL as
+            # its action: doing so poisons the global tool-call adapter and
+            # emits a fictitious studio.query trajectory event.
+            source="*" if is_aggregator else sub.get("_source") or sub.get("source"),
+            sql=None if is_aggregator else sub.get("sql"),
+            ok=(not sub.get("errors") and not (sub.get("text") or "").startswith(
+                ("(agent error", "(Agent error", "(Orchestrator error"))),
             error=(sub.get("errors") or [None])[0],
             row_count=len(sub.get("rows") or []),
             chart_type=(sub.get("chart") or {}).get("type"),
             panel_count=len(sub.get("panels") or []), duration_ms=duration_ms,
             reward=agent_reward(role, sub), reward_source="per_agent",
-            meta={"agent": agent_name, "agents": [agent_name], "role": role},
+            meta={"agent": agent_name, "agents": [agent_name], "role": role,
+                  "root_prompt": root_prompt,
+                  "conditioning_prompt": actual_prompt,
+                  "history": history or []},
         )
     except Exception:
         return None
@@ -540,15 +565,16 @@ def rollout_input(t):
     data_id is the Studio trace id: the server's /rollouts/terminal projection
     exposes input["data_id"], which is how the verl trainer joins a finished
     rollout back to the row it came from."""
+    meta = t.get("meta") or {}
     return {
         "data_id": t["id"],
-        "prompt": t.get("prompt"),
+        "prompt": meta.get("conditioning_prompt") or t.get("prompt"),
         "source": t.get("source"),
         "table": t.get("tbl"),
         "conversation_id": t.get("conversation_id"),
         # The turns the model actually saw, so training conditions the way
         # serving does (see record_chat_trace).
-        "history": (t.get("meta") or {}).get("history") or [],
+        "history": meta.get("history") or [],
     }
 
 

@@ -274,6 +274,48 @@ class DatabricksConnector(Connector):
             return [r[1] for r in cur.fetchall()]
         return self._execute(go)
 
+    #: Cap on catalogs walked by list_namespaces — one round trip each, and a
+    #: metastore with hundreds of catalogs must not hang the connect screen.
+    BROWSE_CATALOG_LIMIT = 25
+
+    def list_namespaces(self):
+        """Every catalog.schema pair this token can see, for the connect
+        screen's picker.
+
+        SHOW CATALOGS fails on a workspace without Unity Catalog, which is a
+        normal configuration, not an error — fall back to the schemas of the
+        current catalog. Catalog names come back from the server and go back in
+        as an identifier, so they are backtick-quoted and any name carrying a
+        backtick is skipped rather than escaped: there is no legitimate catalog
+        that needs one, and quoting it wrongly would be an injection."""
+        current = self._cfg()["catalog"]
+        self.namespaces_truncated = False
+
+        def go(con):
+            cur = con.cursor()
+            try:
+                cur.execute("SHOW CATALOGS")
+                catalogs = [r[0] for r in cur.fetchall() if r[0]]
+            except Exception:
+                catalogs = [current] if current else [""]
+            self.namespaces_truncated = len(catalogs) > self.BROWSE_CATALOG_LIMIT
+            out = []
+            for catalog in catalogs[:self.BROWSE_CATALOG_LIMIT]:
+                if "`" in catalog:
+                    continue
+                try:
+                    cur.execute(f"SHOW SCHEMAS IN `{catalog}`" if catalog else "SHOW SCHEMAS")
+                except Exception:
+                    continue
+                # SHOW SCHEMAS → (databaseName,) on Spark, (namespace,) on UC.
+                for r in cur.fetchall():
+                    schema = r[0]
+                    if schema and schema.lower() != "information_schema":
+                        out.append({"database": catalog, "schema": schema})
+            return out
+
+        return self._execute(go)
+
     def get_schema(self, table):
         def go(con):
             cur = con.cursor()

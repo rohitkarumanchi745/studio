@@ -17,7 +17,7 @@ const require = createRequire(import.meta.url);
 let hooks = null;
 const bundle = await build({
   stdin: {
-    contents: `export {default as DataConnections, buildTiles, suggestName}
+    contents: `export {default as DataConnections, buildTiles, suggestName, planConnections, connectionReadiness, Namespaces, namespaceKey, remainingPickedNamespaces}
       from "./src/components/DataConnections.jsx";
       export {metaFor} from "./src/components/sourceCatalog.jsx";`,
     resolveDir: frontend, loader: "jsx",
@@ -35,16 +35,19 @@ compiled.require = (id) => id === "react" ? {
   useMemo: (...args) => hooks ? hooks.useMemo(...args) : React.useMemo(...args),
 } : require(id);
 compiled._compile(bundle.outputFiles[0].text, compiled.filename);
-const { DataConnections, buildTiles, suggestName, metaFor } = compiled.exports;
+const { DataConnections, buildTiles, suggestName, planConnections, connectionReadiness,
+        Namespaces, namespaceKey, remainingPickedNamespaces, metaFor } = compiled.exports;
 
 // What the four endpoints answer on a deployment with Postgres configured from
 // the environment, one user-added Snowflake, and S3 keys that were never set.
 const TYPES = [
   { ctype: "postgres", label: "PostgreSQL", dialect: "postgres",
+    ns: { schema: "schema", database: "" },
     fields: [{ key: "dsn", label: "Connection string (DSN)", required: true, secret: true,
                default: "", placeholder: "postgresql://…" },
              { key: "schema", label: "Schema", required: false, secret: false, default: "public", placeholder: "" }] },
   { ctype: "snowflake", label: "Snowflake", dialect: "snowflake",
+    ns: { schema: "schema", database: "database" },
     fields: [{ key: "account", label: "Account", required: true, secret: false, default: "", placeholder: "org-account" }] },
 ];
 const CONNS = [{ id: "c1", name: "sales-sf", ctype: "snowflake", type_label: "Snowflake",
@@ -198,9 +201,19 @@ test("picking a source asks for that source's fields, and only that source's", a
       assert.match(html, /type="password"/);            // the DSN carries a password
       assert.match(html, /value="public"/);             // field defaults are prefilled
       assert.match(html, /value="postgres-2"/);         // and the name cannot collide
-      assert.match(html, /Test connection/);
+      // A type with namespaces offers to list them in the same press.
+      assert.match(html, /Sign in and list schemas/);
       // Nothing from another connector leaks into this form.
       assert.doesNotMatch(html, /Account|Warehouse|HTTP path/);
+
+      // A connector with no namespaces (Neo4j) skips the schema step entirely.
+      panel.set(S.types, [...TYPES, { ctype: "neo4j", label: "Neo4j", dialect: "cypher",
+        ns: {}, fields: [{ key: "uri", label: "URI", required: true, secret: false,
+                           default: "", placeholder: "bolt://host:7687" }] }]);
+      panel.set(S.picked, "neo4j");
+      const neo = panel.render();
+      assert.match(neo, /Test connection/);
+      assert.doesNotMatch(neo, /list schemas/);
 
       // Microsoft 365 is an OAuth grant, not a credential form.
       panel.set(S.picked, "m365");
@@ -232,4 +245,195 @@ test("a non-admin sees the map of sources but never a credential form", async ()
       assert.doesNotMatch(detail, /Connection string|Test connection/);
       assert.match(detail, /An administrator connects sources/);
     });
+});
+
+
+// ── The schema step ─────────────────────────────────────────────────────
+// A Studio source is pinned to ONE namespace: qualifiers() refuses any other,
+// and allowed_tables() matches bare table names, so a source spanning two
+// schemas would let a grant for `orders` admit the other schema's `orders`.
+// Picking N schemas therefore has to produce N sources, not one wide one.
+
+const SF_NS = { schema: "schema", database: "database" };
+const FOUND = [{ database: "acme", schema: "public" },
+                { database: "acme", schema: "analytics" },
+                { database: "warehouse", schema: "raw" }];
+
+test("picking three schemas plans three sources, each pinned to one namespace", () => {
+  const plan = planConnections({
+    cfg: { account: "acme-prod", password: "pw", schema: "public" },
+    ns: SF_NS, name: "sales-sf", chosen: FOUND, takenNames: new Set(["demo"]),
+  });
+
+  assert.deepEqual(plan.map((p) => [p.name, p.config.database, p.config.schema]), [
+    ["sales-sf-1", "acme", "public"],
+    ["sales-sf-2", "acme", "analytics"],
+    ["sales-sf-3", "warehouse", "raw"],
+  ]);
+  // Source names are catalog-visible even to roles without access. They must
+  // not repeat namespace names that the API deliberately redacts.
+  assert.ok(plan.every((p) => !p.name.includes(p.config.schema.toLowerCase())));
+  // The credential rides along unchanged; only the namespace differs.
+  assert.ok(plan.every((p) => p.config.account === "acme-prod" && p.config.password === "pw"));
+  // No plan is a superset of another — that is the whole safety property.
+  assert.equal(new Set(plan.map((p) => p.config.schema)).size, 3);
+});
+
+test("BigQuery's namespace lands on dataset/project, not schema/database", () => {
+  const plan = planConnections({
+    cfg: { project: "old-proj", dataset: "old", credentials_json: "{}" },
+    ns: { schema: "dataset", database: "project" }, name: "bq",
+    chosen: [{ database: "analytics-prod", schema: "Events" }],
+  });
+  assert.equal(plan.length, 1);
+  assert.equal(plan[0].config.dataset, "Events");   // case preserved — BigQuery is case-sensitive
+  assert.equal(plan[0].config.project, "analytics-prod");
+  assert.equal(plan[0].config.schema, undefined);
+});
+
+test("Postgres keeps its database in the DSN and only rewrites the schema", () => {
+  const plan = planConnections({
+    cfg: { dsn: "postgresql://u:p@h:5432/acme", schema: "public" },
+    ns: { schema: "schema", database: "" }, name: "pg",
+    chosen: [{ database: "acme", schema: "analytics" }],
+  });
+  assert.equal(plan[0].config.schema, "analytics");
+  assert.equal(plan[0].config.dsn, "postgresql://u:p@h:5432/acme");
+  assert.equal(plan[0].config[""], undefined);      // no empty-string key written
+});
+
+test("planned names dodge existing sources and each other", () => {
+  const plan = planConnections({
+    cfg: {}, ns: SF_NS, name: "sf", chosen: FOUND,
+    takenNames: new Set(["sf-1", "sf-2"]),
+  });
+  assert.deepEqual(plan.map((p) => p.name), ["sf-3", "sf-4", "sf-5"]);
+  assert.equal(new Set(plan.map((p) => p.name)).size, 3);
+  // Source names are [a-z0-9_-] and at most 31 characters, server-side.
+  for (const p of plan) assert.match(p.name, /^[a-z0-9][a-z0-9_-]{1,30}$/);
+});
+
+test("one picked namespace dodges a collision on the typed base name", () => {
+  const plan = planConnections({
+    cfg: {}, ns: SF_NS, name: "warehouse",
+    chosen: [{ database: "acme", schema: "analytics" }],
+    takenNames: new Set(["warehouse", "warehouse-1"]),
+  });
+  assert.equal(plan[0].name, "warehouse-2");
+  assert.equal(plan[0].config.database, "acme");
+  assert.equal(plan[0].config.schema, "analytics");
+});
+
+test("long generated names retain their uniqueness suffix", () => {
+  const base = "warehouse-connection-prefix";
+  const first = planConnections({
+    cfg: {}, ns: SF_NS, name: base,
+    chosen: [{ database: "acme", schema: "schema-name-one" },
+             { database: "acme", schema: "schema-name-two" }],
+  });
+  assert.ok(first[0].name.length <= 31);
+  assert.ok(first[1].name.length <= 31);
+  assert.notEqual(first[0].name, first[1].name);
+  assert.match(first[0].name, /-1$/);
+  assert.match(first[1].name, /-2$/);
+
+  const again = planConnections({
+    cfg: {}, ns: SF_NS, name: base,
+    chosen: [{ database: "acme", schema: "schema-name-one" }],
+    takenNames: new Set([base, first[0].name, first[1].name]),
+  });
+  assert.match(again[0].name, /-3$/);
+  assert.ok(again[0].name.length <= 31);
+});
+
+test("schema spelling never enters a public generated source name", () => {
+  const plan = planConnections({
+    cfg: {}, ns: SF_NS, name: "dw",
+    chosen: [{ database: "d", schema: "Raw.Events_2024" },
+             { database: "d", schema: "a-very-long-schema-name-that-will-be-cut-off" }],
+  });
+  for (const p of plan) assert.match(p.name, /^[a-z0-9][a-z0-9_-]{1,30}$/);
+  assert.deepEqual(plan.map((p) => p.name), ["dw-1", "dw-2"]);
+  assert.ok(plan.every((p) => !p.name.includes("raw") && !p.name.includes("schema")));
+});
+
+test("partial batch retry drops successful namespaces and reserves their names", () => {
+  const named = planConnections({
+    cfg: {}, ns: SF_NS, name: "dw", chosen: FOUND,
+  });
+  assert.deepEqual(named.map((p) => p.name), ["dw-1", "dw-2", "dw-3"]);
+
+  const initiallyPicked = FOUND.map(namespaceKey);
+  const remaining = remainingPickedNamespaces(initiallyPicked, named, ["dw-1"]);
+  assert.deepEqual(remaining, FOUND.slice(1).map(namespaceKey));
+
+  const retry = planConnections({
+    cfg: {}, ns: SF_NS, name: "dw", chosen: FOUND.slice(1),
+    takenNames: new Set(["dw-1"]),
+  });
+  assert.deepEqual(retry.map((p) => p.name), ["dw-2", "dw-3"]);
+  assert.ok(!retry.some((p) => p.config.schema === "public"));
+});
+
+test("picking nothing plans the single source the form already describes", () => {
+  const plan = planConnections({
+    cfg: { dsn: "postgresql://…", schema: "public" },
+    ns: { schema: "schema", database: "" }, name: "sales-pg", chosen: [],
+  });
+  assert.deepEqual(plan, [{ ns: null, name: "sales-pg",
+                            config: { dsn: "postgresql://…", schema: "public" } }]);
+});
+
+test("credentials can browse before required namespace fields are selected", () => {
+  const fields = [
+    { key: "account", required: true },
+    { key: "user", required: true },
+    { key: "password", required: true },
+    { key: "database", required: true },
+    { key: "schema", required: true },
+  ];
+  const cfg = { account: "acct", user: "analyst", password: "secret" };
+  assert.deepEqual(connectionReadiness({ fields, ns: SF_NS, cfg }), {
+    credentialsFilled: true,
+    saveFilled: false,
+  });
+  assert.deepEqual(connectionReadiness({
+    fields, ns: SF_NS, cfg,
+    chosen: [{ database: "ACME", schema: "PUBLIC" }],
+  }), { credentialsFilled: true, saveFilled: true });
+  assert.equal(connectionReadiness({
+    fields, ns: SF_NS, cfg: { account: "acct", user: "analyst" },
+  }).credentialsFilled, false);
+});
+
+// ── The checklist ───────────────────────────────────────────────────────
+
+const keyOf = (n) => `${n.database || ""}\u0000${n.schema}`;
+const renderNs = (props) => renderToStaticMarkup(
+  React.createElement(Namespaces, { picked: [], setPicked() {}, keyOf, ...props }));
+
+test("the checklist groups schemas under their database", () => {
+  const html = renderNs({ browse: { ok: true, namespaces: FOUND } });
+  assert.match(html, /Schemas this account can see/);
+  assert.match(html, /conn-ns-db">acme</);
+  assert.match(html, /conn-ns-db">warehouse</);
+  for (const schema of ["public", "analytics", "raw"]) {
+    assert.match(html, new RegExp(`<span>${schema}</span>`));
+  }
+  // Selection is visible, and only on what was picked.
+  const picked = renderNs({ browse: { ok: true, namespaces: FOUND },
+                            picked: [keyOf(FOUND[1])] });
+  assert.equal((picked.match(/conn-ns-on/g) || []).length, 1);
+  assert.match(picked, /1 selected/);
+});
+
+test("a listing the warehouse refused does not block connecting", () => {
+  const html = renderNs({ browse: { ok: false, error: "SHOW SCHEMAS denied", namespaces: [] } });
+  assert.match(html, /SHOW SCHEMAS denied/);
+  assert.match(html, /only affects the picker, not the connection/);
+  assert.doesNotMatch(html, /type="checkbox"/);
+
+  // And an account that simply sees nothing says so rather than looking broken.
+  assert.match(renderNs({ browse: { ok: true, namespaces: [] } }),
+               /No schemas visible to this account/);
 });

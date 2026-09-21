@@ -28,7 +28,7 @@ import re
 
 from fastapi import HTTPException
 
-from . import queries, queryguard, util
+from . import governance, queries, queryguard, util
 from .connectors.base import jsonify_rows
 
 # One blend is one in-memory table: cap it so a careless cartesian join cannot
@@ -201,6 +201,11 @@ def blend(user, parts, combine_sql=None):
     if not parts or len(parts) < 2:
         raise HTTPException(400, "A blend needs at least two parts")
 
+    try:
+        policy_identity = governance.identity()
+    except Exception as exc:
+        raise HTTPException(503, f"Governance identity unavailable: {str(exc)[:200]}")
+
     taken, prepared = set(), []
     for i, p in enumerate(parts):
         name = _safe_name(p.get("name") or f"{p.get('source', 'part')}_{p.get('table', i)}", taken)
@@ -251,6 +256,18 @@ def blend(user, parts, combine_sql=None):
         except Exception:
             pass
 
+    # The rows above were filtered under exactly policy_identity. A policy
+    # change at any point during the concurrent fetch or local combine makes
+    # the materialized table impossible to re-mask safely (its aliases and
+    # joins no longer map one-to-one to source columns), so discard it rather
+    # than persisting a result from a mixed policy epoch.
+    try:
+        closing_identity = governance.identity()
+    except Exception as exc:
+        raise HTTPException(503, f"Governance identity unavailable: {str(exc)[:200]}")
+    if closing_identity != policy_identity:
+        raise HTTPException(409, "Governance changed while blending; retry the request")
+
     return {
         "columns": columns,
         "rows": rows,
@@ -259,4 +276,13 @@ def blend(user, parts, combine_sql=None):
         "parts": [{k: f[k] for k in ("name", "source", "table", "columns", "row_count")}
                   for f in fetched],
         "lineage": lineage(fetched),
+        # Server-minted from the post-verification parts. Never copy this from
+        # a client canvas payload: stored reads trust the envelope only because
+        # every SQL string here is the cleaned statement the gateway ran.
+        "blend_provenance": {
+            "kind": "blend_v1",
+            "governance_identity": policy_identity,
+            "inputs": [{k: f.get(k) for k in ("source", "table", "sql")}
+                       for f in fetched],
+        },
     }

@@ -68,10 +68,18 @@ def _read_rows(user, source, sql, purpose, table, max_rows):
 @router.get("/sources")
 def sources(user=Depends(current_user)):
     allowed = rbac.allowed_sources(user["role"])
-    return [
-        {**s, "allowed": s["name"] in allowed}
-        for s in all_sources()
-    ]
+    out = []
+    for source in all_sources():
+        can_access = source["name"] in allowed
+        public = {**source, "allowed": can_access}
+        if not can_access:
+            # Source identity/status is intentionally visible so the picker can
+            # render a disabled "no access" option.  Its database/schema is
+            # catalog metadata, however, and follows the same permission gate
+            # as tables, schemas and samples below.
+            public.pop("namespace", None)
+        out.append(public)
+    return out
 
 
 @router.get("/sources/{source}/tables")

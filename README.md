@@ -80,7 +80,7 @@ flowchart TB
             route["router.py · learned-scope cascade"]
         end
         subgraph agents["Agent layer"]
-            orch["orchestrator.py · fan-out"]
+            orch["orchestrator.py · planned DAG / fan-out"]
             agent["agent.py · LangGraph ReAct"]
             flowm["flow.py · staged typed pipeline"]
             auto["autopilot.py · proactive agents"]
@@ -308,8 +308,9 @@ sequenceDiagram
 
 While a turn runs, the chat shows a **live activity feed** — the routing
 tier taken, which named agent is running which SQL, charts being rendered,
-fan-out and aggregation across sources — streamed by the worker running the
-turn through the background-task row the UI already polls (`progress.py`), so
+DAG planning/execution, fan-out fallback, and aggregation across sources —
+streamed by the worker running the turn through the background-task row the UI
+already polls (`progress.py`), so
 nothing new to deploy or open.
 
 Without an API key the agent degrades to a deterministic preview
@@ -398,23 +399,37 @@ flowchart LR
 
 Every connected source gets its own **worker agent**, briefed by an
 auto-generated *skill file* (`skills.py`) that lists only the tables the current
-user's role may touch. A cross-source question fans out to every accessible
-worker and an **Aggregator** synthesizes their answers; a staged pipeline adds a
-**Pipeline planner**, **Code generator**, **Validator**, **Approval agent**, and
-a **Deployment executor**; the verified-SQL path is served by a **SQL verifier**.
-`roster.py` gives each a stable name, so every answer reports which agent(s) ran
-and each rollout is attributed to them.
+user's role may touch. For a cross-source question, a planner selects only from
+that RBAC-filtered roster and may arrange the workers as a dependency DAG.
+Independent nodes run in parallel; a dependent node starts only after its
+upstreams succeed and receives a bounded, explicitly data-only projection of
+their rows. A failed node skips its dependent chain while independent branches
+still run. The terminal **Aggregator** either synthesizes the workers' answers
+or, for a `combine="table"` plan, sends every verified part through the guarded
+in-memory blend path and returns one table. A partial or failed blend is reported
+as a failure, not presented as a complete table. The successful combine statement
+is retained as `blend_sql` provenance, not ordinary replayable warehouse SQL:
+its input tables exist only inside that request's locked-down DuckDB, so chat does
+not mislabel it as a refresh action or reusable pipeline.
+
+Planning is a safe optimization, not an availability dependency: no model, a
+malformed/cyclic plan, or an unusable source selection falls back to the classic
+all-accessible-source parallel fan-out. Set `STUDIO_AGENT_GRAPH=0` to force that
+classic path. A staged pipeline separately adds a **Pipeline planner**, **Code
+generator**, **Validator**, **Approval agent**, and a **Deployment executor**;
+the verified-SQL path is served by a **SQL verifier**. `roster.py` gives each a
+stable name, so every answer reports which agent(s) ran and each executed node's
+rollout is attributed to it.
 
 ```mermaid
 flowchart LR
-    q["Question (source = all)"] --> orch["Orchestrator"]
-    orch --> w1["Snowflake agent"]
-    orch --> w2["Databricks agent"]
-    orch --> w3["Demo agent"]
-    w1 --> agg["Aggregator"]
-    w2 --> agg
+    q["Question (source = all)"] --> plan["Planner<br/>accessible sources only"]
+    plan --> w1["Postgres agent<br/>top accounts"]
+    w1 -->|"bounded reference rows"| w2["Snowflake agent<br/>spend for those accounts"]
+    plan --> w3["Databricks agent<br/>inventory"]
+    w2 --> agg["Reasoner / table combiner"]
     w3 --> agg
-    agg --> ans["one synthesized answer<br/>+ per-agent chart panels"]
+    agg --> ans["one answer or<br/>one guarded blended table"]
 ```
 
 The skill file carries a fingerprint of `(dialect, allowed tables, schemas)` and
@@ -1032,8 +1047,12 @@ flowchart LR
 
 An admin connects a warehouse straight from the **Data connections** screen — no
 env vars, no redeploy. Pick a type (PostgreSQL, Snowflake, Databricks SQL,
-BigQuery, Neo4j), fill the form, **Test**, **Save** — and it becomes a
-first-class source in the chat picker, served by the SAME connector classes the
+BigQuery, Neo4j), enter its credentials, and test them. For SQL warehouses the
+test also lists the visible schemas/datasets; select one or several, and Studio
+saves **one independently named and governed source per namespace**. A namespace
+that cannot be listed can still be typed explicitly and probed before save.
+Neo4j keeps the direct **Test** then **Save** flow. Every saved connection becomes
+a first-class source in the chat picker, served by the SAME connector classes the
 env-configured sources use, so the gateway guard, RBAC, governance masking and
 skill files all apply to it unchanged.
 
@@ -1042,8 +1061,10 @@ skill files all apply to it unchanged.
   by any endpoint and never logged — listings carry only a non-secret
   host/account/project hint. A rotated `STUDIO_SECRET` fails closed: the row stops
   decrypting, the source shows unconfigured, and an admin reconnects.
-- **Saved only after a live probe.** A connection is persisted only once a
-  `list_tables()` call against it succeeds, so a broken DSN can't be saved.
+- **Saved only after a live probe.** Namespace discovery validates the submitted
+  credentials but does not save them. Each selected or typed namespace is then
+  persisted only after its own `list_tables()` probe succeeds, so one credential
+  can create several separately scoped sources without saving a broken scope.
 - **Admin-only, governance-aware.** Create / list / delete are admin-only
   (pointing the server at a DSN is operator power). A new source is reachable by
   admin by default; other roles get it only through an explicit governance grant.
@@ -1271,7 +1292,7 @@ the SQL verifier on whether its check ran. So the orchestrated crew produces a
 per-worker rollout plus an aggregator rollout, and the `/learning` tally counts
 only single-agent rollouts — no agent's average is smeared by another's work.
 Each agent's reward + rollout count shows on its card in the **Agents** panel.
-Each is its own rollout on the server, so a fan-out turn delivers several.
+Each is its own rollout on the server, so a multi-agent turn delivers several.
 
 **Train our own model.** `GET /training` reports prompts collected vs. a
 threshold, reward-labeled and human-rated counts, and readiness; the admin
@@ -1566,8 +1587,8 @@ measurable.
   Postgres — the refresh only ever risked the *view*, and now not even that.
 - **Live agent activity** — while a background turn runs, the thinking bubble
   narrates it: routing tier, `snowflake agent: running SQL — SELECT …`,
-  chart rendering, fan-out / aggregation. Steps are appended to the task row
-  (`chat_tasks.steps`, capped) by `progress.py` from the worker running the
+  chart rendering, DAG execution, fan-out fallback / aggregation. Steps are
+  appended to the task row (`chat_tasks.steps`, capped) by `progress.py` from the worker running the
   turn and returned by the same `GET /tasks/{id}` poll; reopening a chat
   mid-run picks the feed back up.
 - **Chat folders** — personal, per-user organization of the sidebar: create /
@@ -1959,7 +1980,7 @@ optional and falls back to the in-process cache silently.
 | **404, never 403**, for unauthorized resources | The id space must not be an existence oracle | Slightly less "helpful" errors — intentional |
 | **Typed JSON contracts between flow stages** (Pydantic) | Explicit agent boundaries; every stage serializable + traceable | More ceremony than passing raw dicts |
 | **Fail-fast flow + repair loop → human review** | A bad artifact must never reach approval or deploy | A borderline case a smarter model could fix still goes to a human |
-| **Parallelize independent I/O, keep agent tools sequential** | Tools share the turn's context (`run_sql → render_chart` order matters) | No intra-turn tool parallelism — the orchestrator fans out across agents instead |
+| **Parallelize independent I/O, keep agent tools sequential** | Tools share the turn's context (`run_sql → render_chart` order matters) | No intra-turn tool parallelism — the orchestrator runs independent agent-graph nodes in parallel instead |
 | **One SQLite-shaped facade over Postgres** | Write each statement once; runs on dev and prod | The facade must patch dialect gaps (`REAL → DOUBLE`, uuid PKs) |
 | **Per-database agent + auto skill file** | RBAC-scoped context — an agent only ever sees tables the role may touch | The skill file must rebuild on any schema/access change (fingerprinted) |
 | **LangGraph provider-neutral ReAct** | Swap Claude ↔ GPT without touching the graph or tools | Bound to LangChain's abstractions |
@@ -2196,6 +2217,7 @@ you in: the account is created unverified and the emailed 6-digit code
 | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | Key for whichever provider `STUDIO_LLM` names (users may also BYOK) |
 | `HARRIER_EMBED_MODEL` / `HARRIER_EMBED_INSTRUCT` / `HARRIER_EMBED_KEY` | Harrier model id (default `microsoft/harrier-oss-v1-0.6b`), query instruction, optional auth |
 | `HARRIER_EMBED_URL` | Harrier embedding endpoint (OpenAI-compatible `/embeddings`); unset → lexical matching |
+| `STUDIO_AGENT_GRAPH` | Cross-source planner/executor toggle (default on). Set `0`, `false`, or `no` to force the classic independent all-accessible-source fan-out |
 | `STUDIO_HISTORY_TURNS` | Prior turns replayed to the model each turn (default 8); sessions keep the full transcript |
 | `STUDIO_LLM` | LangChain `init_chat_model` string — `anthropic:claude-sonnet-5`, `openai:gpt-4o`, … |
 | `STUDIO_LLM_BASE_URL` / `STUDIO_BITNET_LLM` | Self-hosted BitNet endpoint + model spec for the learned-scope router |
@@ -2436,8 +2458,9 @@ default; not needed at today's volume, adopt when data/QPS justify a cluster):
   safe, but it needs a numbered migration and a recorded SSO flag).
 
 **Product:**
-- **Blend into chat** — the cross-source blend engine is built + tested; wire the
-  Fields/encoding picker into the chat UI.
+- **Explicit cross-source field controls** — automatic planner-selected table
+  blending is wired into chat; add a Fields/encoding picker so users can request
+  the join shape directly instead of relying only on the planner.
 - **Data Threads** — the branching exploration history to complete the Data
   Formulator reshell.
 - CPU adapter hot-swap (auto PEFT→GGUF convert), dashboard drill-through,

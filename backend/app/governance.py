@@ -15,7 +15,8 @@ Fleet-wide hot reload. The parsed document is cached per PROCESS, but the
 store is shared, so `PUT /api/governance` can only reload the replica that
 handled it — every other web worker and the job worker would keep enforcing
 the older, more permissive document forever. The active document's IDENTITY
-is therefore a DB fact: governance_docs already records (id, applied_at), and
+is therefore a DB fact: governance_docs records an immutable row ID (plus a
+content digest to detect accidental in-place edits), and
 every accessor that gates a decision calls _refresh_if_stale() first, which at
 most once per STUDIO_GOVERNANCE_REFRESH_S (default 5s) per process reads that
 one indexed row and reloads when it differs. Tightening a policy converges
@@ -61,11 +62,17 @@ from .queryguard import QueryRejected, _tokens, base_tables
 
 router = APIRouter(prefix="/governance", tags=["governance"])
 
-_STATE = {"doc": None, "yaml": "", "source": None}  # in-process cache of the active doc
+_STATE = {"doc": None, "yaml": "", "source": None,
+          "identity": "builtin", "identity_basis": None}
+# in-process cache of the active doc. ``identity`` is deliberately distinct
+# from version(): version is a content digest used for cache keys, while the
+# identity includes the immutable governance_docs row ID.  Re-applying the
+# same YAML is therefore still a policy epoch change, which matters for
+# persisted, non-replayable artifacts such as blended rows.
 _ON_CHANGE = []   # callbacks fired whenever the active document changes (cache invalidation)
 
 # Freshness bookkeeping for _refresh_if_stale(): "at" is the monotonic time of
-# this process's last store probe, "ident" the (id, applied_at) of the newest
+# this process's last store probe, "ident" the (id, applied_at, digest) of the newest
 # applied document as of that probe. Both are process-local by design — they
 # describe what THIS process has seen, never what is true.
 _FRESH = {"at": 0.0, "ident": None}
@@ -100,18 +107,23 @@ def _refresh_ttl():
 
 
 def _newest_ident():
-    """(id, applied_at) of the newest applied document — the document's whole
-    identity, since a row is never edited in place. None when the table is
-    empty; _UNKNOWN when the store cannot be read at all, which must NEVER be
-    read as "no document" (that would fall open to built-in RBAC on a blip)."""
+    """(id, applied_at, digest) of the newest applied document.
+
+    Rows are immutable by contract; the digest also detects an accidental or
+    manual in-place edit instead of silently retaining the prior policy.
+    Returns None when the table is empty and _UNKNOWN when the store cannot be
+    read at all, which must NEVER be read as "no document" (that would fall
+    open to built-in RBAC on a blip).
+    """
     try:
         with db.connect() as c:
             row = c.execute(
-                "SELECT id, applied_at FROM governance_docs "
+                "SELECT id, yaml, applied_at FROM governance_docs "
                 "ORDER BY applied_at DESC, id DESC LIMIT 1").fetchone()
     except Exception:
         return _UNKNOWN
-    return (row["id"], row["applied_at"]) if row else None
+    return (row["id"], row["applied_at"],
+            hashlib.sha256(row["yaml"].encode("utf-8", "replace")).hexdigest()) if row else None
 
 
 def _refresh_if_stale():
@@ -148,6 +160,19 @@ def _refresh_if_stale():
     load()
 
 
+def _document_identity(prefix, text, epoch=None):
+    """Stable, non-secret identity for one effective policy epoch."""
+    digest = hashlib.sha256((text or "").encode("utf-8", "replace")).hexdigest()
+    return f"{prefix}:{epoch + ':' if epoch else ''}{digest}"
+
+
+def _set_state(doc, text, source, ident):
+    _STATE.update(doc=doc, yaml=text, source=source, identity=ident)
+    _STATE["identity_basis"] = (
+        _STATE["yaml"], _STATE["source"], _STATE["doc"] is not None,
+        _FRESH.get("ident"))
+
+
 def load():
     """Load the active document: DB (admin-applied) first, else STUDIO_GOVERNANCE
     file, else none (Studio uses built-in RBAC). Cached in _STATE; accessors
@@ -158,32 +183,45 @@ def load():
                         "ORDER BY applied_at DESC, id DESC LIMIT 1").fetchone()
     # Record the identity even when the row's YAML is unusable: otherwise every
     # refresh would see a "change" and reload the same broken document forever.
-    _FRESH.update(at=time.monotonic(),
-                  ident=(row["id"], row["applied_at"]) if row else None)
+    _FRESH.update(
+        at=time.monotonic(),
+        ident=((row["id"], row["applied_at"],
+                hashlib.sha256(row["yaml"].encode("utf-8", "replace")).hexdigest())
+               if row else None))
+    epoch = str(row["id"]) if row else None
     if row and row["yaml"].strip():
-        _set(row["yaml"], "database")
+        _set(row["yaml"], "database",
+             identity=_document_identity("database", row["yaml"], epoch))
         return
     path = os.getenv("STUDIO_GOVERNANCE")
     if path and os.path.isfile(path):
         with open(path) as f:
-            _set(f.read(), f"file:{path}")
+            text = f.read()
+            # An empty DB row is a clear tombstone. Include its epoch even
+            # when the configured file becomes the effective fallback.
+            prefix = "database-clear-file" if epoch else "file"
+            _set(text, f"file:{path}",
+                 identity=_document_identity(prefix, text, epoch))
         return
-    _STATE.update(doc=None, yaml="", source=None)
+    ident = f"database-clear:{epoch}" if epoch else "builtin"
+    _set_state(None, "", None, ident)
     _changed()
 
 
-def _set(text, source):
+def _set(text, source, identity=None):
     """Install a document in this process. Callers other than load() (a test,
     a direct injection) deliberately leave _FRESH["ident"] alone: what they
     installed stands until the STORE's newest document differs from the one
     this process last observed — at which point the store, the shared fact,
     wins."""
     ok, errors, doc = validate(text)
+    ident = identity or _document_identity("local", text)
     if ok:
-        _STATE.update(doc=doc, yaml=text, source=source)
+        _set_state(doc, text, source, ident)
     else:
         # A malformed stored doc must fail closed to built-in RBAC, not crash.
-        _STATE.update(doc=None, yaml=text, source=f"{source} (invalid: {errors[0] if errors else '?'})")
+        invalid_source = f"{source} (invalid: {errors[0] if errors else '?'})"
+        _set_state(None, text, invalid_source, ident)
     _FRESH["at"] = time.monotonic()      # just installed is just checked
     _changed()
 
@@ -219,6 +257,35 @@ def version():
     if not doc:
         return "builtin"
     return hashlib.sha1(_STATE["yaml"].encode("utf-8", "replace")).hexdigest()[:12]
+
+
+def identity():
+    """Return the exact active policy epoch used for a security decision.
+
+    Unlike :func:`version`, this changes when an administrator re-applies
+    byte-identical YAML.  That closes an A -> B -> A gap for stored blended
+    rows: equality means both the policy content and its immutable application
+    epoch are the same.  The basis check also makes direct test/config
+    injection safe instead of accidentally retaining a previous identity.
+    """
+    # Identity is used to authorize release of rows that cannot be safely
+    # re-filtered later.  The ordinary accessor TTL is intentionally not good
+    # enough here: an apply on another replica halfway through a blend/read
+    # must be observable by the closing identity check.
+    store_ident = _newest_ident()
+    if store_ident is _UNKNOWN:
+        raise RuntimeError("governance identity is unavailable")
+    if store_ident != _FRESH.get("ident"):
+        load()
+    else:
+        _FRESH["at"] = time.monotonic()
+    basis = (_STATE.get("yaml", ""), _STATE.get("source"),
+             _STATE.get("doc") is not None, _FRESH.get("ident"))
+    if _STATE.get("identity_basis") != basis:
+        if not _STATE.get("doc") and not _STATE.get("yaml") and not _STATE.get("source"):
+            return "builtin"
+        return _document_identity("local", _STATE.get("yaml", ""))
+    return _STATE.get("identity") or "builtin"
 
 
 def loaded():
@@ -675,10 +742,18 @@ def apply_config(body: YamlIn, user=Depends(current_user)):
 
 @router.delete("")
 def clear_config(user=Depends(current_user)):
-    """Revert to built-in RBAC (removes the applied document)."""
+    """Revert to built-in RBAC and record a new policy epoch.
+
+    A tombstone, rather than deleting policy history, makes apply/clear/apply
+    transitions distinguishable to persisted artifacts even when the first
+    and last YAML are byte-identical.
+    """
     _admin(user)
     with db.connect() as c:
         c.execute("DELETE FROM governance_docs")
+        c.execute("INSERT INTO governance_docs (id, yaml, applied_by, applied_at) "
+                  "VALUES (?,?,?,?)",
+                  (__import__("uuid").uuid4().hex, "", (user or {}).get("email"), time.time()))
         c.commit()
     reload()
     db.log_activity(user, "governance_clear")

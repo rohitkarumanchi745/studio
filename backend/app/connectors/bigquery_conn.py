@@ -174,6 +174,21 @@ class BigQueryConnector(Connector):
         c = self._client()
         return sorted(t.table_id for t in c.list_tables(self._dataset_ref()))
 
+    def list_namespaces(self):
+        """Datasets in the configured project, for the connect screen's picker.
+        datasets.list is a metadata call, so this bills nothing — the same
+        reason list_tables() avoids INFORMATION_SCHEMA. Dataset ids are
+        case-sensitive and are returned exactly as BigQuery spells them, which
+        is what qualifiers() will later have to match."""
+        c = self._client()
+        # An inline service-account key or ADC can establish the project even
+        # before the form has one selected.  Return the client's resolved
+        # project so picking this dataset also fills the required project field.
+        project = self._project() or str(getattr(c, "project", "") or "")
+        return [{"database": project, "schema": d.dataset_id}
+                for d in sorted(c.list_datasets(project=project or None),
+                                key=lambda d: d.dataset_id)]
+
     def get_schema(self, table):
         c = self._client()
         t = c.get_table(f"{self._dataset_ref()}.{table}")

@@ -212,6 +212,35 @@ def test_clearing_the_document_propagates_back_to_builtin_rbac():
     assert worker.version() == "builtin"
 
 
+def test_policy_identity_tracks_reapply_and_a_persisted_clear_epoch():
+    """Content digests are insufficient for non-remaskable stored rows.
+
+    Re-applying identical YAML and returning to built-in policy are distinct
+    epochs, and clear leaves one tombstone so another replica can observe it.
+    """
+    builtin_identity = governance.identity()
+    assert governance.apply_yaml(TIGHTEN, ADMIN)[0]
+    first = governance.identity()
+    assert first != builtin_identity
+
+    assert governance.apply_yaml(TIGHTEN, ADMIN)[0]
+    second = governance.identity()
+    assert second != first                         # identical text, new event
+
+    result = governance.clear_config(ADMIN)
+    cleared = governance.identity()
+    assert result["cleared"] is True and not governance.loaded()
+    assert governance.version() == "builtin"
+    assert cleared not in (builtin_identity, first, second)
+    c = db._conn()
+    rows = c.execute("SELECT yaml FROM governance_docs").fetchall()
+    c.close()
+    assert len(rows) == 1 and rows[0]["yaml"] == ""  # observable tombstone
+
+    worker = _replica()
+    assert worker.identity() == cleared
+
+
 # ── The cost: one indexed single-row read per process per TTL ───────────
 
 def test_the_ttl_throttles_the_store_probe(monkeypatch):

@@ -28,7 +28,7 @@ os.environ.setdefault("STUDIO_DB_PATH", os.path.join(_TMP, "studio.db"))
 
 import pytest
 
-from app import chat, db, mcp, migrations, qcache, redteam, trainer
+from app import chat, db, mcp, migrations, qcache, redteam, sessions, trainer
 
 # Table -> columns a migration must add. Mirrors MIGRATIONS.
 EXPECTED = {
@@ -41,6 +41,7 @@ EXPECTED = {
     "redteam_benchmarks": ["model_revision"],
     "training_adapters": ["sha256"],
     "agent_traces": ["updated_at", "training_revision"],
+    "agent_sessions": ["conversation_message_ids", "is_fork"],
 }
 
 # Derived from the list itself, so appending a migration does not mean editing
@@ -78,6 +79,10 @@ CREATE TABLE training_adapters (
     status TEXT NOT NULL DEFAULT 'active', created_at REAL NOT NULL);
 CREATE TABLE agent_traces (
     id TEXT PRIMARY KEY, created_at REAL NOT NULL);
+CREATE TABLE agent_sessions (
+    id TEXT PRIMARY KEY, user_id TEXT NOT NULL, conversation_id TEXT,
+    title TEXT NOT NULL, messages TEXT NOT NULL, created_at REAL NOT NULL,
+    updated_at REAL NOT NULL);
 """
 
 
@@ -180,6 +185,25 @@ def test_old_columns_get_working_defaults(old_db):
     raw.close()
 
 
+def test_session_fork_migration_marks_only_the_oldest_row_canonical(old_db):
+    raw = sqlite3.connect(old_db)
+    raw.execute("INSERT INTO agent_sessions "
+                "(id,user_id,conversation_id,title,messages,created_at,updated_at) "
+                "VALUES ('original','u','c','original','[]',1,1)")
+    raw.execute("INSERT INTO agent_sessions "
+                "(id,user_id,conversation_id,title,messages,created_at,updated_at) "
+                "VALUES ('fork','u','c','fork','[]',2,2)")
+    raw.commit()
+    raw.close()
+
+    migrations.apply_pending()
+    raw = sqlite3.connect(old_db)
+    assert raw.execute(
+        "SELECT id,is_fork FROM agent_sessions ORDER BY created_at").fetchall() == [
+            ("original", 0), ("fork", 1)]
+    raw.close()
+
+
 # ── Fresh baseline: nothing to alter, versions still recorded ────────────
 
 def test_fresh_baseline_records_without_altering(fresh_path):
@@ -189,6 +213,7 @@ def test_fresh_baseline_records_without_altering(fresh_path):
     qcache.init_tables()
     redteam.init_tables()
     trainer.init_tables()
+    sessions.init_tables()
     _assert_complete(fresh_path)                          # baseline is complete
     before = {t: _columns(fresh_path, t) for t in EXPECTED}
 

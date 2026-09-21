@@ -26,8 +26,9 @@ _TMP = tempfile.mkdtemp(prefix="studio-sharing-test-")
 os.environ["STUDIO_DB_PATH"] = os.path.join(_TMP, "studio.db")
 
 import pytest
+from fastapi import HTTPException
 
-from app import chat, db, governance
+from app import chat, db, governance, sessions
 
 warnings.filterwarnings("ignore")
 
@@ -60,6 +61,7 @@ def _tables():
     db.init_db()
     chat.init_tables()
     governance.init_tables()
+    sessions.init_tables()
     yield
 
 
@@ -137,10 +139,12 @@ def test_table_label_is_not_trusted_when_sql_reads_another_table():
                                                 "SELECT * FROM t", "columns": ["x"],
                                         "rows": [[1]]}]}
     assert not chat._msg_allowed("viewer", with_panel)
-    # Unattributable SQL (a file path) fails closed to the whole-source rule.
+    # Unattributable SQL (a file path) fails closed even for a whole-source
+    # role: stored frames now require a currently valid source/namespace query,
+    # not merely a broad role grant.
     opaque = {**honest, "sql": "SELECT * FROM 's3://b/x.parquet'"}
     assert not chat._msg_allowed("viewer", opaque)
-    assert chat._msg_allowed("analyst", opaque)
+    assert not chat._msg_allowed("analyst", opaque)
 
 
 # ── (c) read-time compliance, owner included, DB untouched ──────────────
@@ -262,6 +266,316 @@ def test_questions_stay_visible_to_a_restricted_reader():
     assert shown[0]["content"]["text"] == q["text"] and not shown[0]["content"].get("redacted")
     assert shown[1]["content"].get("redacted")
     assert chat._hidden_count(cid, "viewer") == 1
+
+
+def _blend_content(identity="gov-a"):
+    return {
+        "text": "Ada's lifetime value is 4200 across both systems.",
+        "source": "*", "table": "all sources", "author_role": "analyst",
+        "sql": None, "blend_sql": "SELECT * FROM left JOIN right USING (id)",
+        "columns": ["id", "lifetime_value"], "rows": [[1, 4200.0]],
+        "chart": {"type": "table"},
+        "panels": [{"source": "*", "sql": None,
+                    "columns": ["id", "lifetime_value"],
+                    "rows": [[1, 4200.0]], "chart": {"type": "table"}}],
+        "blend_provenance": {
+            "kind": "blend_v1", "governance_identity": identity,
+            "inputs": [
+                {"source": "demo", "table": "sales",
+                 "sql": "SELECT id, revenue FROM sales LIMIT 2000"},
+                {"source": "demo", "table": "customers",
+                 "sql": "SELECT id, lifetime_value FROM customers LIMIT 2000"},
+            ],
+        },
+    }
+
+
+def test_blend_requires_stable_identity_and_every_verified_input(monkeypatch):
+    identities = iter(["gov-a", "gov-a"])
+    checked = []
+    monkeypatch.setattr(governance, "identity", lambda: next(identities))
+    monkeypatch.setattr(
+        chat, "_stored_pipeline_step_allowed",
+        lambda role, step, source=None: checked.append((source, step["sql"])) or True)
+
+    assert chat._msg_allowed("analyst", _blend_content())
+    assert [source for source, _ in checked] == ["demo", "demo"]
+
+    # An input permission failure denies the whole derived artifact; a partial
+    # provenance check would let the aggregate retain the denied input's rows.
+    monkeypatch.setattr(governance, "identity", lambda: "gov-a")
+    monkeypatch.setattr(
+        chat, "_stored_pipeline_step_allowed",
+        lambda role, step, source=None: "customers" not in step["sql"])
+    assert not chat._msg_allowed("analyst", _blend_content())
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda c: c.pop("blend_provenance"),
+    lambda c: c["blend_provenance"].update(kind="future_or_forged"),
+    lambda c: c["blend_provenance"].pop("governance_identity"),
+    lambda c: c["blend_provenance"].update(inputs=[]),
+    lambda c: c["blend_provenance"].update(inputs=c["blend_provenance"]["inputs"][:1]),
+    lambda c: c["blend_provenance"]["inputs"][0].update(source="*"),
+    lambda c: c["blend_provenance"]["inputs"][0].update(sql=""),
+])
+def test_blend_provenance_is_fail_closed(monkeypatch, mutate):
+    content = _blend_content()
+    mutate(content)
+    monkeypatch.setattr(governance, "identity", lambda: "gov-a")
+    monkeypatch.setattr(chat, "_stored_pipeline_step_allowed", lambda *a, **k: True)
+    assert not chat._msg_allowed("analyst", content)
+
+
+def test_blend_read_closes_policy_change_race_and_survives_row_retention(monkeypatch):
+    identities = iter(["gov-a", "gov-b"])
+    monkeypatch.setattr(governance, "identity", lambda: next(identities))
+    monkeypatch.setattr(chat, "_stored_pipeline_step_allowed", lambda *a, **k: True)
+    assert not chat._msg_allowed("analyst", _blend_content())
+
+    # Retention removes values but deliberately keeps prose and columns.  The
+    # provenance/version gate must still hide that prose under a new policy.
+    purged = _blend_content()
+    purged["rows"] = []
+    purged["rows_purged"] = True
+    purged["panels"][0]["rows"] = []
+    monkeypatch.setattr(governance, "identity", lambda: "gov-b")
+    assert not chat._msg_allowed("analyst", purged)
+
+
+def test_visible_messages_rechecks_blend_identity_immediately_before_release(monkeypatch):
+    identities = iter(["gov-a", "gov-a", "gov-b"])
+    monkeypatch.setattr(governance, "identity", lambda: next(identities))
+    monkeypatch.setattr(chat, "_stored_pipeline_step_allowed", lambda *a, **k: True)
+    cid, _ = _chat_with(ANA, _blend_content())
+
+    shown = chat._visible_messages(cid, ANA, "owner")[0]["content"]
+    assert shown.get("redacted") and shown["text"] == chat._REDACTED
+
+
+def test_multi_source_reason_checks_every_panel_before_wildcard_return(monkeypatch):
+    content = {
+        "text": "Combined answer", "source": "demo", "table": "all sources",
+        "author_role": "analyst", "sql": "SELECT region FROM sales",
+        "columns": ["region"], "rows": [["EU"]],
+        "panels": [
+            {"source": "demo", "sql": "SELECT region FROM sales",
+             "columns": ["region"], "rows": [["EU"]]},
+            {"source": "private", "sql": "SELECT name FROM customers",
+             "columns": ["name"], "rows": [["Ada"]]},
+        ],
+    }
+    checked = []
+    monkeypatch.setattr(chat, "_unrestricted", lambda *a: True)
+
+    def allowed(role, step, source=None):
+        checked.append(source)
+        return source != "private"
+
+    monkeypatch.setattr(chat, "_stored_pipeline_step_allowed", allowed)
+    assert not chat._msg_allowed("analyst", content)
+    assert "private" in checked
+
+
+def test_unattributed_stored_frames_fail_closed_even_with_author_role(monkeypatch):
+    assert not chat._msg_allowed("analyst", {
+        "text": "secret", "source": None, "table": "*",
+        "author_role": "analyst", "columns": ["secret"], "rows": [["value"]],
+    })
+
+    content = {
+        "text": "answer", "source": "demo", "table": "*",
+        "author_role": "analyst", "sql": "SELECT region FROM sales",
+        "columns": ["region"], "rows": [["EU"]],
+        "panels": [{"source": "demo", "sql": None,
+                    "columns": ["secret"], "rows": [["value"]]}],
+    }
+    monkeypatch.setattr(chat, "_unrestricted", lambda *a: True)
+    monkeypatch.setattr(chat, "_stored_pipeline_step_allowed", lambda *a, **k: True)
+    assert not chat._msg_allowed("analyst", content)
+
+
+def test_canvas_cannot_persist_a_client_copy_without_server_provenance():
+    cid = db.create_conversation(ANA["id"], "blend canvas")
+    body = chat.CanvasEdit(
+        instruction="make this a bar chart", columns=["secret"], rows=[[4200]],
+        chart={"type": "table"}, conversation_id=cid, source="*", table="all sources",
+        sql=None)
+    with pytest.raises(HTTPException) as exc:
+        chat.canvas_edit(body, user=ANA)
+    assert getattr(exc.value, "status_code", None) == 400
+    assert db.list_messages(cid) == []
+
+
+def test_canvas_persistence_uses_the_governed_parent_not_client_rows(monkeypatch):
+    parent = {
+        "text": "revenue", "source": "demo", "table": "sales",
+        "author_role": "analyst", "sql": "SELECT region, revenue FROM sales",
+        "columns": ["region", "revenue"], "rows": [["EU", 125]],
+        "chart": {"type": "table"},
+    }
+    cid, parent_id = _chat_with(ANA, parent)
+    seen = {}
+    monkeypatch.setattr(chat.agent, "llm_available", lambda *a, **k: False)
+
+    def edit(_instruction, columns, rows, chart, **_kwargs):
+        seen.update(columns=columns, rows=rows, chart=chart)
+        return {"note": "edited", "columns": columns, "rows": rows,
+                "chart": {"type": "bar"}}
+
+    monkeypatch.setattr(chat.agent, "edit_canvas", edit)
+    body = chat.CanvasEdit(
+        instruction="make this a bar chart",
+        # All four fields are hostile client assertions. A saved version must
+        # ignore them and derive its frame from parent_id on the server.
+        columns=["secret"], rows=[[999999]], chart={"type": "pie"},
+        conversation_id=cid, parent_message_id=parent_id,
+        source="private", table="customers", sql="SELECT secret FROM customers")
+
+    result = chat.canvas_edit(body, user=ANA)
+
+    assert seen == {"columns": ["region", "revenue"], "rows": [["EU", 125]],
+                    "chart": {"type": "table"}}
+    assert result["message_id"]
+    saved = db.list_messages(cid)[-1]["content"]
+    assert saved["rows"] == [["EU", 125]] and saved["source"] == "demo"
+    assert saved["sql"] == "SELECT region, revenue FROM sales"
+    assert saved["panels"][0]["sql"] == saved["sql"]
+    assert saved["canvas_provenance"] == {
+        "kind": "canvas_v1", "parent_message_id": parent_id,
+        "parent_panel_index": 0,
+    }
+
+
+def test_canvas_reused_panel_inherits_parent_sql_for_read_time_governance(monkeypatch):
+    parent = {
+        "text": "revenue", "source": "demo", "table": "sales",
+        "author_role": "analyst", "sql": "SELECT region, revenue FROM sales",
+        "columns": ["region", "revenue"], "rows": [["EU", 125]],
+        "chart": {"type": "table"},
+    }
+    cid, parent_id = _chat_with(ANA, parent)
+    monkeypatch.setattr(chat.agent, "llm_available", lambda *a, **k: True)
+    monkeypatch.setattr(chat, "_canvas_source", lambda *a, **k: (None, [], {}))
+    monkeypatch.setattr(chat.agent, "compose_canvas", lambda *a, **k: {
+        "note": "reused", "panels": [{
+            "sql": None, "columns": parent["columns"], "rows": parent["rows"],
+            "chart": {"type": "bar"},
+        }],
+    })
+
+    result = chat.canvas_edit(chat.CanvasEdit(
+        instruction="show the same data as bars", columns=[], rows=[],
+        conversation_id=cid, parent_message_id=parent_id), user=ANA)
+
+    saved = result["message"]
+    assert saved["panels"][0]["sql"] == parent["sql"]
+    assert chat._msg_allowed("analyst", saved)
+
+
+def test_multi_panel_canvas_versions_keep_siblings_and_can_chain_edits(monkeypatch):
+    parent = {
+        "text": "two views", "source": "demo", "table": "sales",
+        "author_role": "analyst", "sql": "SELECT region, revenue FROM sales",
+        "columns": ["region", "revenue"], "rows": [["EU", 125]],
+        "chart": {"type": "bar"},
+        "panels": [
+            {"source": "demo", "sql": "SELECT region, revenue FROM sales",
+             "columns": ["region", "revenue"], "rows": [["EU", 125]],
+             "chart": {"type": "bar"}},
+            {"source": "demo", "sql": "SELECT month, revenue FROM sales",
+             "columns": ["month", "revenue"], "rows": [["Jan", 300]],
+             "chart": {"type": "line"}},
+        ],
+    }
+    cid, parent_id = _chat_with(ANA, parent)
+    seen = []
+    monkeypatch.setattr(chat.agent, "llm_available", lambda *a, **k: False)
+
+    def edit(_instruction, columns, rows, chart, **_kwargs):
+        seen.append((columns, rows, chart))
+        return {"note": "edited", "columns": columns, "rows": rows,
+                "chart": {"type": "area"}}
+
+    monkeypatch.setattr(chat.agent, "edit_canvas", edit)
+    first = chat.canvas_edit(chat.CanvasEdit(
+        instruction="change the monthly panel", columns=[], rows=[],
+        conversation_id=cid, parent_message_id=parent_id, parent_panel_index=1), user=ANA)
+
+    assert len(first["panels"]) == 2
+    assert first["panels"][0]["rows"] == [["EU", 125]]
+    assert first["panels"][1]["chart"] == {"type": "area"}
+    # The new full-sheet message is a valid parent at the same index.
+    second = chat.canvas_edit(chat.CanvasEdit(
+        instruction="edit it again", columns=[], rows=[], conversation_id=cid,
+        parent_message_id=first["message_id"], parent_panel_index=1), user=ANA)
+    assert len(second["panels"]) == 2
+    assert seen[1][0] == ["month", "revenue"] and seen[1][1] == [["Jan", 300]]
+
+
+def test_conversation_session_read_resume_and_fork_rebuild_visible_transcript(monkeypatch):
+    current = {"identity": "gov-a"}
+    monkeypatch.setattr(governance, "identity", lambda: current["identity"])
+    monkeypatch.setattr(chat, "_stored_pipeline_step_allowed", lambda *a, **k: True)
+
+    secret = "Ada's lifetime value is 4200 across both systems."
+    cid = db.create_conversation(ANA["id"], "governed blend")
+    content = _blend_content("gov-a")
+    content["text"] = secret
+    db.add_message(cid, "assistant", content)
+    sid = sessions.snapshot(
+        ANA, conversation_id=cid, title="governed blend", model_spec="m",
+        source="*", table_scope="all sources",
+        messages=[{"role": "assistant", "text": secret}])
+
+    assert secret in " ".join(m["text"] for m in sessions.get(sid, user=ANA)["messages"])
+    forked_under_a = sessions.fork(sid, user=ANA)
+    assert forked_under_a["conversation_id"] == cid
+    assert forked_under_a["id"] != sid
+    assert secret in " ".join(m["text"] for m in forked_under_a["messages"])
+
+    # A snapshot and its fork are stable branches, not aliases for the live
+    # conversation. Later turns must not silently appear in either session.
+    later = "this question was added after the snapshot"
+    db.add_message(cid, "user", {"text": later, "author_role": "analyst"})
+    for payload in (sessions.get(sid, user=ANA),
+                    sessions.get(forked_under_a["id"], user=ANA)):
+        assert later not in " ".join(m["text"] for m in payload["messages"])
+        assert len(payload["messages"]) == 1
+
+    current["identity"] = "gov-b"
+    read = sessions.get(sid, user=ANA)
+    resumed = sessions.resume(sid, user=ANA)
+    old_fork = sessions.get(forked_under_a["id"], user=ANA)
+    forked = sessions.fork(sid, user=ANA)
+    for payload in (read, resumed, old_fork, forked):
+        text = " ".join(m["text"] for m in payload["messages"])
+        assert secret not in text
+        assert later not in text
+        assert chat._REDACTED in text
+
+
+def test_deleting_canonical_session_never_turns_a_fork_into_live_checkpoint(monkeypatch):
+    monkeypatch.setattr(chat, "_stored_pipeline_step_allowed", lambda *a, **k: True)
+    content = {"text": "first answer", "source": "demo", "table": "sales",
+               "author_role": "analyst", "sql": "SELECT region FROM sales",
+               "columns": ["region"], "rows": [["EU"]]}
+    cid, _ = _chat_with(ANA, content)
+    original = sessions.snapshot(
+        ANA, conversation_id=cid, messages=[{"role": "assistant", "text": "first answer"}])
+    branch = sessions.fork(original, user=ANA)
+    sessions.remove(original, user=ANA)
+
+    db.add_message(cid, "user", {"text": "later question", "author_role": "analyst"})
+    replacement = sessions.snapshot(
+        ANA, conversation_id=cid, messages=[
+            {"role": "assistant", "text": "first answer"},
+            {"role": "user", "text": "later question"},
+        ])
+
+    assert replacement != branch["id"]
+    stable = sessions.get(branch["id"], user=ANA)
+    assert [m["text"] for m in stable["messages"]] == ["first answer"]
 
 
 # ── (d) retention strips old rows only ──────────────────────────────────
