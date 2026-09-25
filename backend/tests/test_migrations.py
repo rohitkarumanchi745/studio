@@ -41,6 +41,7 @@ EXPECTED = {
     "redteam_benchmarks": ["model_revision"],
     "training_adapters": ["sha256"],
     "agent_traces": ["updated_at", "training_revision"],
+    "user_memory": ["embedding", "updated_at"],
 }
 
 # Derived from the list itself, so appending a migration does not mean editing
@@ -78,6 +79,8 @@ CREATE TABLE training_adapters (
     status TEXT NOT NULL DEFAULT 'active', created_at REAL NOT NULL);
 CREATE TABLE agent_traces (
     id TEXT PRIMARY KEY, created_at REAL NOT NULL);
+CREATE TABLE user_memory (
+    id TEXT PRIMARY KEY, user_id TEXT NOT NULL, note TEXT NOT NULL, created_at REAL NOT NULL);
 """
 
 

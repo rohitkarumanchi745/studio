@@ -15,6 +15,8 @@ import Jobs from "./components/Jobs";
 import Kag from "./components/Kag";
 import PyBuild from "./components/PyBuild";
 import Pipelines from "./components/Pipelines";
+import LearnedRules from "./components/LearnedRules";
+import Memory from "./components/Memory";
 import QueryLibrary from "./components/QueryLibrary";
 import RedTeam from "./components/RedTeam";
 import Sessions from "./components/Sessions";
@@ -200,6 +202,8 @@ export default function App() {
         onAgents={go("/agents")}
         onFlow={go("/flow")}
         onSkills={go("/skills")}
+        onMemory={go("/memory")}
+        onLearnedRules={go("/learned-rules")}
         onAutopilot={go("/autopilot")}
         onToolBuilder={go("/toolbuilder")}
         onKag={go("/kag")}
@@ -217,6 +221,8 @@ export default function App() {
       {showActivity && <Activity onClose={() => setShowActivity(false)} />}
       <Routes>
         <Route path="/skills" element={<Skills onClose={home} />} />
+        <Route path="/memory" element={<Memory onClose={home} />} />
+        <Route path="/learned-rules" element={<LearnedRules onClose={home} />} />
         <Route path="/autopilot" element={<Autopilot user={user} onClose={home} onOpenJobs={go("/jobs")} />} />
         <Route path="/kag" element={<Kag user={user} onClose={home} />} />
         <Route path="/toolbuilder" element={<ToolBuilder onClose={home} onOpenJobs={go("/jobs")} />} />

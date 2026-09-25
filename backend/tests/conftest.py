@@ -19,3 +19,8 @@ os.environ.setdefault("STUDIO_DEMO_MODE", "1")
 _SESSION_DATA = tempfile.mkdtemp(prefix="studio-pytest-")
 os.environ["STUDIO_DB_PATH"] = os.path.join(_SESSION_DATA, "studio.db")
 os.environ["DATABASE_URL"] = ""
+
+# An app booted by a test runs the in-process worker, whose learned-rules
+# ticker would send failed test traces to a real LLM whenever the shell has a
+# provider key. test_learned_rules.py drives tick_once() directly instead.
+os.environ["STUDIO_LEARNED_RULES_TICKER"] = "0"

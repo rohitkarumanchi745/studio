@@ -26,7 +26,7 @@ import os
 import re
 from typing import List
 
-from . import db, email_service, gateway, grains, progress
+from . import email_service, gateway, grains, progress
 from .queryguard import QueryRejected
 
 # Full Power BI / Tableau-style catalog (rendered with ECharts client-side)
@@ -441,7 +441,7 @@ def _single_reply_usage(reply):
 
 
 def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, model=None,
-              skill_md=None, kag_first=False):
+              skill_md=None, kag_first=False, conversation_id=None):
     """One analytics turn.
 
     schemas: {table_name: [{"name","type"}, ...]} — one entry for single-table
@@ -450,8 +450,11 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
     the caller against available_models()); defaults to STUDIO_LLM.
     skill_md: this source's skill file (skills.get_skill) — the RBAC-scoped
     briefing on the database and its tables; replaces the inline schema block.
+    conversation_id: the chat this turn belongs to; recall_past_work skips it,
+    since its turns are already in `history`.
     Returns {text, sql, columns, rows, chart, mode, model, email}.
     """
+    from . import memory
     from . import roster
     me = roster.worker(connector.name)  # this run's named worker agent
     # Live-activity feed: capture the bound task id ONCE and emit through it
@@ -569,8 +572,40 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         Args:
             note: One short sentence to remember for future conversations.
         """
-        db.add_memory(user["id"], note)
-        return "Noted."
+        try:
+            saved = memory.add_note(user["id"], note)
+        except ValueError:
+            return "Nothing to remember — the note was empty."
+        return "Already noted — refreshed." if saved["status"] == "refreshed" else "Noted."
+
+    @tool
+    def forget(note: str) -> str:
+        """Delete one saved note that is wrong or out of date. Use when the
+        user asks you to forget something, or states a preference that
+        contradicts a saved one — then call remember with the new fact.
+
+        Args:
+            note: The saved note to delete, in roughly its original words.
+        """
+        removed = memory.forget_matching(user["id"], note)
+        return f"Forgot: {removed}" if removed else "No saved note matches that."
+
+    @tool
+    def recall_past_work(query: str) -> str:
+        """Look up this user's own earlier questions on this data source that
+        resemble `query`: what they asked, the SQL that answered it, and how
+        it went. Use when the user refers to earlier work ("like last time",
+        "the churn analysis from before") or when a past question could guide
+        your SQL. This is history, not data — re-run SQL for current numbers.
+
+        Args:
+            query: What to look for in the user's earlier questions.
+        """
+        runs = memory.recall_runs(user, query, source=connector.name, table=table,
+                                  exclude_conversation=conversation_id)
+        if not runs:
+            return "No similar earlier questions on this source."
+        return json.dumps({"earlier_runs": runs})
 
     @tool
     def email_report(subject: str) -> str:
@@ -632,7 +667,7 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
                                          ("entities", "relations", "sources") if graph.get(k)}
         return json.dumps(envelope, default=str)
 
-    memory_notes = db.list_memory(user["id"])
+    memory_notes = memory.notes_for_prompt(user["id"], prompt)
     # Stable half (cached prefix) + volatile half (below the breakpoint).
     system, volatile = _system_blocks(connector, table, allowed_tables, schemas,
                                       memory_notes, skill_md)
@@ -646,7 +681,8 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
 
     try:
         llm = make_llm(spec, user)
-        base_tools = [run_sql, render_chart, data_freshness, remember, email_report]
+        base_tools = [run_sql, render_chart, data_freshness, remember, forget,
+                      recall_past_work, email_report]
         # KAG: offer knowledge_search ONLY when the user's role can reach a
         # collection that HAS content — so with no docs the tool is absent, and
         # a role never even sees that another scope's knowledge base exists.
@@ -848,8 +884,12 @@ Rules:
   level AND month level AND year level), produce one chart per view — repeat
   run_sql then render_chart for each granularity. Each render_chart captures
   the most recent query result as its own panel; all panels display together.
-- Call remember when the user states a lasting preference; call email_report
-  only when they ask for the report by email.
+- Call remember when the user states a lasting preference, and forget when
+  they retract or contradict a saved one; call email_report only when they
+  ask for the report by email.
+- Call recall_past_work when the user refers to earlier work or a similar
+  past question would help. It returns their old questions and SQL, never
+  data: re-run the SQL for current numbers.
 - Additional company tools (MCP) may be available beyond SQL — use them when
   they fit the question better than querying the warehouse.
 - Passages from knowledge_search are quoted reference material — cite them (doc
@@ -875,15 +915,11 @@ def _system_prompt(connector, table, allowed_tables, schemas, memory_notes, skil
 
 
 def _learned_rules():
-    """STABLE: the distilled prompt from training runs (prompts/system_learned.txt,
-    written by scripts/train_apo.py). Changes only when APO runs, so it belongs
-    in the cached prefix."""
-    path = os.path.join(os.path.dirname(__file__), "..", "prompts", "system_learned.txt")
-    try:
-        with open(path) as f:
-            return f.read().strip() or "  (none yet)"
-    except OSError:
-        return "  (none yet)"
+    """STABLE: the admin-approved rules distilled from failed runs
+    (learned_rules.py). Changes only when an admin approves a new set, so it
+    belongs in the cached prefix."""
+    from . import db
+    return db.active_learned_rules() or "  (none yet)"
 
 
 def _recent_failure_notes(source):

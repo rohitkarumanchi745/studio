@@ -1,12 +1,16 @@
 """Offline learning job — Agent Lightning's APO idea applied to Studio.
 
-Reads rewarded traces from studio.db, clusters the failures, and distills
-them into prompts/system_learned.txt — the "Learned guidance" block every
-future agent run receives. Prompt optimization is the right training lever
-for API models (Claude/GPT): their weights can't be fine-tuned by us, but
-their instructions can be evolved from evidence.
+Reads rewarded traces from studio.db, clusters the failures, and drafts a
+learned-rules proposal from them (app/learned_rules.py) — the "Learned
+guidance" block every agent run receives once an admin approves it. Prompt
+optimization is the right training lever for API models (Claude/GPT): their
+weights can't be fine-tuned by us, but their instructions can be evolved from
+evidence. The worker drafts proposals on its own schedule; this script is the
+on-demand path.
 
 Run from backend/:            .venv/bin/python scripts/train_apo.py
+Draft and activate at once:   .venv/bin/python scripts/train_apo.py --approve
+  (you are the reviewer: read the printed rules before you pass --approve)
 Export rollouts for real RL:  .venv/bin/python scripts/train_apo.py --export rollouts.jsonl
   (feed the JSONL to an Agent Lightning VERL/GRPO pipeline against a
   self-hosted open-weight model — that part needs GPUs, not this laptop.)
@@ -19,16 +23,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from dotenv import load_dotenv  # noqa: E402
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
-from app import db, lightning  # noqa: E402
-from app.agent import llm_available, llm_spec  # noqa: E402
-
-PROMPT_PATH = os.path.join(os.path.dirname(__file__), "..", "prompts", "system_learned.txt")
+from app import db, learned_rules, lightning  # noqa: E402
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--export", help="write rollouts JSONL for external RL training")
     ap.add_argument("--limit", type=int, default=500)
+    ap.add_argument("--approve", action="store_true",
+                    help="activate the drafted rules immediately instead of leaving "
+                         "them for an admin to approve in the app")
     args = ap.parse_args()
 
     if args.export:
@@ -42,39 +46,24 @@ def main():
     for c in stats["failure_clusters"]:
         print(f"  {c['n']:>3}x  {c['cluster']}")
 
-    bad = db.list_traces(limit=args.limit, max_reward=0.4)
-    if not bad:
+    if not db.list_traces(limit=1, max_reward=0.4):
         print("no low-reward traces yet — nothing to learn from. "
               "Use the app, give 👍/👎, then rerun.")
         return
 
-    evidence = "\n".join(
-        f"- prompt: {t['prompt'][:150]!r}\n  sql: {(t['sql'] or 'none')[:200]}\n"
-        f"  error: {(t['error'] or 'none')[:200]}  reward: {t['reward']} ({t['reward_source']})"
-        for t in bad[:40]
-    )
-
-    if not llm_available():
-        print(f"\n{len(bad)} low-reward traces collected, but no LLM key is set, so the "
-              "distillation step can't run. Add ANTHROPIC_API_KEY/OPENAI_API_KEY and rerun.")
+    learned_rules.init_tables()
+    proposal, reason = learned_rules.draft(force=True)
+    if proposal is None:
+        print(f"\nno rules drafted: {reason}")
         return
-
-    from langchain.chat_models import init_chat_model
-    llm = init_chat_model(llm_spec())
-    out = llm.invoke(
-        "You are optimizing the system prompt of a SQL analytics agent. Below are its "
-        "recent low-reward runs (bad SQL, errors, user thumbs-down). Distill AT MOST 6 "
-        "short imperative rules that would prevent these specific failures. Output only "
-        "the rules as '- ' bullet lines, no preamble.\n\nFailures:\n" + evidence
-    )
-    rules = out.content if hasattr(out, "content") else str(out)
-
-    os.makedirs(os.path.dirname(PROMPT_PATH), exist_ok=True)
-    if os.path.exists(PROMPT_PATH):
-        os.replace(PROMPT_PATH, PROMPT_PATH + ".bak")
-    with open(PROMPT_PATH, "w") as f:
-        f.write(rules.strip() + "\n")
-    print(f"\nwrote {PROMPT_PATH} — every future agent run now receives these rules:\n{rules}")
+    print(f"\ndrafted rule set {proposal['id']} from {proposal['evidence_count']} "
+          f"low-reward runs:\n{proposal['rules']}")
+    if args.approve:
+        learned_rules.approve(proposal["id"], "train_apo.py")
+        print("\nactivated — every future agent run now receives these rules.")
+    else:
+        print("\nwaiting for an admin to approve it (Learned rules page), or rerun "
+              "with --approve.")
 
 
 if __name__ == "__main__":

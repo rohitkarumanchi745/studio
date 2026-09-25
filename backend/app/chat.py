@@ -853,7 +853,8 @@ def _run_turn(ctx, user):
         return agent.run_agent(
             prompt=prompt, connector=connector, table=ctx["table_param"],
             allowed_tables=ctx["allowed"], schemas=ctx["schemas"], history=ctx["history"],
-            user=user, model=spec, skill_md=skill_md, kag_first=kag_first)
+            user=user, model=spec, skill_md=skill_md, kag_first=kag_first,
+            conversation_id=cid)
 
     # Explicit engine chosen in the model selector: honor it directly, ahead of the
     # automatic tiers. 'bitnet' forces the self-hosted engine; 'kag' forces a
@@ -1417,7 +1418,7 @@ def learning(user=Depends(current_user)):
     stats["storage"] = {
         "rollouts_table": "agent_traces",
         "store": "postgres" if db.IS_PG else f"sqlite ({db.DB_PATH})",
-        "learned_prompt": "prompts/system_learned.txt",
+        "learned_prompt": "learned_rules table (admin-approved)",
     }
     return stats
 

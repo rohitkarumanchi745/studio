@@ -219,6 +219,14 @@ def _m11_training_adapters_one_active(c, is_pg):
         "ON training_adapters(scope,kind) WHERE status='active'")
 
 
+def _m12_user_memory_rank_columns(c, is_pg):
+    # memory.py dedups a re-remembered note by refreshing it (updated_at) and
+    # ranks notes against the prompt (embedding). NULL updated_at reads as
+    # created_at, so old notes keep their order.
+    _add_column(c, "user_memory", "embedding", "TEXT", is_pg)
+    _add_column(c, "user_memory", "updated_at", "REAL", is_pg)
+
+
 MIGRATIONS = [
     (1, "users.verified", _m1_users_verified),
     (2, "conversations.folder_id", _m2_conversations_folder_id),
@@ -231,6 +239,7 @@ MIGRATIONS = [
     (9, "training_adapters.sha256", _m9_training_adapters_sha256),
     (10, "agent_traces.training_revision", _m10_agent_traces_updated_at),
     (11, "training_adapters.one_active", _m11_training_adapters_one_active),
+    (12, "user_memory.embedding+updated_at", _m12_user_memory_rank_columns),
 ]
 
 
