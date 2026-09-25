@@ -26,4 +26,3 @@ spec:
                 name: studio-web
                 port:
                   name: http
-
