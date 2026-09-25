@@ -14,7 +14,7 @@
 // Nothing here ever sees a stored secret. Microsoft 365 runs its OAuth grant on
 // Microsoft's site; database credentials are posted once, encrypted at rest by
 // the backend, and only ever read back as a non-secret hint (host / account /
-// project). Creating and deleting connections is admin-only on the server —
+// project). Creating, disconnecting and removing connections is admin-only on the server —
 // this screen mirrors that instead of hiding it, so a non-admin still sees the
 // map of available sources and who to ask.
 import { useEffect, useMemo, useState } from "react";
@@ -78,6 +78,23 @@ export function buildTiles({ types = [], conns = [], sources = [], q = "" }) {
       kind: own ? "user" : "env",
       connId: own?.id,
       hint: own?.hint || "",
+      disconnected: false,
+    });
+  }
+  // A disconnected connection is gone from the catalog — that is what
+  // disconnecting means — so only /connections knows it exists. It still
+  // belongs on its tile, where the admin can reconnect or remove it.
+  for (const c of conns) {
+    if (c.enabled !== false) continue;
+    put(c.ctype).instances.push({
+      name: c.name,
+      configured: false,
+      allowed: false,
+      dialect: "",
+      kind: "user",
+      connId: c.id,
+      hint: c.hint || "",
+      disconnected: true,
     });
   }
 
@@ -135,7 +152,10 @@ export default function DataConnections({ onClose }) {
   const tiles = useMemo(() => buildTiles({ types, conns, sources, q }),
                         [types, conns, sources, q]);
 
-  const takenNames = useMemo(() => new Set(sources.map((s) => s.name)), [sources]);
+  // A disconnected connection is absent from /catalog/sources but still owns
+  // its name on the server, so it counts as taken here too.
+  const takenNames = useMemo(() => new Set([...sources.map((s) => s.name),
+                                            ...conns.map((c) => c.name)]), [sources, conns]);
   const tile = picked ? tiles.find((t) => t.id === picked) : null;
 
   function back() {
@@ -396,13 +416,27 @@ function ConnectForm({ tile, defaultName, takenNames, onDone, onError, onRemoved
       : `Connected ${done.length} sources — ${done.join(", ")} — each scoped to its own schema.`);
   }
 
-  async function remove(inst) {
-    if (!confirm(`Remove the “${inst.name}” connection? Queries against it will stop working.`)) return;
+  // Disconnect parks the source (credential and name kept, reconnect is one
+  // click); remove forgets it. Both take it out of the picker immediately.
+  const [rowBusy, setRowBusy] = useState("");
+  async function act(inst, verb) {
+    const ask = {
+      disconnect: `Disconnect “${inst.name}”? It leaves the chat picker and queries against it stop, `
+        + "but the credential is kept so you can reconnect without re-entering it.",
+      remove: `Remove “${inst.name}” permanently? Its stored credential is deleted — `
+        + "connecting it again means entering it again.",
+    }[verb];
+    if (ask && !confirm(ask)) return;
+    setRowBusy(`${verb}:${inst.name}`);
+    onError("");
     try {
-      await api(`/connections/${inst.connId}`, { method: "DELETE" });
+      await api(verb === "remove" ? `/connections/${inst.connId}` : `/connections/${inst.connId}/${verb}`,
+                { method: verb === "remove" ? "DELETE" : "POST" });
       onRemoved();
     } catch (e) {
       onError(e.message);
+    } finally {
+      setRowBusy("");
     }
   }
 
@@ -415,7 +449,7 @@ function ConnectForm({ tile, defaultName, takenNames, onDone, onError, onRemoved
 
   return (
     <div className="conn-detail">
-      <Instances tile={tile} onRemove={remove} />
+      <Instances tile={tile} onAct={act} busy={rowBusy} />
 
       <div className="conn-form">
         {fields.map((f) => (
@@ -554,20 +588,49 @@ function DetailPanel({ tile, isAdmin }) {
   );
 }
 
-function Instances({ tile, onRemove }) {
+function badgeFor(i) {
+  if (i.disconnected) return "disconnected";
+  // A user connection that is on but unconfigured is a row whose credential no
+  // longer decrypts (STUDIO_SECRET rotated): Reconnect can't help, so the badge
+  // must not promise it.
+  if (!i.configured) return i.kind === "user" ? "credential unreadable" : "needs reconnect";
+  return i.kind === "env" ? "configured by environment" : "connected";
+}
+
+export function Instances({ tile, onAct, busy = "" }) {
   if (!tile.instances.length) return null;
+  const is = (verb, i) => busy === `${verb}:${i.name}`;
   return (
     <div className="conn-instances">
       {tile.instances.map((i) => (
-        <div key={i.name} className="dbconn-row">
+        <div key={i.name} className={`dbconn-row${i.disconnected ? " dbconn-row-off" : ""}`}>
           <SourceIcon id={tile.id} size={20} />
           <b>{i.name}</b>
           {i.hint && <span className="meta">{i.hint}</span>}
           <span className={`m365-badge${i.configured ? " m365-badge-on" : " m365-badge-off"}`}>
-            {i.configured ? (i.kind === "env" ? "configured by environment" : "connected") : "needs reconnect"}
+            {badgeFor(i)}
           </span>
-          {onRemove && i.kind === "user" && (
-            <button className="chip ctx-danger" onClick={() => onRemove(i)}>✕</button>
+          {/* Env-configured sources are switched off in the deployment's
+              environment, not here — so they get no buttons at all. */}
+          {onAct && i.kind === "user" && (
+            <span className="dbconn-actions">
+              {i.disconnected ? (
+                <button className="chip" onClick={() => onAct(i, "reconnect")} disabled={!!busy}>
+                  {is("reconnect", i) ? "reconnecting…" : "↻ Reconnect"}
+                </button>
+              ) : (
+                // A row whose credential no longer decrypts has nothing to park;
+                // the only way back is remove and connect again.
+                i.configured && (
+                  <button className="chip" onClick={() => onAct(i, "disconnect")} disabled={!!busy}>
+                    {is("disconnect", i) ? "disconnecting…" : "⏸ Disconnect"}
+                  </button>
+                )
+              )}
+              <button className="chip ctx-danger" onClick={() => onAct(i, "remove")} disabled={!!busy}>
+                {is("remove", i) ? "removing…" : "✕ Remove"}
+              </button>
+            </span>
           )}
         </div>
       ))}

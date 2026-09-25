@@ -9,7 +9,9 @@ Locked in here:
   /catalog/sources; non-admin roles get the standard fail-closed treatment
   (allowed=False, 403 on tables) until governance grants the source;
 - a failing probe blocks the save; name rules reject builtins/duplicates/bad
-  slugs; a row that no longer decrypts fails CLOSED (unconfigured, no resolve).
+  slugs; a row that no longer decrypts fails CLOSED (unconfigured, no resolve);
+- disconnect is reversible: the source is offline on every read path but keeps
+  its credential and its name; reconnect re-probes before bringing it back.
 """
 import importlib
 
@@ -181,14 +183,79 @@ def test_delete_unregisters(client, monkeypatch):
     assert client.get("/api/catalog/sources/crm/tables").status_code == 403
 
 
+def test_disconnect_takes_the_source_offline_and_reconnect_restores_it(client, monkeypatch):
+    _stub_type(monkeypatch)
+    _login(client)
+    cid = _create(client).json()["id"]
+    from app import connections, rbac
+    from app.connectors import get_connector
+
+    r = client.post(f"/api/connections/{cid}/disconnect")
+    assert r.status_code == 200 and r.json()["enabled"] is False
+    # Offline on every read path, exactly like a deleted source…
+    assert connections.resolve("crm") is None
+    with pytest.raises(KeyError):
+        get_connector("crm")
+    assert "crm" not in {s["name"] for s in client.get("/api/catalog/sources").json()}
+    assert "crm" not in rbac.allowed_sources("admin")
+    assert client.get("/api/catalog/sources/crm/tables").status_code == 403
+    # …but still listed for the admin, and still owning its name.
+    row = next(c for c in client.get("/api/connections").json() if c["id"] == cid)
+    assert row["enabled"] is False and row["hint"] == "crm.internal"
+    taken = _create(client)
+    assert taken.status_code == 400 and "disconnected" in taken.json()["detail"]
+    # Idempotent: a second disconnect is not an error.
+    assert client.post(f"/api/connections/{cid}/disconnect").status_code == 200
+
+    r = client.post(f"/api/connections/{cid}/reconnect")
+    assert r.status_code == 200 and r.json()["enabled"] is True
+    assert get_connector("crm").list_tables() == ["orders", "users"]
+    assert "crm" in {s["name"] for s in client.get("/api/catalog/sources").json()}
+
+
+def test_reconnect_reprobes_the_stored_credential(client, monkeypatch):
+    _stub_type(monkeypatch)
+    _login(client)
+    cid = _create(client).json()["id"]
+    client.post(f"/api/connections/{cid}/disconnect")
+
+    # The warehouse starts refusing the credential while the source is parked.
+    monkeypatch.setattr(_Stub, "list_tables",
+                        lambda self: (_ for _ in ()).throw(RuntimeError("password expired")))
+    r = client.post(f"/api/connections/{cid}/reconnect")
+    assert r.status_code == 400 and "password expired" in r.json()["detail"]
+    assert SECRET not in r.text
+    from app import connections
+    assert connections.resolve("crm") is None                    # stays offline
+
+    # A row that no longer decrypts cannot come back in place.
+    from app import db
+    c = db._conn()
+    c.execute("UPDATE data_connections SET config=?", ("not-a-fernet-token",))
+    c.commit()
+    c.close()
+    r = client.post(f"/api/connections/{cid}/reconnect")
+    assert r.status_code == 400 and "remove it and connect again" in r.json()["detail"]
+
+    # A disconnected source can still be removed outright, freeing the name.
+    assert client.delete(f"/api/connections/{cid}").status_code == 200
+    monkeypatch.setattr(_Stub, "list_tables", lambda self: ["orders", "users"])
+    assert _create(client).status_code == 201
+
+
 def test_non_admin_cannot_manage(client, monkeypatch):
     _stub_type(monkeypatch)
+    _login(client)
+    cid = _create(client).json()["id"]
     _login(client, "analyst@studio.local", "analyst123")
     assert client.get("/api/connections").status_code == 403
-    assert _create(client).status_code == 403
+    assert _create(client, name="crm2").status_code == 403
     assert client.post("/api/connections/test",
                        json={"ctype": "stub", "config": {}}).status_code == 403
     assert client.get("/api/connections/types").status_code == 403
+    assert client.post(f"/api/connections/{cid}/disconnect").status_code == 403
+    assert client.post(f"/api/connections/{cid}/reconnect").status_code == 403
+    assert client.delete(f"/api/connections/{cid}").status_code == 403
 
 
 # ── Fail closed when the row no longer decrypts ──────────────────────────
