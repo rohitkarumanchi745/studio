@@ -272,9 +272,11 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
     setBusy(false);
     setLiveSteps([]);
     setActiveStartedAt(null);
+    // Another conversation's chart must not stay open over this one.
+    setCanvas(null);
+    setChatOpen(true);
     if (!conversationId) {
       setMessages([]);
-      setCanvas(null);
       return;
     }
     api(`/conversations/${conversationId}/messages`)
@@ -459,13 +461,14 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
   function loadMessages(ms) {
     const loaded = ms.map((m) => ({ role: m.role, ...m.content, message_id: m.id }));
     setMessages(loaded);
-    // Reopening a conversation restores its charts to the canvas — the
-    // visualization is part of the saved conversation, not a transient view.
-    // (The D3 & artifacts window draws them in the thread instead: the canvas
-    // offers every engine, and that window is D3 alone.)
+    // The canvas opens when the user asks for it (⤢ on an answer), never on
+    // its own: a new answer or a reopened conversation shows the chat. A
+    // canvas the user already has open follows the newest chart, so a
+    // follow-up question updates what they are looking at. (The D3 &
+    // artifacts window never opens it: it draws its charts in the thread.)
     const last = [...loaded].reverse().find(
       (m) => m.role === "assistant" && (m.panels?.length || (m.chart && m.rows?.length)));
-    setCanvas(last && !visualMode ? buildCanvas(last) : null);
+    setCanvas((open) => (open && last && !visualMode ? buildCanvas(last) : null));
     return loaded;
   }
 

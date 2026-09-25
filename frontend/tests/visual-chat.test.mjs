@@ -315,8 +315,10 @@ test("reopening a window conversation keeps its charts in the thread, not the ca
         assert.doesNotMatch(markup, /with-canvas/);
         assert.match(markup, /class="msg-visual"/);
       } else {
-        assert.ok(canvas, "the ordinary chat restores the canvas");
-        assert.match(markup, /with-canvas/);
+        // The ordinary chat opens the canvas only when asked (⤢ on an answer).
+        assert.equal(canvas, null);
+        assert.doesNotMatch(markup, /msg-visual/);
+        assert.match(markup, /charts? in canvas/);
       }
     });
   }
