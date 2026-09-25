@@ -16,7 +16,7 @@
 // Nothing here ever sees a stored secret. Microsoft 365 runs its OAuth grant on
 // Microsoft's site; database credentials are posted once, encrypted at rest by
 // the backend, and only ever read back as a non-secret hint (host / account /
-// project). Creating and deleting connections is admin-only on the server —
+// project). Creating, disconnecting and removing connections is admin-only on the server —
 // this screen mirrors that instead of hiding it, so a non-admin still sees the
 // map of available sources and who to ask.
 import { useEffect, useMemo, useState } from "react";
@@ -108,6 +108,23 @@ export function buildTiles({ types = [], conns = [], sources = [], repos = [], e
       // "environment" | "replaced" | "disconnected". Absent for user
       // connections — and for everyone but admins, who alone can change it.
       mode: own || s.ctype ? undefined : envByName.get(s.name)?.mode,
+      disconnected: false,
+    });
+  }
+  // A disconnected connection is gone from the catalog — that is what
+  // disconnecting means — so only /connections knows it exists. It still
+  // belongs on its tile, where the admin can reconnect or remove it.
+  for (const c of conns) {
+    if (c.enabled !== false) continue;
+    put(c.ctype).instances.push({
+      name: c.name,
+      configured: false,
+      allowed: false,
+      dialect: "",
+      kind: "user",
+      connId: c.id,
+      hint: c.hint || "",
+      disconnected: true,
     });
   }
 
@@ -173,7 +190,10 @@ export default function DataConnections({ onClose }) {
   const tiles = useMemo(() => buildTiles({ types, conns, sources, repos, envs, q }),
                         [types, conns, sources, repos, envs, q]);
 
-  const takenNames = useMemo(() => new Set(sources.map((s) => s.name)), [sources]);
+  // A disconnected connection is absent from /catalog/sources but still owns
+  // its name on the server, so it counts as taken here too.
+  const takenNames = useMemo(() => new Set([...sources.map((s) => s.name),
+                                            ...conns.map((c) => c.name)]), [sources, conns]);
   const tile = picked ? tiles.find((t) => t.id === picked) : null;
 
   function back() {
@@ -612,13 +632,27 @@ export function ConnectForm({ tile, defaultName, takenNames, onDone, onError, on
     }
   }
 
-  async function remove(inst) {
-    if (!confirm(`Remove the “${inst.name}” connection? Queries against it will stop working.`)) return;
+  // A connection made here: disconnect parks it (credential and name kept,
+  // reconnect is one click); remove forgets it. Both take it out of the picker
+  // immediately.
+  async function act(inst, verb) {
+    const ask = {
+      disconnect: `Disconnect “${inst.name}”? It leaves the chat picker and queries against it stop, `
+        + "but the credential is kept so you can reconnect without re-entering it.",
+      remove: `Remove “${inst.name}” permanently? Its stored credential is deleted — `
+        + "connecting it again means entering it again.",
+    }[verb];
+    if (ask && !confirm(ask)) return;
+    setRowBusy(`${verb}:${inst.name}`);
+    onError("");
     try {
-      await api(`/connections/${inst.connId}`, { method: "DELETE" });
+      await api(verb === "remove" ? `/connections/${inst.connId}` : `/connections/${inst.connId}/${verb}`,
+                { method: verb === "remove" ? "DELETE" : "POST" });
       onRemoved();
     } catch (e) {
       onError(e.message);
+    } finally {
+      setRowBusy("");
     }
   }
 
@@ -632,7 +666,7 @@ export function ConnectForm({ tile, defaultName, takenNames, onDone, onError, on
 
   return (
     <div className="conn-detail">
-      <Instances tile={tile} onRemove={remove} onManage={manage} busy={rowBusy} />
+      <Instances tile={tile} onAct={act} onManage={manage} busy={rowBusy} />
 
       {replacing && (
         <div className="meta share-notice conn-replacing">
@@ -835,7 +869,13 @@ function DetailPanel({ tile, isAdmin }) {
 
 /** The status a source row shows. Exported for tests. */
 export function instanceBadge(i) {
-  if (i.kind !== "env") return i.configured ? "connected" : "needs reconnect";
+  if (i.kind !== "env") {
+    if (i.disconnected) return "disconnected";
+    // On but unconfigured: the stored credential no longer decrypts (the
+    // STUDIO_SECRET rotated). Reconnect can't help, so the badge must not
+    // promise it — the way back is remove and connect again.
+    return i.configured ? "connected" : "credential unreadable";
+  }
   if (i.mode === "disconnected") return "disconnected here";
   if (i.mode === "replaced") return i.configured ? "set up here" : "credential unreadable";
   return i.configured ? "configured by environment" : "not configured";
@@ -855,17 +895,29 @@ export function envActions(i) {
   return out;
 }
 
-const ENV_ACTION_LABEL = {
+/**
+ * What an admin can do to a connection made on this screen: park it
+ * (disconnect — credential and name kept) or bring it back, and remove it.
+ * An unreadable one can only be removed. Exported for tests.
+ */
+export function userActions(i) {
+  if (i.kind !== "user") return [];
+  if (i.disconnected) return ["reconnect", "remove"];
+  return i.configured ? ["disconnect", "remove"] : ["remove"];
+}
+
+const ACTION_LABEL = {
   change: "✎ Change", setup: "✎ Set up", disconnect: "⏸ Disconnect",
-  reconnect: "↻ Reconnect", revert: "↺ Back to environment",
+  reconnect: "↻ Reconnect", revert: "↺ Back to environment", remove: "✕ Remove",
 };
 
-function Instances({ tile, onRemove, onManage, busy = "" }) {
+export function Instances({ tile, onAct, onManage, busy = "" }) {
   if (!tile.instances.length) return null;
+  const is = (verb, i) => busy === `${verb}:${i.name}`;
   return (
     <div className="conn-instances">
       {tile.instances.map((i) => (
-        <div key={i.name} className="dbconn-row">
+        <div key={i.name} className={`dbconn-row${i.disconnected ? " dbconn-row-off" : ""}`}>
           <SourceIcon id={tile.id} size={20} />
           <b>{i.name}</b>
           {i.hint && <span className="meta">{i.hint}</span>}
@@ -875,11 +927,18 @@ function Instances({ tile, onRemove, onManage, busy = "" }) {
           {onManage && envActions(i).map((verb) => (
             <button key={verb} className={`chip${verb === "disconnect" ? " ctx-danger" : ""}`}
               onClick={() => onManage(i, verb)} disabled={!!busy}>
-              {busy === `${verb}:${i.name}` ? "working…" : ENV_ACTION_LABEL[verb]}
+              {is(verb, i) ? "working…" : ACTION_LABEL[verb]}
             </button>
           ))}
-          {onRemove && i.kind === "user" && (
-            <button className="chip ctx-danger" onClick={() => onRemove(i)}>✕</button>
+          {onAct && userActions(i).length > 0 && (
+            <span className="dbconn-actions">
+              {userActions(i).map((verb) => (
+                <button key={verb} className={`chip${verb === "reconnect" ? "" : " ctx-danger"}`}
+                  onClick={() => onAct(i, verb)} disabled={!!busy}>
+                  {is(verb, i) ? "working…" : ACTION_LABEL[verb]}
+                </button>
+              ))}
+            </span>
           )}
         </div>
       ))}

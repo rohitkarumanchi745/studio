@@ -22,6 +22,12 @@ Security model:
   keeping their names (see "Built-in sources, managed from this screen").
   Same encryption, same admin gate; a disconnected or unreadable one fails
   closed and never falls back to the environment's credential.
+- Disconnect is reversible, delete is not. A disconnected row (enabled=0) is
+  invisible to every read path — resolve(), source_entries() and RBAC all go
+  through _rows()/_row_by_name(), which only see enabled rows — so it fails
+  closed exactly like a deleted one. It keeps its ciphertext, so reconnecting
+  needs no re-typed secret, and keeps its NAME, so no other connection can take
+  that name and inherit the governance grants written against it.
 """
 import base64
 import json
@@ -466,6 +472,13 @@ def _evict_cached(name):
         _close_connector(hit[1])
 
 
+def _row_by_id(cid):
+    """Any row, enabled or not — for the admin routes that act on one."""
+    with db.connect() as c:
+        r = c.execute("SELECT * FROM data_connections WHERE id=?", (cid,)).fetchone()
+    return dict(r) if r else None
+
+
 def resolve(name):
     """The live connector for a user-connected source, or None. Cached per row;
     a row that no longer decrypts resolves to None (fail closed)."""
@@ -680,7 +693,8 @@ def _public(row):
             "type_label": t.get("label", row["ctype"]), "label": row.get("label") or "",
             "hint": _hint(row["ctype"], cfg) if cfg else "",
             "namespace": _namespace(row["ctype"], cfg) if cfg else "",
-            "configured": cfg is not None, "created_at": row.get("created_at")}
+            "configured": cfg is not None, "enabled": bool(row.get("enabled", 1)),
+            "created_at": row.get("created_at")}
 
 
 # ── Probe ────────────────────────────────────────────────────────────────
@@ -883,8 +897,13 @@ def types(user=Depends(current_user)):
 
 @router.get("")
 def list_connections(user=Depends(current_user)):
+    """Every connection, disconnected ones included (enabled=False) — this is
+    the only place a disconnected row is visible, so the admin can reconnect or
+    remove it."""
     _admin(user)
-    return [_public(r) for r in _rows()]
+    with db.connect() as c:
+        rows = c.execute("SELECT * FROM data_connections ORDER BY created_at").fetchall()
+    return [_public(dict(r)) for r in rows]
 
 
 @router.post("/test")
@@ -932,6 +951,13 @@ def create_connection(body: ConnIn, user=Depends(current_user)):
     from . import connectors
     if name in connectors._REGISTRY or _row_by_name(name):
         raise HTTPException(400, f"a source named '{name}' already exists")
+    with db.connect() as c:
+        parked = c.execute("SELECT 1 FROM data_connections WHERE name=?", (name,)).fetchone()
+    if parked:
+        # A disconnected row still owns the name (and any grants written
+        # against it) — the UNIQUE constraint would say so as a 500.
+        raise HTTPException(400, f"a disconnected source named '{name}' exists — "
+                                 "reconnect it or remove it first")
     if body.ctype not in TYPES:
         raise HTTPException(400, f"unknown connection type '{body.ctype}'")
     cfg = _normalized(body.ctype, {k: str(v) for k, v in (body.config or {}).items()})
@@ -951,6 +977,53 @@ def create_connection(body: ConnIn, user=Depends(current_user)):
         c.commit()
     _evict_cached(name)
     db.log_activity(user, "connection_create", prompt=name, source=body.ctype)
+    return _public(row)
+
+
+def _set_enabled(cid, enabled):
+    with db.connect() as c:
+        c.execute("UPDATE data_connections SET enabled=? WHERE id=?", (1 if enabled else 0, cid))
+        c.commit()
+
+
+@router.post("/{cid}/disconnect")
+def disconnect_connection(cid: str, user=Depends(current_user)):
+    """Take the source offline without forgetting it: it leaves the picker and
+    every query path, but the encrypted credential and the name stay, so a
+    reconnect is one click and governance grants still mean the same source."""
+    _admin(user)
+    row = _row_by_id(cid)
+    if row is None:
+        raise HTTPException(404, "Not found")
+    if row["enabled"]:
+        _set_enabled(cid, False)
+        _evict_cached(row["name"])
+        db.log_activity(user, "connection_disconnect", prompt=row["name"], source=row["ctype"])
+    row["enabled"] = 0
+    return _public(row)
+
+
+@router.post("/{cid}/reconnect")
+def reconnect_connection(cid: str, user=Depends(current_user)):
+    """Bring a disconnected source back on its stored credential. Re-probed
+    first, like create: the password may have rotated while it was parked, and
+    a source that comes back dead is worse than one that says why it can't."""
+    _admin(user)
+    row = _row_by_id(cid)
+    if row is None:
+        raise HTTPException(404, "Not found")
+    if not row["enabled"]:
+        cfg = _decrypt(row["config"])
+        if cfg is None:
+            raise HTTPException(400, "the stored credential can no longer be read "
+                                     "(STUDIO_SECRET changed) — remove it and connect again")
+        probe = _probe(row["ctype"], cfg)
+        if not probe["ok"]:
+            raise HTTPException(400, f"connection test failed: {probe['error']}")
+        _set_enabled(cid, True)
+        _evict_cached(row["name"])
+        db.log_activity(user, "connection_reconnect", prompt=row["name"], source=row["ctype"])
+    row["enabled"] = 1
     return _public(row)
 
 
