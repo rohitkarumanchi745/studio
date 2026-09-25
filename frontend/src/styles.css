@@ -1105,6 +1105,12 @@ input:focus, select:focus, .composer-pill:focus-within { box-shadow: 0 0 0 1px v
 .conn-ns-item:hover { border-color: var(--axis); }
 .conn-ns-item input { margin: 0; accent-color: var(--accent); }
 .conn-ns-on { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+.conn-ns-item:has(input:disabled) { cursor: default; opacity: .65; }
+/* Add schemas to a live source: the same picker, opened from a source row. */
+.conn-add-schemas {
+  display: flex; flex-direction: column; gap: 8px;
+  border-left: 3px solid var(--accent); padding-left: 10px;
+}
 .conn-req { color: var(--bad); }
 .conn-warn { color: var(--warn); }
 
