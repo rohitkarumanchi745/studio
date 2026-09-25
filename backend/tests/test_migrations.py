@@ -43,6 +43,7 @@ EXPECTED = {
     "training_adapters": ["sha256"],
     "agent_traces": ["updated_at", "training_revision"],
     "agent_sessions": ["conversation_message_ids", "is_fork"],
+    "user_memory": ["embedding", "updated_at"],
 }
 
 # Derived from the list itself, so appending a migration does not mean editing
@@ -84,6 +85,8 @@ CREATE TABLE agent_sessions (
     id TEXT PRIMARY KEY, user_id TEXT NOT NULL, conversation_id TEXT,
     title TEXT NOT NULL, messages TEXT NOT NULL, created_at REAL NOT NULL,
     updated_at REAL NOT NULL);
+CREATE TABLE user_memory (
+    id TEXT PRIMARY KEY, user_id TEXT NOT NULL, note TEXT NOT NULL, created_at REAL NOT NULL);
 """
 
 

@@ -12,8 +12,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import (auth, autopilot, catalog, chat, confluence, connections, dashboards, db, flow, freshness,
-               governance, jobs, kag, kag_graph, keys, mcp, migrations, pipelines,
-               policy_trajectories, pybuild,
+               governance, jobs, kag, kag_graph, keys, learned_rules, mcp, memory, migrations,
+               pipelines, policy_trajectories, pybuild,
                qcache, queries, redteam, repos, semantic, sessions, supervisor,
                toolbuilder, trainer)
 from .agent import llm_available, llm_spec
@@ -46,7 +46,7 @@ _ROUTERS = (auth.router, catalog.router, chat.router, dashboards.router,
             flow.router, trainer.router, policy_trajectories.router,
             freshness.router, objectstore.router,
             semantic.router, autopilot.router, redteam.router, m365.router,
-            connections.router)
+            connections.router, memory.router, learned_rules.router)
 for _router in _ROUTERS:
     app.include_router(_router, prefix="/api")
 
@@ -90,6 +90,7 @@ def init_state():
     objectstore.init_tables()
     autopilot.init_tables()
     connections.init_tables()
+    learned_rules.init_tables()
     # Microsoft 365 / Graph extraction tables (graph_accounts / _subscriptions /
     # _items). CREATE-only DDL, safe on SQLite and Postgres; inert when dormant.
     m365_sync.init_tables()
