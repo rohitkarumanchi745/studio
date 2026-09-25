@@ -107,7 +107,7 @@ def _guard(connector):
     return cypherguard if getattr(connector, "dialect", "") == "cypher" else queryguard
 
 
-def check(user, source, sql, *, table_label="*", max_rows=None):
+def check(user, source, sql, *, table_label="*", max_rows=None, allow_explain=False):
     """Steps (a)-(e): scope() plus the query guard and LIMIT injection, with no
     execution and no audit row — for pin-time / validate-only callers such as
     dashboards and pipelines. Returns (connector, allowed_tables, cleaned_sql);
@@ -128,6 +128,12 @@ def check(user, source, sql, *, table_label="*", max_rows=None):
         # without knowing that. Cypher has no such folding question, and
         # cypherguard.validate takes no dialect, so only the SQL guard is told.
         kw["dialect"] = getattr(connector, "dialect", None)
+        # Opt-in EXPLAIN: a planning call, never an execution. The guard still
+        # validates the inner SELECT (tables → RBAC, forbidden keywords, single
+        # statement) and refuses EXPLAIN ANALYZE, so the plan request crosses the
+        # SAME gate as the read it describes.
+        if allow_explain:
+            kw["allow_explain"] = True
     cleaned = guard.validate(sql, allowed, **kw)
     cleaned = guard.enforce_limit(cleaned, _cap(max_rows))
     return connector, allowed, cleaned
@@ -172,7 +178,8 @@ def _audit(user, purpose, source, table_label, sql, *, row_count=None,
                     row_count=row_count, ok=ok, error=error, duration_ms=duration_ms)
 
 
-def execute(user, source, sql, purpose, *, table_label="*", max_rows=None, audit=True):
+def execute(user, source, sql, purpose, *, table_label="*", max_rows=None, audit=True,
+            allow_explain=False):
     """Steps (a)-(i). `purpose` is a short snake_case name for the caller
     (agent_sql, rerun, dashboard_tile, ...) and becomes the audit_log action.
 
@@ -185,7 +192,8 @@ def execute(user, source, sql, purpose, *, table_label="*", max_rows=None, audit
     cleaned = None
     try:
         connector, _allowed, cleaned = check(
-            user, source, sql, table_label=table_label, max_rows=max_rows)
+            user, source, sql, table_label=table_label, max_rows=max_rows,
+            allow_explain=allow_explain)
         columns, rows = _run(connector, cleaned, purpose)
         rows = list(rows)[:_cap(max_rows)]
         columns, rows = governance.filter_result(source, cleaned, columns, rows)

@@ -94,31 +94,63 @@ class QueryRejected(Exception):
 def _tokens(sql):
     """(kind, text) tokens with comments removed, plus the comment-free SQL.
 
+    The two-value form every rule below uses. `lex()` is the same pass with
+    the tokens' spans kept; this drops them.
+    """
+    toks, cleaned, _spans = lex(sql)
+    return toks, cleaned
+
+
+def lex(sql):
+    """(kind, text) tokens, the comment-free SQL, and each token's (start, end)
+    span WITHIN that comment-free SQL.
+
+    The spans are what a rewriter needs and the guard does not: app/sqlrewrite.py
+    edits SQL by splicing text at token boundaries, and a second tokenizer would
+    be a second reading of the same string — exactly the divergence this module
+    exists to prevent (validate() returns the text the caller must execute, so a
+    rewrite that lexed differently could edit a query the guard never saw).
+
     Whitespace and comments produce no token, so `FROM/**/t` and `FROM  t` are
     indistinguishable to the caller. Original spacing is preserved in the
     returned SQL — only comments are replaced (by a space, which is why
     `FROM/**/t` stays valid). Raises on an unterminated literal or comment
     rather than guessing where it ends.
     """
-    toks, out, i, n = [], [], 0, len(sql)
+    toks, out, spans, at, i, n = [], [], [], 0, 0, len(sql)
+
+    def emit(tok, text):
+        """Append one token and the text it occupies in the cleaned output."""
+        nonlocal at
+        toks.append(tok)
+        spans.append((at, at + len(text)))
+        out.append(text)
+        at += len(text)
+
+    def skip(text):
+        """Append output that produces NO token (whitespace, a blanked comment)."""
+        nonlocal at
+        out.append(text)
+        at += len(text)
+
     while i < n:
         ch = sql[i]
         if ch in _WS:
             j = i
             while j < n and sql[j] in _WS:
                 j += 1
-            out.append(sql[i:j])
+            skip(sql[i:j])
             i = j
         elif sql.startswith("--", i):
             j = sql.find("\n", i)
             i = n if j < 0 else j
-            out.append(" ")
+            skip(" ")
         elif sql.startswith("/*", i):
             j = sql.find("*/", i + 2)
             if j < 0:
                 raise QueryRejected("Unterminated comment in query")
             i = j + 2
-            out.append(" ")
+            skip(" ")
         elif ch == "'":
             j = i + 1
             while True:
@@ -129,8 +161,7 @@ def _tokens(sql):
                     j += 2
                     continue
                 break
-            toks.append(("str", sql[i:j + 1]))
-            out.append(sql[i:j + 1])
+            emit(("str", sql[i:j + 1]), sql[i:j + 1])
             i = j + 1
         elif ch in _QUOTES:
             close = _QUOTES[ch]
@@ -143,28 +174,28 @@ def _tokens(sql):
                     j += 2
                     continue
                 break
-            toks.append(("ident", sql[i + 1:j].replace('""', '"')))
-            out.append(sql[i:j + 1])
+            emit(("ident", sql[i + 1:j].replace('""', '"')), sql[i:j + 1])
             i = j + 1
         elif ch.isalpha() or ch == "_":
             j = i
             while j < n and (sql[j].isalnum() or sql[j] in "_$"):
                 j += 1
-            toks.append(("word", sql[i:j]))
-            out.append(sql[i:j])
+            emit(("word", sql[i:j]), sql[i:j])
             i = j
         elif ch.isdigit():
             j = i
             while j < n and (sql[j].isalnum() or sql[j] == "."):
                 j += 1
-            toks.append(("num", sql[i:j]))
-            out.append(sql[i:j])
+            emit(("num", sql[i:j]), sql[i:j])
             i = j
         else:
-            toks.append(("punct", ch))
-            out.append(ch)
+            emit(("punct", ch), ch)
             i += 1
-    return toks, "".join(out).strip()
+    # The historical return strips the cleaned text; spans are indices INTO it,
+    # so the leading whitespace that strip() removes has to come off them too.
+    raw = "".join(out)
+    lead = len(raw) - len(raw.lstrip())
+    return toks, raw.strip(), [(a - lead, b - lead) for a, b in spans]
 
 
 def _skip_parens(toks, i):
@@ -447,7 +478,38 @@ def _qualifier_ok(canon_parts, by_arity):
     return ".".join(canon_parts) in by_arity.get(len(canon_parts), ())
 
 
-def validate(sql, allowed_tables, qualifiers=None, dialect=None):
+def _skip_explain(toks, i):
+    """Index of the first token after an `EXPLAIN [options]` prefix.
+
+    Accepts every dialect's option spelling — a parenthesised list
+    (`EXPLAIN (FORMAT JSON)`, `EXPLAIN (TYPE DISTRIBUTED)`) and bare option words
+    (`EXPLAIN FORMATTED|EXTENDED|COST|VERBOSE`, `EXPLAIN QUERY PLAN`,
+    `EXPLAIN USING JSON`). Raises on ANALYZE in any position: EXPLAIN ANALYZE
+    executes the statement, which would turn a planning call into a real read
+    that never passed the row cap."""
+    j = i + 1
+    if j < len(toks) and toks[j] == ("punct", "("):
+        depth = 0
+        while j < len(toks):
+            tok = toks[j]
+            if tok == ("punct", "("):
+                depth += 1
+            elif tok == ("punct", ")"):
+                depth -= 1
+                if depth == 0:
+                    return j + 1
+            elif tok[0] == "word" and tok[1].lower() == "analyze":
+                raise QueryRejected("EXPLAIN ANALYZE executes the query; not allowed")
+            j += 1
+        raise QueryRejected("Unbalanced parentheses after EXPLAIN")
+    while j < len(toks) and toks[j][0] == "word" and toks[j][1].lower() not in ("select", "with"):
+        if toks[j][1].lower() == "analyze":
+            raise QueryRejected("EXPLAIN ANALYZE executes the query; not allowed")
+        j += 1
+    return j
+
+
+def validate(sql, allowed_tables, qualifiers=None, dialect=None, allow_explain=False):
     """Raise QueryRejected unless `sql` is a single SELECT touching only
     allowed tables. Returns the comment-free SQL the caller must execute.
 
@@ -473,7 +535,20 @@ def validate(sql, allowed_tables, qualifiers=None, dialect=None):
         raise QueryRejected("Empty query")
 
     # Leading parens are legal: `(SELECT ...) UNION (SELECT ...)`.
-    head = next((t for t in toks if t != ("punct", "(")), None)
+    head_i = next((i for i, t in enumerate(toks) if t != ("punct", "(")), None)
+    head = toks[head_i] if head_i is not None else None
+    # EXPLAIN is opt-in (allow_explain), and only ever a PREFIX: the planner is
+    # asked what it WOULD do, nothing is executed. The prefix is consumed here and
+    # the statement after it must still be a real SELECT/WITH — every other check
+    # below (single statement, forbidden keywords, external functions, table refs
+    # → RBAC) runs over the whole token stream exactly as before, so the inner
+    # query is governed identically. ANALYZE is refused because EXPLAIN ANALYZE
+    # actually RUNS the query on Postgres/Trino.
+    if allow_explain and head and head[0] == "word" and head[1].lower() == "explain":
+        head_i = _skip_explain(toks, head_i)
+        head = toks[head_i] if head_i < len(toks) else None
+        if not head or head[0] != "word" or head[1].lower() not in ("select", "with"):
+            raise QueryRejected("EXPLAIN must be followed by a SELECT query")
     if not head or head[0] != "word" or head[1].lower() not in ("select", "with"):
         raise QueryRejected("Only SELECT queries are allowed")
 
