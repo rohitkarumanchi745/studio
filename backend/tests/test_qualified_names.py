@@ -257,6 +257,46 @@ def test_postgres_output_relation_probe_reads_metadata_not_table_rows(monkeypatc
     assert connector.relation_kind("pipeline_output", "daily_sales") == "missing"
 
 
+def test_databricks_output_relation_probe_rejects_views(monkeypatch):
+    seen, returned = {}, [["MANAGED"]]
+
+    class Cursor:
+        def execute(self, sql, params):
+            seen.update(sql=sql, params=params)
+
+        def fetchone(self):
+            return returned[0]
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+    connector = DatabricksConnector()
+    monkeypatch.setattr(connector, "_execute", lambda fn: fn(Connection()))
+    assert connector.relation_kind("pipeline_output", "daily_sales") == "table"
+    assert "information_schema.tables" in seen["sql"]
+    assert "table_type" in seen["sql"]
+    assert "SHOW TABLES" not in seen["sql"]
+    assert seen["params"] == ("pipeline_output", "daily_sales")
+
+    returned[0] = ["VIEW"]
+    assert connector.relation_kind("pipeline_output", "daily_sales") == "other"
+    returned[0] = ["MATERIALIZED_VIEW"]
+    assert connector.relation_kind("pipeline_output", "daily_sales") == "other"
+    returned[0] = None
+    assert connector.relation_kind("pipeline_output", "daily_sales") == "missing"
+
+
+@pytest.mark.parametrize("namespace,table", [
+    ("pipeline-output", "daily_sales"),
+    ("pipeline_output", "daily-sales"),
+    ("pipeline_output", "daily_sales; DROP TABLE sales"),
+])
+def test_databricks_output_relation_probe_rejects_unsafe_identity(namespace, table):
+    with pytest.raises(ValueError, match="Invalid relation identity"):
+        DatabricksConnector().relation_kind(namespace, table)
+
+
 def test_every_registered_connector_declares_a_cheap_arity_keyed_namespace():
     """qualifiers() runs on every query, so it must never touch the network.
     Every prefix must be a non-empty dotted string of at most three parts —
