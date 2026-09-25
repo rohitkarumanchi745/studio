@@ -17,7 +17,7 @@ const require = createRequire(import.meta.url);
 let hooks = null;
 const bundle = await build({
   stdin: {
-    contents: `export {default as DataConnections, buildTiles, suggestName, planConnections, connectionReadiness, Namespaces, namespaceKey, namespaceLabel, remainingPickedNamespaces, GithubPanel, githubRegistrationReady, ConnectForm, instanceBadge, envActions, userActions, Instances}
+    contents: `export {default as DataConnections, buildTiles, suggestName, planConnections, connectionReadiness, Namespaces, namespaceKey, namespaceLabel, remainingPickedNamespaces, GithubPanel, githubRegistrationReady, ConnectForm, instanceBadge, envActions, userActions, Instances, planSchemaAdds}
       from "./src/components/DataConnections.jsx";
       export {metaFor} from "./src/components/sourceCatalog.jsx";`,
     resolveDir: frontend, loader: "jsx",
@@ -38,7 +38,7 @@ compiled._compile(bundle.outputFiles[0].text, compiled.filename);
 const { DataConnections, buildTiles, suggestName, planConnections, connectionReadiness,
         Namespaces, namespaceKey, namespaceLabel, remainingPickedNamespaces, GithubPanel,
         githubRegistrationReady, metaFor, ConnectForm, instanceBadge, envActions,
-        userActions, Instances } = compiled.exports;
+        userActions, Instances, planSchemaAdds } = compiled.exports;
 
 // What the four endpoints answer on a deployment with Postgres configured from
 // the environment, one user-added Snowflake, and S3 keys that were never set.
@@ -1024,4 +1024,64 @@ test("connections made here and built-in sources each get their own actions", ()
   assert.match(row("snowflake"), /Set up/);
   assert.match(row("sales-sf"), /Disconnect/);
   assert.match(row("old-sf"), /Reconnect/);
+});
+
+// ── Add schemas to a live source ────────────────────────────────────────
+// The connect form can list schemas only right after typing a credential; a
+// live source (the env-configured warehouse above all) adds them from its row.
+
+test("a live source can add schemas from its row — an env one gets nothing else", () => {
+  const tiles = byId(buildTiles({ types: TYPES, conns: [...CONNS, PARKED], sources: SOURCES }));
+  const rowsOf = (tile) => {
+    const html = renderToStaticMarkup(React.createElement(Instances, { tile, onAct() {} }));
+    const rows = html.split('class="dbconn-row').slice(1);
+    return (name) => rows.find((r) => r.includes(`<b>${name}</b>`));
+  };
+  const pg = rowsOf(tiles.postgres)("postgres");           // configured by environment
+  assert.match(pg, /Add schemas/);
+  assert.doesNotMatch(pg, /Disconnect|Remove/);
+
+  const sf = rowsOf(tiles.snowflake);
+  assert.match(sf("sales-sf"), /Add schemas/);             // a live user connection
+  assert.doesNotMatch(sf("old-sf"), /Add schemas/);        // parked: reconnect first
+  assert.doesNotMatch(sf("snowflake"), /<button/);          // env, not configured
+
+  // A type with no schemas (Neo4j) never offers the step.
+  const graph = { id: "neo4j", ns: {}, instances: [
+    { name: "neo4j", configured: true, kind: "env", disconnected: false }] };
+  assert.doesNotMatch(renderToStaticMarkup(React.createElement(Instances, { tile: graph, onAct() {} })),
+                      /Add schemas/);
+});
+
+test("added schemas are named after the source and dodge taken names", () => {
+  const plan = planSchemaAdds({
+    source: "postgres",
+    chosen: [{ database: "railway", schema: "messy_retail" }, { database: "railway", schema: "staging" }],
+    takenNames: new Set(["postgres", "postgres-staging"]),
+  });
+  assert.deepEqual(plan, [
+    { name: "postgres-messy-retail", schema: "messy_retail", database: "railway" },
+    { name: "postgres-staging-2", schema: "staging", database: "railway" },
+  ]);
+  assert.deepEqual(planSchemaAdds({ source: "postgres", chosen: [] }), []);
+  // Every schema of a catalog, and a long name keeps its suffix.
+  assert.equal(planSchemaAdds({ source: "databricks",
+    chosen: [{ database: "main", schema: "*" }] })[0].name, "databricks-all");
+  const long = "a".repeat(29);
+  const [first, second] = planSchemaAdds({ source: long,
+    chosen: [{ schema: "x1" }, { schema: "x1" }] });
+  assert.equal(first.name.length <= 31 && second.name.length <= 31, true);
+  assert.notEqual(first.name, second.name);
+  assert.match(second.name, /-2$/);
+});
+
+test("the source's own schema is listed but cannot be picked", () => {
+  const found = [{ database: "railway", schema: "messy_retail" }, { database: "railway", schema: "public" }];
+  const html = renderNs({ browse: { ok: true, namespaces: found },
+                          current: { schema: "public", database: "" } });
+  const items = html.split('class="conn-ns-item').slice(1);
+  const own = items.find((i) => i.includes("<span>public</span>"));
+  assert.match(own, /disabled=""/);
+  assert.match(own, /this source/);
+  assert.doesNotMatch(items.find((i) => i.includes("messy_retail")), /disabled|this source/);
 });

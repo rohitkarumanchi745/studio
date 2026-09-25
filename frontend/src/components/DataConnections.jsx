@@ -635,7 +635,13 @@ export function ConnectForm({ tile, defaultName, takenNames, onDone, onError, on
   // A connection made here: disconnect parks it (credential and name kept,
   // reconnect is one click); remove forgets it. Both take it out of the picker
   // immediately.
+  // "schemas" opens the add-schemas step under the rows instead of calling out.
+  const [adding, setAdding] = useState("");     // source name whose schemas are open
   async function act(inst, verb) {
+    if (verb === "schemas") {
+      setAdding((a) => (a === inst.name ? "" : inst.name));
+      return;
+    }
     const ask = {
       disconnect: `Disconnect “${inst.name}”? It leaves the chat picker and queries against it stop, `
         + "but the credential is kept so you can reconnect without re-entering it.",
@@ -678,6 +684,11 @@ export function ConnectForm({ tile, defaultName, takenNames, onDone, onError, on
             Cancel
           </button>
         </div>
+      )}
+      {adding && (
+        <AddSchemas key={adding} source={adding} takenNames={takenNames}
+          onDone={onDone} onError={onError} onPartial={onRemoved}
+          onCancel={() => setAdding("")} />
       )}
 
       <div className="conn-form">
@@ -771,18 +782,119 @@ export function ConnectForm({ tile, defaultName, takenNames, onDone, onError, on
   );
 }
 
-/** The picked-schema checklist, grouped by database / catalog / project. */
-export function Namespaces({ browse, picked, setPicked, keyOf }) {
-  if (!browse.ok) {
-    return (
-      <div className="meta conn-warn">
-        Couldn't list schemas ({browse.error}). Type the schema in the field above and
-        connect — this only affects the picker, not the connection.
+// ── Add schemas to a source that is already connected ────────────────────
+//
+// The form above can list schemas only while the admin holds the credential
+// they just typed. A live source — the env-configured warehouse above all,
+// whose secret nobody types here — gets the same step from its row, on the
+// credential the server already has. Same rule as connecting: each picked
+// schema becomes its own pinned source.
+
+/** Sources to create for schemas added to `source`: wh + analytics -> wh-analytics. */
+/** A name for a schema added to `base`: the base and the schema, as a slug
+ * (`postgres` + `messy_retail` → `postgres-messy-retail`; every schema, `*`,
+ * → `-all`), numbered past names already taken. The suffix gets its room
+ * before the cut to 31, so a long name cannot lose it. */
+function schemaSourceName(base, ns, taken) {
+  const slug = ns.schema === ALL ? "all"
+    : String(ns.schema).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  const candidate = `${base}-${slug}`.slice(0, 31).replace(/-+$/, "");
+  if (!taken.has(candidate)) return candidate;
+  for (let i = 2; i < 10000; i++) {
+    const suffix = `-${i}`;
+    const next = `${candidate.slice(0, 31 - suffix.length).replace(/-+$/, "")}${suffix}`;
+    if (!taken.has(next)) return next;
+  }
+  throw new Error("Could not generate a unique source name");
+}
+
+export function planSchemaAdds({ source, chosen = [], takenNames = new Set() }) {
+  const taken = new Set(takenNames);
+  return chosen.map((n) => {
+    const name = schemaSourceName(source, n, taken);
+    taken.add(name);
+    return { name, schema: n.schema, database: n.database || "" };
+  });
+}
+
+function AddSchemas({ source, takenNames, onDone, onError, onPartial, onCancel }) {
+  const [browse, setBrowse] = useState(null);
+  const [picked, setPicked] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState("");
+  const key = (n) => `${n.database || ""}\u0000${n.schema}`;
+  const path = `/connections/sources/${encodeURIComponent(source)}`;
+
+  useEffect(() => {
+    let live = true;
+    api(`${path}/namespaces`)
+      .then((d) => live && setBrowse(d))
+      .catch((e) => live && setBrowse({ ok: false, error: e.message, namespaces: [] }));
+    return () => { live = false; };
+  }, [path]);
+
+  const chosen = (browse?.namespaces || []).filter((n) => picked.includes(key(n)));
+  const plan = planSchemaAdds({ source, chosen, takenNames });
+
+  async function save() {
+    setBusy(true);
+    onError("");
+    // Sequential for the same reason as connecting: each POST re-probes, and a
+    // partial failure names the schema that failed and keeps the ones that landed.
+    const done = [];
+    for (const p of plan) {
+      setProgress(`adding ${p.name} (${done.length + 1} of ${plan.length})…`);
+      try {
+        await api(`${path}/schemas`, { method: "POST", body: JSON.stringify(p) });
+        done.push(p.name);
+      } catch (e) {
+        setBusy(false);
+        setProgress("");
+        onError(done.length ? `Added ${done.join(", ")}, then “${p.name}” failed: ${e.message}`
+                            : e.message);
+        if (done.length) onPartial();
+        return;
+      }
+    }
+    onDone(`Added ${done.length === 1 ? `“${done[0]}”` : `${done.length} sources — ${done.join(", ")} —`}`
+      + ` from ${source}, each scoped to its own schema. Grant them to other roles in Governance.`);
+  }
+
+  return (
+    <div className="conn-add-schemas">
+      {!browse ? <div className="meta">Looking up schemas {source} can see…</div> : (
+        <Namespaces browse={browse} picked={picked} setPicked={setPicked} keyOf={key}
+          current={browse.current}
+          failHint="Nothing was changed."
+          emptyHint="This account can't see any other schemas." />
+      )}
+      {plan.length > 0 && (
+        <div className="meta">Will add: {plan.map((p) => p.name).join(", ")}</div>
+      )}
+      <div className="m365-actions">
+        <button className="primary" onClick={save} disabled={busy || !plan.length}>
+          {busy ? (progress || "adding…")
+            : plan.length > 1 ? `✓ Add ${plan.length} schemas` : "✓ Add schema"}
+        </button>
+        <button className="chip" onClick={onCancel} disabled={busy}>Cancel</button>
       </div>
-    );
+      <div className="meta">
+        Uses {source}'s existing credential — nothing to re-enter. {source} itself stays
+        pinned to its own schema.
+      </div>
+    </div>
+  );
+}
+
+/** The picked-schema checklist, grouped by database / catalog / project. */
+export function Namespaces({ browse, picked, setPicked, keyOf, current = null,
+                             failHint = "Type the schema in the field above and connect — this only affects the picker, not the connection.",
+                             emptyHint = "No schemas visible to this account — type one above." }) {
+  if (!browse.ok) {
+    return <div className="meta conn-warn">Couldn't list schemas ({browse.error}). {failHint}</div>;
   }
   if (!browse.namespaces.length) {
-    return <div className="meta">No schemas visible to this account — type one above.</div>;
+    return <div className="meta">{emptyHint}</div>;
   }
   // Table counts come with the listing where the warehouse can say (Databricks
   // with Unity Catalog). Every counted schema empty almost always means the
@@ -790,6 +902,11 @@ export function Namespaces({ browse, picked, setPicked, keyOf }) {
   const counted = browse.namespaces.filter((n) => typeof n.tables === "number");
   const allEmpty = counted.length > 0 && counted.length === browse.namespaces.length
     && counted.every((n) => n.tables === 0);
+  // The schema the source is already pinned to is shown, but not pickable.
+  // Postgres reports its database while the pin has none, so a blank side
+  // matches any database.
+  const isCurrent = (n) => !!current && n.schema === current.schema
+    && (!current.database || !n.database || n.database === current.database);
 
   const groups = [];
   for (const n of browse.namespaces) {
@@ -816,13 +933,15 @@ export function Namespaces({ browse, picked, setPicked, keyOf }) {
           <div className="conn-ns-list">
             {g.items.map((n) => {
               const k = keyOf(n);
+              const here = isCurrent(n);
               const empty = n.tables === 0;
               return (
                 <label key={k} title={empty ? "No tables this credential can see" : undefined}
                        className={`conn-ns-item${picked.includes(k) ? " conn-ns-on" : ""}${empty ? " conn-ns-empty" : ""}`}>
-                  <input type="checkbox" checked={picked.includes(k)} disabled={empty && !picked.includes(k)}
-                         onChange={() => toggle(k)} />
+                  <input type="checkbox" checked={here || picked.includes(k)}
+                         disabled={here || (empty && !picked.includes(k))} onChange={() => toggle(k)} />
                   <span>{schemaLabel(n)}</span>
+                  {here && <span className="meta"> (this source)</span>}
                   {typeof n.tables === "number" && (
                     <span className="meta">{empty ? "empty" : `${n.tables} table${n.tables === 1 ? "" : "s"}`}</span>
                   )}
@@ -914,6 +1033,10 @@ const ACTION_LABEL = {
 export function Instances({ tile, onAct, onManage, busy = "" }) {
   if (!tile.instances.length) return null;
   const is = (verb, i) => busy === `${verb}:${i.name}`;
+  // Any live source of a type with schemas can bind more of them — the
+  // env-configured one included, since that reuses its credential and changes
+  // nothing about the source itself.
+  const canAdd = (i) => !!tile.ns?.schema && i.configured && !i.disconnected;
   return (
     <div className="conn-instances">
       {tile.instances.map((i) => (
@@ -924,6 +1047,11 @@ export function Instances({ tile, onAct, onManage, busy = "" }) {
           <span className={`m365-badge${i.configured ? " m365-badge-on" : " m365-badge-off"}`}>
             {instanceBadge(i)}
           </span>
+          {onAct && canAdd(i) && (
+            <button className="chip" onClick={() => onAct(i, "schemas")} disabled={!!busy}>
+              ＋ Add schemas
+            </button>
+          )}
           {onManage && envActions(i).map((verb) => (
             <button key={verb} className={`chip${verb === "disconnect" ? " ctx-danger" : ""}`}
               onClick={() => onManage(i, verb)} disabled={!!busy}>
