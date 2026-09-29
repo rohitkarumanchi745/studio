@@ -1,6 +1,6 @@
 # EXAMPLE, intentionally excluded from base/kustomization.yaml.
 # Build a CUDA-capable image from scripts/Dockerfile.trainer (replacing its
-# CPU torch wheel), set the empty values below, then raise replicas to one.
+# CPU torch wheel), set the empty values below, then unsuspend the one-shot Job.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -30,26 +30,25 @@ data:
   STUDIO_TRAJECTORY_EVAL_SUITE_SHA256: ""
   STUDIO_TRAJECTORY_EVAL_MIN_CANDIDATE_PASS_RATE: "0.9"
 ---
-apiVersion: apps/v1
-kind: Deployment
+apiVersion: batch/v1
+kind: Job
 metadata:
   name: studio-trajectory-trainer
   namespace: studio-system
 spec:
   # Safety default: this example cannot spend GPU or stream private data until
-  # an operator configures it and explicitly scales it to one.
-  replicas: 0
-  strategy:
-    type: Recreate
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: studio-trajectory-trainer
+  # an operator configures a private copy and explicitly unsuspends it.
+  suspend: true
+  completions: 1
+  parallelism: 1
+  backoffLimit: 0
   template:
     metadata:
       labels:
         app.kubernetes.io/name: studio-trajectory-trainer
         app.kubernetes.io/part-of: studio
     spec:
+      restartPolicy: Never
       automountServiceAccountToken: false
       enableServiceLinks: false
       securityContext:
@@ -63,7 +62,11 @@ spec:
         - name: trainer
           image: studio-trajectory-trainer:cuda-required
           imagePullPolicy: IfNotPresent
-          command: ["python", "train_trajectory_policy.py"]
+          command:
+            - python
+            - train_trajectory_policy.py
+            - --once
+            - --defer-publish
           envFrom:
             - configMapRef:
                 name: studio-trajectory-trainer-config

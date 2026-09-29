@@ -52,6 +52,7 @@ x-studio-runtime: &studio-runtime
     STUDIO_TOOLBUILDER: "0"
     STUDIO_LLM: ${STUDIO_LLM:-anthropic:claude-sonnet-5}
     STUDIO_POLICY_LLM: ${STUDIO_POLICY_LLM:-openai:bitnet-policy}
+    STUDIO_POLICY_TRUSTED_ENDPOINT: ${STUDIO_POLICY_TRUSTED_ENDPOINT:-0}
     STUDIO_POLICY_LLM_BASE_URL: ${STUDIO_POLICY_LLM_BASE_URL:-}
     STUDIO_POLICY_LLM_API_KEY: ${STUDIO_POLICY_LLM_API_KEY:-}
     ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
@@ -361,12 +362,14 @@ services:
   trajectory-trainer:
     <<: *trajectory-trainer-image
     profiles: ["trajectory-training"]
-    restart: unless-stopped
+    restart: "no"
     command:
       - python
       - train_trajectory_policy.py
       - --scope
       - ${STUDIO_TRAJECTORY_SCOPE:-}
+      - --once
+      - --defer-publish
     environment:
       STUDIO_API_URL: http://studio-web:8000
       STUDIO_TRAINER_EMAIL: ${STUDIO_TRAINER_EMAIL:-}

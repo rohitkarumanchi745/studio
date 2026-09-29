@@ -256,7 +256,7 @@ kubectl apply -f /path/to/your/private/studio-ingress.yaml
 ### Optional whole-trajectory trainer
 
 `trajectory-trainer.example.yaml` is intentionally excluded from the base
-Kustomization and starts with zero replicas. It is a template for a separately
+Kustomization and defines a suspended one-shot Job. It is a template for a separately
 permissioned training workload, not an always-on runtime component. Before
 using it:
 
@@ -270,8 +270,9 @@ using it:
 4. provision encrypted `ReadWriteOnce` storage and restrict network egress to
    Studio, the model/artifact registries, and the evaluator's required private
    services; and
-5. apply a private copy of the example, then change its replica count from zero
-   to one only for the controlled training run.
+5. apply a private copy of the example, then unsuspend the Job only for the
+   controlled training run. Delete and recreate it for a later round; do not
+   turn deferred BitNet training into an unattended restart loop.
 
 The job consumes validated examples for all five contracts and refuses to
 publish a partial policy. A candidate is promotable only after the server
@@ -283,11 +284,12 @@ it in an external policy gateway, and acknowledge that exact release before
 the cursor advances.
 
 The manifests do not bundle that policy gateway because its engine and adapter
-format are deployment-specific. Route it privately through
-`STUDIO_POLICY_LLM_BASE_URL` and provide `STUDIO_POLICY_LLM_API_KEY` through
-`studio-app-secrets`. Until an evaluated adapter is active, Studio continues to
-use the frontier model. Trained recovery output remains shadow-only; the live
-Agent Lightning controller and Studio supervisor keep retry authority.
+format are deployment-specific. `STUDIO_POLICY_LLM_BASE_URL` and
+`STUDIO_POLICY_LLM_API_KEY` can describe its isolated, exact-scope release wire,
+but this runtime does not automatically send prompts or upstream evidence to
+it. Studio continues to use the governed frontier/Agent Lightning paths;
+trained recovery output is offline-only and the live controller and supervisor
+keep retry authority.
 
 ## 5. Prove the live chain
 

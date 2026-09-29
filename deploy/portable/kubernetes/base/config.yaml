@@ -19,6 +19,8 @@ data:
   STUDIO_AUTO_MIGRATE: "1"
   STUDIO_LLM: anthropic:claude-sonnet-5
   STUDIO_POLICY_LLM: openai:bitnet-policy
+  # Release plumbing is present, but automatic external inference is dormant.
+  STUDIO_POLICY_TRUSTED_ENDPOINT: "0"
   # Set through an overlay only after an evaluated scoped adapter is mounted.
   STUDIO_POLICY_LLM_BASE_URL: ""
   STUDIO_AGL_URL: http://lightning-server:8080

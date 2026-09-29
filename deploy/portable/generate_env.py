@@ -53,6 +53,7 @@ def document() -> str:
         "STUDIO_RECOVERY_UPSTREAM_MODEL": "anthropic:claude-sonnet-5",
         "STUDIO_BITNET_GATEWAY_KEY": token(48),
         "STUDIO_POLICY_LLM": "openai:bitnet-policy",
+        "STUDIO_POLICY_TRUSTED_ENDPOINT": "0",
         "STUDIO_POLICY_LLM_BASE_URL": "",
         "STUDIO_POLICY_LLM_API_KEY": token(48),
         "STUDIO_BITNET_GGUF_REVISION": "29f884c2aefd035cd498fa0750b7781e6f269032",

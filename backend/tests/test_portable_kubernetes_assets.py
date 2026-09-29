@@ -299,7 +299,7 @@ def test_example_separates_studio_reader_from_airflow_pipeline_writer():
     assert "AIRFLOW_CONN_STUDIO_POSTGRES: postgresql://warehouse_pipeline_writer:" in text
 
 
-def test_whole_trajectory_trainer_is_an_explicit_zero_replica_example():
+def test_whole_trajectory_trainer_is_an_explicit_suspended_one_shot_example():
     base = _documents("base/kustomization.yaml")[0]
     assert "../trajectory-trainer.example.yaml" not in base["resources"]
 
@@ -307,21 +307,26 @@ def test_whole_trajectory_trainer_is_an_explicit_zero_replica_example():
     assert config["data"]["STUDIO_TENANT_ID"] == "studio-system"
     assert config["data"]["STUDIO_TRAJECTORY_TRAINING"] == "off"
     assert config["data"]["STUDIO_POLICY_LLM_BASE_URL"] == ""
+    assert config["data"]["STUDIO_POLICY_TRUSTED_ENDPOINT"] == "0"
 
     pvc = _resource(
         "trajectory-trainer.example.yaml", "PersistentVolumeClaim",
         "studio-trajectory-training",
     )
     assert pvc["spec"]["accessModes"] == ["ReadWriteOnce"]
-    deployment = _resource(
-        "trajectory-trainer.example.yaml", "Deployment",
+    job = _resource(
+        "trajectory-trainer.example.yaml", "Job",
         "studio-trajectory-trainer",
     )
-    assert deployment["spec"]["replicas"] == 0
-    assert deployment["spec"]["strategy"] == {"type": "Recreate"}
-    pod = deployment["spec"]["template"]["spec"]
+    assert job["spec"]["suspend"] is True
+    assert job["spec"]["completions"] == 1
+    assert job["spec"]["parallelism"] == 1
+    assert job["spec"]["backoffLimit"] == 0
+    pod = job["spec"]["template"]["spec"]
+    assert pod["restartPolicy"] == "Never"
     assert pod["automountServiceAccountToken"] is False
     trainer = _named(pod["containers"], "trainer")
+    assert trainer["command"][-2:] == ["--once", "--defer-publish"]
     assert trainer["securityContext"]["allowPrivilegeEscalation"] is False
     assert trainer["securityContext"]["capabilities"]["drop"] == ["ALL"]
     assert trainer["envFrom"] == [

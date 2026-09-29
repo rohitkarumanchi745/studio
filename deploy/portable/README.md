@@ -277,8 +277,13 @@ fine-tuning. Then start only the opt-in profile:
 ```sh
 docker compose --env-file deploy/portable/.env \
   -f deploy/portable/compose.yaml \
-  --profile trajectory-training up --build trajectory-trainer
+  --profile trajectory-training run --build --rm trajectory-trainer
 ```
+
+The portable service deliberately runs one `--defer-publish` round and exits
+without consuming its pending batch. Re-run it only for another controlled
+round. Direct directory-LoRA publication is a separate deployment mode with an
+explicit trainer opt-in; these BitNet-oriented defaults do not enable it.
 
 Training is cumulative and scope-isolated. Its encrypted source records stay
 in Studio PostgreSQL, while its replay, cursor, candidate adapter, and release
@@ -292,14 +297,17 @@ release path remains deliberately manual: convert the evaluated adapter to its
 supported artifact form, evaluate that exact artifact again, upload it under
 an immutable URI, publish its digest and provenance, mount and attest it in a
 separate adapter-aware policy gateway, and only then acknowledge the release
-so the trainer advances its cursor. Set `STUDIO_POLICY_LLM_BASE_URL` and
-`STUDIO_POLICY_LLM_API_KEY` to that gateway. Do not reuse the ordinary
-SQL/tool endpoint unless it enforces the trajectory adapter's kind and scope.
+so the trainer advances its cursor. `STUDIO_POLICY_LLM_BASE_URL` and
+`STUDIO_POLICY_LLM_API_KEY` describe that isolated release wire; the portable
+runtime does not automatically send prompts or evidence to it. Do not reuse the
+ordinary SQL/tool endpoint unless it enforces the trajectory adapter's kind and
+exact user scope.
 
-The learned recovery contract is shadow advice only. Agent Lightning remains
-the live failure/reward loop and Studio retains authority over retry limits,
-approvals, permissions, and child-run creation. This prevents a newly trained
-adapter from silently gaining execution authority.
+The learned recovery contract is an offline evaluation artifact only. Agent
+Lightning remains the live failure/reward loop and Studio retains authority
+over retry limits, approvals, permissions, and child-run creation. Aggregator
+and dependent-agent evidence also stays on the existing governed runtime path;
+a newly trained adapter never silently gains prompt or execution authority.
 
 ## Kubernetes production
 
