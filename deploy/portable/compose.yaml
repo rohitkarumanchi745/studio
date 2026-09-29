@@ -12,6 +12,12 @@ x-airflow-image: &airflow-image
     context: ../..
     dockerfile: deploy/airflow/Dockerfile
 
+x-trajectory-trainer-image: &trajectory-trainer-image
+  image: ${STUDIO_TRAJECTORY_TRAINER_IMAGE:-studio-trajectory-trainer:cpu}
+  build:
+    context: ../../scripts
+    dockerfile: Dockerfile.trainer
+
 x-airflow-env: &airflow-env
   AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg://${AIRFLOW_DB_USER:-airflow}:${AIRFLOW_DB_PASSWORD:?set AIRFLOW_DB_PASSWORD}@airflow-db:5432/${AIRFLOW_DB_NAME:-airflow}
   AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?set AIRFLOW_FERNET_KEY}
@@ -38,11 +44,16 @@ x-studio-runtime: &studio-runtime
     POSTGRES_DSN: postgresql://${WAREHOUSE_READER_USER:-warehouse_reader}:${WAREHOUSE_READER_PASSWORD:?set WAREHOUSE_READER_PASSWORD}@warehouse:5432/${WAREHOUSE_DB:-warehouse}
     POSTGRES_SCHEMA: public
     STUDIO_SECRET: ${STUDIO_SECRET:?set STUDIO_SECRET}
+    STUDIO_TENANT_ID: ${STUDIO_TENANT_ID:?set a stable STUDIO_TENANT_ID}
+    STUDIO_TRAJECTORY_TRAINING: ${STUDIO_TRAJECTORY_TRAINING:-off}
     STUDIO_ADMIN_EMAIL: ${STUDIO_ADMIN_EMAIL:-admin@studio.local}
     STUDIO_ADMIN_PASSWORD: ${STUDIO_ADMIN_PASSWORD:?set STUDIO_ADMIN_PASSWORD}
     STUDIO_DEMO_MODE: ${STUDIO_DEMO_MODE:-0}
     STUDIO_TOOLBUILDER: "0"
     STUDIO_LLM: ${STUDIO_LLM:-anthropic:claude-sonnet-5}
+    STUDIO_POLICY_LLM: ${STUDIO_POLICY_LLM:-openai:bitnet-policy}
+    STUDIO_POLICY_LLM_BASE_URL: ${STUDIO_POLICY_LLM_BASE_URL:-}
+    STUDIO_POLICY_LLM_API_KEY: ${STUDIO_POLICY_LLM_API_KEY:-}
     ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
     OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     AIRFLOW_URL: http://airflow-api:8080
@@ -344,6 +355,39 @@ services:
       timeout: 6s
       retries: 6
 
+  # Opt-in profile. The checked-in image is CPU-only and is suitable for data
+  # path validation, not economical production training. Point
+  # STUDIO_TRAJECTORY_TRAINER_IMAGE at a CUDA image on a GPU node for real use.
+  trajectory-trainer:
+    <<: *trajectory-trainer-image
+    profiles: ["trajectory-training"]
+    restart: unless-stopped
+    command:
+      - python
+      - train_trajectory_policy.py
+      - --scope
+      - ${STUDIO_TRAJECTORY_SCOPE:-}
+    environment:
+      STUDIO_API_URL: http://studio-web:8000
+      STUDIO_TRAINER_EMAIL: ${STUDIO_TRAINER_EMAIL:-}
+      STUDIO_TRAINER_PASSWORD: ${STUDIO_TRAINER_PASSWORD:-}
+      STUDIO_TRAINER_TOKEN: ${STUDIO_TRAINER_TOKEN:-}
+      STUDIO_TRAJECTORY_SCOPE: ${STUDIO_TRAJECTORY_SCOPE:-}
+      STUDIO_TRAJECTORY_OUTPUT_DIR: /var/lib/studio-trajectory
+      STUDIO_TRAJECTORY_BASE_MODEL: ${STUDIO_TRAJECTORY_BASE_MODEL:-microsoft/bitnet-b1.58-2B-4T-bf16}
+      STUDIO_TRAJECTORY_TRAIN_MODE: ${STUDIO_TRAJECTORY_TRAIN_MODE:-sft}
+      STUDIO_TRAJECTORY_TRAIN_MAX_LENGTH: ${STUDIO_TRAJECTORY_TRAIN_MAX_LENGTH:-4096}
+      STUDIO_TRAJECTORY_ADAPTER_BASE_URI: ${STUDIO_TRAJECTORY_ADAPTER_BASE_URI:-/var/lib/studio-trajectory}
+      STUDIO_TRAJECTORY_EVALUATOR_COMMAND: ${STUDIO_TRAJECTORY_EVALUATOR_COMMAND:-}
+      STUDIO_TRAJECTORY_EVAL_SUITE_SHA256: ${STUDIO_TRAJECTORY_EVAL_SUITE_SHA256:-}
+      STUDIO_TRAJECTORY_EVAL_MIN_CANDIDATE_PASS_RATE: ${STUDIO_TRAJECTORY_EVAL_MIN_CANDIDATE_PASS_RATE:-0.9}
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+    volumes:
+      - trajectory-training:/var/lib/studio-trajectory
+    depends_on:
+      studio-web:
+        condition: service_healthy
+
 volumes:
   studio-db:
   airflow-db:
@@ -351,3 +395,4 @@ volumes:
   redis:
   airflow-dags:
   agent-lightning-state:
+  trajectory-training:

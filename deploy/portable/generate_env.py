@@ -13,12 +13,27 @@ def token(size: int = 32) -> str:
 
 
 def document() -> str:
+    admin_password = token(18)
     values = {
         "STUDIO_IMAGE": "studio:portable",
         "STUDIO_AIRFLOW_IMAGE": "studio-airflow:3.3.1",
         "STUDIO_SECRET": token(48),
+        "STUDIO_TENANT_ID": "studio-" + token(12),
+        "STUDIO_TRAJECTORY_TRAINING": "off",
         "STUDIO_ADMIN_EMAIL": "admin@studio.local",
-        "STUDIO_ADMIN_PASSWORD": token(18),
+        "STUDIO_ADMIN_PASSWORD": admin_password,
+        "STUDIO_TRAINER_EMAIL": "admin@studio.local",
+        "STUDIO_TRAINER_PASSWORD": admin_password,
+        "STUDIO_TRAINER_TOKEN": "",
+        "STUDIO_TRAJECTORY_SCOPE": "",
+        "STUDIO_TRAJECTORY_TRAINER_IMAGE": "studio-trajectory-trainer:cpu",
+        "STUDIO_TRAJECTORY_BASE_MODEL": "microsoft/bitnet-b1.58-2B-4T-bf16",
+        "STUDIO_TRAJECTORY_TRAIN_MODE": "sft",
+        "STUDIO_TRAJECTORY_TRAIN_MAX_LENGTH": "4096",
+        "STUDIO_TRAJECTORY_ADAPTER_BASE_URI": "/var/lib/studio-trajectory",
+        "STUDIO_TRAJECTORY_EVALUATOR_COMMAND": "",
+        "STUDIO_TRAJECTORY_EVAL_SUITE_SHA256": "",
+        "STUDIO_TRAJECTORY_EVAL_MIN_CANDIDATE_PASS_RATE": "0.9",
         "STUDIO_DEMO_MODE": "0",
         "STUDIO_BIND_ADDRESS": "127.0.0.1",
         "STUDIO_DB_PASSWORD": token(24),
@@ -37,6 +52,9 @@ def document() -> str:
         "STUDIO_RECOVERY_GATEWAY_MODE": "langchain",
         "STUDIO_RECOVERY_UPSTREAM_MODEL": "anthropic:claude-sonnet-5",
         "STUDIO_BITNET_GATEWAY_KEY": token(48),
+        "STUDIO_POLICY_LLM": "openai:bitnet-policy",
+        "STUDIO_POLICY_LLM_BASE_URL": "",
+        "STUDIO_POLICY_LLM_API_KEY": token(48),
         "STUDIO_BITNET_GGUF_REVISION": "29f884c2aefd035cd498fa0750b7781e6f269032",
         "STUDIO_BITNET_GGUF_SHA256": "4221b252fdd5fd25e15847adfeb5ee88886506ba50b8a34548374492884c2162",
         "STUDIO_BITNET_ADAPTER_URL": "",
@@ -44,6 +62,7 @@ def document() -> str:
         "STUDIO_BITNET_ADAPTER_SHA256": "",
         "ANTHROPIC_API_KEY": "",
         "OPENAI_API_KEY": "",
+        "HUGGING_FACE_HUB_TOKEN": "",
     }
     return "".join(f"{key}={value}\n" for key, value in values.items())
 

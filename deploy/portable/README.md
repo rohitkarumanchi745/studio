@@ -254,6 +254,53 @@ failed/invalid BitNet planning attempt is retried with the configured frontier
 model. The frontier `STUDIO_LLM` remains authoritative for new/out-of-scope
 work and fallback.
 
+### Train the complete prompt-to-pipeline policy
+
+Studio records five separate, versioned contracts for this policy: complete
+Airflow DAGs, multi-step agent graphs, recovery decisions, grounded aggregate
+answers, and dependent-agent prompts that include the real upstream results.
+Collection is opt-in. Keep the generated, stable `STUDIO_TENANT_ID`, then set
+`STUDIO_TRAJECTORY_TRAINING=user` to capture only the signed-in user's private
+examples. The runtime validates each target again before it becomes eligible;
+fallback previews, failed validation, ungrounded aggregates, and recovery
+decisions without an observed outcome are retained for audit but are not
+positive training examples.
+
+The optional Compose profile is a private training worker, not part of the
+request path. Configure a scope such as `user:<uuid>`, a verified evaluator as
+JSON argv in `STUDIO_TRAJECTORY_EVALUATOR_COMMAND`, and its immutable suite
+digest in `STUDIO_TRAJECTORY_EVAL_SUITE_SHA256`. The checked-in image is useful
+for a dry run and contract validation on CPU; point
+`STUDIO_TRAJECTORY_TRAINER_IMAGE` at an operator-built CUDA image for practical
+fine-tuning. Then start only the opt-in profile:
+
+```sh
+docker compose --env-file deploy/portable/.env \
+  -f deploy/portable/compose.yaml \
+  --profile trajectory-training up --build trajectory-trainer
+```
+
+Training is cumulative and scope-isolated. Its encrypted source records stay
+in Studio PostgreSQL, while its replay, cursor, candidate adapter, and release
+metadata stay on the private `trajectory-training` volume. A successful
+training process still does not activate weights. Promotion requires an
+independent paired baseline/candidate report covering all five contracts and
+matching the dataset, base model, scope, and evaluation-suite identities.
+
+PEFT output also cannot be mounted directly by `bitnet.cpp`. The CPU-serving
+release path remains deliberately manual: convert the evaluated adapter to its
+supported artifact form, evaluate that exact artifact again, upload it under
+an immutable URI, publish its digest and provenance, mount and attest it in a
+separate adapter-aware policy gateway, and only then acknowledge the release
+so the trainer advances its cursor. Set `STUDIO_POLICY_LLM_BASE_URL` and
+`STUDIO_POLICY_LLM_API_KEY` to that gateway. Do not reuse the ordinary
+SQL/tool endpoint unless it enforces the trajectory adapter's kind and scope.
+
+The learned recovery contract is shadow advice only. Agent Lightning remains
+the live failure/reward loop and Studio retains authority over retry limits,
+approvals, permissions, and child-run creation. This prevents a newly trained
+adapter from silently gaining execution authority.
+
 ## Kubernetes production
 
 The files under `deploy/portable/kubernetes/` deploy Studio web/worker, the

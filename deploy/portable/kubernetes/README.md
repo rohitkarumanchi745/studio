@@ -253,6 +253,42 @@ this bundle:
 kubectl apply -f /path/to/your/private/studio-ingress.yaml
 ```
 
+### Optional whole-trajectory trainer
+
+`trajectory-trainer.example.yaml` is intentionally excluded from the base
+Kustomization and starts with zero replicas. It is a template for a separately
+permissioned training workload, not an always-on runtime component. Before
+using it:
+
+1. enable private capture deliberately by patching
+   `STUDIO_TRAJECTORY_TRAINING=user` while keeping `STUDIO_TENANT_ID` stable;
+2. build and pin a CUDA-capable variant of `scripts/Dockerfile.trainer` rather
+   than scheduling the example CPU image for a real fine-tune;
+3. set one `user:<uuid>` scope, a credential for a dedicated verified Studio
+   administrator, an immutable adapter destination, and the JSON-argv
+   evaluator plus its suite SHA-256;
+4. provision encrypted `ReadWriteOnce` storage and restrict network egress to
+   Studio, the model/artifact registries, and the evaluator's required private
+   services; and
+5. apply a private copy of the example, then change its replica count from zero
+   to one only for the controlled training run.
+
+The job consumes validated examples for all five contracts and refuses to
+publish a partial policy. A candidate is promotable only after the server
+recomputes the paired baseline/candidate gates and binds the result to the
+scope, dataset digest, base model, artifact SHA-256, and evaluator suite. PEFT
+to GGUF conversion is not automated: evaluate and publish the final serving
+artifact, make the scoped `trajectory_policy` release active, mount and attest
+it in an external policy gateway, and acknowledge that exact release before
+the cursor advances.
+
+The manifests do not bundle that policy gateway because its engine and adapter
+format are deployment-specific. Route it privately through
+`STUDIO_POLICY_LLM_BASE_URL` and provide `STUDIO_POLICY_LLM_API_KEY` through
+`studio-app-secrets`. Until an evaluated adapter is active, Studio continues to
+use the frontier model. Trained recovery output remains shadow-only; the live
+Agent Lightning controller and Studio supervisor keep retry authority.
+
 ## 5. Prove the live chain
 
 ```sh

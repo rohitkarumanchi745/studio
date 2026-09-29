@@ -9,9 +9,18 @@ data:
   STUDIO_DEMO_MODE: "0"
   STUDIO_OPEN_REGISTRATION: "0"
   STUDIO_TOOLBUILDER: "0"
+  # Stable deployment identity used to bind encrypted trajectory data and
+  # tenant-scoped adapters. Change it only with an explicit data/key migration.
+  STUDIO_TENANT_ID: studio-system
+  # Retention is always local; trainer streaming remains explicit and off by
+  # default. Use `user` for the built-in private capture hooks.
+  STUDIO_TRAJECTORY_TRAINING: "off"
   STUDIO_WORKER_MODE: external
   STUDIO_AUTO_MIGRATE: "1"
   STUDIO_LLM: anthropic:claude-sonnet-5
+  STUDIO_POLICY_LLM: openai:bitnet-policy
+  # Set through an overlay only after an evaluated scoped adapter is mounted.
+  STUDIO_POLICY_LLM_BASE_URL: ""
   STUDIO_AGL_URL: http://lightning-server:8080
   STUDIO_WORKER_CLAIM_GATE_URL: http://lightning-controller:8082/readyz
   STUDIO_AGL_RECOVERY_MODEL: studio-recovery
