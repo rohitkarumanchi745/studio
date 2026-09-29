@@ -296,8 +296,9 @@ use internal TLS/service-mesh encryption and set
 
 Training is cumulative and scope-isolated. Its encrypted source records stay
 in Studio PostgreSQL, while its replay, cursor, candidate adapter, and release
-metadata stay on the private `trajectory-training` volume. A successful
-training process still does not activate weights. Promotion requires an
+metadata stay on the private `trajectory-training` volume. Candidate trees are
+forced to owner-only `0700`/`0600` modes before evaluation or publication. A
+successful training process still does not activate weights. Promotion requires an
 independent paired baseline/candidate report covering all five contracts and
 matching the dataset, base model, scope, and evaluation-suite identities.
 The web/worker registry and trainer receive the same model/revision/digest from
@@ -305,6 +306,12 @@ the generated environment. A dedicated policy gateway must set
 `STUDIO_GATEWAY_BASE_MODEL_SHA256` to that same serving digest and expose
 supervisor state proving the running base bytes; vLLM or an unsupervised gateway
 is refused for this policy.
+
+Turning collection off is not a distributed erasure operation. This release
+does not coordinate deletion across PostgreSQL, every trainer volume, the
+registry, and operator-owned immutable artifact storage. Keep the feature off
+where an automated per-user deletion SLA is required, or supply and audit that
+retention/revocation procedure outside Studio before enrollment.
 
 PEFT output also cannot be mounted directly by `bitnet.cpp`. The CPU-serving
 release path remains deliberately manual: convert the evaluated adapter to its

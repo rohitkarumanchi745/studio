@@ -493,11 +493,20 @@ but it cannot become an all-five runtime policy.
 
 The encrypted source examples remain in Studio's database. The trainer volume
 holds a mode-0600 atomic cursor plus pending batch, cumulative private replay,
-diagnostic JSONL, PEFT candidate, and deferred-release manifest. A failed train,
+diagnostic JSONL, PEFT candidate, and deferred-release manifest. Trajectory
+candidate trees are secured to owner-only directories/files (`0700`/`0600`)
+before hashing, evaluation, or publication. A failed train,
 evaluation, or publish leaves pending data intact. Bounds are explicit:
 `STUDIO_TRAJECTORY_TRAIN_MAX_PENDING[_BYTES]` and
 `STUDIO_TRAJECTORY_TRAIN_MAX_REPLAY[_BYTES]`; overflow refuses the round rather
 than silently evicting examples.
+
+This corpus is cumulative and has no coordinated exact-user deletion protocol
+yet. Disabling collection prevents future capture but does not erase the
+encrypted source rows, the trainer volume, candidates, or immutable artifacts
+already copied to serving/object storage. Operators with deletion obligations
+must keep collection off until they provide a retention procedure that covers
+all of those stores and registry revocation.
 
 `--dry-run` intentionally uses no ML dependencies. It verifies authentication,
 scope resolution, the versioned canonical wire contract, and per-contract row

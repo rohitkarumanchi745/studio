@@ -12,11 +12,12 @@ or a Spark payload built from them; the Python it generates is a syntax-checked
 **deliverable Studio never executes**. A separate chat workflow path builds
 dependency-aware, single-source SQL DAGs for Airflow from declarative plans,
 using a trusted compiler and administrator-approved publication and execution.
-Around these paths sit **governance-as-code**
-and a learning loop (**Agent Lightning**) that records every run as a rewarded
-rollout — and delivers it to a real Agent Lightning server when one is
-configured. A separately operated trainer can use eligible rollouts to train a
-**self-hosted BitNet** adapter for recurring work. Recording a run does not
+Around these paths sit **governance-as-code** and two deliberately separate
+learning channels: **Agent Lightning** controls live recovery and can receive
+supported chat/per-agent rewarded rollouts, while complete orchestration labels
+enter an encrypted five-contract corpus. Separately operated trainers can use
+eligible data to train **self-hosted BitNet** adapters for recurring SQL or the
+whole orchestration policy. Recording a run does not
 update model weights or activate an adapter; serving and a verified training
 result must be configured before learned-scope routing can take over.
 
@@ -792,6 +793,11 @@ attest the same identity, and only then acknowledge the release so the cursor
 can advance. See [the trainer guide](scripts/README-training.md) and the
 [cloud-neutral portable deployment](deploy/portable/README.md).
 
+That identity includes the trainable repository, a full immutable model commit
+actually passed to every Transformers load, and the SHA-256 of the exact base
+artifact measured by the supervised policy gateway. A mutable model name is not
+promotion evidence, and vLLM/unattested gateways cannot serve this strict path.
+
 The registry and dedicated gateway are prepared, but **this build does not call
 the external trajectory-policy endpoint at runtime**. Frontier planners and
 aggregators continue to serve live traffic, while Agent Lightning remains the
@@ -799,6 +805,16 @@ live recovery controller. This avoids silently exporting upstream result rows,
 failure diagnostics, or private prompts merely because an adapter was
 published. Enabling live learned-policy inference needs a separate reviewed
 disclosure and execution boundary; setting an endpoint alone does not do it.
+
+Private-corpus retention is currently operator-managed. Turning
+`STUDIO_TRAJECTORY_TRAINING` off stops new collection, but it does not delete
+existing encrypted database rows, a trainer's cumulative plaintext replay and
+diagnostic JSONL, candidate adapters, or externally published immutable
+artifacts. Candidate files are owner-only (`0700` directories / `0600` files),
+but Studio does not yet provide a coordinated exact-user purge across those
+stores. Do not enable collection where an automated deletion SLA is required;
+removing that data and revoking its registry release is a separate destructive
+operator procedure.
 
 ### The staged flow — safe production behavior
 
@@ -2103,7 +2119,7 @@ optional and falls back to the in-process cache silently.
 | Decision | Why | Tradeoff accepted |
 |---|---|---|
 | **Hosted LLMs (Claude / GPT) via BYOK**, not self-hosted weights | No GPU fleet; users bring their own key; always the latest models | Can't do gradient/weight RL — learning is prompt-level |
-| **Agent Lightning stores recovery trajectories and rewards; Studio reuses proven recipes** | Hosted weights are frozen and retries need durable evidence | Weight optimization is a separate ML release; structured recovery data is not consumed by the SQL adapter trainer |
+| **Agent Lightning controls live recovery; Studio stores typed outcome labels privately** | Retries need durable model decisions and physical outcomes, while diagnostics and upstream rows need narrower scope than a generic rollout stream | Weight optimization is a separate five-contract release; it is never mixed into the global SQL adapter or activated merely by recording data |
 | **BitNet serves the learned scope, frontier serves the new** (scope grows) | Recurring work shouldn't keep paying the frontier; the frontier bootstraps data and handles novelty | Runs two models; needs a BitNet + Harrier endpoint stood up; a training lag (covered by escalation) |
 | **Learned scope centralized + access-gated** | One user's learned patterns benefit everyone with the same access | The *cache* tier stays role-scoped (it reuses stored insight text) — only the routing is centralized |
 | **BitNet serves on CPU; LoRA training uses bf16 master weights** | Keeps inference inexpensive while retaining a trainable source model | A GPU trainer is strongly recommended; CPU/MPS training is a slow fallback and final GGUF conversion/evaluation is a release gate |
@@ -2372,6 +2388,10 @@ you in: the account is created unverified and the emailed 6-digit code
 | `STUDIO_TRAIN_BASE_MODEL` | HF id of the **trainable** base (default `microsoft/bitnet-b1.58-2B-4T-bf16`) — the packed 1-bit repo cannot be fine-tuned |
 | `STUDIO_TRAIN_DEVICE` / `STUDIO_TRAIN_DTYPE` | Override the accelerator and weight dtype; by default cuda→bf16 (fp16 on pre-Ampere), mps→bf16, cpu→fp32 |
 | `STUDIO_TRAIN_MAX_LENGTH` / `_BATCH_SIZE` / `_GRAD_ACCUM` / `_GRAD_CHECKPOINT` | The VRAM levers; checkpointing defaults on for CUDA, which is what makes an 8 GB card fit |
+| `STUDIO_TENANT_ID` / `STUDIO_TRAJECTORY_TRAINING` | Stable HMAC input plus exact private-corpus mode: `off` (default), `user` (all five contracts, promotable), or `tenant` (no raw-evidence contracts, offline-only) |
+| `STUDIO_TRAJECTORY_BASE_MODEL` / `_BASE_REVISION` / `_BASE_SHA256` | Exact whole-policy base identity: trainable repo, full immutable 40/64-hex revision passed to Transformers, and SHA-256 of the base bytes attested by policy serving. Real training/promotion fails closed without all three |
+| `STUDIO_TRAJECTORY_EVAL_SUITE_SHA256` / `_EVAL_MIN_CASES` / `_EVAL_MIN_CANDIDATE_PASS_RATE` | Immutable independent evaluation suite and server-enforced all-five promotion floors; default pass-rate floor cannot be lowered below 0.90 |
+| `STUDIO_POLICY_TRUSTED_ENDPOINT` / `STUDIO_POLICY_LLM_BASE_URL` / `STUDIO_POLICY_LLM_API_KEY` | Isolated policy-client configuration. Runtime invocation is deliberately dormant in this build even when configured; these values prepare an explicitly reviewed future boundary, not an activation switch |
 | `STUDIO_REDTEAM_MAX_CASES` | Maximum attack cases in one adversarial benchmark after expanding attacker × technique × objective × trial (default 500) |
 | `STUDIO_REDTEAM_MAX_MODEL_CALLS` | Maximum estimated attacker + target + judge calls in one benchmark (default 3000) |
 | `STUDIO_REDTEAM_MODEL_TIMEOUT_S` | Per-call timeout used uniformly for attacker, target, and judge models (default 60; clamped to 5–300 seconds). Each model object also gets one provider-level retry |
@@ -2550,6 +2570,16 @@ way round from the feature list above:
   Collected examples and successful Agent Lightning delivery do not close
   those gates or change model weights. Treat routing/gateway tests against a
   stub separately from proof that the actual engine can execute Studio's tools.
+- **A trained five-contract candidate is not a live orchestration policy.** The
+  private corpus, balanced trainer, evaluation gate, registry, and strict
+  gateway wire are implemented, but runtime invocation is deliberately dormant.
+  A production claim additionally requires immutable base/candidate provenance,
+  final-artifact evaluation, successful mount/readiness attestation, and a
+  reviewed disclosure boundary for private prompts and upstream evidence.
+- **Private trajectory opt-out is not erasure.** Disabling collection prevents
+  future writes only. Encrypted source rows, private trainer replay/JSONL,
+  candidates, and externally stored releases need an operator-owned retention
+  and deletion procedure; there is no coordinated per-user purge API yet.
 
 ### Future rollouts
 
