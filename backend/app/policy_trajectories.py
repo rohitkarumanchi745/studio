@@ -32,6 +32,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 
 from . import bootstrap, db
 from .auth import current_user
@@ -87,6 +88,7 @@ _DAG_ID_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}$")
 _GRAPH_ID_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 _SOURCE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _SCOPE_RE = re.compile(r"^(user|tenant):[0-9a-f]{64}$")
+_SCOPE_SPEC_RE = re.compile(r"^(?:user|tenant):[A-Za-z0-9][A-Za-z0-9_.@+-]{0,127}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _EVIDENCE_TOKEN_RE = re.compile(r"^ev_[0-9a-f]{20}$")
 _SENSITIVE_KEY = re.compile(
@@ -918,6 +920,23 @@ def fetch_training_page(*, scope: str, after: int = 0, limit: int = 100,
 def _admin(user: dict | None) -> None:
     if (user or {}).get("role") != "admin":
         raise HTTPException(403, "Training control is admin-only")
+
+
+class TrainingScopeIn(BaseModel):
+    scope: str
+
+
+@router.post("/trajectories/resolve-scope")
+def resolve_training_scope(body: TrainingScopeIn, user=Depends(current_user)):
+    """HMAC one readable identity without placing it in a URL or returning data."""
+    _admin(user)
+    scope = body.scope.strip() if isinstance(body.scope, str) else ""
+    if not _SCOPE_SPEC_RE.fullmatch(scope):
+        raise HTTPException(400, "scope must be user:<stable-id> or tenant:<stable-id>")
+    try:
+        return {"scope": normalize_scope(scope)}
+    except ContractRejected as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @router.get("/trajectories")

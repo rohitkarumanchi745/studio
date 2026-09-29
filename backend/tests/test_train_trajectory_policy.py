@@ -176,11 +176,54 @@ def test_scope_requires_one_exact_opaque_user_or_tenant_identity(tmp_path, scope
 def test_readable_scope_is_resolved_by_server_before_private_state(tmp_path, monkeypatch):
     module = _load(tmp_path)
     seen = {}
-    monkeypatch.setattr(module, "pull_trajectories", lambda token, scope, since, limit=1: (
-        seen.update(scope=scope, since=since, limit=limit) or {
-            "scope": _scope("tenant"), "trajectories": [], "cursor": 0, "count": 0}))
+
+    def request(method, path, token=None, body=None):
+        seen.update(method=method, path=path, token=token, body=body)
+        return {"scope": _scope("tenant")}
+
+    monkeypatch.setattr(module, "_req", request)
     assert module.resolve_scope("token", "tenant:acme-prod") == _scope("tenant")
-    assert seen == {"scope": "tenant:acme-prod", "since": 0, "limit": 1}
+    assert seen == {
+        "method": "POST", "path": "/api/training/trajectories/resolve-scope",
+        "token": "token", "body": {"scope": "tenant:acme-prod"},
+    }
+    assert "acme-prod" not in seen["path"]
+
+    monkeypatch.setattr(
+        module, "_req", lambda *args, **kwargs: pytest.fail(
+            "an opaque scope must not need resolution"))
+    assert module.resolve_scope("token", _scope()) == _scope()
+
+
+def test_api_transport_ignores_ambient_proxies_and_forbids_redirects(
+        tmp_path, monkeypatch):
+    module = _load(tmp_path)
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:8080")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:8080")
+    monkeypatch.setenv("NO_PROXY", "")
+    opener = module._build_api_opener()
+    proxy_handlers = [handler for handler in opener.handlers
+                      if isinstance(handler, module.urllib.request.ProxyHandler)]
+    assert not proxy_handlers or all(handler.proxies == {} for handler in proxy_handlers)
+
+    redirect = next(handler for handler in opener.handlers
+                    if isinstance(handler, module._NoRedirectHandler))
+    request = module.urllib.request.Request(
+        "https://studio.example/api/training/trajectories",
+        headers={"Authorization": "Bearer admin-secret"})
+    with pytest.raises(module.urllib.error.HTTPError, match="redirects are forbidden"):
+        redirect.redirect_request(
+            request, None, 302, "Found", {}, "https://attacker.invalid/steal")
+
+
+def test_trajectory_pagination_refuses_readable_scope_in_query_string(
+        tmp_path, monkeypatch):
+    module = _load(tmp_path)
+    monkeypatch.setattr(
+        module, "_req", lambda *args, **kwargs: pytest.fail(
+            "a readable scope must never reach a GET query"))
+    with pytest.raises(SystemExit, match="explicit opaque"):
+        module.pull_trajectories("token", "user:person@example.com", 0)
 
 
 def test_canonical_deployment_environment_and_script_compile(tmp_path, monkeypatch):

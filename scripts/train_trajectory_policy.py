@@ -136,6 +136,24 @@ _RELEASE_VERSION = 2
 _online_module = None
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Never forward Studio credentials or private responses to another URL."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url, code, "Studio API redirects are forbidden", headers, fp)
+
+
+def _build_api_opener():
+    # Trainer requests carry an administrator bearer token and decrypted private
+    # trajectories. Do not let ambient HTTP(S)_PROXY variables reroute them.
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), _NoRedirectHandler())
+
+
+_API_OPENER = _build_api_opener()
+
+
 def _fail(message):
     return SystemExit(f"[trajectory-trainer] {message}")
 
@@ -237,7 +255,7 @@ def _req(method, path, token=None, body=None):
         headers["Authorization"] = "Bearer " + token
     req = urllib.request.Request(API + path, data=data, method=method, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=60) as response:
+        with _API_OPENER.open(req, timeout=60) as response:
             raw = response.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:
         detail = exc.read(500).decode("utf-8", errors="replace")
@@ -271,7 +289,10 @@ def login():
 
 
 def pull_trajectories(token, scope, since, limit=PAGE_LIMIT):
-    scope = validate_scope_spec(scope)
+    # A readable user/tenant identity must never enter an access-log-friendly
+    # query string. Resolve it through the authenticated JSON-body endpoint
+    # first; pagination uses only the HMAC-derived opaque scope.
+    scope = validate_scope(scope)
     if type(since) is not int or since < 0:
         raise _fail("trajectory cursor must be a non-negative integer")
     if type(limit) is not int or not 1 <= limit <= 200:
@@ -288,8 +309,10 @@ def resolve_scope(token, scope):
     scope = validate_scope_spec(scope)
     if _SCOPE.fullmatch(scope):
         return scope
-    page = pull_trajectories(token, scope, 0, limit=1)
-    resolved = page.get("scope") if isinstance(page, dict) else None
+    response = _req(
+        "POST", "/api/training/trajectories/resolve-scope", token=token,
+        body={"scope": scope})
+    resolved = response.get("scope") if isinstance(response, dict) else None
     try:
         return validate_scope(resolved)
     except SystemExit:

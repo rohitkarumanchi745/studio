@@ -173,6 +173,26 @@ def test_collection_mode_and_raw_evidence_scope_fail_closed(monkeypatch):
                    scope="tenant", training_opt_in=True)
 
 
+def test_scope_resolution_is_admin_only_bounded_and_returns_no_training_data():
+    raw_user_id = str(uuid.uuid4())
+    body = pt.TrainingScopeIn(scope=f"user:{raw_user_id}")
+    with pytest.raises(HTTPException) as forbidden:
+        pt.resolve_training_scope(body, user={"id": raw_user_id, "role": "analyst"})
+    assert forbidden.value.status_code == 403
+
+    resolved = pt.resolve_training_scope(
+        body, user={"id": "trainer", "role": "admin"})
+    assert resolved == {"scope": pt.user_scope(raw_user_id)}
+    assert raw_user_id not in resolved["scope"]
+    assert set(resolved) == {"scope"}
+
+    with pytest.raises(HTTPException) as invalid:
+        pt.resolve_training_scope(
+            pt.TrainingScopeIn(scope="user:contains/a/slash"),
+            user={"id": "trainer", "role": "admin"})
+    assert invalid.value.status_code == 400
+
+
 def test_aggregator_rejects_numeric_and_qualitative_hallucinations():
     inp, target = _aggregate("Revenue was 999.")
     with pytest.raises(pt.ContractRejected, match="numeric claims"):
