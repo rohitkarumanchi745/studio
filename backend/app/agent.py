@@ -296,9 +296,16 @@ def make_policy_llm(contract, user=None, **kwargs):
     spec = policy_llm_spec()
     if not spec.startswith("openai:"):
         raise PolicyUnavailable("STUDIO_POLICY_LLM must use the OpenAI-compatible provider")
+    try:
+        from . import trainer
+        base_identity = trainer._normalize_trajectory_base_identity(
+            adapter.get("base_identity"))
+    except Exception:
+        raise PolicyUnavailable("the trajectory adapter base identity is invalid") from None
     if adapter.get("kind") != "trajectory_policy" \
             or adapter.get("scope", "").split(":", 1)[0] != "user" \
-            or contract not in (adapter.get("capabilities") or []):
+            or contract not in (adapter.get("capabilities") or []) \
+            or adapter.get("base_model") != base_identity["training_model"]:
         raise PolicyUnavailable("the trajectory adapter wire identity is invalid")
     parsed_endpoint = urlsplit(endpoint)
     if parsed_endpoint.scheme not in {"http", "https"} or not parsed_endpoint.hostname \

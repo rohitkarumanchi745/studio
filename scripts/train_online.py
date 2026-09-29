@@ -1282,11 +1282,14 @@ def _training_kwargs(device):
     return kw
 
 
-def _load_base_model(base_model, dtype, device, grad_ckpt):
+def _load_base_model(base_model, dtype, device, grad_ckpt, *, base_revision=None):
     """from_pretrained + placement, with the two settings gradient checkpointing
     needs on a LoRA run (no KV cache, and inputs that carry grad)."""
     from transformers import AutoModelForCausalLM
-    model = AutoModelForCausalLM.from_pretrained(base_model, torch_dtype=dtype)
+    pretrained = {"torch_dtype": dtype}
+    if base_revision is not None:
+        pretrained["revision"] = base_revision
+    model = AutoModelForCausalLM.from_pretrained(base_model, **pretrained)
     if grad_ckpt:
         if getattr(model, "config", None) is not None:
             model.config.use_cache = False
@@ -1452,7 +1455,7 @@ def _completion_collator(tokenizer):
 
 
 def train_lora(samples, base_model, out_dir, epochs, adapter_kind="tool_call",
-               allow_prompt_truncation=True):
+               allow_prompt_truncation=True, *, base_revision=None):
     """Reward-filtered SFT of a small LoRA adapter on BitNet's bf16 masters.
 
     This is the GPU half of the system (serving BitNet is the CPU half — see
@@ -1476,7 +1479,8 @@ def train_lora(samples, base_model, out_dir, epochs, adapter_kind="tool_call",
             f"  (missing: {e.name}). Use --dry-run to exercise the loop without it.")
 
     announce_model_fetch(base_model)
-    tok = AutoTokenizer.from_pretrained(base_model)
+    tokenizer_args = {"revision": base_revision} if base_revision is not None else {}
+    tok = AutoTokenizer.from_pretrained(base_model, **tokenizer_args)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
@@ -1495,7 +1499,8 @@ def train_lora(samples, base_model, out_dir, epochs, adapter_kind="tool_call",
     _, steps = _print_step_plan(len(samples), "samples", epochs)
     grad_ckpt = _grad_checkpoint_on(device)
     model = _guard_oom("loading the base model", device, dtype_name,
-                       _load_base_model, base_model, dtype, device, grad_ckpt)
+                       _load_base_model, base_model, dtype, device, grad_ckpt,
+                       base_revision=base_revision)
     lora = LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05, bias="none",
                       task_type="CAUSAL_LM",
                       target_modules=["q_proj", "k_proj", "v_proj", "o_proj"])
@@ -1531,7 +1536,8 @@ def train_lora(samples, base_model, out_dir, epochs, adapter_kind="tool_call",
     return adapter_dir, metrics
 
 
-def train_dpo(pairs, base_model, out_dir, epochs, adapter_kind="tool_call"):
+def train_dpo(pairs, base_model, out_dir, epochs, adapter_kind="tool_call", *,
+              base_revision=None):
     """Direct Preference Optimization of a LoRA adapter — genuine preference-based
     RL. Optimizes the policy so the chosen (higher-reward) completion is preferred
     over the rejected one, relative to a frozen reference (the base with the LoRA
@@ -1554,7 +1560,8 @@ def train_dpo(pairs, base_model, out_dir, epochs, adapter_kind="tool_call"):
             f"  (missing: {e.name}). Use --dry-run to mine pairs without it.")
 
     announce_model_fetch(base_model)
-    tok = AutoTokenizer.from_pretrained(base_model)
+    tokenizer_args = {"revision": base_revision} if base_revision is not None else {}
+    tok = AutoTokenizer.from_pretrained(base_model, **tokenizer_args)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
@@ -1588,7 +1595,8 @@ def train_dpo(pairs, base_model, out_dir, epochs, adapter_kind="tool_call"):
     _, steps = _print_step_plan(len(pairs), "pairs", epochs)
     grad_ckpt = _grad_checkpoint_on(device)
     model = _guard_oom("loading the base model", device, dtype_name,
-                       _load_base_model, base_model, dtype, device, grad_ckpt)
+                       _load_base_model, base_model, dtype, device, grad_ckpt,
+                       base_revision=base_revision)
     lora = LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05, bias="none",
                       task_type="CAUSAL_LM",
                       target_modules=["q_proj", "k_proj", "v_proj", "o_proj"])

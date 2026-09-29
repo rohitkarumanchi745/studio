@@ -90,6 +90,8 @@ BASE_MODEL = os.getenv(
               os.getenv("STUDIO_TRAIN_BASE_MODEL",
                         "microsoft/bitnet-b1.58-2B-4T-bf16")),
 ).strip()
+BASE_REVISION = os.getenv("STUDIO_TRAJECTORY_BASE_REVISION", "").strip().lower()
+BASE_SERVING_SHA256 = os.getenv("STUDIO_TRAJECTORY_BASE_SHA256", "").strip().lower()
 MODE = os.getenv("STUDIO_TRAJECTORY_TRAIN_MODE", "sft").strip().lower()
 MIN_REWARD = float(os.getenv("STUDIO_TRAJECTORY_TRAIN_MIN_REWARD", "0.6"))
 PAIR_MARGIN = float(os.getenv("STUDIO_TRAJECTORY_TRAIN_PAIR_MARGIN", "0.15"))
@@ -125,16 +127,40 @@ MAX_REPLAY_BYTES = int(os.getenv(
 _SCOPE = re.compile(r"(?:tenant|user):[0-9a-f]{64}\Z")
 _SCOPE_SPEC = re.compile(r"(?:tenant|user):[A-Za-z0-9][A-Za-z0-9_.@+-]{0,127}\Z")
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
+_FULL_REVISION = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _MAX_WIRE_TEXT = 2 * 1024 * 1024
 _MAX_REPORT_BYTES = 1024 * 1024
 _STATE_VERSION = 1
 _REPLAY_VERSION = 1
-_RELEASE_VERSION = 1
+_RELEASE_VERSION = 2
 _online_module = None
 
 
 def _fail(message):
     return SystemExit(f"[trajectory-trainer] {message}")
+
+
+def base_identity():
+    """Exact trainable snapshot plus exact target serving-base bytes.
+
+    The revision is passed into every Transformers load. The serving digest is
+    evaluated, registry-pinned, and finally compared with the supervisor's
+    actual base-file hash by the policy gateway. Neither value is decorative.
+    """
+    if not BASE_MODEL or len(BASE_MODEL) > 512 \
+            or any(ord(char) < 32 or ord(char) == 127 for char in BASE_MODEL):
+        raise _fail("STUDIO_TRAJECTORY_BASE_MODEL must identify one trainable model")
+    if not _FULL_REVISION.fullmatch(BASE_REVISION):
+        raise _fail(
+            "STUDIO_TRAJECTORY_BASE_REVISION must be the full 40- or 64-hex commit")
+    if not _HEX64.fullmatch(BASE_SERVING_SHA256):
+        raise _fail(
+            "STUDIO_TRAJECTORY_BASE_SHA256 must be the 64-hex digest of the exact serving base")
+    return {
+        "training_model": BASE_MODEL,
+        "training_revision": BASE_REVISION,
+        "serving_sha256": BASE_SERVING_SHA256,
+    }
 
 
 def validate_scope(scope):
@@ -579,7 +605,9 @@ def load_tokenizer():
         raise _fail(
             "complete token preflight requires transformers; install "
             "scripts/requirements-trainer.txt") from exc
-    return AutoTokenizer.from_pretrained(BASE_MODEL)
+    identity = base_identity()
+    return AutoTokenizer.from_pretrained(
+        identity["training_model"], revision=identity["training_revision"])
 
 
 def _token_ids(tokenizer, text, *, special=False):
@@ -798,6 +826,7 @@ def _write_jsonl(path, rows):
 
 def train_sft(samples):
     shared = _online()
+    identity = base_identity()
     shared.MAX_LENGTH = MAX_LENGTH
     shaped = [{
         "system": row["system"], "prompt": row["prompt"],
@@ -805,12 +834,14 @@ def train_sft(samples):
         "history": [], "source": row["contract"],
     } for row in samples]
     return shared.train_lora(
-        shaped, BASE_MODEL, OUT_DIR, EPOCHS,
-        adapter_kind=ADAPTER_KIND, allow_prompt_truncation=False)
+        shaped, identity["training_model"], OUT_DIR, EPOCHS,
+        adapter_kind=ADAPTER_KIND, allow_prompt_truncation=False,
+        base_revision=identity["training_revision"])
 
 
 def train_dpo(pairs):
     shared = _online()
+    identity = base_identity()
     shared.MAX_LENGTH = MAX_LENGTH
     # DPOTrainer has a separate prompt cap.  Preflight already proved each full
     # prompt+completion fits, so matching it to MAX_LENGTH prevents a second,
@@ -823,7 +854,9 @@ def train_dpo(pairs):
         "margin": row["margin"], "history": [], "source": row["contract"],
     } for row in pairs]
     return shared.train_dpo(
-        shaped, BASE_MODEL, OUT_DIR, EPOCHS, adapter_kind=ADAPTER_KIND)
+        shaped, identity["training_model"], OUT_DIR, EPOCHS,
+        adapter_kind=ADAPTER_KIND,
+        base_revision=identity["training_revision"])
 
 
 def _tree_sha256(adapter_dir):
@@ -885,7 +918,7 @@ def validate_evaluation_report(report, expected, config):
     if not isinstance(report, dict):
         raise _fail("evaluator report root must be an object")
     identity_keys = (
-        "protocol", "request_id", "artifact_sha256", "base_model",
+        "protocol", "request_id", "artifact_sha256", "base_identity",
         "suite_sha256", "dataset_sha256", "scope",
     )
     if {key: report.get(key) for key in identity_keys} != \
@@ -934,7 +967,7 @@ def validate_evaluation_report(report, expected, config):
         "artifact_sha256": expected["artifact_sha256"],
         "dataset_sha256": expected["dataset_sha256"],
         "scope": expected["scope"],
-        "base_model": expected["base_model"],
+        "base_identity": expected["base_identity"],
         "capabilities": list(CONTRACTS),
         "contracts": evidence,
     }
@@ -977,13 +1010,14 @@ def _evaluator_env():
 
 def evaluate_candidate(adapter_dir, dataset_digest, scope, mode, config=None):
     config = config or evaluator_config()
+    identity = base_identity()
     artifact_digest = _tree_sha256(adapter_dir)
     request = {
         "protocol": EVALUATION_PROTOCOL,
         "request_id": secrets.token_hex(16),
         "adapter_dir": os.path.abspath(adapter_dir),
         "artifact_sha256": artifact_digest,
-        "base_model": BASE_MODEL,
+        "base_identity": identity,
         "mode": mode,
         "suite_sha256": config["suite_sha256"],
         "dataset_sha256": dataset_digest,
@@ -1041,11 +1075,13 @@ def _uri_join(base, name):
 
 def _manifest(scope, *, cursor, pending, adapter_dir, artifact_sha256,
               dataset_digest, mode, counts, metrics):
+    identity = base_identity()
     value = {
         "version": _RELEASE_VERSION,
         "scope": scope,
         "kind": ADAPTER_KIND,
-        "base_model": BASE_MODEL,
+        "base_model": identity["training_model"],
+        "base_identity": identity,
         "cursor": cursor,
         "pending": [{"id": row["id"], "revision": row["revision"]} for row in pending],
         "peft_adapter": os.path.abspath(adapter_dir),
@@ -1081,7 +1117,7 @@ def _metrics_object(value):
 
 
 def _validate_recorded_evidence(metrics, *, scope, artifact_sha256,
-                                dataset_sha256, base_model):
+                                dataset_sha256, base_identity):
     # ``promotion_evidence`` is written by the registry after it independently
     # recomputes every threshold.  Requiring it prevents an acknowledgement
     # from trusting the trainer/evaluator's own unverified summary.
@@ -1093,12 +1129,12 @@ def _validate_recorded_evidence(metrics, *, scope, artifact_sha256,
         "artifact_sha256": artifact_sha256,
         "dataset_sha256": dataset_sha256,
         "scope": scope,
-        "base_model": base_model,
+        "base_identity": base_identity,
         "passed": True,
         "safety_passed": True,
     }
     if {key: evidence.get(key) for key in expected} != expected:
-        raise _fail("active adapter evaluation is not bound to this scope/artifact/dataset/base")
+        raise _fail("active adapter evaluation is not bound to this scope/artifact/dataset/base identity")
     suite = evidence.get("suite_sha256")
     if not isinstance(suite, str) or not _HEX64.fullmatch(suite):
         raise _fail("active adapter evaluation does not identify a pinned suite")
@@ -1143,20 +1179,27 @@ def acknowledge_published_release(token, scope, uri, version, sha256):
             or not _HEX64.fullmatch(sha256):
         raise _fail("release acknowledgement needs exact URI, positive version and SHA-256")
     adapter = active_adapter(token, scope)
+    current_base = base_identity()
+    if manifest.get("base_identity") != current_base \
+            or manifest.get("base_model") != current_base["training_model"]:
+        raise _fail("deferred release base identity no longer matches trainer configuration")
     expected = {
         "scope": scope, "kind": ADAPTER_KIND, "uri": uri, "version": version,
         "sha256": sha256, "base_model": manifest["base_model"], "status": "active",
+        "base_identity": manifest["base_identity"],
     }
     if {key: adapter.get(key) for key in expected} != expected:
         raise _fail("active registry adapter does not match the acknowledged release identity")
     metrics = _metrics_object(adapter.get("metrics"))
     if metrics.get("dataset_sha256") != manifest["dataset_sha256"] \
             or metrics.get("scope") != scope \
+            or metrics.get("base_identity") != manifest["base_identity"] \
             or set(metrics.get("capabilities") or []) != CONTRACT_SET:
         raise _fail("active adapter metrics do not match the retained five-capability dataset")
     _validate_recorded_evidence(
         metrics, scope=scope, artifact_sha256=sha256,
-        dataset_sha256=manifest["dataset_sha256"], base_model=manifest["base_model"])
+        dataset_sha256=manifest["dataset_sha256"],
+        base_identity=manifest["base_identity"])
     cursor, pending = load_state(scope)
     identity = [{"id": row["id"], "revision": row["revision"]} for row in pending]
     if cursor != manifest["cursor"] or identity != manifest["pending"]:
@@ -1169,6 +1212,7 @@ def acknowledge_published_release(token, scope, uri, version, sha256):
     return {
         "acknowledged": True, "scope": scope, "kind": ADAPTER_KIND,
         "version": version, "uri": uri, "sha256": sha256,
+        "base_identity": manifest["base_identity"],
         "dataset_sha256": manifest["dataset_sha256"],
         "cleared_pending": len(pending), "cursor": cursor,
     }
@@ -1184,6 +1228,7 @@ def run_once(token, scope, *, dry_run=False, defer_publish=False, tokenizer=None
             "STUDIO_TRAJECTORY_ALLOW_PEFT_PUBLICATION=1 only for a verified "
             "directory-LoRA policy runtime")
     scope = require_complete_policy_scope(resolve_scope(token, scope))
+    identity = None if dry_run else base_identity()
     cursor_before, pending_before = load_state(scope)
     incoming, cursor, _pages = pull_pages(token, scope, cursor_before)
     pending = merge_rows(pending_before, incoming, MAX_PENDING_ROWS)
@@ -1255,6 +1300,7 @@ def run_once(token, scope, *, dry_run=False, defer_publish=False, tokenizer=None
     artifact_digest = _tree_sha256(adapter_dir)
     training_metrics.update({
         "scope": scope, "capabilities": list(CONTRACTS),
+        "base_identity": identity,
         "contract_counts": counts, "dataset_sha256": digest,
         "preflight_dropped": dropped,
     })
@@ -1268,7 +1314,8 @@ def run_once(token, scope, *, dry_run=False, defer_publish=False, tokenizer=None
             "peft_adapter": adapter_dir, "peft_sha256": artifact_digest,
             "release_requires": [
                 "peft_to_served_artifact_conversion", "five_capability_evaluation",
-                "stable_uri", "sha256", "registry_publication", "active_acknowledgement",
+                "base_identity_attestation", "stable_uri", "sha256",
+                "registry_publication", "active_acknowledgement",
             ],
             "metrics": training_metrics,
         }
@@ -1285,6 +1332,8 @@ def run_once(token, scope, *, dry_run=False, defer_publish=False, tokenizer=None
     if published.get("scope") != scope or published.get("kind") != ADAPTER_KIND \
             or published.get("uri") != uri \
             or published.get("sha256") != evaluation["artifact_sha256"] \
+            or published.get("base_model") != identity["training_model"] \
+            or published.get("base_identity") != identity \
             or type(published.get("version")) is not int or published["version"] < 1:
         raise _fail("adapter registry returned a mismatched publication identity")
     save_state(scope, cursor, [])
@@ -1296,7 +1345,8 @@ def run_once(token, scope, *, dry_run=False, defer_publish=False, tokenizer=None
 
 
 def run_loop(token, scope):
-    print(f"[trajectory-trainer] scope={scope} mode={MODE} poll={POLL_SECONDS}s base={BASE_MODEL}")
+    print(f"[trajectory-trainer] scope={scope} mode={MODE} poll={POLL_SECONDS}s "
+          f"base={BASE_MODEL}@{BASE_REVISION}")
     while True:
         try:
             print(json.dumps(run_once(token, scope), indent=2, default=str))

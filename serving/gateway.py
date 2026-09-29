@@ -118,6 +118,8 @@ if CPU_ADAPTER_KIND not in {"tool_call", "trajectory_policy"}:
     CPU_ADAPTER_KIND = "invalid"
 EXPECTED_ADAPTER_SCOPE = (os.getenv("STUDIO_GATEWAY_ADAPTER_SCOPE") or "").strip()
 _POLICY_SCOPE = re.compile(r"^user:[0-9a-f]{64}$")
+_POLICY_REVISION = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _POLICY_CAPABILITIES = ["airflow_dag", "agent_graph", "recovery_decision",
                         "aggregator_output", "dependent_agent"]
 TIMEOUT = int(os.getenv("STUDIO_GATEWAY_TIMEOUT", "600"))
@@ -242,6 +244,24 @@ def _identity(value):
     return {"uri": uri.strip(), "version": version, "sha256": sha256}
 
 
+def _policy_base_identity(value):
+    """Validate the exact training/serving provenance carried by a policy."""
+    if not isinstance(value, dict) or set(value) != {
+            "training_model", "training_revision", "serving_sha256"}:
+        return None
+    model = value.get("training_model")
+    revision = value.get("training_revision")
+    digest = value.get("serving_sha256")
+    if not isinstance(model, str) or not model.strip() or len(model) > 512 \
+            or any(ord(char) < 32 or ord(char) == 127 for char in model) \
+            or not isinstance(revision, str) or not _POLICY_REVISION.fullmatch(revision) \
+            or not isinstance(digest, str) or not _SHA256.fullmatch(digest):
+        return None
+    canonical = {"training_model": model.strip(), "training_revision": revision,
+                 "serving_sha256": digest}
+    return canonical if canonical == value else None
+
+
 def _required_identity():
     if not REQUIRE_TOOL_ADAPTER:
         return None
@@ -295,6 +315,23 @@ def _readiness():
             body.update(ok=False, stage="adapter_scope_config_invalid",
                         detail="whole trajectory policy serving requires one exact user scope")
             return 503, body
+        if CPU_ADAPTER_KIND == "trajectory_policy":
+            # A policy adapter is promoted against one exact served base. vLLM
+            # cannot attest either the mounted LoRA bytes or its base bytes, and
+            # a standalone gateway has no supervisor state to prove them, so the
+            # policy path is llama/supervisor-only and strict by construction.
+            if BACKEND_KIND != "llama" or stage == "unsupervised":
+                body.update(ok=False, stage="policy_attestation_unsupported",
+                            detail="trajectory policy serving requires supervised llama attestation")
+                return 503, body
+            if not REQUIRE_TOOL_ADAPTER:
+                body.update(ok=False, stage="policy_adapter_attestation_required",
+                            detail="trajectory policy serving requires strict adapter attestation")
+                return 503, body
+            if not _SHA256.fullmatch(REQUIRED_BASE_SHA256):
+                body.update(ok=False, stage="base_model_config_invalid",
+                            detail="trajectory policy serving requires a pinned base SHA-256")
+                return 503, body
         if REQUIRED_BASE_SHA256:
             model_identity = st.get("model") or {}
             if len(REQUIRED_BASE_SHA256) != 64 \
@@ -528,7 +565,8 @@ def _resolve_adapter(studio_adapters):
                 or not _POLICY_SCOPE.fullmatch(str(entry.get("scope") or "")) \
                 or not _POLICY_SCOPE.fullmatch(EXPECTED_ADAPTER_SCOPE) \
                 or entry.get("scope") != EXPECTED_ADAPTER_SCOPE \
-                or entry.get("capabilities") != _POLICY_CAPABILITIES:
+                or entry.get("capabilities") != _POLICY_CAPABILITIES \
+                or _policy_base_identity(entry.get("base_identity")) is None:
             return None, None
     order = PRIORITY
     if BACKEND_KIND == "llama":
@@ -552,7 +590,10 @@ def _resolve_adapter_identity(studio_adapters):
         return None, None
     entry = studio_adapters.get(kind)
     if REQUIRE_TOOL_ADAPTER:
-        return _identity(entry), kind
+        identity = _identity(entry)
+        if kind == "trajectory_policy" and identity is not None:
+            return {**dict(entry), **identity}, kind
+        return identity, kind
     # Preserve the complete entry when supplied, while retaining legacy URI-only
     # behavior outside strict mode.
     return dict(entry), kind
@@ -649,9 +690,21 @@ class Handler(BaseHTTPRequestHandler):
                 "error": "trajectory_policy requires one exact kind and scope",
                 "stage": "adapter_scope_mismatch",
             })
+        if policy_requested:
+            state = _sync_engine_epoch()
+            base_identity = _policy_base_identity(adapter.get("base_identity"))
+            running_digest = str((state.get("model") or {}).get("sha256") or "").lower()
+            if BACKEND_KIND != "llama" or state.get("stage") == "unsupervised" \
+                    or base_identity is None or not _SHA256.fullmatch(REQUIRED_BASE_SHA256) \
+                    or running_digest != REQUIRED_BASE_SHA256 \
+                    or base_identity["serving_sha256"] != running_digest:
+                return self._send_json(503, {
+                    "error": "trajectory policy base identity is not attested",
+                    "stage": "base_model_identity_mismatch",
+                })
         uri = adapter.get("uri") if adapter else None
 
-        if REQUIRE_TOOL_ADAPTER and adapter != _required_identity():
+        if REQUIRE_TOOL_ADAPTER and _identity(adapter) != _required_identity():
             _mismatch(adapter, _identity((_sync_engine_epoch().get("adapter") or {})))
             return self._send_json(503, {
                 "error": "the exact required tool adapter was not requested",

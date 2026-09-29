@@ -28,6 +28,7 @@ the next call, so training and serving are genuinely simultaneous. The trainer's
 heavy ML deps live in scripts/requirements-trainer.txt, out of the lean API image.
 """
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -47,6 +48,8 @@ router = APIRouter(prefix="/training", tags=["training"])
 KINDS = ("tool_call", "user_style", "trajectory_policy")
 TRAJECTORY_EVAL_PROTOCOL = "studio.trajectory-policy.promotion-eval.v1"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_FULL_REVISION = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+_WINDOWS_ABSOLUTE = re.compile(r"^[A-Za-z]:[\\/]")
 
 
 def require_tool_adapter_sha256():
@@ -200,18 +203,113 @@ def _exact_keys(value, required, name):
         raise HTTPException(400, f"{name} must contain exactly: {', '.join(required)}")
 
 
+def _normalize_trajectory_base_identity(value, *, status_code=400):
+    """Canonical policy base identity with fields that have operational meaning.
+
+    ``training_revision`` is the full immutable revision passed to Transformers
+    by the trajectory trainer. ``serving_sha256`` is the digest of the exact
+    base artifact which the gateway later verifies from supervisor state. They
+    intentionally are not conflated: a trainable bf16 snapshot and its served
+    GGUF conversion are different bytes.
+    """
+    required = ("training_model", "training_revision", "serving_sha256")
+    if not isinstance(value, dict) or set(value) != set(required):
+        raise HTTPException(
+            status_code,
+            "trajectory base_identity must contain exactly training_model, "
+            "training_revision, serving_sha256")
+    model = value.get("training_model")
+    revision = value.get("training_revision")
+    serving_sha256 = value.get("serving_sha256")
+    if not isinstance(model, str) or not model.strip() or len(model) > 512 \
+            or any(ord(char) < 32 or ord(char) == 127 for char in model):
+        raise HTTPException(status_code, "trajectory training_model is invalid")
+    canonical = {
+        "training_model": model.strip(),
+        "training_revision": str(revision or "").strip().lower(),
+        "serving_sha256": str(serving_sha256 or "").strip().lower(),
+    }
+    if not _FULL_REVISION.fullmatch(canonical["training_revision"]):
+        raise HTTPException(
+            status_code,
+            "trajectory training_revision must be a full 40- or 64-hex commit")
+    if not _SHA256.fullmatch(canonical["serving_sha256"]):
+        raise HTTPException(
+            status_code,
+            "trajectory serving_sha256 must be 64 lowercase hexadecimal characters")
+    if value != canonical:
+        raise HTTPException(status_code, "trajectory base_identity must be canonical")
+    return canonical
+
+
+def trajectory_base_identity():
+    """Operator-pinned base identity required for policy promotion.
+
+    There is deliberately no mutable revision default. A deployment which has
+    not pinned all three values may collect/train offline, but it cannot promote
+    a trajectory policy into the active registry.
+    """
+    value = {
+        "training_model": (os.getenv("STUDIO_TRAJECTORY_BASE_MODEL") or "").strip(),
+        "training_revision": (os.getenv(
+            "STUDIO_TRAJECTORY_BASE_REVISION") or "").strip().lower(),
+        "serving_sha256": (os.getenv(
+            "STUDIO_TRAJECTORY_BASE_SHA256") or "").strip().lower(),
+    }
+    return _normalize_trajectory_base_identity(value, status_code=503)
+
+
+def _validate_trajectory_uri(uri):
+    """Accept an absolute local artifact or a stable, credential-free URL."""
+    value = uri.strip()
+    parsed = urlsplit(value)
+    if parsed.scheme in {"https", "http"}:
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+            invalid_port = True
+        else:
+            invalid_port = False
+        if invalid_port or not parsed.netloc or not parsed.hostname \
+                or parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise HTTPException(
+                400, "trajectory_policy URL must be stable and contain no credentials")
+        if parsed.scheme == "http":
+            host = parsed.hostname.lower()
+            try:
+                loopback = ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                loopback = host == "localhost"
+            if not loopback:
+                raise HTTPException(
+                    400, "trajectory_policy HTTP URLs are allowed only on loopback")
+        return value
+    # urlsplit treats a Windows drive letter as a scheme, so recognize it
+    # separately. Relative paths and exotic schemes are ambiguous at serve time.
+    windows_absolute = bool(_WINDOWS_ABSOLUTE.match(value))
+    absolute = value.startswith("/") or windows_absolute
+    if (parsed.scheme and not windows_absolute) or not absolute:
+        raise HTTPException(
+            400, "trajectory_policy uri must be an absolute local path or HTTPS URL")
+    separators = value.replace("\\", "/").split("/")
+    if ".." in separators:
+        raise HTTPException(400, "trajectory_policy local path must not contain traversal")
+    return value
+
+
 def validate_evaluation_report(report, *, artifact_sha256, dataset_sha256,
                                scope, base_model):
     """Recompute trajectory-policy promotion from bound paired evidence.
 
     The evaluator's summary booleans are assertions, not authority. Promotion
-    binds the exact candidate bytes, dataset, scope, base model and pinned suite,
+    binds the exact candidate bytes, dataset, scope, base identity and pinned suite,
     then recomputes minimum case counts, candidate pass rate, and no-regression
     from each contract's paired baseline/candidate counts.
     """
     from . import policy_trajectories
     required = ("protocol", "passed", "safety_passed", "artifact_sha256",
-                "dataset_sha256", "scope", "base_model", "suite_sha256",
+                "dataset_sha256", "scope", "base_identity", "suite_sha256",
                 "capabilities", "contracts")
     _exact_keys(report, required, "trajectory evaluation")
     artifact_sha256 = (artifact_sha256 or "").strip().lower()
@@ -227,9 +325,12 @@ def validate_evaluation_report(report, *, artifact_sha256, dataset_sha256,
         raise HTTPException(400, "trajectory evaluation is not bound to these artifact/dataset bytes")
     if report["scope"] != scope:
         raise HTTPException(400, "trajectory evaluation scope does not match publication scope")
-    if not isinstance(base_model, str) or not base_model.strip() \
-            or report["base_model"] != base_model.strip():
-        raise HTTPException(400, "trajectory evaluation base model does not match publication")
+    base_identity = _normalize_trajectory_base_identity(report["base_identity"])
+    configured_identity = trajectory_base_identity()
+    if base_identity != configured_identity:
+        raise HTTPException(400, "trajectory evaluation base identity does not match deployment pin")
+    if not isinstance(base_model, str) or base_model.strip() != base_identity["training_model"]:
+        raise HTTPException(400, "trajectory adapter base_model does not match base identity")
     suite = trajectory_eval_suite_sha256()
     if suite is None:
         raise HTTPException(400, "STUDIO_TRAJECTORY_EVAL_SUITE_SHA256 must pin the promotion suite")
@@ -268,7 +369,7 @@ def validate_evaluation_report(report, *, artifact_sha256, dataset_sha256,
         "passed": True, "safety_passed": True,
         "artifact_sha256": artifact_sha256,
         "dataset_sha256": dataset_sha256,
-        "scope": scope, "base_model": base_model.strip(),
+        "scope": scope, "base_identity": base_identity,
         "suite_sha256": suite, "capabilities": expected,
         "thresholds": {"min_cases": minimum,
                        "min_candidate_pass_rate": threshold,
@@ -285,10 +386,7 @@ def _validate_trajectory_publication(scope, uri, sha256, base_model, metrics):
     if not isinstance(uri, str) or not uri.strip() or len(uri) > 2048 \
             or any(ord(char) < 32 or ord(char) == 127 for char in uri):
         raise HTTPException(400, "trajectory_policy uri is required")
-    parsed = urlsplit(uri.strip())
-    if parsed.scheme in {"http", "https"} and (not parsed.netloc or parsed.username
-            or parsed.password or parsed.query or parsed.fragment):
-        raise HTTPException(400, "trajectory_policy uri must be stable and contain no credentials")
+    uri = _validate_trajectory_uri(uri)
     if not _SHA256.fullmatch(sha256 or ""):
         raise HTTPException(400, "trajectory_policy requires an immutable artifact SHA-256")
     if not isinstance(metrics, dict):
@@ -298,6 +396,8 @@ def _validate_trajectory_publication(scope, uri, sha256, base_model, metrics):
     evidence = validate_evaluation_report(
         report, artifact_sha256=sha256, dataset_sha256=dataset,
         scope=scope, base_model=base_model)
+    if metrics.get("base_identity") != evidence["base_identity"]:
+        raise HTTPException(400, "trajectory metrics base identity does not match evaluation")
     capabilities = metrics.get("capabilities")
     if capabilities != list(policy_trajectories.CONTRACTS) \
             or capabilities != evidence["capabilities"]:
@@ -305,6 +405,7 @@ def _validate_trajectory_publication(scope, uri, sha256, base_model, metrics):
     # Return server-recomputed evidence; never serve the evaluator's untrusted
     # summary object as the proof of promotion.
     return {**metrics, "dataset_sha256": dataset,
+            "base_identity": evidence["base_identity"],
             "capabilities": list(policy_trajectories.CONTRACTS),
             "promotion_evidence": evidence}
 
@@ -415,6 +516,9 @@ def publish(scope, kind, uri, base_model=None, metrics=None, sha256=None):
     result = {"id": aid, "scope": scope, "kind": kind, "version": version, "uri": uri}
     if sha256:
         result["sha256"] = sha256
+    if kind == "trajectory_policy":
+        result["base_model"] = base_model
+        result["base_identity"] = metrics["base_identity"]
     return result
 
 
@@ -474,6 +578,7 @@ def trajectory_adapter(user, contract):
         return {"uri": row["uri"], "version": row["version"],
                 "sha256": row["sha256"], "scope": scope,
                 "kind": "trajectory_policy", "base_model": row.get("base_model"),
+                "base_identity": validated["base_identity"],
                 "capabilities": capabilities}
     return None
 
@@ -566,13 +671,16 @@ def active_adapter_endpoint(scope: str, kind: str, user=Depends(current_user)):
         # threshold invalidates an old release rather than blessing it.
         metrics = _validate_trajectory_publication(
             scope, row.get("uri"), row.get("sha256"), row.get("base_model"), metrics)
-    return {"adapter": {
+    adapter = {
         "id": row["id"], "scope": row["scope"], "kind": row["kind"],
         "version": row["version"], "uri": row["uri"],
         "sha256": row.get("sha256"), "base_model": row.get("base_model"),
         "metrics": metrics, "status": row["status"],
         "created_at": row["created_at"],
-    }}
+    }
+    if kind == "trajectory_policy":
+        adapter["base_identity"] = metrics["base_identity"]
+    return {"adapter": adapter}
 
 
 @router.get("/adapters/for-user/{uid}")

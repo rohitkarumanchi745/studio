@@ -3,7 +3,6 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import py_compile
 import stat
 import sys
 
@@ -23,6 +22,9 @@ def _load(tmp_path=None, env=None):
         "STUDIO_TRAJECTORY_TRAIN_MAX_LENGTH": "4096",
         "STUDIO_TRAJECTORY_TRAIN_MODE": "sft",
         "STUDIO_TRAJECTORY_ALLOW_PEFT_PUBLICATION": "1",
+        "STUDIO_TRAJECTORY_BASE_MODEL": "example/policy-base",
+        "STUDIO_TRAJECTORY_BASE_REVISION": "1" * 40,
+        "STUDIO_TRAJECTORY_BASE_SHA256": "2" * 64,
     }
     values.update(env or {})
     saved = dict(os.environ)
@@ -95,7 +97,7 @@ def _report(module, *, artifact="b" * 64, dataset="c" * 64,
         "protocol": module.EVALUATION_PROTOCOL,
         "request_id": request_id,
         "artifact_sha256": artifact,
-        "base_model": base or module.BASE_MODEL,
+        "base_identity": base or module.base_identity(),
         "suite_sha256": "d" * 64,
         "dataset_sha256": dataset,
         "scope": scope or _scope(),
@@ -131,7 +133,7 @@ a = p.parse_args()
 with open(a.request, encoding='utf-8') as h:
     request = json.load(h)
 report = {k: request[k] for k in (
-    'protocol', 'request_id', 'artifact_sha256', 'base_model',
+    'protocol', 'request_id', 'artifact_sha256', 'base_identity',
     'suite_sha256', 'dataset_sha256', 'scope')}
 report.update(passed=True, safety_passed=True,
               capabilities=request['capabilities'])
@@ -150,7 +152,7 @@ def _expected(module, **overrides):
         "protocol": module.EVALUATION_PROTOCOL,
         "request_id": "request",
         "artifact_sha256": "b" * 64,
-        "base_model": module.BASE_MODEL,
+        "base_identity": module.base_identity(),
         "suite_sha256": "d" * 64,
         "dataset_sha256": "c" * 64,
         "scope": _scope(),
@@ -185,13 +187,77 @@ def test_canonical_deployment_environment_and_script_compile(tmp_path, monkeypat
     module = _load(tmp_path, {
         "STUDIO_TRAJECTORY_OUTPUT_DIR": str(tmp_path / "canonical"),
         "STUDIO_TRAJECTORY_BASE_MODEL": "example/policy-base",
+        "STUDIO_TRAJECTORY_BASE_REVISION": "a" * 40,
+        "STUDIO_TRAJECTORY_BASE_SHA256": "b" * 64,
         "STUDIO_TRAJECTORY_SCOPE": "tenant:acme-prod",
     })
     assert module.OUT_DIR == str(tmp_path / "canonical")
     assert module.BASE_MODEL == "example/policy-base"
+    assert module.base_identity() == {
+        "training_model": "example/policy-base",
+        "training_revision": "a" * 40,
+        "serving_sha256": "b" * 64,
+    }
     monkeypatch.setenv("STUDIO_TRAJECTORY_SCOPE", "tenant:acme-prod")
     assert module.configured_scope() == "tenant:acme-prod"
-    py_compile.compile(str(_SCRIPT), doraise=True)
+    compile(_SCRIPT.read_text(encoding="utf-8"), str(_SCRIPT), "exec")
+
+
+def test_real_round_requires_full_immutable_base_identity_before_polling(
+        tmp_path, monkeypatch):
+    module = _load(tmp_path, {"STUDIO_TRAJECTORY_BASE_REVISION": "short",
+                              "STUDIO_TRAJECTORY_BASE_SHA256": ""})
+    monkeypatch.setattr(
+        module, "pull_trajectories",
+        lambda *args, **kwargs: pytest.fail("invalid base identity must fail before polling"))
+    with pytest.raises(SystemExit, match="BASE_REVISION"):
+        module.run_once("token", _scope(), tokenizer=FakeTokenizer())
+
+
+def test_policy_tokenizer_and_shared_training_use_exact_revision(tmp_path, monkeypatch):
+    module = _load(tmp_path)
+    calls = []
+
+    class AutoTokenizer:
+        @staticmethod
+        def from_pretrained(model, **kwargs):
+            calls.append(("tokenizer", model, kwargs))
+            return object()
+
+    transformers = type(sys)("transformers")
+    transformers.AutoTokenizer = AutoTokenizer
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+    module.load_tokenizer()
+
+    class Shared:
+        MAX_LENGTH = None
+        MAX_PROMPT_LENGTH = None
+        DPO_BETA = None
+
+        def train_lora(self, samples, model, out_dir, epochs, **kwargs):
+            calls.append(("sft", model, kwargs))
+            return "adapter", {}
+
+        def train_dpo(self, pairs, model, out_dir, epochs, **kwargs):
+            calls.append(("dpo", model, kwargs))
+            return "adapter", {}
+
+    monkeypatch.setattr(module, "_online", lambda: Shared())
+    sample = {"system": "s", "prompt": "p", "completion": "{}", "reward": 1.0,
+              "contract": module.CONTRACTS[0]}
+    pair = {**sample, "chosen": "{}", "rejected": '{"x":1}', "margin": 1.0}
+    module.train_sft([sample])
+    module.train_dpo([pair])
+
+    assert calls == [
+        ("tokenizer", module.BASE_MODEL, {"revision": module.BASE_REVISION}),
+        ("sft", module.BASE_MODEL,
+         {"adapter_kind": module.ADAPTER_KIND, "allow_prompt_truncation": False,
+          "base_revision": module.BASE_REVISION}),
+        ("dpo", module.BASE_MODEL,
+         {"adapter_kind": module.ADAPTER_KIND,
+          "base_revision": module.BASE_REVISION}),
+    ]
 
 
 def test_remote_http_is_fail_closed_without_explicit_private_network_opt_in(tmp_path):
@@ -558,7 +624,8 @@ def test_saturated_replay_reserves_pending_candidates_before_clearing_state(
     })
     monkeypatch.setattr(module, "publish_adapter", lambda token, scope, uri, sha, metrics: {
         "scope": scope, "kind": module.ADAPTER_KIND, "uri": uri,
-        "sha256": sha, "version": 1,
+        "sha256": sha, "version": 1, "base_model": module.BASE_MODEL,
+        "base_identity": module.base_identity(),
     })
 
     result = module.run_once("token", _scope(), tokenizer=FakeTokenizer())
@@ -606,7 +673,7 @@ def test_round_preflights_then_balances_digests_evaluates_and_publishes(
         "protocol": module.EVALUATION_PROTOCOL, "passed": True,
         "safety_passed": True, "artifact_sha256": artifact,
         "dataset_sha256": args[1], "scope": args[2],
-        "base_model": module.BASE_MODEL, "suite_sha256": "d" * 64,
+        "base_identity": module.base_identity(), "suite_sha256": "d" * 64,
         "capabilities": list(module.CONTRACTS),
         "contracts": {contract: {"positive_cases": 20, "paired_cases": 20,
                                   "baseline_passed": 18, "candidate_passed": 19,
@@ -617,7 +684,8 @@ def test_round_preflights_then_balances_digests_evaluates_and_publishes(
     monkeypatch.setattr(module, "publish_adapter", lambda token, scope, uri, sha, metrics: (
         published.update(scope=scope, uri=uri, sha=sha, metrics=metrics) or {
             "scope": scope, "kind": module.ADAPTER_KIND, "uri": uri,
-            "sha256": sha, "version": 1}))
+            "sha256": sha, "version": 1, "base_model": module.BASE_MODEL,
+            "base_identity": module.base_identity()}))
 
     result = module.run_once("token", _scope(), tokenizer=FakeTokenizer())
 
@@ -699,6 +767,7 @@ def _passing_metrics(module, scope, artifact, dataset):
     return {
         "scope": scope,
         "dataset_sha256": dataset,
+        "base_identity": module.base_identity(),
         "capabilities": list(module.CONTRACTS),
         "evaluation": evidence,
         "promotion_evidence": promoted,
@@ -719,6 +788,7 @@ def test_manual_ack_verifies_active_final_artifact_and_evidence_before_clearing(
     monkeypatch.setattr(module, "active_adapter", lambda token, scope: {
         "scope": scope, "kind": module.ADAPTER_KIND, "uri": "https://models/policy.gguf",
         "version": 7, "sha256": artifact, "base_model": module.BASE_MODEL,
+        "base_identity": module.base_identity(),
         "status": "active", "metrics": metrics,
     })
 
@@ -733,6 +803,7 @@ def test_manual_ack_verifies_active_final_artifact_and_evidence_before_clearing(
 
 @pytest.mark.parametrize("mutation,match", [
     ("artifact", "release identity"),
+    ("base", "release identity"),
     ("dataset", "retained five-capability dataset"),
     ("capability", "exact five-contract evidence"),
     ("cursor", "changed since deferred"),
@@ -754,9 +825,12 @@ def test_manual_ack_mismatch_never_consumes_pending(tmp_path, monkeypatch, mutat
         metrics["promotion_evidence"]["contracts"].pop(module.CONTRACTS[-1])
     if mutation == "cursor":
         module.save_state(_scope(), 6, rows)
+    active_base = ({**module.base_identity(), "serving_sha256": "9" * 64}
+                   if mutation == "base" else module.base_identity())
     monkeypatch.setattr(module, "active_adapter", lambda token, scope: {
         "scope": scope, "kind": module.ADAPTER_KIND, "uri": "https://models/policy.gguf",
         "version": 7, "sha256": adapter_sha, "base_model": module.BASE_MODEL,
+        "base_identity": active_base,
         "status": "active", "metrics": metrics,
     })
     with pytest.raises(SystemExit, match=match):
@@ -781,3 +855,5 @@ def test_shared_training_entrypoints_default_to_existing_tool_call_kind():
     spec.loader.exec_module(module)
     assert module.train_lora.__defaults__ == ("tool_call", True)
     assert module.train_dpo.__defaults__ == ("tool_call",)
+    assert module.train_lora.__kwdefaults__ == {"base_revision": None}
+    assert module.train_dpo.__kwdefaults__ == {"base_revision": None}

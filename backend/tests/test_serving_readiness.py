@@ -242,20 +242,31 @@ STRICT_ENV = {
 }
 
 POLICY_SCOPE = "user:" + "b" * 64
+POLICY_BASE_SHA = "2" * 64
+POLICY_BASE_IDENTITY = {
+    "training_model": "example/policy-base",
+    "training_revision": "1" * 40,
+    "serving_sha256": POLICY_BASE_SHA,
+}
 POLICY_CAPABILITIES = ["airflow_dag", "agent_graph", "recovery_decision",
                        "aggregator_output", "dependent_agent"]
 POLICY_ENV = {
+    **STRICT_ENV,
     "STUDIO_GATEWAY_ADAPTER_KIND": "trajectory_policy",
     "STUDIO_GATEWAY_ADAPTER_SCOPE": POLICY_SCOPE,
     "STUDIO_GATEWAY_ADAPTER_PRIORITY": "trajectory_policy",
+    "STUDIO_GATEWAY_BASE_MODEL_SHA256": POLICY_BASE_SHA,
 }
 POLICY_ADAPTER = {"uri": MOUNTED["uri"], "version": 7,
                   "sha256": STRICT_SHA, "kind": "trajectory_policy",
-                  "scope": POLICY_SCOPE, "capabilities": POLICY_CAPABILITIES}
+                  "scope": POLICY_SCOPE, "capabilities": POLICY_CAPABILITIES,
+                  "base_identity": POLICY_BASE_IDENTITY}
+POLICY_STATE = {"stage": "ready", "adapter": STRICT_MOUNTED,
+                "model": {"sha256": POLICY_BASE_SHA}}
 
 
 def test_policy_gateway_binds_exact_kind_scope_and_capabilities(gateway, engine):
-    port, _ = gateway(state={"stage": "ready", "adapter": MOUNTED}, extra=POLICY_ENV)
+    port, _ = gateway(state=POLICY_STATE, extra=POLICY_ENV)
     status, _ = _chat(port, {"trajectory_policy": POLICY_ADAPTER})
     assert status == 200
     assert ("/lora-adapters", [{"id": 0, "scale": 1.0}]) in engine.calls
@@ -265,9 +276,11 @@ def test_policy_gateway_binds_exact_kind_scope_and_capabilities(gateway, engine)
     lambda value: {**value, "scope": "user:" + "c" * 64},
     lambda value: {**value, "kind": "tool_call"},
     lambda value: {**value, "capabilities": POLICY_CAPABILITIES[:-1]},
+    lambda value: {**value, "base_identity": {
+        **POLICY_BASE_IDENTITY, "training_revision": "short"}},
 ])
 def test_policy_gateway_refuses_wrong_scope_kind_or_capabilities(gateway, engine, mutate):
-    port, _ = gateway(state={"stage": "ready", "adapter": MOUNTED}, extra=POLICY_ENV)
+    port, _ = gateway(state=POLICY_STATE, extra=POLICY_ENV)
     status, body = _chat(port, {"trajectory_policy": mutate(dict(POLICY_ADAPTER))})
     assert status == 400
     assert body["stage"] == "adapter_scope_mismatch"
@@ -275,14 +288,15 @@ def test_policy_gateway_refuses_wrong_scope_kind_or_capabilities(gateway, engine
 
 
 def test_policy_gateway_refuses_mixed_adapter_body(gateway, engine):
-    port, _ = gateway(state={"stage": "ready", "adapter": MOUNTED}, extra=POLICY_ENV)
+    port, _ = gateway(state=POLICY_STATE, extra=POLICY_ENV)
     status, _ = _chat(port, {"trajectory_policy": POLICY_ADAPTER,
                              "tool_call": {"uri": "/other", "version": 1}})
     assert status == 400
 
 
 def test_policy_gateway_requires_configured_exact_scope(gateway):
-    port, _ = gateway(state={"stage": "ready", "adapter": MOUNTED}, extra={
+    port, _ = gateway(state=POLICY_STATE, extra={
+        **POLICY_ENV,
         "STUDIO_GATEWAY_ADAPTER_KIND": "trajectory_policy",
         "STUDIO_GATEWAY_ADAPTER_SCOPE": "",
         "STUDIO_GATEWAY_ADAPTER_PRIORITY": "trajectory_policy",
@@ -293,6 +307,32 @@ def test_policy_gateway_requires_configured_exact_scope(gateway):
     status, body = _chat(port, {"trajectory_policy": POLICY_ADAPTER})
     assert status == 400
     assert body["stage"] == "adapter_scope_mismatch"
+
+
+@pytest.mark.parametrize("extra,state,stage", [
+    ({**POLICY_ENV, "STUDIO_BACKEND_KIND": "vllm"}, POLICY_STATE,
+     "policy_attestation_unsupported"),
+    ({**POLICY_ENV, "STUDIO_GATEWAY_REQUIRE_TOOL_ADAPTER": "0"}, POLICY_STATE,
+     "policy_adapter_attestation_required"),
+    (POLICY_ENV, {**POLICY_STATE, "model": {"sha256": "3" * 64}},
+     "base_model_identity_mismatch"),
+])
+def test_policy_gateway_readiness_fails_without_attestable_base_and_adapter(
+        gateway, extra, state, stage):
+    port, _ = gateway(state=state, extra=extra)
+    status, body = _health(port)
+    assert status == 503
+    assert body["stage"] == stage
+
+
+def test_policy_request_refuses_base_digest_not_matching_verified_engine(gateway, engine):
+    port, _ = gateway(state=POLICY_STATE, extra=POLICY_ENV)
+    adapter = {**POLICY_ADAPTER, "base_identity": {
+        **POLICY_BASE_IDENTITY, "serving_sha256": "3" * 64}}
+    status, body = _chat(port, {"trajectory_policy": adapter})
+    assert status == 503
+    assert body["stage"] == "base_model_identity_mismatch"
+    assert not [call for call in engine.calls if call[0].startswith("/v1/chat/completions")]
 
 
 def test_a_matching_adapter_is_scaled_and_served(gateway, engine):

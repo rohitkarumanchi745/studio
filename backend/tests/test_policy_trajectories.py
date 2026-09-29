@@ -9,6 +9,13 @@ from fastapi import HTTPException
 from app import agent, db, policy_trajectories as pt, router as model_router, trainer
 
 
+BASE_IDENTITY = {
+    "training_model": "base-model",
+    "training_revision": "1" * 40,
+    "serving_sha256": "2" * 64,
+}
+
+
 def _user():
     return {"id": str(uuid.uuid4()), "role": "analyst", "name": "Policy Tester"}
 
@@ -85,6 +92,9 @@ def _tables(monkeypatch):
     trainer.init_tables()
     monkeypatch.setenv("STUDIO_TRAJECTORY_TRAINING", "user")
     monkeypatch.setenv("STUDIO_TENANT_ID", "test-tenant")
+    monkeypatch.setenv("STUDIO_TRAJECTORY_BASE_MODEL", BASE_IDENTITY["training_model"])
+    monkeypatch.setenv("STUDIO_TRAJECTORY_BASE_REVISION", BASE_IDENTITY["training_revision"])
+    monkeypatch.setenv("STUDIO_TRAJECTORY_BASE_SHA256", BASE_IDENTITY["serving_sha256"])
 
 
 @pytest.mark.parametrize("contract,factory", [
@@ -272,9 +282,12 @@ def _promotion(scope, artifact="a" * 64, dataset="b" * 64, base="base-model"):
     report = {"protocol": trainer.TRAJECTORY_EVAL_PROTOCOL,
               "passed": True, "safety_passed": True,
               "artifact_sha256": artifact, "dataset_sha256": dataset,
-              "scope": scope, "base_model": base, "suite_sha256": "c" * 64,
+              "scope": scope, "base_identity": {
+                  **BASE_IDENTITY, "training_model": base},
+              "suite_sha256": "c" * 64,
               "capabilities": list(pt.CONTRACTS), "contracts": evidence}
-    return {"dataset_sha256": dataset, "capabilities": list(pt.CONTRACTS),
+    return {"dataset_sha256": dataset, "base_identity": report["base_identity"],
+            "capabilities": list(pt.CONTRACTS),
             "evaluation": report}
 
 
@@ -289,10 +302,12 @@ def test_registry_recomputes_promotion_and_only_selects_exact_user(monkeypatch):
     assert selected["version"] == published["version"]
     assert selected["scope"] == scope
     assert selected["kind"] == "trajectory_policy"
+    assert selected["base_identity"] == BASE_IDENTITY
     assert selected["capabilities"] == list(pt.CONTRACTS)
     active = trainer.active_adapter_endpoint(
         scope, "trajectory_policy", user={"id": "admin", "role": "admin"})["adapter"]
     assert active["id"] == published["id"]
+    assert active["base_identity"] == BASE_IDENTITY
     assert active["metrics"]["promotion_evidence"]["artifact_sha256"] == "a" * 64
     monkeypatch.setenv("STUDIO_TRAJECTORY_EVAL_SUITE_SHA256", "d" * 64)
     assert trainer.trajectory_adapter(user, pt.AGENT_GRAPH) is None
@@ -320,6 +335,51 @@ def test_registry_refuses_tenant_forged_safety_and_low_pass_rate(monkeypatch):
                         base_model="base-model", sha256="a" * 64, metrics=weak)
 
 
+def test_registry_pins_full_base_identity_and_fails_closed_without_operator_pin(
+        monkeypatch):
+    monkeypatch.setenv("STUDIO_TRAJECTORY_EVAL_SUITE_SHA256", "c" * 64)
+    scope = pt.user_scope(_user())
+    drifted = _promotion(scope)
+    drifted["base_identity"] = dict(drifted["base_identity"])
+    drifted["evaluation"] = dict(drifted["evaluation"])
+    drifted["base_identity"]["training_revision"] = "3" * 40
+    drifted["evaluation"]["base_identity"] = drifted["base_identity"]
+    with pytest.raises(HTTPException, match="deployment pin"):
+        trainer.publish(scope, "trajectory_policy", "/adapters/drifted",
+                        base_model="base-model", sha256="a" * 64, metrics=drifted)
+
+    monkeypatch.delenv("STUDIO_TRAJECTORY_BASE_REVISION")
+    with pytest.raises(HTTPException) as missing:
+        trainer.publish(scope, "trajectory_policy", "/adapters/unpinned",
+                        base_model="base-model", sha256="a" * 64,
+                        metrics=_promotion(scope))
+    assert missing.value.status_code == 503
+
+
+@pytest.mark.parametrize("uri", [
+    "relative/policy.gguf",
+    "s3://bucket/policy.gguf",
+    "https://user:secret@example.test/policy.gguf",
+    "https://example.test/policy.gguf?mutable=1",
+    "http://policy.example.test/policy.gguf",
+    "/adapters/../secret/policy.gguf",
+])
+def test_trajectory_registry_refuses_ambiguous_or_credentialed_uris(uri):
+    with pytest.raises(HTTPException):
+        trainer._validate_trajectory_uri(uri)
+
+
+@pytest.mark.parametrize("uri", [
+    "/adapters/policy.gguf",
+    r"D:\\adapters\\policy.gguf",
+    "https://models.example.test/policy.gguf",
+    "http://127.0.0.1:9000/policy.gguf",
+    "http://[::1]:9000/policy.gguf",
+])
+def test_trajectory_registry_accepts_attestable_artifact_locations(uri):
+    assert trainer._validate_trajectory_uri(uri) == uri
+
+
 def test_policy_client_is_dormant_and_wire_is_exact(monkeypatch):
     monkeypatch.delenv("STUDIO_POLICY_TRUSTED_ENDPOINT", raising=False)
     with pytest.raises(agent.PolicyUnavailable, match="capture/offline"):
@@ -328,7 +388,8 @@ def test_policy_client_is_dormant_and_wire_is_exact(monkeypatch):
     user = _user()
     adapter = {"uri": "/adapters/policy", "version": 1, "sha256": "a" * 64,
                "scope": pt.user_scope(user), "kind": "trajectory_policy",
-               "base_model": "base-model", "capabilities": list(pt.CONTRACTS)}
+               "base_model": "base-model", "base_identity": BASE_IDENTITY,
+               "capabilities": list(pt.CONTRACTS)}
     monkeypatch.setenv("STUDIO_POLICY_TRUSTED_ENDPOINT", "1")
     monkeypatch.setenv("STUDIO_POLICY_LLM_BASE_URL", "http://127.0.0.1:9001/v1")
     monkeypatch.setenv("STUDIO_POLICY_LLM", "openai:trajectory-policy")
@@ -356,6 +417,7 @@ def test_policy_client_rejects_provider_confusion_and_remote_placeholder_key(mon
     user = _user()
     adapter = {"uri": "/adapters/policy", "version": 1, "sha256": "a" * 64,
                "scope": pt.user_scope(user), "kind": "trajectory_policy",
+               "base_model": "base-model", "base_identity": BASE_IDENTITY,
                "capabilities": list(pt.CONTRACTS)}
     monkeypatch.setenv("STUDIO_POLICY_TRUSTED_ENDPOINT", "1")
     monkeypatch.setenv("STUDIO_POLICY_LLM_BASE_URL", "https://policy.example/v1")
