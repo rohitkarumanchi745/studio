@@ -165,3 +165,72 @@ test("catalog requests the two exact GET endpoints and degrades Confluence", asy
   assert.deepEqual(catalog.confluencePages, []);
   assert.equal(catalog.confluenceStatus, "unconfigured");
 });
+
+test("Confluence pagination appends unique pages and stops after an empty page", async () => {
+  const values = [];
+  const effects = [];
+  let cursor = 0;
+  hooks = {
+    useState(initial) {
+      const index = cursor++;
+      if (index >= values.length) values.push(typeof initial === "function" ? initial() : initial);
+      return [values[index], (next) => {
+        values[index] = typeof next === "function" ? next(values[index]) : next;
+      }];
+    },
+    useEffect(effect) { effects.push(effect); },
+  };
+  globalThis.localStorage = {
+    getItem(key) {
+      return key === "studio_user" ? JSON.stringify({ id: "u1", role: "analyst" }) : null;
+    },
+  };
+  const first = Array.from({ length: 25 }, (_, index) => ({
+    id: String(index + 1), title: `Page ${index + 1}`, space_key: "OPS", version: 1,
+  }));
+  const second = [first[24], ...Array.from({ length: 24 }, (_, index) => ({
+    id: String(index + 26), title: `Page ${index + 26}`, space_key: "OPS", version: 1,
+  }))];
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    calls.push(url);
+    const pages = url === "/api/confluence/pages" ? first
+      : url.endsWith("start=25&limit=25") ? second : [];
+    return {
+      ok: true, status: 200,
+      async json() { return url === "/api/repos" ? { repos: [] } : { pages }; },
+    };
+  };
+
+  usePlanningCatalog();
+  const cleanup = effects[0]();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  cursor = 0;
+  let catalog = usePlanningCatalog();
+  assert.equal(catalog.confluencePages.length, 25);
+  assert.equal(catalog.confluenceHasMore, true);
+  assert.match(html(PlanningContextPicker, catalog), /Load more Confluence pages/);
+
+  await catalog.loadMoreConfluence();
+  cursor = 0;
+  catalog = usePlanningCatalog();
+  assert.equal(catalog.confluencePages.length, 49);
+  assert.equal(new Set(catalog.confluencePages.map((page) => page.id)).size, 49);
+  assert.equal(catalog.confluenceHasMore, true);
+
+  await catalog.loadMoreConfluence();
+  cursor = 0;
+  catalog = usePlanningCatalog();
+  cleanup();
+  hooks = null;
+
+  assert.equal(catalog.confluencePages.length, 49);
+  assert.equal(catalog.confluenceHasMore, false);
+  assert.doesNotMatch(html(PlanningContextPicker, catalog), /Load more Confluence pages/);
+  assert.deepEqual(calls, [
+    "/api/repos",
+    "/api/confluence/pages",
+    "/api/confluence/pages?start=25&limit=25",
+    "/api/confluence/pages?start=50&limit=25",
+  ]);
+});

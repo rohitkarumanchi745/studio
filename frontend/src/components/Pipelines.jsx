@@ -44,6 +44,9 @@ export function usePlanningCatalog() {
   const [confluencePages, setConfluencePages] = useState([]);
   const [confluenceStatus, setConfluenceStatus] = useState(
     () => planningAllowed ? "loading" : "forbidden");
+  const [confluenceStart, setConfluenceStart] = useState(0);
+  const [confluenceHasMore, setConfluenceHasMore] = useState(false);
+  const [confluenceLoadingMore, setConfluenceLoadingMore] = useState(false);
 
   useEffect(() => {
     if (!planningAllowed) return undefined;
@@ -64,25 +67,59 @@ export function usePlanningCatalog() {
     api("/confluence/pages")
       .then((data) => {
         if (!active) return;
-        setConfluencePages(Array.isArray(data?.pages) ? data.pages : []);
+        const pages = Array.isArray(data?.pages) ? data.pages : [];
+        setConfluencePages(pages);
+        setConfluenceStart(0);
+        setConfluenceHasMore(pages.length >= 25);
         setConfluenceStatus("ready");
       })
       .catch(() => {
         if (!active) return;
         setConfluencePages([]);
+        setConfluenceHasMore(false);
         setConfluenceStatus("unconfigured");
       });
     return () => { active = false; };
   }, [planningAllowed]);
 
+  async function loadMoreConfluence() {
+    if (!planningAllowed || confluenceStatus !== "ready"
+        || !confluenceHasMore || confluenceLoadingMore) return;
+    setConfluenceLoadingMore(true);
+    try {
+      const nextStart = confluenceStart + 25;
+      const data = await api(`/confluence/pages?start=${nextStart}&limit=25`);
+      const next = Array.isArray(data?.pages) ? data.pages : [];
+      setConfluencePages((current) => {
+        const seen = new Set(current.map((page) => String(page.id)));
+        return [...current, ...next.filter((page) => {
+          const id = String(page?.id ?? "");
+          if (!id || seen.has(id)) return false;
+          seen.add(id);
+          return true;
+        })];
+      });
+      setConfluenceStart(nextStart);
+      setConfluenceHasMore(next.length >= 25);
+    } catch {
+      // A later page is optional catalog navigation. Keep the already loaded
+      // choices usable and stop offering a control that cannot make progress.
+      setConfluenceHasMore(false);
+    } finally {
+      setConfluenceLoadingMore(false);
+    }
+  }
+
   return { planningAllowed, repositories, repositoryStatus, confluencePages,
-    confluenceStatus };
+    confluenceStatus, confluenceHasMore, confluenceLoadingMore,
+    loadMoreConfluence };
 }
 
 export function PlanningContextPicker({ repositories = [], repositoryStatus = "ready",
   confluencePages = [], confluenceStatus = "ready", repositoryId = "",
   confluencePageIds = [], onRepositoryChange, onConfluenceChange, disabled = false,
-  preview = false, planningAllowed = true }) {
+  preview = false, planningAllowed = true, confluenceHasMore = false,
+  confluenceLoadingMore = false, loadMoreConfluence }) {
   if (!planningAllowed) {
     return (
       <div className="meta" style={{ margin: "8px 0" }}>
@@ -139,6 +176,12 @@ export function PlanningContextPicker({ repositories = [], repositoryStatus = "r
           )}
           {confluencePageIds.length > 0 && (
             <span>{confluencePageIds.length} page{confluencePageIds.length === 1 ? "" : "s"} selected</span>
+          )}
+          {confluenceHasMore && (
+            <button type="button" className="chip" onClick={loadMoreConfluence}
+              disabled={disabled || confluenceLoadingMore}>
+              {confluenceLoadingMore ? "loading more…" : "Load more Confluence pages"}
+            </button>
           )}
         </label>
       </div>
