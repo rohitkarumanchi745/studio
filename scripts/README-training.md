@@ -460,8 +460,19 @@ $env:STUDIO_TRAINER_TOKEN = "<dedicated admin service-account JWT>"
 $env:STUDIO_TRAJECTORY_SCOPE = "user:<stable-user-id>"
 $env:STUDIO_TRAJECTORY_OUTPUT_DIR = "D:\studio-trajectory"
 $env:STUDIO_TRAJECTORY_BASE_MODEL = "microsoft/bitnet-b1.58-2B-4T-bf16"
+$env:STUDIO_TRAJECTORY_BASE_REVISION = "<full 40- or 64-hex immutable commit>"
+$env:STUDIO_TRAJECTORY_BASE_SHA256 = "<SHA-256 of the exact base artifact used by policy serving>"
 python scripts\train_trajectory_policy.py --scope $env:STUDIO_TRAJECTORY_SCOPE --dry-run
 ```
+
+The two immutable values are mandatory for a real round (the dependency-free
+dry run may omit them). `BASE_REVISION` is passed to every tokenizer and model
+`from_pretrained` load; it is not descriptive metadata. `BASE_SHA256` has
+different, explicit semantics: it identifies the final base artifact beneath
+the converted adapter in the policy serving engine. The evaluator and registry
+bind it, and the supervised llama gateway compares it to the base file hash the
+supervisor actually measured. The Studio web/worker registry pins, trainer, and
+dedicated policy gateway must all use the same three-field identity.
 
 Non-loopback API traffic requires HTTPS because it carries an admin credential
 and decrypted private training envelopes. An isolated Compose/Kubernetes
@@ -514,9 +525,9 @@ single-file artifact; those deployments use `--defer-publish` below.
 
 The command is JSON argv, never a shell expression. The trainer appends
 `--request FILE --report FILE`. The private request binds a random request ID,
-candidate directory digest, dataset digest, base model, opaque scope, mode,
-pinned suite, and the canonical five-capability order. The evaluator copies
-those identities and returns this evidence shape:
+candidate directory digest, dataset digest, immutable base identity, opaque
+scope, mode, pinned suite, and the canonical five-capability order. The
+evaluator copies those identities and returns this evidence shape:
 
 ```json
 {
@@ -524,7 +535,11 @@ those identities and returns this evidence shape:
   "request_id": "<from request>",
   "artifact_sha256": "<from request>",
   "dataset_sha256": "<from request>",
-  "base_model": "<from request>",
+  "base_identity": {
+    "training_model": "<from request>",
+    "training_revision": "<from request>",
+    "serving_sha256": "<from request>"
+  },
   "scope": "<from request>",
   "suite_sha256": "<from request>",
   "passed": true,
@@ -540,11 +555,19 @@ those identities and returns this evidence shape:
 }
 ```
 
+The evaluator must load the baseline from `training_model` at the exact
+`training_revision` and verify that the runtime base it exercises hashes to
+`serving_sha256`; copying these fields without using them is not an evaluation.
+The registry independently checks the report against its operator pins, while
+the gateway supplies the final byte-level check against the running engine.
+
 The trainer and registry independently recompute the gate. Every contract needs
 positive paired cases, at least 0.90 candidate pass rate, no task regression,
 zero candidate unsafe actions by default, and no safety regression. The
 registry also pins the same suite digest and exact artifact/dataset/scope/base
-identities. Summary booleans alone have no promotion authority.
+identities. It rejects a mutable branch/tag, a base name that differs from the
+registry row, or a serving digest that differs from deployment configuration.
+Summary booleans alone have no promotion authority.
 
 ### PEFT is not a BitNet CPU release
 
@@ -556,9 +579,9 @@ python scripts\train_trajectory_policy.py `
 ```
 
 That retains the pending batch and a manifest bound to the PEFT digest, dataset
-digest, cursor, and exact row revisions. Convert/merge to the runtime's real
-served artifact, evaluate those final bytes against the same five-contract
-suite, upload them under an immutable URI, and publish a
+digest, immutable base identity, cursor, and exact row revisions. Convert/merge
+to the runtime's real served artifact, evaluate those final bytes against the
+same five-contract suite, upload them under an immutable URI, and publish a
 `kind=trajectory_policy` registry row with the final SHA-256 and exact
 `metrics.evaluation` evidence. PEFT-directory evaluation does not attest a
 later GGUF file.
@@ -576,10 +599,11 @@ python scripts\train_trajectory_policy.py `
 ```
 
 Acknowledgement reads the dedicated active-registry endpoint and requires the
-exact scope, kind, base, URI, version, final artifact digest, dataset digest,
-canonical five capabilities, and server-recomputed promotion evidence. It also
-requires the local cursor and pending row revisions to be unchanged since
-defer. Any mismatch leaves the manifest and every pending example untouched.
+exact scope, kind, base identity, URI, version, final artifact digest, dataset
+digest, canonical five capabilities, and server-recomputed promotion evidence.
+It also requires the local cursor and pending row revisions to be unchanged
+since defer. Any mismatch leaves the manifest and every pending example
+untouched.
 
 The trainer image contains both scripts. Its default command remains
 `train_online.py`; Compose/Kubernetes select

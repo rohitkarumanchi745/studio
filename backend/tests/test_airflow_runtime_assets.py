@@ -163,6 +163,10 @@ def test_whole_trajectory_training_is_opt_in_scoped_and_separately_routed():
 
     assert "STUDIO_TENANT_ID: ${STUDIO_TENANT_ID:?" in shared
     assert "STUDIO_TRAJECTORY_TRAINING: ${STUDIO_TRAJECTORY_TRAINING:-off}" in shared
+    for name in ("STUDIO_TRAJECTORY_BASE_MODEL", "STUDIO_TRAJECTORY_BASE_REVISION",
+                 "STUDIO_TRAJECTORY_BASE_SHA256"):
+        assert f"{name}: ${{{name}:-" in shared
+        assert f"{name}: ${{{name}:-" in trainer
     assert "STUDIO_POLICY_LLM_BASE_URL: ${STUDIO_POLICY_LLM_BASE_URL:-}" in shared
     assert "STUDIO_POLICY_TRUSTED_ENDPOINT: ${STUDIO_POLICY_TRUSTED_ENDPOINT:-0}" in shared
     assert 'profiles: ["trajectory-training"]' in trainer
@@ -184,6 +188,10 @@ def test_whole_trajectory_training_is_opt_in_scoped_and_separately_routed():
     values = dict(line.split("=", 1) for line in generator.document().splitlines())
     assert values["STUDIO_TRAJECTORY_TRAINING"] == "off"
     assert values["STUDIO_TRAJECTORY_ALLOW_INSECURE_HTTP"] == "1"
+    assert values["STUDIO_TRAJECTORY_BASE_MODEL"] == \
+        "microsoft/bitnet-b1.58-2B-4T-bf16"
+    assert values["STUDIO_TRAJECTORY_BASE_REVISION"] == ""
+    assert values["STUDIO_TRAJECTORY_BASE_SHA256"] == ""
     assert values["STUDIO_TENANT_ID"].startswith("studio-")
     assert values["STUDIO_ADMIN_PASSWORD"] == values["STUDIO_TRAINER_PASSWORD"]
     assert values["STUDIO_POLICY_LLM_BASE_URL"] == ""

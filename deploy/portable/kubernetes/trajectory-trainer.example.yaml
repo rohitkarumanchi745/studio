@@ -25,6 +25,10 @@ data:
   STUDIO_TRAJECTORY_SCOPE: ""
   STUDIO_TRAJECTORY_OUTPUT_DIR: /var/lib/studio-trajectory
   STUDIO_TRAJECTORY_BASE_MODEL: microsoft/bitnet-b1.58-2B-4T-bf16
+  # Required before unsuspending: full immutable trainable commit and digest of
+  # the exact base artifact beneath the adapter in the policy serving engine.
+  STUDIO_TRAJECTORY_BASE_REVISION: ""
+  STUDIO_TRAJECTORY_BASE_SHA256: ""
   STUDIO_TRAJECTORY_TRAIN_MODE: sft
   STUDIO_TRAJECTORY_TRAIN_MAX_LENGTH: "4096"
   STUDIO_TRAJECTORY_ADAPTER_BASE_URI: ""

@@ -269,7 +269,11 @@ positive training examples.
 The optional Compose profile is a private training worker, not part of the
 request path. Configure a scope such as `user:<uuid>`, a verified evaluator as
 JSON argv in `STUDIO_TRAJECTORY_EVALUATOR_COMMAND`, and its immutable suite
-digest in `STUDIO_TRAJECTORY_EVAL_SUITE_SHA256`. The checked-in image is useful
+digest in `STUDIO_TRAJECTORY_EVAL_SUITE_SHA256`. Also set
+`STUDIO_TRAJECTORY_BASE_REVISION` to the full 40/64-hex commit of the trainable
+model and `STUDIO_TRAJECTORY_BASE_SHA256` to the SHA-256 of the exact base
+artifact used by the eventual policy serving engine. The checked-in image is
+useful
 for a dry run and contract validation on CPU; point
 `STUDIO_TRAJECTORY_TRAINER_IMAGE` at an operator-built CUDA image for practical
 fine-tuning. Then start only the opt-in profile:
@@ -296,6 +300,11 @@ metadata stay on the private `trajectory-training` volume. A successful
 training process still does not activate weights. Promotion requires an
 independent paired baseline/candidate report covering all five contracts and
 matching the dataset, base model, scope, and evaluation-suite identities.
+The web/worker registry and trainer receive the same model/revision/digest from
+the generated environment. A dedicated policy gateway must set
+`STUDIO_GATEWAY_BASE_MODEL_SHA256` to that same serving digest and expose
+supervisor state proving the running base bytes; vLLM or an unsupervised gateway
+is refused for this policy.
 
 PEFT output also cannot be mounted directly by `bitnet.cpp`. The CPU-serving
 release path remains deliberately manual: convert the evaluated adapter to its

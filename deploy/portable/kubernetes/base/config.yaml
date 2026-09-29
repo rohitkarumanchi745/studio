@@ -15,6 +15,11 @@ data:
   # Retention is always local; trainer streaming remains explicit and off by
   # default. Use `user` for the built-in private capture hooks.
   STUDIO_TRAJECTORY_TRAINING: "off"
+  # Promotion remains disabled until an overlay pins the full trainable commit
+  # and the SHA-256 of the exact base artifact used by policy serving.
+  STUDIO_TRAJECTORY_BASE_MODEL: microsoft/bitnet-b1.58-2B-4T-bf16
+  STUDIO_TRAJECTORY_BASE_REVISION: ""
+  STUDIO_TRAJECTORY_BASE_SHA256: ""
   STUDIO_WORKER_MODE: external
   STUDIO_AUTO_MIGRATE: "1"
   STUDIO_LLM: anthropic:claude-sonnet-5

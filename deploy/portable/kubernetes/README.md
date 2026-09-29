@@ -266,7 +266,10 @@ using it:
    than scheduling the example CPU image for a real fine-tune;
 3. set one `user:<uuid>` scope, a credential for a dedicated verified Studio
    administrator, an immutable adapter destination, and the JSON-argv
-   evaluator plus its suite SHA-256;
+   evaluator plus its suite SHA-256. Pin `STUDIO_TRAJECTORY_BASE_REVISION` to
+   the trainable model's full 40/64-hex commit and
+   `STUDIO_TRAJECTORY_BASE_SHA256` to the exact policy-serving base bytes in
+   both the runtime and trainer ConfigMaps;
 4. provision encrypted `ReadWriteOnce` storage and restrict network egress to
    Studio, the model/artifact registries, and the evaluator's required private
    services; and
@@ -282,7 +285,10 @@ cluster network. Prefer a service mesh or internal TLS origin and set
 The job consumes validated examples for all five contracts and refuses to
 publish a partial policy. A candidate is promotable only after the server
 recomputes the paired baseline/candidate gates and binds the result to the
-scope, dataset digest, base model, artifact SHA-256, and evaluator suite. PEFT
+scope, dataset digest, exact training model/revision, serving-base SHA-256,
+artifact SHA-256, and evaluator suite. The dedicated policy gateway must use
+that same serving digest and supervisor-verified model state; unattestable
+vLLM/standalone policy serving is rejected. PEFT
 to GGUF conversion is not automated: evaluate and publish the final serving
 artifact, make the scoped `trajectory_policy` release active, mount and attest
 it in an external policy gateway, and acknowledge that exact release before

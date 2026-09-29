@@ -29,6 +29,8 @@ def document() -> str:
         "STUDIO_TRAJECTORY_ALLOW_INSECURE_HTTP": "1",
         "STUDIO_TRAJECTORY_TRAINER_IMAGE": "studio-trajectory-trainer:cpu",
         "STUDIO_TRAJECTORY_BASE_MODEL": "microsoft/bitnet-b1.58-2B-4T-bf16",
+        "STUDIO_TRAJECTORY_BASE_REVISION": "",
+        "STUDIO_TRAJECTORY_BASE_SHA256": "",
         "STUDIO_TRAJECTORY_TRAIN_MODE": "sft",
         "STUDIO_TRAJECTORY_TRAIN_MAX_LENGTH": "4096",
         "STUDIO_TRAJECTORY_ADAPTER_BASE_URI": "/var/lib/studio-trajectory",

@@ -306,6 +306,10 @@ def test_whole_trajectory_trainer_is_an_explicit_suspended_one_shot_example():
     config = _resource("base/config.yaml", "ConfigMap", "studio-runtime-config")
     assert config["data"]["STUDIO_TENANT_ID"] == "studio-system"
     assert config["data"]["STUDIO_TRAJECTORY_TRAINING"] == "off"
+    assert config["data"]["STUDIO_TRAJECTORY_BASE_MODEL"] == \
+        "microsoft/bitnet-b1.58-2B-4T-bf16"
+    assert config["data"]["STUDIO_TRAJECTORY_BASE_REVISION"] == ""
+    assert config["data"]["STUDIO_TRAJECTORY_BASE_SHA256"] == ""
     assert config["data"]["STUDIO_POLICY_LLM_BASE_URL"] == ""
     assert config["data"]["STUDIO_POLICY_TRUSTED_ENDPOINT"] == "0"
 
@@ -332,6 +336,12 @@ def test_whole_trajectory_trainer_is_an_explicit_suspended_one_shot_example():
         "studio-trajectory-trainer-config",
     )
     assert trainer_config["data"]["STUDIO_TRAJECTORY_ALLOW_INSECURE_HTTP"] == "1"
+    assert trainer_config["data"]["STUDIO_TRAJECTORY_BASE_MODEL"] == \
+        config["data"]["STUDIO_TRAJECTORY_BASE_MODEL"]
+    assert trainer_config["data"]["STUDIO_TRAJECTORY_BASE_REVISION"] == \
+        config["data"]["STUDIO_TRAJECTORY_BASE_REVISION"]
+    assert trainer_config["data"]["STUDIO_TRAJECTORY_BASE_SHA256"] == \
+        config["data"]["STUDIO_TRAJECTORY_BASE_SHA256"]
     assert trainer["securityContext"]["allowPrivilegeEscalation"] is False
     assert trainer["securityContext"]["capabilities"]["drop"] == ["ALL"]
     assert trainer["envFrom"] == [
