@@ -139,9 +139,9 @@ function GithubRepos() {
     <div className="mcp-block">
       <div className="canvas-title" style={{ fontSize: 15 }}>GitHub repositories</div>
       <div className="meta">
-        Register the repos where your scripts live. When someone builds a pipeline,
-        the agent picks the repo whose scripts best fit the prompt and pulls them in
-        as context. (Set a GITHUB_TOKEN env var to read private repos.)
+        Register repositories that analysts may select when building a pipeline
+        in Chat or Pipelines. Studio reads bounded pipeline-file context; it does
+        not execute repository code. Set a server-side GITHUB_TOKEN for private repos.
       </div>
       {err && <div className="error">{err}</div>}
       <div className="job-form-row" style={{ marginTop: 8 }}>

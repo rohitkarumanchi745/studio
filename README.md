@@ -537,9 +537,10 @@ advancing, not as a schedule alert.
 
 For the read-only Pipelines view and chat SQL bundles, describe a job; the
 **Pipeline planner** routes it to the source whose tables best match and drafts
-an ordered set of steps. An admin can register GitHub repositories in
-**Governance → GitHub repositories**. Builders can then select a repository
-and up to three Confluence pages in Chat or Pipelines when building a draft.
+an ordered set of steps. An admin can register GitHub repositories from the
+**GitHub tile in Data Connections** (also available in Governance). Builders
+can then select a repository and up to three Confluence pages in Chat or
+Pipelines when building a draft.
 The selected repository's allowlisted pipeline files and the selected pages'
 text become **bounded, untrusted reference context** for the model, with
 repository commit/page-version provenance in the draft. A URL in the prompt

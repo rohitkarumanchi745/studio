@@ -1,6 +1,6 @@
 // The source catalog behind the Tableau-style connect grid: one tile per data
-// source Studio knows about, with its mark, its display name and which shelf it
-// sits on.
+// source or pipeline-planning context Studio knows about, with its mark,
+// display name and shelf.
 //
 // Why the presentation lives here and not in the backend: the backend is the
 // source of truth for what a connector NEEDS (/connections/types serves the
@@ -63,6 +63,15 @@ const MARKS = {
       <circle cx="11" cy="13.5" r="4.5" fill={c} />
       <circle cx="29" cy="10" r="3.6" fill={c} opacity=".6" />
       <circle cx="22" cy="29" r="4" fill={c} opacity=".8" />
+    </>
+  ),
+  gitbranch: (c) => (
+    <>
+      <path d="M12 9v18c0 3.2 2.4 5.5 5.7 5.5h5.6c3.3 0 5.7-2.3 5.7-5.5V15"
+        fill="none" stroke={c} strokeWidth="2.8" strokeLinecap="round" />
+      <circle cx="12" cy="8" r="4" fill={c} />
+      <circle cx="29" cy="13" r="4" fill={c} />
+      <circle cx="29" cy="29" r="4" fill={c} />
     </>
   ),
   bucket: (c) => (
@@ -170,6 +179,8 @@ const META = {
   // Connected through their own flow rather than a credential form.
   m365: { label: "Microsoft 365", color: "#0f6cbd", mark: "tiles", category: "workspace",
           blurb: "OneDrive, SharePoint and Outlook, synced into your private knowledge collection." },
+  github: { label: "GitHub", color: "#24292f", mark: "gitbranch", category: "workspace",
+            blurb: "Register repositories as read-only planning context for pipeline drafts; repository code is not executed." },
 
   // Environment-configured sources. They appear so the grid is the whole map
   // of what Studio can read, not just what this screen can set up.
