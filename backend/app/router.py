@@ -21,6 +21,28 @@ import os
 from . import qcache, trainer
 
 
+def trajectory_adapter(user, contract):
+    """Exact user-scoped structured-policy adapter.
+
+    ``trainer.trajectory_adapter`` revalidates promotion evidence. Whole-policy
+    releases cannot fall back to tenant scope because two of the five contracts
+    carry private upstream evidence. Keeping this selection separate from
+    ``choose`` prevents a SQL-cache hit from selecting an adapter trained for a
+    different wire contract.
+    """
+    try:
+        return trainer.trajectory_adapter(user, contract)
+    except Exception:
+        return None
+
+
+def trajectory_policy_ready(user, contract):
+    trusted = (os.getenv("STUDIO_POLICY_TRUSTED_ENDPOINT") or "").strip().lower() \
+        in {"1", "true", "yes", "on"}
+    return bool(trusted and (os.getenv("STUDIO_POLICY_LLM_BASE_URL") or "").strip()
+                and trajectory_adapter(user, contract))
+
+
 def bitnet_spec():
     """The model spec for the self-hosted BitNet (served OpenAI-compatibly)."""
     return os.getenv("STUDIO_BITNET_LLM", "openai:bitnet")

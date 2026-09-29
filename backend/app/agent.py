@@ -26,6 +26,7 @@ import json
 import os
 import re
 from typing import List
+from urllib.parse import urlsplit
 
 from . import db, email_service, gateway, grains, progress
 from .queryguard import QueryRejected
@@ -263,6 +264,60 @@ def make_llm(spec, user=None, **kwargs):
         key = user_key(user, spec)
         if key:
             kwargs["api_key"] = key
+    return init_chat_model(spec, **kwargs)
+
+
+class PolicyUnavailable(RuntimeError):
+    """No exact evaluated structured-policy adapter can serve a safe call."""
+
+
+def policy_llm_spec():
+    return os.getenv("STUDIO_POLICY_LLM", "openai:trajectory-policy")
+
+
+def make_policy_llm(contract, user=None, **kwargs):
+    """Build (but do not invoke) the isolated structured-policy client.
+
+    The caller must separately enforce the contract's disclosure policy before
+    sending any payload. In particular, raw aggregator/dependent evidence and
+    recovery context are offline-training data, not authorized external model
+    input. This factory only establishes exact endpoint/adapter wire identity.
+    """
+    from . import router as model_router
+
+    if (os.getenv("STUDIO_POLICY_TRUSTED_ENDPOINT") or "").strip().lower() \
+            not in {"1", "true", "yes", "on"}:
+        raise PolicyUnavailable(
+            "external trajectory-policy inference is disabled; this build uses capture/offline eval only")
+    endpoint = (os.getenv("STUDIO_POLICY_LLM_BASE_URL") or "").strip()
+    adapter = model_router.trajectory_adapter(user, contract)
+    if not endpoint or not adapter:
+        raise PolicyUnavailable("no evaluated trajectory policy is available for this scope")
+    spec = policy_llm_spec()
+    if not spec.startswith("openai:"):
+        raise PolicyUnavailable("STUDIO_POLICY_LLM must use the OpenAI-compatible provider")
+    if adapter.get("kind") != "trajectory_policy" \
+            or adapter.get("scope", "").split(":", 1)[0] != "user" \
+            or contract not in (adapter.get("capabilities") or []):
+        raise PolicyUnavailable("the trajectory adapter wire identity is invalid")
+    parsed_endpoint = urlsplit(endpoint)
+    if parsed_endpoint.scheme not in {"http", "https"} or not parsed_endpoint.hostname \
+            or parsed_endpoint.username or parsed_endpoint.password \
+            or parsed_endpoint.query or parsed_endpoint.fragment:
+        raise PolicyUnavailable("STUDIO_POLICY_LLM_BASE_URL must be a credential-free HTTP(S) URL")
+    kwargs.setdefault("base_url", endpoint)
+    api_key = (os.getenv("STUDIO_POLICY_LLM_API_KEY") or "").strip()
+    host = (parsed_endpoint.hostname or "").lower()
+    if not api_key and host not in {"localhost", "127.0.0.1", "::1"}:
+        raise PolicyUnavailable(
+            "STUDIO_POLICY_LLM_API_KEY is required for a non-loopback policy endpoint")
+    kwargs.setdefault("api_key", api_key or "studio-local")
+    extra = dict(kwargs.pop("extra_body", {}) or {})
+    # Exactly one kind and scope may cross this wire. Generic SQL/style
+    # adapters must never win by gateway priority for a structured contract.
+    extra["studio_adapters"] = {"trajectory_policy": adapter}
+    kwargs["extra_body"] = extra
+    from langchain.chat_models import init_chat_model
     return init_chat_model(spec, **kwargs)
 
 

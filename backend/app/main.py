@@ -12,7 +12,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import (auth, autopilot, catalog, chat, connections, dashboards, db, flow, freshness,
-               governance, jobs, kag, kag_graph, keys, mcp, migrations, pipelines, pybuild,
+               governance, jobs, kag, kag_graph, keys, mcp, migrations, pipelines,
+               policy_trajectories, pybuild,
                qcache, queries, redteam, repos, semantic, sessions, supervisor,
                toolbuilder, trainer)
 from .agent import llm_available, llm_spec
@@ -42,7 +43,8 @@ _ROUTERS = (auth.router, catalog.router, chat.router, dashboards.router,
             queries.router, pipelines.router, governance.router,
             supervisor.router, mcp.router, pybuild.router, toolbuilder.router,
             kag.router, repos.router, repos._settings, sessions.router,
-            flow.router, trainer.router, freshness.router, objectstore.router,
+            flow.router, trainer.router, policy_trajectories.router,
+            freshness.router, objectstore.router,
             semantic.router, autopilot.router, redteam.router, m365.router,
             connections.router)
 for _router in _ROUTERS:
@@ -83,6 +85,7 @@ def init_state():
     flow.init_tables()
     qcache.init_tables()
     trainer.init_tables()
+    policy_trajectories.init_tables()
     redteam.init_tables()
     objectstore.init_tables()
     autopilot.init_tables()

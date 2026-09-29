@@ -112,7 +112,14 @@ REQUIRED_BASE_SHA256 = os.getenv("STUDIO_GATEWAY_BASE_MODEL_SHA256", "").strip()
 HOST = os.getenv("STUDIO_GATEWAY_HOST", "0.0.0.0")
 PORT = int(os.getenv("STUDIO_GATEWAY_PORT", "9000"))
 PRIORITY = [k.strip() for k in os.getenv(
-    "STUDIO_GATEWAY_ADAPTER_PRIORITY", "user_style,tool_call").split(",") if k.strip()]
+    "STUDIO_GATEWAY_ADAPTER_PRIORITY", "trajectory_policy,user_style,tool_call").split(",") if k.strip()]
+CPU_ADAPTER_KIND = (os.getenv("STUDIO_GATEWAY_ADAPTER_KIND") or "tool_call").strip()
+if CPU_ADAPTER_KIND not in {"tool_call", "trajectory_policy"}:
+    CPU_ADAPTER_KIND = "invalid"
+EXPECTED_ADAPTER_SCOPE = (os.getenv("STUDIO_GATEWAY_ADAPTER_SCOPE") or "").strip()
+_POLICY_SCOPE = re.compile(r"^user:[0-9a-f]{64}$")
+_POLICY_CAPABILITIES = ["airflow_dag", "agent_graph", "recovery_decision",
+                        "aggregator_output", "dependent_agent"]
 TIMEOUT = int(os.getenv("STUDIO_GATEWAY_TIMEOUT", "600"))
 API_KEY = os.getenv("STUDIO_GATEWAY_API_KEY", "").strip()
 MAX_REQUEST_BYTES = max(1024, min(16 * 1024 * 1024, int(os.getenv(
@@ -269,6 +276,8 @@ def _readiness():
     adapter = st.get("adapter")
     body = {"stage": stage, "backend": BACKEND_URL, "kind": BACKEND_KIND,
             "base_model": BASE_MODEL_NAME, "priority": PRIORITY,
+            "adapter_kind": CPU_ADAPTER_KIND,
+            "adapter_scope": EXPECTED_ADAPTER_SCOPE or None,
             "base_model_identity": st.get("model"),
             "mounted_adapter": adapter, "loaded_adapters": sorted(_LOADED),
             "applied_adapter": None}
@@ -277,6 +286,15 @@ def _readiness():
     if st.get("detail"):
         body["detail"] = st["detail"]
     if stage in _READY_STAGES or stage == "unsupervised":
+        if CPU_ADAPTER_KIND == "invalid":
+            body.update(ok=False, stage="adapter_kind_config_invalid",
+                        detail="STUDIO_GATEWAY_ADAPTER_KIND is unsupported")
+            return 503, body
+        if CPU_ADAPTER_KIND == "trajectory_policy" \
+                and not _POLICY_SCOPE.fullmatch(EXPECTED_ADAPTER_SCOPE):
+            body.update(ok=False, stage="adapter_scope_config_invalid",
+                        detail="whole trajectory policy serving requires one exact user scope")
+            return 503, body
         if REQUIRED_BASE_SHA256:
             model_identity = st.get("model") or {}
             if len(REQUIRED_BASE_SHA256) != 64 \
@@ -313,7 +331,7 @@ def _readiness():
                 body.update(ok=False, stage="adapter_identity_mismatch",
                             detail="the mounted adapter does not match the pinned identity")
                 return 503, body
-            name = _lora_name_for(required["uri"], "tool_call")
+            name = _lora_name_for(required["uri"], CPU_ADAPTER_KIND)
             if not _ensure_loaded(required["uri"], name, required):
                 body["adapter_mismatch"] = dict(_MISMATCH) if _MISMATCH else None
                 body.update(ok=False, stage="adapter_not_applied",
@@ -499,10 +517,24 @@ def _resolve_adapter(studio_adapters):
     is document-and-IGNORED (single global adapter only), never an error."""
     if not isinstance(studio_adapters, dict):
         return None, None
+    if "trajectory_policy" in studio_adapters:
+        # A structured policy is a separate model grammar, never something to
+        # compose with a SQL/style adapter by priority. Ambiguous mixed bodies
+        # fail validation in _handle_chat instead of falling back to base.
+        if set(studio_adapters) != {"trajectory_policy"}:
+            return None, None
+        entry = studio_adapters.get("trajectory_policy")
+        if not isinstance(entry, dict) or entry.get("kind") != "trajectory_policy" \
+                or not _POLICY_SCOPE.fullmatch(str(entry.get("scope") or "")) \
+                or not _POLICY_SCOPE.fullmatch(EXPECTED_ADAPTER_SCOPE) \
+                or entry.get("scope") != EXPECTED_ADAPTER_SCOPE \
+                or entry.get("capabilities") != _POLICY_CAPABILITIES:
+            return None, None
     order = PRIORITY
     if BACKEND_KIND == "llama":
-        # CPU path serves only the global tool_call adapter; drop user_style.
-        order = [k for k in PRIORITY if k == "tool_call"] or ["tool_call"]
+        # A CPU process mounts one adapter kind. A dedicated policy gateway can
+        # set trajectory_policy; the ordinary serving box defaults tool_call.
+        order = [CPU_ADAPTER_KIND]
         if studio_adapters.get("user_style"):
             _log("llama.cpp CPU path: user_style adapter ignored (needs the GPU/vLLM "
                  "multi-LoRA path); serving tool_call only.")
@@ -609,7 +641,14 @@ class Handler(BaseHTTPRequestHandler):
 
         # studio_adapters arrives top-level (OpenAI extra_body merges into the body).
         studio_adapters = payload.pop("studio_adapters", None)
+        policy_requested = isinstance(studio_adapters, dict) \
+            and "trajectory_policy" in studio_adapters
         adapter, kind = _resolve_adapter_identity(studio_adapters)
+        if policy_requested and (adapter is None or kind != "trajectory_policy"):
+            return self._send_json(400, {
+                "error": "trajectory_policy requires one exact kind and scope",
+                "stage": "adapter_scope_mismatch",
+            })
         uri = adapter.get("uri") if adapter else None
 
         if REQUIRE_TOOL_ADAPTER and adapter != _required_identity():
@@ -628,7 +667,7 @@ class Handler(BaseHTTPRequestHandler):
                 if BACKEND_KIND != "llama":
                     effective_model = name
             else:
-                if REQUIRE_TOOL_ADAPTER:
+                if REQUIRE_TOOL_ADAPTER or policy_requested:
                     return self._send_json(503, {
                         "error": "the required tool adapter is not confirmed active",
                         "stage": "adapter_not_applied",
@@ -663,6 +702,14 @@ class Handler(BaseHTTPRequestHandler):
                 "error": "adapter identity does not match the pinned deployment",
             })
         kind = (body.get("kind") or "tool_call").strip()
+        if kind == "trajectory_policy" and (
+                body.get("scope") != EXPECTED_ADAPTER_SCOPE
+                or not _POLICY_SCOPE.fullmatch(str(body.get("scope") or ""))):
+            return self._send_json(409, {
+                "error": "trajectory adapter scope does not match this gateway",
+            })
+        if kind not in {"tool_call", "trajectory_policy"}:
+            return self._send_json(400, {"error": "unsupported adapter kind"})
         name = (body.get("name") or "").strip() or _lora_name_for(uri, kind)
         with _NAME_LOCK:
             _URI_TO_NAME[uri] = name

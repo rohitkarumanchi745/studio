@@ -241,6 +241,59 @@ STRICT_ENV = {
     "STUDIO_GATEWAY_TOOL_ADAPTER_SHA256": STRICT_SHA,
 }
 
+POLICY_SCOPE = "user:" + "b" * 64
+POLICY_CAPABILITIES = ["airflow_dag", "agent_graph", "recovery_decision",
+                       "aggregator_output", "dependent_agent"]
+POLICY_ENV = {
+    "STUDIO_GATEWAY_ADAPTER_KIND": "trajectory_policy",
+    "STUDIO_GATEWAY_ADAPTER_SCOPE": POLICY_SCOPE,
+    "STUDIO_GATEWAY_ADAPTER_PRIORITY": "trajectory_policy",
+}
+POLICY_ADAPTER = {"uri": MOUNTED["uri"], "version": 7,
+                  "sha256": STRICT_SHA, "kind": "trajectory_policy",
+                  "scope": POLICY_SCOPE, "capabilities": POLICY_CAPABILITIES}
+
+
+def test_policy_gateway_binds_exact_kind_scope_and_capabilities(gateway, engine):
+    port, _ = gateway(state={"stage": "ready", "adapter": MOUNTED}, extra=POLICY_ENV)
+    status, _ = _chat(port, {"trajectory_policy": POLICY_ADAPTER})
+    assert status == 200
+    assert ("/lora-adapters", [{"id": 0, "scale": 1.0}]) in engine.calls
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda value: {**value, "scope": "user:" + "c" * 64},
+    lambda value: {**value, "kind": "tool_call"},
+    lambda value: {**value, "capabilities": POLICY_CAPABILITIES[:-1]},
+])
+def test_policy_gateway_refuses_wrong_scope_kind_or_capabilities(gateway, engine, mutate):
+    port, _ = gateway(state={"stage": "ready", "adapter": MOUNTED}, extra=POLICY_ENV)
+    status, body = _chat(port, {"trajectory_policy": mutate(dict(POLICY_ADAPTER))})
+    assert status == 400
+    assert body["stage"] == "adapter_scope_mismatch"
+    assert not [call for call in engine.calls if call[0].startswith("/v1/chat/completions")]
+
+
+def test_policy_gateway_refuses_mixed_adapter_body(gateway, engine):
+    port, _ = gateway(state={"stage": "ready", "adapter": MOUNTED}, extra=POLICY_ENV)
+    status, _ = _chat(port, {"trajectory_policy": POLICY_ADAPTER,
+                             "tool_call": {"uri": "/other", "version": 1}})
+    assert status == 400
+
+
+def test_policy_gateway_requires_configured_exact_scope(gateway):
+    port, _ = gateway(state={"stage": "ready", "adapter": MOUNTED}, extra={
+        "STUDIO_GATEWAY_ADAPTER_KIND": "trajectory_policy",
+        "STUDIO_GATEWAY_ADAPTER_SCOPE": "",
+        "STUDIO_GATEWAY_ADAPTER_PRIORITY": "trajectory_policy",
+    })
+    status, body = _health(port)
+    assert status == 503
+    assert body["stage"] == "adapter_scope_config_invalid"
+    status, body = _chat(port, {"trajectory_policy": POLICY_ADAPTER})
+    assert status == 400
+    assert body["stage"] == "adapter_scope_mismatch"
+
 
 def test_a_matching_adapter_is_scaled_and_served(gateway, engine):
     port, _ = gateway(state={"stage": "ready", "adapter": MOUNTED})

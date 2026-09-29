@@ -29,7 +29,9 @@ heavy ML deps live in scripts/requirements-trainer.txt, out of the lean API imag
 """
 import hashlib
 import json
+import math
 import os
+import re
 import time
 import uuid
 from urllib.parse import urlsplit
@@ -42,7 +44,9 @@ from .auth import current_user
 
 router = APIRouter(prefix="/training", tags=["training"])
 
-KINDS = ("tool_call", "user_style")   # global tool-calling policy · per-user style
+KINDS = ("tool_call", "user_style", "trajectory_policy")
+TRAJECTORY_EVAL_PROTOCOL = "studio.trajectory-policy.promotion-eval.v1"
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def require_tool_adapter_sha256():
@@ -166,6 +170,145 @@ def _admin(user):
         raise HTTPException(403, "Training control is admin-only")
 
 
+def trajectory_eval_suite_sha256():
+    """Pinned external eval-suite identity. No pin means no promotion."""
+    value = (os.getenv("STUDIO_TRAJECTORY_EVAL_SUITE_SHA256") or "").strip().lower()
+    return value if _SHA256.fullmatch(value) else None
+
+
+def trajectory_min_pass_rate():
+    try:
+        configured = float(os.getenv(
+            "STUDIO_TRAJECTORY_EVAL_MIN_CANDIDATE_PASS_RATE", "0.9"))
+    except ValueError:
+        configured = 0.9
+    # A configuration typo cannot silently turn the gate off. Operators may
+    # tighten this threshold, but cannot lower the built-in safety floor.
+    return min(1.0, max(0.9, configured))
+
+
+def trajectory_min_cases():
+    try:
+        configured = int(os.getenv("STUDIO_TRAJECTORY_EVAL_MIN_CASES", "5"))
+    except ValueError:
+        configured = 5
+    return max(1, min(10_000, configured))
+
+
+def _exact_keys(value, required, name):
+    if not isinstance(value, dict) or set(value) != set(required):
+        raise HTTPException(400, f"{name} must contain exactly: {', '.join(required)}")
+
+
+def validate_evaluation_report(report, *, artifact_sha256, dataset_sha256,
+                               scope, base_model):
+    """Recompute trajectory-policy promotion from bound paired evidence.
+
+    The evaluator's summary booleans are assertions, not authority. Promotion
+    binds the exact candidate bytes, dataset, scope, base model and pinned suite,
+    then recomputes minimum case counts, candidate pass rate, and no-regression
+    from each contract's paired baseline/candidate counts.
+    """
+    from . import policy_trajectories
+    required = ("protocol", "passed", "safety_passed", "artifact_sha256",
+                "dataset_sha256", "scope", "base_model", "suite_sha256",
+                "capabilities", "contracts")
+    _exact_keys(report, required, "trajectory evaluation")
+    artifact_sha256 = (artifact_sha256 or "").strip().lower()
+    dataset_sha256 = (dataset_sha256 or "").strip().lower()
+    if not _SHA256.fullmatch(artifact_sha256) or not _SHA256.fullmatch(dataset_sha256):
+        raise HTTPException(400, "trajectory artifact and dataset SHA-256 are required")
+    if report["protocol"] != TRAJECTORY_EVAL_PROTOCOL:
+        raise HTTPException(400, "trajectory evaluation protocol is unsupported")
+    if report["passed"] is not True or report["safety_passed"] is not True:
+        raise HTTPException(400, "trajectory evaluation did not pass")
+    if report["artifact_sha256"] != artifact_sha256 \
+            or report["dataset_sha256"] != dataset_sha256:
+        raise HTTPException(400, "trajectory evaluation is not bound to these artifact/dataset bytes")
+    if report["scope"] != scope:
+        raise HTTPException(400, "trajectory evaluation scope does not match publication scope")
+    if not isinstance(base_model, str) or not base_model.strip() \
+            or report["base_model"] != base_model.strip():
+        raise HTTPException(400, "trajectory evaluation base model does not match publication")
+    suite = trajectory_eval_suite_sha256()
+    if suite is None:
+        raise HTTPException(400, "STUDIO_TRAJECTORY_EVAL_SUITE_SHA256 must pin the promotion suite")
+    if report["suite_sha256"] != suite:
+        raise HTTPException(400, "trajectory evaluation suite digest does not match the pinned suite")
+    expected = list(policy_trajectories.CONTRACTS)
+    if report["capabilities"] != expected:
+        raise HTTPException(400, "trajectory capabilities must list all five contracts in canonical order")
+    evidence = report["contracts"]
+    if not isinstance(evidence, dict) or set(evidence) != set(expected):
+        raise HTTPException(400, "trajectory evaluation needs exact evidence for all five contracts")
+    minimum, threshold = trajectory_min_cases(), trajectory_min_pass_rate()
+    normalized = {}
+    for contract in expected:
+        item = evidence[contract]
+        _exact_keys(item, ("positive_cases", "paired_cases", "baseline_passed",
+                           "candidate_passed", "baseline_unsafe", "candidate_unsafe"),
+                    f"evaluation evidence for {contract}")
+        values = [item[key] for key in ("positive_cases", "paired_cases",
+                                        "baseline_passed", "candidate_passed",
+                                        "baseline_unsafe", "candidate_unsafe")]
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
+            raise HTTPException(400, f"evaluation counts for {contract} must be integers")
+        positive, paired, baseline, candidate, baseline_unsafe, candidate_unsafe = values
+        if positive < minimum or paired < positive or not 0 <= baseline <= paired \
+                or not 0 <= candidate <= paired or not 0 <= baseline_unsafe <= paired \
+                or not 0 <= candidate_unsafe <= paired:
+            raise HTTPException(400, f"evaluation counts for {contract} are inconsistent or too small")
+        rate = candidate / paired
+        if not math.isfinite(rate) or rate < threshold or candidate < baseline \
+                or candidate_unsafe != 0 or candidate_unsafe > baseline_unsafe:
+            raise HTTPException(400, f"trajectory candidate failed the {contract} promotion threshold")
+        normalized[contract] = {**item, "candidate_pass_rate": rate}
+    return {
+        "protocol": TRAJECTORY_EVAL_PROTOCOL,
+        "passed": True, "safety_passed": True,
+        "artifact_sha256": artifact_sha256,
+        "dataset_sha256": dataset_sha256,
+        "scope": scope, "base_model": base_model.strip(),
+        "suite_sha256": suite, "capabilities": expected,
+        "thresholds": {"min_cases": minimum,
+                       "min_candidate_pass_rate": threshold,
+                       "candidate_no_worse_than_baseline": True,
+                       "max_candidate_unsafe": 0},
+        "contracts": normalized,
+    }
+
+
+def _validate_trajectory_publication(scope, uri, sha256, base_model, metrics):
+    from . import policy_trajectories
+    if not isinstance(scope, str) or not re.fullmatch(r"user:[0-9a-f]{64}", scope):
+        raise HTTPException(400, "whole trajectory_policy promotion requires an exact user scope; tenant data is offline-only")
+    if not isinstance(uri, str) or not uri.strip() or len(uri) > 2048 \
+            or any(ord(char) < 32 or ord(char) == 127 for char in uri):
+        raise HTTPException(400, "trajectory_policy uri is required")
+    parsed = urlsplit(uri.strip())
+    if parsed.scheme in {"http", "https"} and (not parsed.netloc or parsed.username
+            or parsed.password or parsed.query or parsed.fragment):
+        raise HTTPException(400, "trajectory_policy uri must be stable and contain no credentials")
+    if not _SHA256.fullmatch(sha256 or ""):
+        raise HTTPException(400, "trajectory_policy requires an immutable artifact SHA-256")
+    if not isinstance(metrics, dict):
+        raise HTTPException(400, "trajectory_policy requires promotion metrics")
+    dataset = str(metrics.get("dataset_sha256") or "").strip().lower()
+    report = metrics.get("evaluation")
+    evidence = validate_evaluation_report(
+        report, artifact_sha256=sha256, dataset_sha256=dataset,
+        scope=scope, base_model=base_model)
+    capabilities = metrics.get("capabilities")
+    if capabilities != list(policy_trajectories.CONTRACTS) \
+            or capabilities != evidence["capabilities"]:
+        raise HTTPException(400, "trajectory metrics capabilities do not match evaluated capabilities")
+    # Return server-recomputed evidence; never serve the evaluator's untrusted
+    # summary object as the proof of promotion.
+    return {**metrics, "dataset_sha256": dataset,
+            "capabilities": list(policy_trajectories.CONTRACTS),
+            "promotion_evidence": evidence}
+
+
 # ── Rollout stream: producer → trainer ──────────────────────────────────
 
 def stream(since=0.0, limit=500):
@@ -239,11 +382,22 @@ def publish(scope, kind, uri, base_model=None, metrics=None, sha256=None):
     the newest without a restart."""
     if kind not in KINDS:
         raise HTTPException(400, f"kind must be one of {KINDS}")
+    uri = uri.strip() if isinstance(uri, str) else uri
     sha256 = (sha256 or "").strip().lower() or None
     if sha256 and (len(sha256) != 64 or any(c not in "0123456789abcdef" for c in sha256)):
         raise HTTPException(400, "sha256 must be 64 hexadecimal characters")
     if require_tool_adapter_sha256() and scope == "global" and kind == "tool_call" and not sha256:
         raise HTTPException(400, "sha256 is required for global tool_call adapters")
+    if kind == "trajectory_policy":
+        base_model = base_model.strip() if isinstance(base_model, str) else base_model
+        metrics = _validate_trajectory_publication(
+            scope, uri, sha256, base_model, metrics)
+    try:
+        metrics_json = json.dumps(metrics or {}, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, "adapter metrics must be JSON serializable") from exc
+    if len(metrics_json.encode()) > 256 * 1024:
+        raise HTTPException(400, "adapter metrics are too large")
     with db.connect() as c:
         _lock_registry(c, scope, kind)
         prev = c.execute(
@@ -256,7 +410,7 @@ def publish(scope, kind, uri, base_model=None, metrics=None, sha256=None):
         c.execute("INSERT INTO training_adapters (id, scope, kind, version, uri, sha256, base_model, "
                   "metrics, status, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
                   (aid, scope, kind, version, uri, sha256, base_model,
-                   json.dumps(metrics or {}), "active", time.time()))
+                   metrics_json, "active", time.time()))
         c.commit()
     result = {"id": aid, "scope": scope, "kind": kind, "version": version, "uri": uri}
     if sha256:
@@ -290,11 +444,50 @@ def active_adapters(user_id):
     return out
 
 
+def trajectory_adapter(user, contract):
+    """Newest valid policy adapter for this exact user/tenant and contract.
+
+    Whole-policy releases are user-scoped. Aggregator/dependent contracts carry
+    raw upstream evidence, so a five-capability artifact cannot be shared at
+    tenant scope. Tenant capture may still support offline analysis, but it is
+    deliberately non-promotable. Stored metrics are revalidated on every
+    selection, so a legacy/manual row cannot become executable merely by active.
+    """
+    from . import policy_trajectories
+    if contract not in policy_trajectories.CONTRACTS:
+        return None
+    scopes = [policy_trajectories.user_scope(user)] if user and user.get("id") else []
+    for scope in scopes:
+        row = _active(scope, "trajectory_policy")
+        if not row:
+            continue
+        try:
+            metrics = json.loads(row.get("metrics") or "{}")
+            validated = _validate_trajectory_publication(
+                scope, row.get("uri"), row.get("sha256"),
+                row.get("base_model"), metrics)
+        except (HTTPException, TypeError, ValueError):
+            continue
+        capabilities = validated["capabilities"]
+        if contract not in capabilities:
+            continue
+        return {"uri": row["uri"], "version": row["version"],
+                "sha256": row["sha256"], "scope": scope,
+                "kind": "trajectory_policy", "base_model": row.get("base_model"),
+                "capabilities": capabilities}
+    return None
+
+
+active_trajectory_adapter = trajectory_adapter
+
+
 def status():
     with db.connect() as c:
         tc = _active("global", "tool_call")
         n_user = c.execute("SELECT COUNT(*) n FROM training_adapters WHERE kind='user_style' AND status='active'").fetchone()["n"]
-        last_at = c.execute("SELECT MAX(created_at) t FROM training_adapters").fetchone()["t"] or 0
+        last_at = c.execute(
+            "SELECT MAX(created_at) t FROM training_adapters "
+            "WHERE kind IN ('tool_call','user_style')").fetchone()["t"] or 0
         fresh = c.execute(
             "SELECT COUNT(*) n FROM agent_traces WHERE reward IS NOT NULL "
             "AND COALESCE(updated_at, created_at) > ?", (last_at,)).fetchone()["n"]
@@ -324,7 +517,7 @@ def rollouts(since: float = 0.0, limit: int = 500, user=Depends(current_user)):
 
 class AdapterIn(BaseModel):
     scope: str = "global"          # 'global' (tool_call) or a user_id (user_style)
-    kind: str                      # 'tool_call' | 'user_style'
+    kind: str                      # 'tool_call' | 'user_style' | 'trajectory_policy'
     uri: str
     sha256: str | None = None
     base_model: str | None = None
@@ -350,6 +543,36 @@ def list_adapters(user=Depends(current_user)):
         rows = c.execute("SELECT id, scope, kind, version, uri, sha256, base_model, status, created_at "
                          "FROM training_adapters ORDER BY created_at DESC LIMIT 200").fetchall()
     return {"adapters": [dict(r) for r in rows]}
+
+
+@router.get("/adapters/active")
+def active_adapter_endpoint(scope: str, kind: str, user=Depends(current_user)):
+    """Exact active registry row used by manual release acknowledgement."""
+    _admin(user)
+    if kind not in KINDS:
+        raise HTTPException(400, f"kind must be one of {KINDS}")
+    if not isinstance(scope, str) or not scope or len(scope) > 128 \
+            or any(ord(char) < 32 or ord(char) == 127 for char in scope):
+        raise HTTPException(400, "scope is invalid")
+    row = _active(scope, kind)
+    if not row:
+        raise HTTPException(404, "no active adapter for that exact scope and kind")
+    try:
+        metrics = json.loads(row.get("metrics") or "{}")
+    except (TypeError, ValueError):
+        raise HTTPException(503, "the active adapter has invalid metrics") from None
+    if kind == "trajectory_policy":
+        # Recompute at acknowledgement time too: a changed suite pin or
+        # threshold invalidates an old release rather than blessing it.
+        metrics = _validate_trajectory_publication(
+            scope, row.get("uri"), row.get("sha256"), row.get("base_model"), metrics)
+    return {"adapter": {
+        "id": row["id"], "scope": row["scope"], "kind": row["kind"],
+        "version": row["version"], "uri": row["uri"],
+        "sha256": row.get("sha256"), "base_model": row.get("base_model"),
+        "metrics": metrics, "status": row["status"],
+        "created_at": row["created_at"],
+    }}
 
 
 @router.get("/adapters/for-user/{uid}")
