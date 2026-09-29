@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from app import confluence
 
 
-USER = {"id": "reader", "role": "viewer"}
+USER = {"id": "reader", "role": "analyst"}
 
 
 @pytest.fixture(autouse=True)
@@ -54,6 +54,14 @@ def test_selection_route_lists_only_configured_spaces(monkeypatch):
     assert all(item[2]["limit"] == 25 for item in calls)
     assert client.get("/api/confluence/pages?space_key=SECRET").status_code == 403
     assert len(calls) == 2
+
+
+def test_viewer_cannot_list_confluence_page_metadata(monkeypatch):
+    monkeypatch.setattr(confluence, "_get_json", lambda *a, **k: pytest.fail("No external request"))
+    app = FastAPI()
+    app.include_router(confluence.router, prefix="/api")
+    app.dependency_overrides[confluence.current_user] = lambda: {"id": "viewer", "role": "viewer"}
+    assert TestClient(app).get("/api/confluence/pages").status_code == 403
 
 
 def test_resolve_checks_space_and_preserves_exact_version_digest(monkeypatch):

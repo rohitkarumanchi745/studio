@@ -334,7 +334,9 @@ def _admin(user):
 
 @router.get("")
 def selectable_repos(user=Depends(current_user)):
-    """The enabled registered repositories any signed-in builder may choose."""
+    """Enabled registered repositories an analyst or administrator may choose."""
+    if (user or {}).get("role") not in {"admin", "analyst"}:
+        raise HTTPException(403, "Repository planning sources are for analysts and administrators")
     repos = []
     for row in _all():
         try:
@@ -346,6 +348,8 @@ def selectable_repos(user=Depends(current_user)):
 
 @router.get("/{repo_id}")
 def selected_repo(repo_id: str, user=Depends(current_user)):
+    if (user or {}).get("role") not in {"admin", "analyst"}:
+        raise HTTPException(403, "Repository planning sources are for analysts and administrators")
     return {"repo": get_repo(repo_id)}
 
 
@@ -392,6 +396,8 @@ class PickIn(BaseModel):
 @router.post("/pick")
 def pick_repo(body: PickIn, user=Depends(current_user)):
     """Suggest a repo; the builder still selects its stable ID explicitly."""
+    if (user or {}).get("role") not in {"admin", "analyst"}:
+        raise HTTPException(403, "Repository planning sources are for analysts and administrators")
     best, ranked = pick(body.prompt)
     if not best:
         return {"repo": None, "ranked": [], "files": []}

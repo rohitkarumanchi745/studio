@@ -26,6 +26,8 @@ configured, and the one test that exercises it monkeypatches it.
 Run from the backend directory:
     python -m pytest tests/test_pipelines.py -q
 """
+from types import SimpleNamespace
+
 import pytest
 from fastapi import HTTPException
 
@@ -65,6 +67,38 @@ def _quiet(monkeypatch):
 
 def _sql(draft, table):
     return next(s["sql"] for s in draft["steps"] if s["table"] == table)
+
+
+def test_selected_reference_never_silently_uses_deterministic_template():
+    with pytest.raises(HTTPException) as error:
+        pipelines.build(VIEWER, "Revenue by region", source="demo", tables=["sales"],
+                        planner_context="Selected GitHub file: sales.sql",
+                        require_model_for_context=True)
+    assert error.value.status_code == 503
+
+
+def test_selected_reference_reaches_model_and_sql_is_still_verified(monkeypatch):
+    calls = []
+
+    def invoke(messages):
+        calls.append(messages)
+        return SimpleNamespace(content='[{"name":"Revenue by region","table":"sales",'
+                                      '"sql":"SELECT region, SUM(revenue) FROM sales GROUP BY region"}]')
+
+    monkeypatch.setattr(pipelines.agent, "llm_available", lambda *a, **k: True)
+    monkeypatch.setattr(pipelines.agent, "make_llm", lambda *a, **k: SimpleNamespace(invoke=invoke))
+    draft = pipelines.build(VIEWER, "Revenue by region", source="demo", tables=["sales"],
+                            planner_context="Selected Confluence page: aggregate sales by region",
+                            require_model_for_context=True,
+                            planning_sources={"github_repository": {"repo": {
+                                "id": "repo-1", "name": "Sales DAGs",
+                                "url": "https://github.com/acme/sales-dags"}, "ref": "a" * 40},
+                                "confluence_pages": [{"id": "123", "version": 2}]})
+    assert draft["generation"] == "model"
+    assert draft["steps"] and all(step["verified"] for step in draft["steps"])
+    assert draft["planning_sources"]["confluence_pages"][0]["version"] == 2
+    assert draft["repo"]["name"] == "Sales DAGs"
+    assert "Selected Confluence page" in calls[0][1][1]
 
 
 # ── Prompt fidelity: the drafted SQL answers the question asked ─────────

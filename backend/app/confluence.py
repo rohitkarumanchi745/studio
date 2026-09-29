@@ -159,6 +159,8 @@ def selection_pages(space_key: str | None = None,
                     limit: int = Query(25, ge=1, le=50),
                     start: int = Query(0, ge=0, le=10000),
                     user=Depends(current_user)):
+    if (user or {}).get("role") not in {"admin", "analyst"}:
+        raise HTTPException(403, "Confluence planning sources are for analysts and administrators")
     return list_pages(space_key, limit=limit, start=start)
 
 

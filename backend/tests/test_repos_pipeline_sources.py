@@ -8,7 +8,7 @@ from app import db, repos
 
 
 ADMIN = {"id": "admin", "role": "admin", "email": "admin@example.test"}
-BUILDER = {"id": "builder", "role": "viewer", "email": "builder@example.test"}
+BUILDER = {"id": "builder", "role": "analyst", "email": "builder@example.test"}
 COMMIT = "a" * 40
 TREE = "b" * 40
 
@@ -67,6 +67,16 @@ def test_builder_lists_enabled_repos_and_resolves_only_registered_id():
     with pytest.raises(HTTPException) as exc:
         repos.get_repo(repo_id)
     assert exc.value.status_code == 404
+
+
+def test_viewer_cannot_list_repository_metadata():
+    register()
+    with pytest.raises(HTTPException) as exc:
+        repos.selectable_repos(user={"id": "viewer", "role": "viewer"})
+    assert exc.value.status_code == 403
+    with pytest.raises(HTTPException) as exc:
+        repos.pick_repo(repos.PickIn(prompt="sales"), user={"id": "viewer", "role": "viewer"})
+    assert exc.value.status_code == 403
 
 
 def test_legacy_unsafe_registry_row_is_not_selectable():

@@ -252,7 +252,8 @@ def _repair_blocked(previous, prompt, source):
             "repairs_run_id": _repair_run_id(previous)}
 
 
-def build(user, prompt, *, context=None, source=None, tables=None, model=None, previous=None):
+def build(user, prompt, *, context=None, source=None, tables=None, model=None,
+          previous=None, source_context=None, planning_sources=None):
     """Build or revise using the caller's already access-filtered chat context.
 
     Exact conversion requests preserve prior SQL (including filters). Other
@@ -267,7 +268,7 @@ def build(user, prompt, *, context=None, source=None, tables=None, model=None, p
     objective = previous.get("prompt") if repairing else prompt
     if repairing and not pipelines.agent.llm_available(model or pipelines.agent.llm_spec(), user):
         return _repair_blocked(previous, prompt, source)
-    if previous and _reuse_request(prompt):
+    if previous and _reuse_request(prompt) and not source_context:
         # Reusing a previous recipe must not escape a newly selected source
         # or tables. Check that BEFORE executing verification reads.
         previous_steps = previous.get("steps") or []
@@ -294,7 +295,7 @@ def build(user, prompt, *, context=None, source=None, tables=None, model=None, p
     # monthly" example belonging to another conversation.
     memory_prompt = (f"{previous.get('prompt') or ''}\nCurrent revision: {prompt}"
                      if previous else prompt)
-    matches = pipeline_memory.successful_recipes(
+    matches = [] if source_context else pipeline_memory.successful_recipes(
         user, memory_prompt, source=source, tables=tables, limit=3)
     recipe = matches[0] if matches else None
     if recipe and recipe["match"] == "exact" and not previous:
@@ -315,6 +316,14 @@ def build(user, prompt, *, context=None, source=None, tables=None, model=None, p
     history = _context_text(context)
     if history:
         pieces.append("Visible conversation context:\n" + history)
+    if source_context and not pipelines.agent.llm_available(
+            model or pipelines.agent.llm_spec(), user):
+        return {"name": prompt[:120], "prompt": prompt, "source": source or "*",
+                "steps": [], "dropped": [], "status": "blocked",
+                "execution_mode": "read_only_sql", "lineage": pipelines.lineage([]),
+                "generation": "selected_context_requires_model",
+                "planning_sources": planning_sources or {},
+                "warnings": ["Connect a planning model to use the selected GitHub or Confluence content."]}
     experience = _learning_context(user, source, tables)
     guidance = [experience] if experience else []
     if recipe:
@@ -328,8 +337,12 @@ def build(user, prompt, *, context=None, source=None, tables=None, model=None, p
     failure = _failure_context(previous)
     if failure:
         guidance.append(failure)
-    result = pipelines.build(user, "\n\n".join(pieces), source=source, tables=tables, model=model,
-                             sql_only=True, planner_context="\n\n".join(guidance) or None)
+    if source_context:
+        guidance.append(source_context)
+    result = pipelines.build(
+        user, "\n\n".join(pieces), source=source, tables=tables, model=model,
+        sql_only=True, planner_context="\n\n".join(guidance) or None,
+        require_model_for_context=bool(source_context))
     if repairing and result.get("generation") != "model":
         return _repair_blocked(previous, prompt, source)
     if recipe and result.get("generation") != "model":
@@ -343,6 +356,8 @@ def build(user, prompt, *, context=None, source=None, tables=None, model=None, p
             "status": "ready" if result["steps"] and not result.get("dropped") else "blocked",
             "execution_mode": "read_only_sql", "lineage": result["lineage"],
             "generation": result.get("generation"), "warnings": result.get("warnings", [])}
+    if planning_sources:
+        draft["planning_sources"] = planning_sources
     if _repair_run_id(previous):
         draft["repairs_run_id"] = _repair_run_id(previous)
     if failure and _recipe_key(previous.get("steps") or []) == _recipe_key(draft["steps"]):
@@ -438,6 +453,8 @@ def run(user, draft, *, request_id):
             "status": "ready",
             "repairs_run_id": draft.get("repairs_run_id"),
             "execution_mode": "read_only_sql", "lineage": saved["lineage"], "run": result}
+    if draft.get("planning_sources"):
+        output["planning_sources"] = draft["planning_sources"]
     if isinstance(draft.get("memory"), dict):
         output["memory"] = {k: draft["memory"].get(k) for k in
                             ("trace_id", "run_id", "matched_prompt", "similarity", "reuse_type", "repairs_run_id")}

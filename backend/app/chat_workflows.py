@@ -98,7 +98,8 @@ def _sql_recipe(tasks):
     return sorted(recipe)
 
 
-def build(user, prompt, *, source=None, tables=None, model=None, previous=None, context=None):
+def build(user, prompt, *, source=None, tables=None, model=None, previous=None,
+          context=None, source_context=None, planning_sources=None):
     from . import airflow_dags, pipeline_dags
     if user["role"] not in ("admin", "analyst"):
         raise HTTPException(403, "Only analysts and administrators can build executable DAGs")
@@ -119,7 +120,10 @@ def build(user, prompt, *, source=None, tables=None, model=None, previous=None, 
         # recipe. Security-invalid plans have errors/no tasks and stay hidden.
         return bool(checked.get("tasks") and not checked.get("errors"))
 
-    matches = pipeline_memory.successful_recipes(user, prompt, source=source, tables=tables,
+    # A selected repository/page changes the requested planning evidence. An
+    # old prompt match alone cannot prove it used those selected source bytes.
+    matches = [] if source_context else pipeline_memory.successful_recipes(
+        user, prompt, source=source, tables=tables,
         action_types=("airflow_dag",), validate_action=allowed)
     memory = matches[0] if matches else None
     if memory and memory["match"] == "exact" and not previous:
@@ -127,8 +131,10 @@ def build(user, prompt, *, source=None, tables=None, model=None, previous=None, 
         plan["memory"] = pipeline_memory.provenance(memory, "exact_revalidated")
     else:
         # The visible conversation is context, not a source of new authority.
+        source_kwargs = {"source_context": source_context} if source_context else {}
         plan = pipeline_dags.build(user, prompt, source=source, tables=tables, model=model,
-                                   previous=previous, examples=matches, context=context)
+                                   previous=previous, examples=matches, context=context,
+                                   **source_kwargs)
         if memory:
             plan["memory"] = pipeline_memory.provenance(memory, "model_adapted" if plan.get("status") == "ready" else "adaptation_required")
             old = memory["action"]["plan"].get("tasks") or []
@@ -149,6 +155,8 @@ def build(user, prompt, *, source=None, tables=None, model=None, previous=None, 
         objective = f"{previous['prompt']} Clarification: {prompt}"
     plan.update(prompt=objective or prompt, revision_prompt=prompt,
                 requested_by=user["id"], execution_mode="airflow_dag")
+    if planning_sources:
+        plan["planning_sources"] = planning_sources
     repairs = _repair_id(previous, user)
     if repairs:
         plan["repairs_run_id"] = repairs
@@ -189,7 +197,8 @@ def submit(user, plan, *, request_id, conversation_id=None):
         return out
     jid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"studio-chat-dag:{user['id']}:{request_id}"))
     # An approved recipe is immutable; config or SQL changes need a new job.
-    script = json.dumps({"plan": checked, "digest": artifact["digest"]}, sort_keys=True)
+    script = json.dumps({"plan": checked, "digest": artifact["digest"],
+                         "planning_sources": plan.get("planning_sources") or {}}, sort_keys=True)
     jobs.check_claim()
     job = supervisor.submit(supervisor.DAG_KIND, "airflow", script, user, job_id=jid, notify=False,
         learning_context={"prompt": plan.get("prompt"), "conversation_id": conversation_id,
@@ -210,6 +219,7 @@ def recover(user, request_id):
         raise
     spec = json.loads(job["script"])
     return {**spec["plan"], "execution_mode": "airflow_dag", "requested_by": user["id"],
+            **({"planning_sources": spec["planning_sources"]} if spec.get("planning_sources") else {}),
             "status": job["status"], "job_id": jid, "job": {"id": jid, "status": job["status"]}}
 
 

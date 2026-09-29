@@ -95,6 +95,16 @@ def test_build_from_prompt_respects_selected_table(client):
     assert count("pipeline_runs") == 0
 
 
+def test_viewer_cannot_select_external_planning_sources_or_record_a_turn(client):
+    response = client.post("/api/chat", json={
+        "prompt": "Build a pipeline for monthly revenue by region", "source": "demo",
+        "table": "sales", "pipeline_action": "build", "pipeline_mode": "read_only_sql",
+        "repository_id": "some-repository",
+    })
+    assert response.status_code == 403
+    assert count("messages") == 0
+
+
 def test_build_and_run_in_one_chat_prompt(client):
     answer = ask(client, "Build and run a pipeline for monthly revenue by region")
     draft = answer["message"]["pipeline"]

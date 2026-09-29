@@ -12,7 +12,8 @@ from pydantic import BaseModel
 
 from . import (agent, chat_pipelines, chat_platforms, chat_workflows, db, email_service, gateway, governance, jobs, keys,
                lightning, orchestrator, progress, qcache, queryguard, rbac,
-               roster, router as model_router, semantic, sessions, skills)
+               roster, router as model_router, semantic, sessions, skills,
+               pipeline_sources)
 from .auth import current_user
 from .matching import match_tables
 from .sources import connector_or_400
@@ -76,6 +77,10 @@ class Ask(BaseModel):
     # Disambiguates the build control. Omitted preserves the original
     # read-only SQL pipeline; Airflow is an explicit, typed DAG planning mode.
     pipeline_mode: Optional[Literal["read_only_sql", "airflow_dag"]] = None
+    # Optional registered planning references. The worker resolves IDs under
+    # current permissions; the client never supplies a URL or source text.
+    repository_id: Optional[str] = None
+    confluence_page_ids: Optional[List[str]] = None
     # A Run button selects an immutable version in THIS conversation. The
     # client never supplies executable steps; they are recovered server-side.
     pipeline_message_id: Optional[str] = None
@@ -339,6 +344,13 @@ def _scope(body, user, before_message_id=None):
         if not chat_workflows.is_plan(workflow_previous):
             raise HTTPException(400, "Select an Airflow pipeline to inspect its status")
         workflow_action = "status"
+    if body.repository_id or body.confluence_page_ids:
+        if body.pipeline_action not in (None, "build") or (
+                body.pipeline_action is None and workflow_action not in ("build", "build_submit")):
+            raise HTTPException(400, "GitHub and Confluence sources can only be selected while building a pipeline")
+        if user["role"] not in ("admin", "analyst"):
+            raise HTTPException(403, "Only analysts and administrators can use external planning sources")
+        pipeline_sources.validate_selection(body.repository_id, body.confluence_page_ids)
     if workflow_action and not (body.platform_action or body.platform_target or body.platform_payload is not None):
         if user["role"] not in ("admin", "analyst"):
             raise HTTPException(403, "Your role cannot build or deploy Airflow pipelines")
@@ -459,6 +471,8 @@ def _build_ctx(body, user, cid, scope=None, user_message_id=None):
                 "user_message_id": user_message_id,
                 "pipeline_action": body.pipeline_action,
                 "pipeline_message_id": body.pipeline_message_id,
+                "repository_id": body.repository_id,
+                "confluence_page_ids": body.confluence_page_ids or [],
                 "selected_tables": body.tables or ([body.table] if body.table != "*" else None)})
     return ctx
 
@@ -597,9 +611,13 @@ def _workflow_turn(ctx, user):
     if plan is None:
         if action in ("build", "build_submit"):
             progress.emit("matching successful recipes and planning task dependencies")
+            source_context, planning_sources = pipeline_sources.resolve(
+                user, repository_id=ctx.get("repository_id"),
+                confluence_page_ids=ctx.get("confluence_page_ids"))
             plan = chat_workflows.build(user, ctx["prompt"], source=ctx.get("source"),
                 tables=ctx.get("selected_tables"), model=ctx.get("model"), previous=previous,
-                context=ctx.get("history"))
+                context=ctx.get("history"), source_context=source_context,
+                planning_sources=planning_sources)
         elif action == "status":
             plan = chat_workflows.refresh(user, previous)
         else:
@@ -760,10 +778,14 @@ def _pipeline_turn(ctx, user, action, previous):
             if draft is not None and previous:
                 draft["repairs_run_id"] = draft.get("repairs_run_id") or chat_pipelines._repair_run_id(previous)
             if draft is None:
+                source_context, planning_sources = pipeline_sources.resolve(
+                    user, repository_id=ctx.get("repository_id"),
+                    confluence_page_ids=ctx.get("confluence_page_ids"))
                 draft = chat_pipelines.build(
                     user, ctx["prompt"], context=ctx["history"],
                     source=ctx.get("source"), tables=ctx.get("selected_tables"),
-                    model=ctx.get("model"), previous=previous)
+                    model=ctx.get("model"), previous=previous,
+                    source_context=source_context, planning_sources=planning_sources)
             if draft.get("status") == "ready" and draft.get("steps"):
                 if action == "build_run":
                     draft = execute(draft)
