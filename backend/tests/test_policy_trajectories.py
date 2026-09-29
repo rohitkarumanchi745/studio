@@ -193,6 +193,18 @@ def test_scope_resolution_is_admin_only_bounded_and_returns_no_training_data():
     assert invalid.value.status_code == 400
 
 
+def test_training_get_refuses_readable_identity_in_query_string():
+    admin = {"id": "trainer", "role": "admin"}
+    with pytest.raises(HTTPException) as exposed:
+        pt.training_trajectories("user:plain-user-id", user=admin)
+    assert exposed.value.status_code == 400
+    assert "opaque scope" in exposed.value.detail
+
+    opaque = pt.user_scope("plain-user-id")
+    page = pt.training_trajectories(opaque, since=0, limit=100, user=admin)
+    assert page["scope"] == opaque and page["trajectories"] == []
+
+
 def test_aggregator_rejects_numeric_and_qualitative_hallucinations():
     inp, target = _aggregate("Revenue was 999.")
     with pytest.raises(pt.ContractRejected, match="numeric claims"):

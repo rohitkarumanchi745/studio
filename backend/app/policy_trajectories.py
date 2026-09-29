@@ -946,6 +946,10 @@ def training_trajectories(scope: str, since: int = 0,
                           user=Depends(current_user)):
     """Trainer/admin pull for one exact scope; never a cross-scope dump."""
     _admin(user)
+    if not _SCOPE_RE.fullmatch(scope):
+        raise HTTPException(
+            400,
+            "trajectory pagination requires an opaque scope; resolve readable identities by POST")
     requested = [value.strip() for value in contracts.split(",") if value.strip()] \
         if contracts else None
     try:
