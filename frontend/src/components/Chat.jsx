@@ -6,6 +6,8 @@ import SqlLab from "./SqlLab";
 import ChatPipeline from "./ChatPipeline";
 import ChatWorkflow from "./ChatWorkflow";
 import ChatPlatformRun, { PlatformComposer } from "./ChatPlatformRun";
+import { chatPipelineFields, PlanningContextPicker, PlanningSources,
+  usePlanningCatalog } from "./Pipelines";
 
 // "Demo agent" for a single worker; "Snowflake agent + Databricks agent →
 // Aggregator" when a question fanned out across sources.
@@ -70,6 +72,9 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
   const [prompt, setPrompt] = useState("");
   const [buildPipeline, setBuildPipeline] = useState(false);
   const [buildAirflow, setBuildAirflow] = useState(false);
+  const [repositoryId, setRepositoryId] = useState("");
+  const [confluencePageIds, setConfluencePageIds] = useState([]);
+  const planningCatalog = usePlanningCatalog();
   const [showPlatform, setShowPlatform] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -191,8 +196,8 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
           tables: !orchestrated && sel.length > 1 ? sel : undefined,
           conversation_id: conversationId,
           model: model || undefined,
-          pipeline_action: buildPipeline || buildAirflow ? "build" : undefined,
-          pipeline_mode: buildAirflow ? "airflow_dag" : buildPipeline ? "read_only_sql" : undefined,
+          ...chatPipelineFields(buildPipeline, buildAirflow, repositoryId,
+            confluencePageIds),
         }),
       });
       // Building is a one-turn action; follow-ups such as "run this pipeline"
@@ -577,6 +582,12 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
           }} />
           Build an approval-gated Airflow DAG from this prompt
         </label>
+        {(buildPipeline || buildAirflow) && (
+          <PlanningContextPicker {...planningCatalog}
+            repositoryId={repositoryId} confluencePageIds={confluencePageIds}
+            onRepositoryChange={setRepositoryId} onConfluenceChange={setConfluencePageIds}
+            disabled={busy} />
+        )}
         <button type="button" className="chip" disabled={busy} onClick={() => setShowPlatform((v) => !v)}>Run on Airflow / another platform</button>
         {showPlatform && <PlatformComposer busy={busy} onSubmit={platformAction} onClose={() => setShowPlatform(false)} />}
       </form>
@@ -686,6 +697,7 @@ function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRunPipeli
           </span>
         </div>
         {m.text && <p className="answer">{m.text}</p>}
+        <PlanningSources sources={m.pipeline?.planning_sources} />
         {m.pipeline?.execution_mode === "airflow_dag"
           ? <ChatWorkflow key={m.pipeline.job_id || m.message_id} pipeline={m.pipeline} messageId={m.message_id} busy={busy} onRun={onRunPipeline} onStatus={onPipelineStatus} />
           : m.pipeline && <ChatPipeline pipeline={m.pipeline} messageId={m.message_id} busy={busy} onRun={onRunPipeline} />}

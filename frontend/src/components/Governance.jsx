@@ -4,6 +4,7 @@
 // Studio's built-in RBAC.
 import { Fragment, useEffect, useState } from "react";
 import { api } from "../api";
+import { PlanningContextPicker, usePlanningCatalog } from "./Pipelines";
 
 function McpServers() {
   const [servers, setServers] = useState([]);
@@ -98,7 +99,7 @@ function McpServers() {
 
 function GithubRepos() {
   const [repos, setRepos] = useState([]);
-  const [form, setForm] = useState({ name: "", url: "", description: "" });
+  const [form, setForm] = useState({ name: "", url: "", description: "", default_branch: "main" });
   const [err, setErr] = useState("");
 
   const load = () =>
@@ -119,9 +120,10 @@ function GithubRepos() {
           name: form.name.trim(),
           url: form.url.trim(),
           description: form.description.trim() || undefined,
+          default_branch: form.default_branch.trim() || "main",
         }),
       });
-      setForm({ name: "", url: "", description: "" });
+      setForm({ name: "", url: "", description: "", default_branch: "main" });
       load();
     } catch (e) {
       setErr(e.message);
@@ -149,6 +151,8 @@ function GithubRepos() {
           value={form.url} onChange={(e) => setForm({ ...form, url: e.target.value })} />
         <input className="sqllab-prompt" style={{ flex: 1 }} placeholder="what it does (keywords help matching)"
           value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} />
+        <input className="sqllab-prompt" style={{ maxWidth: 120 }} placeholder="default branch"
+          value={form.default_branch} onChange={(e) => setForm({ ...form, default_branch: e.target.value })} />
         <button className="chip chip-on" onClick={add}
           disabled={!form.name.trim() || !form.url.includes("github.com")}>＋ register</button>
       </div>
@@ -156,14 +160,34 @@ function GithubRepos() {
         {repos.map((r) => (
           <div key={r.name} className="share-row">
             <div>
-              <div>{r.name}</div>
+              <div>{r.name} <span className="query-tag">{r.default_branch || "main"}</span></div>
               <div className="meta">{r.url}{r.description ? ` — ${r.description}` : ""}</div>
+              <div className="meta">Repository ID: {r.id}</div>
             </div>
             <button className="chip" onClick={() => remove(r.name)}>remove</button>
           </div>
         ))}
         {repos.length === 0 && <div className="meta">No repositories registered.</div>}
       </div>
+    </div>
+  );
+}
+
+function PlanningSourcesPreview() {
+  const catalog = usePlanningCatalog();
+  const [repositoryId, setRepositoryId] = useState("");
+  const [confluencePageIds, setConfluencePageIds] = useState([]);
+  return (
+    <div className="mcp-block">
+      <div className="canvas-title" style={{ fontSize: 15 }}>Pipeline planning sources</div>
+      <div className="meta">
+        Preview the repositories and Confluence pages builders can select. This does
+        not set a default or authorize a run; selections are made per draft in Chat
+        or Pipelines.
+      </div>
+      <PlanningContextPicker {...catalog} preview repositoryId={repositoryId}
+        confluencePageIds={confluencePageIds} onRepositoryChange={setRepositoryId}
+        onConfluenceChange={setConfluencePageIds} />
     </div>
   );
 }
@@ -428,6 +452,7 @@ export default function Governance({ onClose }) {
 
       <McpServers />
       <GithubRepos />
+      <PlanningSourcesPreview />
       <ObjectStores />
     </section>
   );
