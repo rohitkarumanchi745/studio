@@ -665,14 +665,14 @@ def sft_candidates(rows):
     return [row for row in rows if row["reward"] >= MIN_REWARD]
 
 
-def _norm_prompt(value):
-    return re.sub(r"\s+", " ", value.strip()).lower()
-
-
 def dpo_candidates(rows):
     groups = defaultdict(dict)
     for row in rows:
-        key = (row["contract"], row["system"], _norm_prompt(row["prompt"]))
+        # ``prompt`` is canonical JSON whose string values remain semantically
+        # case- and whitespace-sensitive (table names, identifiers, evidence,
+        # and the user's request).  Normalizing it would manufacture a
+        # preference pair between two different policy inputs.
+        key = (row["contract"], row["system"], row["prompt"])
         previous = groups[key].get(row["completion"])
         if previous is None or row["reward"] > previous["reward"]:
             groups[key][row["completion"]] = row

@@ -379,6 +379,20 @@ def test_dpo_pairs_only_same_contract_prompt_and_reward_margin(tmp_path):
     assert all(pair["margin"] == 1.0 for pair in pairs)
 
 
+def test_dpo_never_pairs_distinct_case_sensitive_canonical_inputs(tmp_path):
+    module = _load(tmp_path, {"STUDIO_TRAJECTORY_TRAIN_MODE": "dpo"})
+    upper = dict(
+        _row(module, module.CONTRACTS[0], 1, reward=1.0, prompt="Read Sales"),
+        token_count=50)
+    lower = dict(
+        _row(module, module.CONTRACTS[0], 2, reward=0.0, prompt="read sales",
+             target={"answer": "different input", "version": 1}),
+        token_count=50)
+
+    assert upper["prompt"] != lower["prompt"]
+    assert module.dpo_candidates([upper, lower]) == []
+
+
 def test_independent_evaluation_requires_exact_five_capabilities_and_point_nine(tmp_path):
     module = _load(tmp_path)
     evidence = module.validate_evaluation_report(
