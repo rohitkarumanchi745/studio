@@ -37,6 +37,113 @@ function buildCanvas(m) {
   };
 }
 
+function elapsedTime(seconds) {
+  const total = Math.max(0, Math.floor(seconds));
+  const minutes = Math.floor(total / 60);
+  const hours = Math.floor(minutes / 60);
+  if (hours) return `${hours}:${String(minutes % 60).padStart(2, "0")}:${String(total % 60).padStart(2, "0")}`;
+  return `${minutes}:${String(total % 60).padStart(2, "0")}`;
+}
+
+// Task progress is a record of observable work, not the model's reasoning.
+// Completed steps are loaded from the owner-only task endpoint on expansion.
+export function AgentActivity({ steps = [], graph, running = false, taskId, startedAt }) {
+  const [loadedSteps, setLoadedSteps] = useState(null);
+  const [loadError, setLoadError] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [now, setNow] = useState(() => Date.now());
+  const mountedAt = useRef(Date.now());
+  const requested = useRef(false);
+  const events = loadedSteps ?? steps;
+  const firstEvent = events.find((step) => Number.isFinite(step?.t));
+  const lastEvent = [...events].reverse().find((step) => Number.isFinite(step?.t));
+  const start = startedAt || (firstEvent ? firstEvent.t * 1000 : mountedAt.current);
+  const end = running ? now : (lastEvent ? lastEvent.t * 1000 : start);
+  const duration = elapsedTime((end - start) / 1000);
+  const current = events[events.length - 1]?.label;
+  const nodes = Array.isArray(graph?.nodes) ? graph.nodes : [];
+  const nodeNames = Object.fromEntries(nodes.map((node) => [node.id, node.agent || node.source || node.id]));
+
+  useEffect(() => {
+    if (!running) return undefined;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [running]);
+
+  async function onToggle(event) {
+    if (!event.currentTarget.open || running || !taskId || requested.current || events.length) return;
+    requested.current = true;
+    setLoadError("");
+    setLoading(true);
+    try {
+      const task = await api(`/tasks/${encodeURIComponent(taskId)}`);
+      setLoadedSteps(Array.isArray(task.steps) ? task.steps : []);
+    } catch (error) {
+      if (error.status !== 403 && error.status !== 404) requested.current = false;
+      setLoadError("Activity details aren't available for this conversation.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const canShowGraph = running || events.length > 0 || loadedSteps !== null;
+  return (
+    <details className="agent-activity-panel" open={running} onToggle={onToggle}>
+      <summary className="agent-activity-summary">
+        <span className={"activity-indicator" + (running ? " is-running" : "")} aria-hidden="true" />
+        <span className="activity-summary-text">
+          <strong>Agent activity</strong>
+          <span className="activity-current" role={running ? "status" : undefined} aria-live={running ? "polite" : undefined}>
+            {running ? current || "Working…" : events.length ? `${events.length} ${events.length === 1 ? "event" : "events"}` : loadedSteps !== null ? "No recorded events" : "View recorded steps"}
+          </span>
+        </span>
+        {(running || events.length > 0) && <span className="activity-duration" aria-label={`${duration} elapsed`}>{duration}</span>}
+        <span className="activity-chevron" aria-hidden="true" />
+      </summary>
+      <div className="activity-content">
+        {loading && <p className="activity-note" role="status">Loading activity…</p>}
+        {loadError && <p className="activity-note">{loadError}</p>}
+        {!loading && !loadError && events.length > 0 && (
+          <ol className="activity-events">
+            {events.map((step, i) => (
+              <li key={`${step.t ?? ""}-${i}`} className="activity-event">
+                <span className="activity-event-label">{step.label}</span>
+                {Number.isFinite(step.t) && firstEvent && (
+                  <span className="activity-event-time">{elapsedTime(step.t - firstEvent.t)}</span>
+                )}
+              </li>
+            ))}
+          </ol>
+        )}
+        {!loading && !loadError && running && !events.length && (
+          <p className="activity-note">Waiting for the first progress update…</p>
+        )}
+        {!loading && !loadError && !running && loadedSteps !== null && !events.length && (
+          <p className="activity-note">No progress events were recorded for this answer.</p>
+        )}
+        {canShowGraph && nodes.length > 0 && !loadError && (
+          <section className="activity-graph" aria-label="Agent graph">
+            <h4>Agent graph</h4>
+            <ol className="activity-nodes">
+              {nodes.map((node) => (
+                <li key={node.id} className="activity-node">
+                  <span className="activity-node-name">{node.agent || node.source || node.id}</span>
+                  <span className={`activity-node-status is-${node.status === "ok" || node.status === "failed" ? node.status : "pending"}`}>
+                    {node.status === "ok" ? "Finished" : node.status === "failed" ? "Failed" : "Pending"}
+                  </span>
+                  {node.depends_on?.length > 0 && (
+                    <span className="activity-node-deps">After {node.depends_on.map((id) => nodeNames[id] || id).join(", ")}</span>
+                  )}
+                </li>
+              ))}
+            </ol>
+          </section>
+        )}
+      </div>
+    </details>
+  );
+}
+
 export default function Chat({ conversationId, onConversationCreated, onOpenDashboard, modelsEpoch }) {
   const [canvas, setCanvas] = useState(null);
   const [chatOpen, setChatOpen] = useState(true);
@@ -81,6 +188,8 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
   // Live activity: the steps the agent has emitted so far this turn, refreshed
   // by the task poll — so the "thinking" bubble shows what is actually happening.
   const [liveSteps, setLiveSteps] = useState([]);
+  const [activityByTask, setActivityByTask] = useState({});
+  const [activeStartedAt, setActiveStartedAt] = useState(null);
   const endRef = useRef(null);
   // Background-task polling lives in refs, NOT state/effects: creating a new
   // conversation changes conversationId, and an effect keyed on it used to
@@ -144,6 +253,8 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
   useEffect(() => {
     setError("");
     setBusy(false);
+    setLiveSteps([]);
+    setActiveStartedAt(null);
     if (!conversationId) {
       setMessages([]);
       setCanvas(null);
@@ -186,6 +297,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
     setMessages((m) => [...m, { role: "user", text: q, source, table: tableLabel }]);
     setBusy(true);
     setLiveSteps([]);
+    setActiveStartedAt(Date.now());
     try {
       const data = await api("/chat/background", {
         method: "POST",
@@ -228,6 +340,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
     setMessages((ms) => [...ms, { role: "user", text: q, source: pipelineSource, table: "*" }]);
     setBusy(true);
     setLiveSteps([]);
+    setActiveStartedAt(Date.now());
     try {
       const data = await api("/chat/background", {
         method: "POST",
@@ -253,6 +366,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
     setError("");
     setBusy(true);
     setLiveSteps([]);
+    setActiveStartedAt(Date.now());
     setMessages((ms) => [...ms, { role: "user", text, source: "*", table: "platform run" }]);
     try {
       const data = await api("/chat/background", {
@@ -280,6 +394,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
                                 table: both ? "all sources" : opt.source }]);
     setBusy(true);
     setLiveSteps([]);
+    setActiveStartedAt(Date.now());
     try {
       const data = await api("/chat/background", {
         method: "POST",
@@ -339,7 +454,10 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
         return;
       }
       if (st.status === "running") {
-        if (activeConvRef.current === cid) setLiveSteps(st.steps || []);
+        if (activeConvRef.current === cid) {
+          setLiveSteps(st.steps || []);
+          setActiveStartedAt((at) => at || (st.steps?.[0]?.t ? st.steps[0].t * 1000 : Date.now()));
+        }
         // Watchdog: a task that never reaches a terminal state must not hang the
         // UI silently — surface it so the failure is diagnosable, not invisible.
         if (Date.now() - started > 5 * 60 * 1000) {
@@ -352,6 +470,9 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
         return;
       }
       pollingRef.current = null;                        // done or failed
+      if (activeConvRef.current === cid && st.status === "done" && Array.isArray(st.steps)) {
+        setActivityByTask((saved) => ({...saved, [taskId]: st.steps}));
+      }
       // Clear the spinner even if the user switched chats — leaving busy set
       // is what made the composer look permanently stuck.
       setBusy(false);
@@ -512,27 +633,14 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
               onPlatformAction={(action) => platformAction({ platform_action: action, platform_message_id: m.message_id },
                 action === "status" ? "Check this platform job's status" : "Submit this platform job again for approval")}
               busy={busy}
+              activitySteps={activityByTask[m.activity_task_id]}
             />
           )
         )}
 
         {busy && (
           <div className="msg">
-            {liveSteps.length > 1 && (
-              <div className="agent-activity">
-                {liveSteps.slice(-6, -1).map((s, i) => (
-                  <div key={i} className="activity-step">✓ {s.label}</div>
-                ))}
-              </div>
-            )}
-            <div className="thinking">
-              <span className="dot" />
-              <span className="dot" />
-              <span className="dot" />
-              {liveSteps.length
-                ? liveSteps[liveSteps.length - 1].label
-                : "agent is querying…"}
-            </div>
+            <AgentActivity running steps={liveSteps} startedAt={activeStartedAt} />
           </div>
         )}
         {error && <div className="error">{error}</div>}
@@ -596,7 +704,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
   );
 }
 
-function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRunPipeline, onPipelineStatus, onPlatformAction, busy }) {
+export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRunPipeline, onPipelineStatus, onPlatformAction, busy, activitySteps }) {
   const [showSql, setShowSql] = useState(false);
   const [columns, setColumns] = useState(m.columns);
   const [rows, setRows] = useState(m.rows);
@@ -696,6 +804,7 @@ function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRunPipeli
             )}
           </span>
         </div>
+        {m.activity_task_id && <AgentActivity key={m.activity_task_id} taskId={m.activity_task_id} steps={activitySteps || []} graph={m.graph} />}
         {m.text && <p className="answer">{m.text}</p>}
         <PlanningSources sources={m.pipeline?.planning_sources} />
         {m.pipeline?.execution_mode === "airflow_dag"

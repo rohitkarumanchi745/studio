@@ -191,19 +191,68 @@ td { color: var(--ink-2); }
   text-align: left;
 }
 .suggestion:hover { background: var(--surface-2); }
-.thinking { display: flex; gap: 6px; align-items: center; color: var(--ink-3); font-size: 13px; }
 /* Clarification chips: which source's same-named table did you mean? */
 .clarify-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 10px; }
-/* Live agent activity above the thinking dots: completed steps, newest last. */
-.agent-activity { margin-bottom: 6px; }
-.activity-step { color: var(--ink-3); font-size: 12px; line-height: 1.7; opacity: 0.8; }
-.dot {
-  width: 6px; height: 6px; border-radius: 50%; background: var(--ink-3);
-  animation: pulse 1.2s infinite ease-in-out;
+/* Observable task events. The same disclosure sits above an answer after a run. */
+.agent-activity-panel {
+  margin: 0 0 12px; border: 1px solid var(--line); border-radius: 10px;
+  background: var(--surface-2); color: var(--ink-2); overflow: hidden;
 }
-.dot:nth-child(2) { animation-delay: 0.2s; }
-.dot:nth-child(3) { animation-delay: 0.4s; }
-@keyframes pulse { 0%, 100% { opacity: 0.25; } 50% { opacity: 1; } }
+.agent-activity-summary {
+  display: flex; align-items: center; gap: 10px; min-width: 0;
+  padding: 10px 12px; cursor: pointer; list-style: none;
+}
+.agent-activity-summary::-webkit-details-marker { display: none; }
+.agent-activity-summary:hover { background: var(--surface-3); }
+.agent-activity-summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.activity-indicator {
+  flex: none; width: 9px; height: 9px; border-radius: 50%; background: var(--ok);
+}
+.activity-indicator.is-running { background: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); animation: activity-pulse 1.4s ease-in-out infinite; }
+@keyframes activity-pulse { 50% { box-shadow: 0 0 0 6px var(--accent-soft); } }
+.activity-summary-text { display: flex; flex: 1; flex-direction: column; min-width: 0; gap: 1px; }
+.activity-summary-text strong { color: var(--ink); font-size: 13px; font-weight: 600; }
+.activity-current { color: var(--ink-3); font-size: 12px; line-height: 1.35; overflow-wrap: anywhere; }
+.activity-duration { flex: none; color: var(--ink-3); font-size: 11px; font-variant-numeric: tabular-nums; }
+.activity-chevron {
+  flex: none; width: 7px; height: 7px; border-right: 1.5px solid var(--ink-3);
+  border-bottom: 1.5px solid var(--ink-3); transform: rotate(45deg); margin: -3px 2px 0 3px;
+  transition: transform .15s ease;
+}
+.agent-activity-panel[open] .activity-chevron { transform: rotate(225deg); margin-top: 3px; }
+.activity-content { border-top: 1px solid var(--line); padding: 10px 13px 12px 16px; }
+.activity-events, .activity-nodes { list-style: none; margin: 0; padding: 0; }
+.activity-events { border-left: 1px solid var(--axis); margin-left: 4px; }
+.activity-event {
+  display: flex; justify-content: space-between; gap: 12px; position: relative;
+  padding: 0 0 11px 15px; color: var(--ink-2); font-size: 12px; line-height: 1.45;
+}
+.activity-event:last-child { padding-bottom: 0; }
+.activity-event::before {
+  content: ""; position: absolute; left: -4px; top: 5px; width: 7px; height: 7px;
+  border-radius: 50%; background: var(--surface-2); border: 1px solid var(--axis);
+}
+.activity-event:last-child::before { border-color: var(--accent); background: var(--accent); }
+.activity-event-label { min-width: 0; overflow-wrap: anywhere; }
+.activity-event-time { flex: none; color: var(--ink-3); font-size: 11px; font-variant-numeric: tabular-nums; }
+.activity-note { color: var(--ink-3); font-size: 12px; }
+.activity-graph { margin-top: 13px; padding-top: 11px; border-top: 1px solid var(--line); }
+.activity-graph h4 { margin: 0 0 7px; color: var(--ink-3); font-size: 11px; font-weight: 600; letter-spacing: .02em; }
+.activity-nodes { display: grid; gap: 6px; }
+.activity-node {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 1px 8px;
+  padding: 7px 9px; border: 1px solid var(--line); border-radius: 7px;
+  background: var(--surface); font-size: 12px;
+}
+.activity-node-name { min-width: 0; font-weight: 600; color: var(--ink); overflow-wrap: anywhere; }
+.activity-node-status { font-size: 11px; color: var(--ink-3); }
+.activity-node-status.is-ok { color: var(--ok); }
+.activity-node-status.is-failed { color: var(--bad); }
+.activity-node-deps { grid-column: 1 / -1; color: var(--ink-3); font-size: 11px; overflow-wrap: anywhere; }
+@media (prefers-reduced-motion: reduce) {
+  .activity-indicator.is-running { animation: none; }
+  .activity-chevron { transition: none; }
+}
 .composer {
   display: flex; gap: 8px; max-width: 780px; margin: 0 auto; width: 100%;
   padding: 12px 20px 20px;
