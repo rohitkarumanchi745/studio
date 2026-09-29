@@ -153,9 +153,74 @@ def test_store_encrypts_content_hmacs_identity_and_is_idempotent():
             (first["id"],)).fetchone()
     assert inp["prompt"] not in row["ciphertext"]
     assert row["idempotency_key"] != "same logical run"
+    envelope = json.loads(pt._fernet().decrypt(row["ciphertext"].encode()).decode())
+    assert envelope["protocol"] == pt.STORAGE_PROTOCOL
+    assert envelope["binding"] == {
+        "id": first["id"], "revision": first["revision"],
+        "contract": pt.AIRFLOW_DAG, "contract_version": 1,
+        "scope": first["scope"], "reward": 1.0,
+    }
     other = pt.capture(pt.AIRFLOW_DAG, inp, target, user=_user(), scope="user",
                        training_opt_in=True, idempotency_key="same logical run")
     assert other["id"] != first["id"]
+
+
+@pytest.mark.parametrize("column,mutated", [
+    ("id", "tr_" + "f" * 32),
+    ("revision", 1_000_000),
+    ("contract", pt.AGENT_GRAPH),
+    ("contract_version", 99),
+    ("scope", "user:" + "f" * 64),
+    ("reward", -0.25),
+])
+def test_fetch_rejects_independently_modified_encrypted_metadata(column, mutated):
+    user = _user()
+    inp, target = _airflow()
+    saved = pt.capture(
+        pt.AIRFLOW_DAG, inp, target, user=user, scope="user", reward=0.75,
+        training_opt_in=True, idempotency_key=f"metadata-binding-{column}-{uuid.uuid4()}")
+    original_scope = saved["scope"]
+    with db.connect() as connection:
+        connection.execute(
+            f"UPDATE policy_trajectories SET {column}=? WHERE id=?",
+            (mutated, saved["id"]))
+        connection.commit()
+
+    query_scope = mutated if column == "scope" else original_scope
+    page = pt.fetch_training_page(scope=query_scope)
+    assert page["trajectories"] == []
+    assert page["count"] == 0
+    assert page["cursor"] == (mutated if column == "revision" else saved["revision"])
+    assert page["has_more"] is False
+
+
+def test_legacy_unbound_ciphertext_fails_closed_and_advances_cursor():
+    user = _user()
+    inp, target = _airflow()
+    idem = f"legacy-envelope-{uuid.uuid4()}"
+    saved = pt.capture(
+        pt.AIRFLOW_DAG, inp, target, user=user, scope="user",
+        training_opt_in=True, idempotency_key=idem)
+    with db.connect() as connection:
+        row = dict(connection.execute(
+            "SELECT ciphertext FROM policy_trajectories WHERE id=?",
+            (saved["id"],)).fetchone())
+        envelope = json.loads(pt._fernet().decrypt(row["ciphertext"].encode()).decode())
+        # This is the exact unbound body written before storage protocol v2.
+        legacy_ciphertext = pt._fernet().encrypt(
+            json.dumps(envelope["payload"], sort_keys=True,
+                       separators=(",", ":")).encode()).decode()
+        connection.execute(
+            "UPDATE policy_trajectories SET ciphertext=? WHERE id=?",
+            (legacy_ciphertext, saved["id"]))
+        connection.commit()
+
+    page = pt.fetch_training_page(scope=saved["scope"])
+    assert page["trajectories"] == []
+    assert page["cursor"] == saved["revision"]
+    with pytest.raises(pt.ContractRejected, match="metadata binding"):
+        pt.capture(pt.AIRFLOW_DAG, inp, target, user=user, scope="user",
+                   training_opt_in=True, idempotency_key=idem)
 
 
 def test_collection_mode_and_raw_evidence_scope_fail_closed(monkeypatch):
