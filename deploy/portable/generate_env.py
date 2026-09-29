@@ -26,6 +26,7 @@ def document() -> str:
         "STUDIO_TRAINER_PASSWORD": admin_password,
         "STUDIO_TRAINER_TOKEN": "",
         "STUDIO_TRAJECTORY_SCOPE": "",
+        "STUDIO_TRAJECTORY_ALLOW_INSECURE_HTTP": "1",
         "STUDIO_TRAJECTORY_TRAINER_IMAGE": "studio-trajectory-trainer:cpu",
         "STUDIO_TRAJECTORY_BASE_MODEL": "microsoft/bitnet-b1.58-2B-4T-bf16",
         "STUDIO_TRAJECTORY_TRAIN_MODE": "sft",

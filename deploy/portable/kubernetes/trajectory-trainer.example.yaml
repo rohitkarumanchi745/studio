@@ -19,6 +19,9 @@ metadata:
   namespace: studio-system
 data:
   STUDIO_API_URL: http://studio-web:8000
+  # Explicit private-cluster HTTP opt-in. Prefer an internal TLS/service-mesh
+  # origin and set this to "0" before putting a real admin credential here.
+  STUDIO_TRAJECTORY_ALLOW_INSECURE_HTTP: "1"
   STUDIO_TRAJECTORY_SCOPE: ""
   STUDIO_TRAJECTORY_OUTPUT_DIR: /var/lib/studio-trajectory
   STUDIO_TRAJECTORY_BASE_MODEL: microsoft/bitnet-b1.58-2B-4T-bf16

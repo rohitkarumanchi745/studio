@@ -274,6 +274,11 @@ using it:
    controlled training run. Delete and recreate it for a later round; do not
    turn deferred BitNet training into an unattended restart loop.
 
+The example explicitly permits HTTP to the cluster-internal `studio-web`
+Service. That carries the dedicated administrator credential on the private
+cluster network. Prefer a service mesh or internal TLS origin and set
+`STUDIO_TRAJECTORY_ALLOW_INSECURE_HTTP=0` for a production credential.
+
 The job consumes validated examples for all five contracts and refuses to
 publish a partial policy. A candidate is promotable only after the server
 recomputes the paired baseline/candidate gates and binds the result to the

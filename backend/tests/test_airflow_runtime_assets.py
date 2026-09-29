@@ -170,6 +170,7 @@ def test_whole_trajectory_training_is_opt_in_scoped_and_separately_routed():
     assert "- --once" in trainer
     assert "- --defer-publish" in trainer
     assert "STUDIO_TRAJECTORY_SCOPE: ${STUDIO_TRAJECTORY_SCOPE:-}" in trainer
+    assert "STUDIO_TRAJECTORY_ALLOW_INSECURE_HTTP:" in trainer
     assert "STUDIO_TRAJECTORY_EVALUATOR_COMMAND:" in trainer
     assert "STUDIO_TRAJECTORY_EVAL_SUITE_SHA256:" in trainer
     assert "trajectory-training:/var/lib/studio-trajectory" in trainer
@@ -182,6 +183,7 @@ def test_whole_trajectory_training_is_opt_in_scoped_and_separately_routed():
     spec.loader.exec_module(generator)
     values = dict(line.split("=", 1) for line in generator.document().splitlines())
     assert values["STUDIO_TRAJECTORY_TRAINING"] == "off"
+    assert values["STUDIO_TRAJECTORY_ALLOW_INSECURE_HTTP"] == "1"
     assert values["STUDIO_TENANT_ID"].startswith("studio-")
     assert values["STUDIO_ADMIN_PASSWORD"] == values["STUDIO_TRAINER_PASSWORD"]
     assert values["STUDIO_POLICY_LLM_BASE_URL"] == ""

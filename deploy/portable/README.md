@@ -284,6 +284,11 @@ The portable service deliberately runs one `--defer-publish` round and exits
 without consuming its pending batch. Re-run it only for another controlled
 round. Direct directory-LoRA publication is a separate deployment mode with an
 explicit trainer opt-in; these BitNet-oriented defaults do not enable it.
+The generated Compose environment explicitly permits the trainer's HTTP call to
+`studio-web` because that hop stays on the private Compose bridge. This sends an
+administrator credential over that bridge. On a shared or production network,
+use internal TLS/service-mesh encryption and set
+`STUDIO_TRAJECTORY_ALLOW_INSECURE_HTTP=0`.
 
 Training is cumulative and scope-isolated. Its encrypted source records stay
 in Studio PostgreSQL, while its replay, cursor, candidate adapter, and release

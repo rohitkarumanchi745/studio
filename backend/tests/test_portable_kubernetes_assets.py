@@ -327,6 +327,11 @@ def test_whole_trajectory_trainer_is_an_explicit_suspended_one_shot_example():
     assert pod["automountServiceAccountToken"] is False
     trainer = _named(pod["containers"], "trainer")
     assert trainer["command"][-2:] == ["--once", "--defer-publish"]
+    trainer_config = _resource(
+        "trajectory-trainer.example.yaml", "ConfigMap",
+        "studio-trajectory-trainer-config",
+    )
+    assert trainer_config["data"]["STUDIO_TRAJECTORY_ALLOW_INSECURE_HTTP"] == "1"
     assert trainer["securityContext"]["allowPrivilegeEscalation"] is False
     assert trainer["securityContext"]["capabilities"]["drop"] == ["ALL"]
     assert trainer["envFrom"] == [

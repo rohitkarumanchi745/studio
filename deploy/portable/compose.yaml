@@ -372,6 +372,9 @@ services:
       - --defer-publish
     environment:
       STUDIO_API_URL: http://studio-web:8000
+      # Explicit because this hop stays on the private Compose bridge. Use
+      # internal TLS and set 0 when the platform supplies it.
+      STUDIO_TRAJECTORY_ALLOW_INSECURE_HTTP: ${STUDIO_TRAJECTORY_ALLOW_INSECURE_HTTP:-1}
       STUDIO_TRAINER_EMAIL: ${STUDIO_TRAINER_EMAIL:-}
       STUDIO_TRAINER_PASSWORD: ${STUDIO_TRAINER_PASSWORD:-}
       STUDIO_TRAINER_TOKEN: ${STUDIO_TRAINER_TOKEN:-}
