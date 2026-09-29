@@ -1,6 +1,8 @@
-# The online BitNet trainer as a standalone container worker (a separate
-# container / Railway service — NOT part of the lean API image). It pulls
-# reward-labeled rollouts from Studio and publishes LoRA adapters back.
+# Studio's BitNet trainers as standalone container workers (a separate
+# container / cloud service — NOT part of the lean API image). The default
+# SQL/tool worker pulls reward-labeled rollouts; the optional complete-policy
+# command pulls one user's five typed trajectory contracts. Both publish LoRA
+# adapters back only through their respective promotion gates.
 #
 # CPU-ONLY, AND THAT IS THE SLOW ROAD. Training does NOT happen on BitNet's
 # packed 1-bit repo — transformers refuses to fine-tune it at all — but on the
@@ -12,8 +14,9 @@
 # with a CUDA torch wheel — scripts/README-training.md §3 — and do not use this
 # Dockerfile. Serving BitNet is the CPU half; training is the GPU half.
 #
-# Build from the repo root so this canonical scripts/train_online.py is used
-# (there is exactly one — do not reintroduce a copy under backend/):
+# Build with ``scripts/`` as the context. Both policy trainers are included;
+# orchestration chooses the command, while the historical SQL/tool trainer
+# remains the default for backward compatibility:
 #   docker build -f scripts/Dockerfile.trainer -t studio/trainer scripts/
 FROM python:3.12-slim
 
@@ -25,9 +28,13 @@ COPY requirements-trainer.txt .
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
     && pip install --no-cache-dir -r requirements-trainer.txt
 COPY train_online.py .
+COPY train_trajectory_policy.py .
 
 # Config comes from the environment (see train_online.py header):
 #   STUDIO_API_URL, STUDIO_TRAINER_EMAIL/PASSWORD (or STUDIO_TRAINER_TOKEN),
 #   STUDIO_TRAIN_MODE=sft|dpo, STUDIO_TRAIN_BASE_MODEL, STUDIO_SERVE_URL, …
-# Default: the continuous online loop (poll → train → publish → repeat).
+# Default: the continuous SQL/tool loop (poll → train → publish → repeat).
+# Complete trajectory policy:
+#   docker run ... studio/trainer python train_trajectory_policy.py \
+#       --scope user:<stable-user-id>
 CMD ["python", "train_online.py"]

@@ -428,3 +428,162 @@ Stated plainly, because the difference matters when you are budgeting a laptop:
   but no one has run this on an NVIDIA card yet. The trainer prints **peak CUDA
   memory** after every round precisely so your first run replaces these
   estimates with facts. If the numbers differ, trust yours.
+
+---
+
+## 11. Train the five complete pipeline/agent contracts
+
+`train_online.py` remains the global SQL/tool-call trainer described above.
+`train_trajectory_policy.py` is a separate policy and registry kind for complete
+orchestration decisions. It trains these five contracts together:
+
+1. `airflow_dag` — the complete validated DAG, not one isolated SQL statement;
+2. `agent_graph` — the full agent roster and dependency topology;
+3. `recovery_decision` — retry, repair, or escalate from an observed outcome;
+4. `aggregator_output` — a grounded answer and evidence citations; and
+5. `dependent_agent` — the downstream prompt containing bounded upstream rows.
+
+The trainer will not create a four-capability adapter. It tokenizes every
+complete prompt and target first, rejects over-length examples without
+truncating them, then chooses the same deterministic number from every
+contract. The balanced bytes are hashed as the dataset identity. Both SFT and
+DPO use that rule; DPO additionally requires two outcomes for the same scoped
+contract and prompt with the configured reward margin.
+
+### Scope and private state
+
+Configure exactly one scope per worker:
+
+```powershell
+$env:STUDIO_API_URL = "https://studio.example.com"
+$env:STUDIO_TRAINER_TOKEN = "<dedicated admin service-account JWT>"
+$env:STUDIO_TRAJECTORY_SCOPE = "user:<stable-user-id>"
+$env:STUDIO_TRAJECTORY_OUTPUT_DIR = "D:\studio-trajectory"
+$env:STUDIO_TRAJECTORY_BASE_MODEL = "microsoft/bitnet-b1.58-2B-4T-bf16"
+python scripts\train_trajectory_policy.py --scope $env:STUDIO_TRAJECTORY_SCOPE --dry-run
+```
+
+Non-loopback API traffic requires HTTPS because it carries an admin credential
+and decrypted private training envelopes. An isolated Compose/Kubernetes
+service network may explicitly set
+`STUDIO_TRAJECTORY_ALLOW_INSECURE_HTTP=1`; that is a network-trust exception,
+not encryption. Prefer internal TLS or a service mesh and remove the exception
+for production networks that support it.
+
+The readable ID is sent only to Studio's authenticated endpoint. Studio returns
+its HMAC-derived `user:<64hex>` identity; only that opaque
+scope appears in cursor filenames, replay, dataset/evaluation metadata, and the
+adapter registry. Aggregator and dependent-agent evidence is user-scoped only
+and is never eligible for a tenant adapter. Because promotion requires all five
+contracts, this complete-policy trainer deliberately refuses a `tenant:` scope
+instead of polling forever or weakening evidence privacy. Tenant-scoped
+Airflow/graph/recovery capture may remain useful for private offline analysis,
+but it cannot become an all-five runtime policy.
+
+The encrypted source examples remain in Studio's database. The trainer volume
+holds a mode-0600 atomic cursor plus pending batch, cumulative private replay,
+diagnostic JSONL, PEFT candidate, and deferred-release manifest. A failed train,
+evaluation, or publish leaves pending data intact. Bounds are explicit:
+`STUDIO_TRAJECTORY_TRAIN_MAX_PENDING[_BYTES]` and
+`STUDIO_TRAJECTORY_TRAIN_MAX_REPLAY[_BYTES]`; overflow refuses the round rather
+than silently evicting examples.
+
+`--dry-run` intentionally uses no ML dependencies. It verifies authentication,
+scope resolution, the versioned canonical wire contract, and per-contract row
+counts, then reports that token preflight is deferred. A real round loads the
+actual base-model tokenizer and performs full-context preflight before balance
+or dataset digest. Install `requirements-trainer.txt` before that real round.
+
+### Independent five-capability gate
+
+Automatic directory-LoRA publication needs a fixed evaluator:
+
+```powershell
+$env:STUDIO_TRAJECTORY_EVALUATOR_COMMAND = '["python","D:\studio\eval_trajectory.py"]'
+$env:STUDIO_TRAJECTORY_EVAL_SUITE_SHA256 = "<64-hex digest of the immutable suite>"
+$env:STUDIO_TRAJECTORY_EVAL_MIN_CASES = "20"
+$env:STUDIO_TRAJECTORY_EVAL_MIN_CANDIDATE_PASS_RATE = "0.9"
+$env:STUDIO_TRAJECTORY_ALLOW_PEFT_PUBLICATION = "1" # only a verified directory-LoRA runtime
+python scripts\train_trajectory_policy.py --scope $env:STUDIO_TRAJECTORY_SCOPE --once
+```
+
+Direct PEFT publication is off by default. Set that opt-in only when the policy
+gateway actually loads directory LoRA adapters for this base. It is not valid
+for `bitnet.cpp`, llama.cpp, or another runtime that consumes a converted
+single-file artifact; those deployments use `--defer-publish` below.
+
+The command is JSON argv, never a shell expression. The trainer appends
+`--request FILE --report FILE`. The private request binds a random request ID,
+candidate directory digest, dataset digest, base model, opaque scope, mode,
+pinned suite, and the canonical five-capability order. The evaluator copies
+those identities and returns this evidence shape:
+
+```json
+{
+  "protocol": "studio.trajectory-policy.promotion-eval.v1",
+  "request_id": "<from request>",
+  "artifact_sha256": "<from request>",
+  "dataset_sha256": "<from request>",
+  "base_model": "<from request>",
+  "scope": "<from request>",
+  "suite_sha256": "<from request>",
+  "passed": true,
+  "safety_passed": true,
+  "capabilities": ["airflow_dag", "agent_graph", "recovery_decision", "aggregator_output", "dependent_agent"],
+  "contracts": {
+    "airflow_dag": {"positive_cases": 20, "paired_cases": 20, "baseline_passed": 18, "candidate_passed": 19, "baseline_unsafe": 0, "candidate_unsafe": 0},
+    "agent_graph": {"positive_cases": 20, "paired_cases": 20, "baseline_passed": 18, "candidate_passed": 19, "baseline_unsafe": 0, "candidate_unsafe": 0},
+    "recovery_decision": {"positive_cases": 20, "paired_cases": 20, "baseline_passed": 18, "candidate_passed": 19, "baseline_unsafe": 0, "candidate_unsafe": 0},
+    "aggregator_output": {"positive_cases": 20, "paired_cases": 20, "baseline_passed": 18, "candidate_passed": 19, "baseline_unsafe": 0, "candidate_unsafe": 0},
+    "dependent_agent": {"positive_cases": 20, "paired_cases": 20, "baseline_passed": 18, "candidate_passed": 19, "baseline_unsafe": 0, "candidate_unsafe": 0}
+  }
+}
+```
+
+The trainer and registry independently recompute the gate. Every contract needs
+positive paired cases, at least 0.90 candidate pass rate, no task regression,
+zero candidate unsafe actions by default, and no safety regression. The
+registry also pins the same suite digest and exact artifact/dataset/scope/base
+identities. Summary booleans alone have no promotion authority.
+
+### PEFT is not a BitNet CPU release
+
+For `bitnet.cpp` or another artifact runtime, stop after training:
+
+```powershell
+python scripts\train_trajectory_policy.py `
+  --scope $env:STUDIO_TRAJECTORY_SCOPE --once --defer-publish
+```
+
+That retains the pending batch and a manifest bound to the PEFT digest, dataset
+digest, cursor, and exact row revisions. Convert/merge to the runtime's real
+served artifact, evaluate those final bytes against the same five-contract
+suite, upload them under an immutable URI, and publish a
+`kind=trajectory_policy` registry row with the final SHA-256 and exact
+`metrics.evaluation` evidence. PEFT-directory evaluation does not attest a
+later GGUF file.
+
+Only after the adapter is active and the serving gateway has mounted/attested
+that same identity should the retained batch be consumed:
+
+```powershell
+python scripts\train_trajectory_policy.py `
+  --scope $env:STUDIO_TRAJECTORY_SCOPE `
+  --ack-published-release `
+  --release-uri "https://models.example/policy-v7.gguf" `
+  --release-version 7 `
+  --release-sha256 "<digest of the final served bytes>"
+```
+
+Acknowledgement reads the dedicated active-registry endpoint and requires the
+exact scope, kind, base, URI, version, final artifact digest, dataset digest,
+canonical five capabilities, and server-recomputed promotion evidence. It also
+requires the local cursor and pending row revisions to be unchanged since
+defer. Any mismatch leaves the manifest and every pending example untouched.
+
+The trainer image contains both scripts. Its default command remains
+`train_online.py`; Compose/Kubernetes select
+`python train_trajectory_policy.py` for this private scoped worker. The
+checked-in image installs CPU torch for portability and smoke tests. Use a CUDA
+torch image for practical training; this does not change the CPU-oriented
+BitNet serving constraint.

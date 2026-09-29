@@ -1370,7 +1370,8 @@ def _device_and_dtype():
     return dev, dtype
 
 
-def _completion_features(tokenizer, sample, max_length=MAX_LENGTH):
+def _completion_features(tokenizer, sample, max_length=MAX_LENGTH,
+                         allow_prompt_truncation=True):
     """Tokenize one SFT sample while masking every non-assistant target token.
 
     The completion budget is reserved first. If context is too long, retain its
@@ -1406,6 +1407,10 @@ def _completion_features(tokenizer, sample, max_length=MAX_LENGTH):
             f"assistant completion uses {len(completion_ids)} tokens, leaving no context "
             f"inside STUDIO_TRAIN_MAX_LENGTH={max_length}")
     keep = max_length - len(completion_ids)
+    if len(prompt_ids) > keep and not allow_prompt_truncation:
+        raise ValueError(
+            f"complete trajectory uses {len(prompt_ids) + len(completion_ids)} tokens, "
+            f"above STUDIO_TRAIN_MAX_LENGTH={max_length}; trajectory truncation is disabled")
     if len(prompt_ids) > keep:
         # Preserve both the skill/source prefix and the live user suffix. Any
         # removed middle is old history/schema detail, never the target label.
@@ -1446,7 +1451,8 @@ def _completion_collator(tokenizer):
     return collate
 
 
-def train_lora(samples, base_model, out_dir, epochs):
+def train_lora(samples, base_model, out_dir, epochs, adapter_kind="tool_call",
+               allow_prompt_truncation=True):
     """Reward-filtered SFT of a small LoRA adapter on BitNet's bf16 masters.
 
     This is the GPU half of the system (serving BitNet is the CPU half — see
@@ -1475,7 +1481,10 @@ def train_lora(samples, base_model, out_dir, epochs):
         tok.pad_token = tok.eos_token
 
     try:
-        features = [_completion_features(tok, sample) for sample in samples]
+        features = [_completion_features(
+            tok, sample, max_length=MAX_LENGTH,
+            allow_prompt_truncation=allow_prompt_truncation)
+            for sample in samples]
     except ValueError as exc:
         raise SystemExit(f"[trainer] refusing label-less/truncated SFT sample: {exc}") from None
     ds = Dataset.from_list(features)
@@ -1491,7 +1500,14 @@ def train_lora(samples, base_model, out_dir, epochs):
                       task_type="CAUSAL_LM",
                       target_modules=["q_proj", "k_proj", "v_proj", "o_proj"])
     model = get_peft_model(model, lora)
-    adapter_dir = os.path.join(out_dir, f"tool_call-{int(time.time())}")
+    # ``adapter_kind`` lets the complete-trajectory trainer share the proven
+    # PEFT machinery without publishing a directory under the tool-call name.
+    # Keep the default for every existing caller and reject path separators so
+    # a registry kind can never escape ``out_dir``.
+    adapter_kind = str(adapter_kind or "").strip()
+    if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", adapter_kind):
+        raise SystemExit("[trainer] adapter_kind must be a safe lowercase identifier")
+    adapter_dir = os.path.join(out_dir, f"{adapter_kind}-{int(time.time())}")
     cfg = TrainingArguments(output_dir=adapter_dir, num_train_epochs=epochs,
                             learning_rate=2e-4, logging_steps=_log_every(steps),
                             save_strategy="no", report_to=[], remove_unused_columns=False,
@@ -1515,7 +1531,7 @@ def train_lora(samples, base_model, out_dir, epochs):
     return adapter_dir, metrics
 
 
-def train_dpo(pairs, base_model, out_dir, epochs):
+def train_dpo(pairs, base_model, out_dir, epochs, adapter_kind="tool_call"):
     """Direct Preference Optimization of a LoRA adapter — genuine preference-based
     RL. Optimizes the policy so the chosen (higher-reward) completion is preferred
     over the rejected one, relative to a frozen reference (the base with the LoRA
@@ -1576,7 +1592,10 @@ def train_dpo(pairs, base_model, out_dir, epochs):
     lora = LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05, bias="none",
                       task_type="CAUSAL_LM",
                       target_modules=["q_proj", "k_proj", "v_proj", "o_proj"])
-    adapter_dir = os.path.join(out_dir, f"tool_call-dpo-{int(time.time())}")
+    adapter_kind = str(adapter_kind or "").strip()
+    if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", adapter_kind):
+        raise SystemExit("[trainer] adapter_kind must be a safe lowercase identifier")
+    adapter_dir = os.path.join(out_dir, f"{adapter_kind}-dpo-{int(time.time())}")
     cfg = DPOConfig(output_dir=adapter_dir, num_train_epochs=epochs,
                     learning_rate=5e-5, beta=DPO_BETA, logging_steps=_log_every(steps),
                     save_strategy="no", report_to=[], max_length=MAX_LENGTH,
