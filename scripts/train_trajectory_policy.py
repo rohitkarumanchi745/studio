@@ -917,6 +917,140 @@ def _write_jsonl(path, rows):
     return path
 
 
+def _secure_candidate_tree(adapter_dir):
+    """Make one trajectory-policy candidate private, rejecting unsafe entries.
+
+    The shared trainer is intentionally also used by the generic SQL adapter,
+    so its filesystem behavior cannot be tightened globally.  This policy-only
+    boundary accepts a real directory below ``OUT_DIR``, walks it without
+    following links, rejects every entry except directories and regular files,
+    and applies owner-only modes through opened file descriptors.  Descriptor
+    identity checks keep a path replacement from turning the chmod into a
+    symlink traversal.
+    """
+    if not hasattr(os, "fchmod") \
+            or os.open not in getattr(os, "supports_dir_fd", ()) \
+            or os.stat not in getattr(os, "supports_dir_fd", ()) \
+            or os.stat not in getattr(os, "supports_follow_symlinks", ()) \
+            or os.listdir not in getattr(os, "supports_fd", ()):
+        raise _fail(
+            "private candidate hardening requires POSIX descriptor-relative "
+            "filesystem support")
+    try:
+        candidate = os.fspath(adapter_dir)
+    except TypeError:
+        raise _fail("candidate adapter path is not filesystem-compatible") from None
+    if not isinstance(candidate, str) or not candidate or "\x00" in candidate:
+        raise _fail("candidate adapter path must be one non-empty text path")
+    root = os.path.abspath(candidate)
+    output_root = os.path.abspath(OUT_DIR)
+    root_real = os.path.realpath(root)
+    output_real = os.path.realpath(output_root)
+    try:
+        contained = os.path.commonpath((root_real, output_real)) == output_real
+    except ValueError:
+        contained = False
+    if not contained or root_real == output_real:
+        raise _fail("candidate adapter must be a child of STUDIO_TRAJECTORY_OUTPUT_DIR")
+
+    try:
+        before = os.lstat(root)
+    except OSError as exc:
+        raise _fail(f"cannot inspect candidate adapter {root}: {exc}") from None
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+        raise _fail("candidate adapter must be a real directory, not a link")
+
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) \
+        | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    file_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) \
+        | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0) \
+        | getattr(os, "O_NONBLOCK", 0)
+
+    def open_checked(name, parent_fd, expected, flags, relative):
+        try:
+            fd = os.open(name, flags, dir_fd=parent_fd)
+        except OSError as exc:
+            raise _fail(f"cannot open candidate entry {relative!r}: {exc}") from None
+        try:
+            opened = os.fstat(fd)
+        except OSError as exc:
+            os.close(fd)
+            raise _fail(f"cannot inspect opened candidate entry {relative!r}: {exc}") from None
+        if (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino):
+            os.close(fd)
+            raise _fail(f"candidate entry changed while securing it: {relative!r}")
+        return fd
+
+    def secure_directory(directory_fd, relative):
+        try:
+            os.fchmod(directory_fd, 0o700)
+            secured = os.fstat(directory_fd)
+            if not stat.S_ISDIR(secured.st_mode) \
+                    or stat.S_IMODE(secured.st_mode) != 0o700:
+                raise _fail(f"candidate directory is not private: {relative!r}")
+            names = sorted(os.listdir(directory_fd))
+        except SystemExit:
+            raise
+        except OSError as exc:
+            raise _fail(f"cannot secure candidate directory {relative!r}: {exc}") from None
+        for name in names:
+            child_relative = name if relative == "." else f"{relative}/{name}"
+            try:
+                child = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except OSError as exc:
+                raise _fail(
+                    f"cannot inspect candidate entry {child_relative!r}: {exc}") from None
+            if stat.S_ISLNK(child.st_mode):
+                raise _fail(f"candidate adapter contains symlink {child_relative!r}")
+            if stat.S_ISDIR(child.st_mode):
+                child_fd = open_checked(
+                    name, directory_fd, child, directory_flags, child_relative)
+                try:
+                    secure_directory(child_fd, child_relative)
+                finally:
+                    os.close(child_fd)
+                continue
+            if not stat.S_ISREG(child.st_mode):
+                raise _fail(
+                    f"candidate adapter contains non-regular file {child_relative!r}")
+            child_fd = open_checked(name, directory_fd, child, file_flags, child_relative)
+            try:
+                os.fchmod(child_fd, 0o600)
+                secured = os.fstat(child_fd)
+                if not stat.S_ISREG(secured.st_mode) \
+                        or stat.S_IMODE(secured.st_mode) != 0o600:
+                    raise _fail(f"candidate file is not private: {child_relative!r}")
+            except SystemExit:
+                raise
+            except OSError as exc:
+                raise _fail(
+                    f"cannot secure candidate file {child_relative!r}: {exc}") from None
+            finally:
+                os.close(child_fd)
+
+    root_fd = open_checked(root, None, before, directory_flags, ".")
+    try:
+        secure_directory(root_fd, ".")
+    finally:
+        os.close(root_fd)
+    return root
+
+
+def _private_training_call(function, *args, **kwargs):
+    """Run the shared ML writer with an owner-only creation mask."""
+    previous_umask = os.umask(0o077)
+    try:
+        result = function(*args, **kwargs)
+    finally:
+        os.umask(previous_umask)
+    try:
+        adapter_dir, metrics = result
+    except (TypeError, ValueError):
+        raise _fail("shared trainer returned an invalid candidate result") from None
+    _secure_candidate_tree(adapter_dir)
+    return adapter_dir, metrics
+
+
 def train_sft(samples):
     shared = _online()
     identity = base_identity()
@@ -926,7 +1060,8 @@ def train_sft(samples):
         "completion": row["completion"], "reward": row["reward"],
         "history": [], "source": row["contract"],
     } for row in samples]
-    return shared.train_lora(
+    return _private_training_call(
+        shared.train_lora,
         shaped, identity["training_model"], OUT_DIR, EPOCHS,
         adapter_kind=ADAPTER_KIND, allow_prompt_truncation=False,
         base_revision=identity["training_revision"])
@@ -946,13 +1081,15 @@ def train_dpo(pairs):
         "chosen": row["chosen"], "rejected": row["rejected"],
         "margin": row["margin"], "history": [], "source": row["contract"],
     } for row in pairs]
-    return shared.train_dpo(
+    return _private_training_call(
+        shared.train_dpo,
         shaped, identity["training_model"], OUT_DIR, EPOCHS,
         adapter_kind=ADAPTER_KIND,
         base_revision=identity["training_revision"])
 
 
 def _tree_sha256(adapter_dir):
+    _secure_candidate_tree(adapter_dir)
     return _online()._adapter_tree_sha256(adapter_dir)
 
 

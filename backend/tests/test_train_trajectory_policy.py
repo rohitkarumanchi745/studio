@@ -261,6 +261,12 @@ def test_policy_tokenizer_and_shared_training_use_exact_revision(tmp_path, monke
     module = _load(tmp_path)
     calls = []
 
+    def adapter(name):
+        path = tmp_path / name
+        path.mkdir()
+        (path / "adapter.bin").write_bytes(b"candidate")
+        return str(path)
+
     class AutoTokenizer:
         @staticmethod
         def from_pretrained(model, **kwargs):
@@ -279,11 +285,11 @@ def test_policy_tokenizer_and_shared_training_use_exact_revision(tmp_path, monke
 
         def train_lora(self, samples, model, out_dir, epochs, **kwargs):
             calls.append(("sft", model, kwargs))
-            return "adapter", {}
+            return adapter("sft-adapter"), {}
 
         def train_dpo(self, pairs, model, out_dir, epochs, **kwargs):
             calls.append(("dpo", model, kwargs))
-            return "adapter", {}
+            return adapter("dpo-adapter"), {}
 
     monkeypatch.setattr(module, "_online", lambda: Shared())
     sample = {"system": "s", "prompt": "p", "completion": "{}", "reward": 1.0,
@@ -301,6 +307,154 @@ def test_policy_tokenizer_and_shared_training_use_exact_revision(tmp_path, monke
          {"adapter_kind": module.ADAPTER_KIND,
           "base_revision": module.BASE_REVISION}),
     ]
+
+
+@pytest.mark.parametrize("method", ["sft", "dpo"])
+def test_shared_policy_trainers_use_private_umask_and_restore_it(
+        tmp_path, monkeypatch, method):
+    module = _load(tmp_path)
+    current_mask = [0o022]
+    changes = []
+    observed = []
+
+    def fake_umask(mask):
+        previous = current_mask[0]
+        current_mask[0] = mask
+        changes.append(mask)
+        return previous
+
+    monkeypatch.setattr(module.os, "umask", fake_umask)
+
+    class Shared:
+        MAX_LENGTH = None
+        MAX_PROMPT_LENGTH = None
+        DPO_BETA = None
+
+        def write(self, name):
+            observed.append(current_mask[0])
+            path = tmp_path / name
+            path.mkdir()
+            (path / "adapter.bin").write_bytes(b"candidate")
+            return str(path), {}
+
+        def train_lora(self, *args, **kwargs):
+            return self.write("sft-private")
+
+        def train_dpo(self, *args, **kwargs):
+            return self.write("dpo-private")
+
+    monkeypatch.setattr(module, "_online", lambda: Shared())
+    sample = {"system": "s", "prompt": "p", "completion": "{}", "reward": 1.0,
+              "contract": module.CONTRACTS[0]}
+    pair = {**sample, "chosen": "{}", "rejected": '{"x":1}', "margin": 1.0}
+
+    (module.train_sft([sample]) if method == "sft" else module.train_dpo([pair]))
+
+    assert observed == [0o077]
+    assert changes == [0o077, 0o022]
+    assert current_mask == [0o022]
+
+
+def test_private_training_restores_umask_when_shared_trainer_fails(tmp_path, monkeypatch):
+    module = _load(tmp_path)
+    current_mask = [0o027]
+    changes = []
+
+    def fake_umask(mask):
+        previous = current_mask[0]
+        current_mask[0] = mask
+        changes.append(mask)
+        return previous
+
+    def fail():
+        assert current_mask == [0o077]
+        raise RuntimeError("training failed")
+
+    monkeypatch.setattr(module.os, "umask", fake_umask)
+
+    with pytest.raises(RuntimeError, match="training failed"):
+        module._private_training_call(fail)
+
+    assert changes == [0o077, 0o027]
+    assert current_mask == [0o027]
+
+
+def test_candidate_tree_is_private_before_policy_hashing(tmp_path, monkeypatch):
+    module = _load(tmp_path)
+    candidate = tmp_path / "candidate-private"
+    nested = candidate / "nested"
+    nested.mkdir(parents=True)
+    weights = nested / "adapter.bin"
+    weights.write_bytes(b"weights")
+    os.chmod(candidate, 0o755)
+    os.chmod(nested, 0o777)
+    os.chmod(weights, 0o644)
+    observed = {}
+
+    class Shared:
+        @staticmethod
+        def _adapter_tree_sha256(path):
+            observed.update(
+                root=stat.S_IMODE(os.stat(candidate).st_mode),
+                nested=stat.S_IMODE(os.stat(nested).st_mode),
+                file=stat.S_IMODE(os.stat(weights).st_mode),
+                path=os.path.abspath(path),
+            )
+            return "a" * 64
+
+    monkeypatch.setattr(module, "_online", lambda: Shared())
+
+    assert module._tree_sha256(str(candidate)) == "a" * 64
+    assert observed == {
+        "root": 0o700, "nested": 0o700, "file": 0o600,
+        "path": str(candidate),
+    }
+
+
+@pytest.mark.parametrize("unsafe", ["root_symlink", "nested_symlink", "fifo"])
+def test_candidate_tree_rejects_links_and_special_files(tmp_path, unsafe):
+    if unsafe == "fifo" and not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO creation is unavailable on this platform")
+    module = _load(tmp_path)
+    real = tmp_path / "real-candidate"
+    real.mkdir()
+    (real / "adapter.bin").write_bytes(b"weights")
+    candidate = real
+    if unsafe == "root_symlink":
+        candidate = tmp_path / "linked-candidate"
+        candidate.symlink_to(real, target_is_directory=True)
+    elif unsafe == "nested_symlink":
+        (real / "linked.bin").symlink_to(real / "adapter.bin")
+    else:
+        os.mkfifo(real / "named-pipe")
+
+    with pytest.raises(SystemExit, match="child of|real directory|symlink|non-regular"):
+        module._secure_candidate_tree(str(candidate))
+
+
+def test_candidate_tree_refuses_to_chmod_outside_policy_output(tmp_path):
+    module = _load(tmp_path / "private-output")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    file_path = outside / "adapter.bin"
+    file_path.write_bytes(b"weights")
+    os.chmod(outside, 0o755)
+    os.chmod(file_path, 0o644)
+
+    with pytest.raises(SystemExit, match="child of"):
+        module._secure_candidate_tree(str(outside))
+
+    assert stat.S_IMODE(os.stat(outside).st_mode) == 0o755
+    assert stat.S_IMODE(os.stat(file_path).st_mode) == 0o644
+
+
+def test_candidate_hardening_fails_closed_without_descriptor_relative_io(
+        tmp_path, monkeypatch):
+    module = _load(tmp_path)
+    monkeypatch.setattr(module.os, "supports_dir_fd", set())
+
+    with pytest.raises(SystemExit, match="POSIX descriptor-relative"):
+        module._secure_candidate_tree(str(tmp_path / "candidate"))
 
 
 def test_remote_http_is_fail_closed_without_explicit_private_network_opt_in(tmp_path):
