@@ -560,8 +560,9 @@ comes from; a failed step emails the requester naming the failing source/table,
 and each completed or failed run records its complete attempted recipe in
 `agent_traces` as `mode="pipeline"`. A successful execution earns `1`, a failed
 execution `0`; a corrected follow-up keeps the earlier failure and links its
-new outcome through `repairs_run_id`. These outcomes are queued for delivery to
-an Agent Lightning server when `STUDIO_AGL_URL` is configured. Recent SQL
+new outcome through `repairs_run_id`. Complete pipeline bundles remain local —
+they are not exported through the generic Agent Lightning trace stream or
+mistaken for one-query `run_sql` labels. Recent SQL
 pipeline examples are scoped to their owner and rechecked against current
 source/table permissions and connector namespaces before they inform another
 draft. `pipeline_memory.py` ranks the caller's bounded successful history by
@@ -626,9 +627,10 @@ The execution sequence is:
    a run. Chat/Jobs display publication, launch, and execution as separate states.
 5. The worker records the actual terminal outcome, even after chat closes.
    **"Repair this pipeline"** includes the observed failure in a new plan; the
-   correction needs fresh approval. Its successful `airflow_dag` action stores
-   the complete plan and `repairs_run_id` for later prompt retrieval and optional
-   Agent Lightning delivery. A plain repair follow-up retains the original
+   correction needs fresh approval. Its terminal `airflow_dag` action stores
+   the complete plan and `repairs_run_id` for later prompt retrieval and, when
+   private trajectory collection is enabled, the typed five-contract corpus.
+   A plain repair follow-up retains the original
    business requirement as its learning prompt, so a future matching request
    finds the corrected recipe rather than an example named only "fix it".
    Exact recipes still need current validation;
@@ -739,6 +741,64 @@ provider imports, shared mounts, real credentials, and execution must be smoke
 tested in the target environment. The [portable deployment assets and acceptance
 checks](deploy/portable/README.md) make those requirements explicit. Nothing in
 these tests deploys a service or proves that the live demo has this configuration.
+
+### Training the whole prompt-to-pipeline policy
+
+Studio now has a separate, typed training path for the orchestration decisions
+that cannot be represented as one SQL tool call. It records exactly five
+versioned contracts:
+
+| Contract | Label comes from | When it is eligible |
+|---|---|---|
+| `airflow_dag` | The complete validated DAG, including every task and dependency | After a real terminal platform outcome; success is reward `1`, failure is `0` |
+| `agent_graph` | The independent planner council's selected seed topology | After the governed graph ran; dynamically spawned children remain outcomes, not rewritten planning labels |
+| `recovery_decision` | Agent Lightning's `retry`, typed `repair`, or safe `escalate` decision | Escalation is terminal and safe; retry/repair waits for the child run's physical outcome |
+| `aggregator_output` | The frontier aggregator's answer plus server-owned citations | Only when every contribution is cited and numeric/lexical grounding passes |
+| `dependent_agent` | The exact server-built prompt actually sent to a provider worker | Only with bounded, real upstream rows; failed/deterministic previews are excluded |
+
+```mermaid
+flowchart LR
+    prompt["Natural-language request"] --> runtime["Governed runtime<br/>planner · graph · Airflow · Lightning recovery"]
+    runtime --> outcome["Observed topology, evidence<br/>and terminal outcomes"]
+    outcome --> store[("policy_trajectories<br/>Fernet ciphertext · HMAC scope")]
+    store --> trainer["Five-way balanced SFT or DPO<br/>full-context · no truncation"]
+    trainer --> candidate["Private PEFT candidate"]
+    candidate --> gate{"Pinned independent evaluation<br/>all five · task + safety · no regression"}
+    gate -->|pass| registry[("trajectory_policy registry<br/>exact scope + artifact provenance")]
+    registry -. "mount + attest + acknowledge" .-> isolated["Dedicated policy gateway"]
+    isolated -. "live invocation deliberately dormant" .-> runtime
+```
+
+This is not the global SQL adapter. Complete inputs/targets are encrypted in
+the application database; plaintext user, tenant, run, and evidence identifiers
+are replaced by keyed identities. `STUDIO_TRAJECTORY_TRAINING=off` is the
+default. `user` mode can collect all five contracts and is the only promotable
+scope. `tenant` mode records only the three contracts without raw worker
+evidence and is intentionally offline-only. A user-scoped trainer can read only
+that exact scope through the admin endpoint.
+
+The private trainer keeps mode-0600 cursor, pending, cumulative replay,
+candidate, and release-manifest files on its own volume. It tokenizes complete
+examples without truncation, requires enough new eligible data from every
+contract, balances the final dataset equally, and supports reward-filtered SFT
+or exact-prompt DPO. A pending example must actually appear in the selected
+dataset before a successful release can consume it.
+
+Training is not activation. The portable Compose profile and Kubernetes Job run
+one `--defer-publish` round, then stop. An operator must convert the PEFT output
+to the serving runtime's real artifact, evaluate those exact final bytes against
+the immutable five-contract suite, publish the digest/provenance, mount and
+attest the same identity, and only then acknowledge the release so the cursor
+can advance. See [the trainer guide](scripts/README-training.md) and the
+[cloud-neutral portable deployment](deploy/portable/README.md).
+
+The registry and dedicated gateway are prepared, but **this build does not call
+the external trajectory-policy endpoint at runtime**. Frontier planners and
+aggregators continue to serve live traffic, while Agent Lightning remains the
+live recovery controller. This avoids silently exporting upstream result rows,
+failure diagnostics, or private prompts merely because an adapter was
+published. Enabling live learned-policy inference needs a separate reviewed
+disclosure and execution boundary; setting an endpoint alone does not do it.
 
 ### The staged flow — safe production behavior
 
@@ -1192,8 +1252,10 @@ the state store until an admin deletes the run.
 
 ## Agent Lightning — the learning loop, and a real client of its server
 
-Every run becomes a **rollout** (prompt → actions → outcome) with a **reward**,
-persisted to the `agent_traces` table. That loop is Studio's own. On top of it,
+Supported agent runs become **rollouts** (prompt → actions → outcome) with a
+**reward**, persisted to the `agent_traces` table. Complete pipeline outcomes
+are also stored there for owner-scoped reuse, but stay out of the generic
+external rollout stream and the scalar SQL trainer. That loop is Studio's own. On top of it,
 the [`agentlightning`](https://github.com/microsoft/agent-lightning) package
 (1.0.1 — a **real requirement** in `backend/requirements.txt`, not an optional
 extra: its core deps are fastapi / httpx / pydantic / uvicorn / pyyaml / jinja2
@@ -1207,7 +1269,8 @@ verl bridge) with no Studio-specific code on that side.
 
 ```mermaid
 flowchart LR
-    run["Runs<br/>chat · autopilot · crew · pipeline outcomes"] --> roll[("agent_traces<br/>prompt · actions · reward · agents")]
+    run["Runs<br/>chat · autopilot · crew"] --> roll[("agent_traces<br/>prompt · actions · reward · agents")]
+    pipe["Terminal pipeline outcomes"] --> local[("local owner trace<br/>typed private corpus when enrolled")]
     roll --> fb["👍 / 👎 overwrites the heuristic reward"]
     roll --> fail["recent failures → system prompt<br/>(immediate, in-context)"]
     roll --> apo["APO distills low-reward traces<br/>→ prompts/system_learned.txt"]
@@ -1244,8 +1307,8 @@ is visible in `/api/health`; the answer already went out.
 | `RolloutCreate.input` | `data_id` (the trace id — the field `/api/rollouts/terminal` projects), `prompt`, `source`, `table`, `conversation_id`, `history` (the turns the model saw; the global SQL trainer excludes non-empty history by default to reduce cross-user memorization) |
 | `RolloutCreate.metadata` | `studio_trace_id`, `studio_user_id`, `studio_role`, `mode`, `model`, `agents`, `created_at` — `RolloutMetadata` allows extras; the opaque user id travels, never the email |
 | `RolloutCreate.is_train` | `STUDIO_AGL_TRAIN` (default true) |
-| `EventCreate` | `studio.run` (mode · model · source · table · ok · duration · agents) · `studio.query` (sql · row_count) · `studio.chart` (type · panel_count) · `studio.errors` · `studio.action` (structured pipeline recipe, run ID, and repair link when present) |
-| `RewardData` | `value` = the trace's reward, `source` = `heuristic` / `user` / `per_agent` / `pipeline_outcome`, `reason` = a machine slug, `message` = the 👍/👎 note or a compact outcome string |
+| `EventCreate` | `studio.run` (mode · model · source · table · ok · duration · agents) · `studio.query` (sql · row_count) · `studio.chart` (type · panel_count) · `studio.errors` |
+| `RewardData` | `value` = the trace's reward, `source` = `heuristic` / `user` / `per_agent`, `reason` = a machine slug, `message` = the 👍/👎 note or a compact outcome string |
 | rollout state | `queuing → running → succeeded / failed` from the run's `ok`, which is what puts the rollout in the terminal log a trainer pages through |
 
 Fallback-mode runs (no LLM key) are deliberately **unscored** — no reward event
@@ -1291,8 +1354,9 @@ and nothing re-drives it — the sweep only reconsiders traces that already
 delivered once, because sweeping every undelivered trace would replay the whole
 history the first time `STUDIO_AGL_URL` is set. For the older chat/per-agent
 writers, the trace INSERT and queue INSERT are two transactions, so a crash
-between them loses that delivery (never the trace). Pipeline outcome recording
-commits its trace and delivery enqueue together. And reward re-delivery is a sweep rather than an enqueue
+between them loses that delivery (never the trace). Complete pipeline outcomes
+are deliberately local and therefore have no generic delivery transaction.
+Reward re-delivery is a sweep rather than an enqueue
 at the moment of the click, which is why it is seconds rather than immediate.
 The event de-duplication is read-then-post rather than atomic, so two
 deliveries of the same trace overlapping in different workers could double an
@@ -1301,9 +1365,9 @@ posting into it leaves that attempt briefly empty until the retry fills it —
 both self-heal, and neither can touch the trace the answer came from.
 
 **Scope of delivery.** Chat turns (synchronous and background), autopilot
-turns, the crew's per-agent rollouts, SQL pipeline execution outcomes, and
-terminal platform execution outcomes go through `lightning.record_*` and are
-eligible for external delivery. Flow-stage traces (`flow.py`) and standalone
+turns, and the crew's per-agent rollouts go through `lightning.record_*` and are
+eligible for generic external delivery. Complete SQL/Airflow/platform pipeline
+outcomes, flow-stage traces (`flow.py`), and standalone
 `/verify-sql` traces (`queries.py`) that call `db.add_trace()` directly remain
 local. Delivery to an external Agent Lightning server requires
 `STUDIO_AGL_URL`; local recording works with it unset.
@@ -1321,19 +1385,22 @@ its reward. Prompt-to-pipeline memory retrieves eligible successful recipes
 from the caller's own history, revalidates exact matches, and gives similar
 matches to the planner for adaptation; failed attempts remain diagnostic
 context, not successful templates. Platform actions retain their normal
-validation and human approval gate. This collects useful experience and improves prompt context;
-it does not start training, change hosted-model weights, or publish/load a
-BitNet adapter. Structured pipeline actions also stay out of the single-query
-`sql` field so a tool-calling trainer cannot mistake a job payload for SQL.
+validation and human approval gate. This collects useful experience and improves prompt context.
+When private trajectory collection is enabled, complete Airflow outcomes also
+enter the typed encrypted corpus; recording alone still does not start a
+trainer, change weights, or activate an adapter. Structured pipeline actions
+stay out of both the single-query `sql` field and generic external delivery, so
+a tool-calling trainer cannot mistake a job payload for SQL.
 
 **Is it reinforcement learning?** The rollout/reward record has the structure
 an RL system needs, but the running recovery loop does not optimize weights.
 Hosted model weights are frozen; immediate improvement comes from revalidated
-successful-recipe retrieval and prompt context. The separate BitNet trainer
-currently performs reward-filtered SFT or DPO only on eligible single-query SQL
-actions. Structured Airflow/recovery trajectories are retained, but require a
-separate formatter, optimizer, evaluation, and model-release path before they
-can change a recovery policy.
+successful-recipe retrieval and prompt context. `train_online.py` performs
+reward-filtered SFT or DPO on eligible single-query SQL actions. The separate
+`train_trajectory_policy.py` path now formats, balances, optimizes, and evaluates
+the five complete contracts described above. Its release remains offline until
+an independently evaluated artifact is published, mounted, attested, and a
+future reviewed runtime boundary is enabled.
 
 **What a verl path would consume next.** Agent Lightning's verl trainer
 enqueues its own rollouts from a dataset and, for each terminal rollout, reads
@@ -1452,8 +1519,10 @@ reports the loop status and BitNet's growing scope. The heavy ML deps live in
 worker via `scripts/Dockerfile.trainer`.
 Recording rewarded chat or pipeline outcomes does not start this trainer or
 change served weights. Structured pipeline and recovery actions are retained
-as application/Lightning experience but are intentionally not mixed into this
-single-query adapter. BitNet routing requires a configured
+in the separate five-contract corpus when enrolled; they are intentionally not
+mixed into this single-query adapter. `train_trajectory_policy.py` owns their
+balanced private release path, and its external live client remains dormant.
+BitNet routing requires a configured
 `STUDIO_LLM_BASE_URL` and an eligible published adapter, with the actual mounted
 adapter and tool-calling behavior verified separately. `HARRIER_EMBED_URL`
 enables semantic embeddings; unset, matching uses the documented lexical
@@ -1760,9 +1829,17 @@ erDiagram
     }
     training_adapters {
         text id PK
-        text scope "global | user_id"
-        text kind "tool_call | user_style"
+        text scope "global | user_id | opaque user scope"
+        text kind "tool_call | user_style | trajectory_policy"
         int version
+    }
+    policy_trajectories {
+        text id PK
+        int revision UK
+        text contract "one of five versioned contracts"
+        text scope "HMAC user or tenant identity"
+        text ciphertext "Fernet input, target, lineage, metadata"
+        double reward
     }
     background_jobs {
         text id PK
@@ -1779,13 +1856,15 @@ erDiagram
 ```
 
 Alongside these: `governance_docs`, `mcp_servers`, `github_repos`, `chat_tasks`,
-`training_adapters`, `scheduler_leases` — each a small table with a TEXT-uuid
+`training_adapters`, `policy_trajectories`, `scheduler_leases` — each a small table with a TEXT-uuid
 primary key (Postgres has no implicit autoincrement, and a `REAL` epoch would
 round; the facade maps `REAL → DOUBLE PRECISION`). `query_cache` doubles as
 the semantic cache and BitNet's learned-scope repertoire (repetition + reward +
 Harrier embedding). `background_jobs` is the durable job queue and
 `scheduler_leases` makes the periodic tickers single-instance (see *Sessions &
-concurrent tasks*).
+concurrent tasks*). `policy_trajectories` is deliberately separate from
+`agent_traces`: its complete five-contract envelopes are encrypted, revisions
+are monotonic, and its scope/lineage/evidence identities are keyed tokens.
 
 **Schema migrations.** The `CREATE TABLE IF NOT EXISTS` baseline in
 `init_db()` / each module's `init_tables()` is the complete schema for a fresh
@@ -2301,11 +2380,11 @@ you in: the account is created unverified and the emailed 6-digit code
 
 | Variable | Purpose |
 |---|---|
-| `STUDIO_AGL_URL` | Base URL of an Agent Lightning server (its API is under `/api`). **The delivery switch**: set, supported chat/per-agent and terminal pipeline rollouts are queued for delivery; unset, they are recorded locally without external delivery. The chat path never imports `agentlightning` either way — only the job does, plus `/api/health` reading its `__version__` |
+| `STUDIO_AGL_URL` | Base URL of an Agent Lightning server (its API is under `/api`). **The delivery switch**: set, supported chat/per-agent rollouts are queued for generic delivery and the separate recovery controller may run; complete pipeline bundles remain local. Unset, traces are recorded locally without external delivery. The chat path never imports `agentlightning` either way — only the job does, plus `/api/health` reading its `__version__` |
 | `STUDIO_AGL_TOKEN` | The server's `AGL_KEY`, sent as `Authorization: Bearer …` (the server also accepts `x-api-key`). Omit when the server runs without a key |
 | `STUDIO_AGL_TIMEOUT_S` | Per-HTTP-call timeout for one delivery (default 10). Client-side retries are off on purpose — the durable queue owns retries |
 | `STUDIO_AGL_MAX_ATTEMPTS` | Queue attempts per delivery before the job is failed (default 5, with the queue's 5 s / 10 s / 20 s… backoff) |
-| `STUDIO_AGL_TRAIN` | `is_train` on delivered rollouts: `1`/default = training data, `0`/`false`/`no` = evaluation |
+| `STUDIO_AGL_TRAIN` | `is_train` on generic delivered chat/per-agent rollouts: `1`/default = training data, `0`/`false`/`no` = evaluation. Live recovery diagnosis always uses `false`; its outcome label enters the scoped trajectory corpus separately |
 | `STUDIO_AGL_PENDING_STALE_S` | Seconds before a reward re-delivery that was queued but never completed is retried by the sweep (default 600) |
 
 **Data gate & results**
