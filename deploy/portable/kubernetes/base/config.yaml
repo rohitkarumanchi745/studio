@@ -23,6 +23,10 @@ data:
   STUDIO_WORKER_MODE: external
   STUDIO_AUTO_MIGRATE: "1"
   STUDIO_LLM: anthropic:claude-sonnet-5
+  # Optional selected Confluence planning references; credentials belong in
+  # studio-app-secrets. Both Studio web and worker consume this ConfigMap.
+  STUDIO_CONFLUENCE_BASE_URL: ""
+  STUDIO_CONFLUENCE_SPACES: ""
   STUDIO_POLICY_LLM: openai:bitnet-policy
   # Release plumbing is present, but automatic external inference is dormant.
   STUDIO_POLICY_TRUSTED_ENDPOINT: "0"

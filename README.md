@@ -52,6 +52,11 @@ For a **new dependency-aware pipeline**, ask **"build an Airflow pipeline"**
 and describe the input, transformations, duplicate key/winner rule, and explicit
 output tables. Chat drafts supported SQL tasks and their dependencies, asks
 about missing details, and offers **Submit for approval** and **Download DAG**.
+For either pipeline build path, you can explicitly select one administrator-
+registered GitHub repository and up to three pages from configured Confluence
+spaces. Studio reads a bounded snapshot of those sources to inform planning;
+it never runs repository scripts or page code. The usual SQL checks and, for
+Airflow, administrator approval still decide what can execute.
 Its SQL checks are static: unlike a read-only bundle, a DAG draft has **not run**.
 Successful private recipes can be retrieved for the same or a similar prompt;
 exact reuse is revalidated, and changed requirements need model adaptation and
@@ -531,9 +536,20 @@ advancing, not as a schedule alert.
 ### Prompt-built pipelines + data lineage
 
 For the read-only Pipelines view and chat SQL bundles, describe a job; the
-**Pipeline planner** routes it to the source whose tables
-best match, drafts an ordered set of steps, and can pick the right **GitHub
-repo** (`repos.py`) whose scripts fit the prompt. Every drafted step is run
+**Pipeline planner** routes it to the source whose tables best match and drafts
+an ordered set of steps. An admin can register GitHub repositories in
+**Governance → GitHub repositories**. Builders can then select a repository
+and up to three Confluence pages in Chat or Pipelines when building a draft.
+The selected repository's allowlisted pipeline files and the selected pages'
+text become **bounded, untrusted reference context** for the model, with
+repository commit/page-version provenance in the draft. A URL in the prompt
+cannot register a repository, choose a different site, or grant access. A
+failed fetch or missing planning model blocks a source-backed draft instead of
+claiming to have used material it did not read. Source selection is a planning
+input, not a command to clone, import, deploy, or run code from GitHub or
+Confluence. Execution uses newly verified read-only SQL through Studio's data
+gateway, or the separately approved, trusted-compiled Airflow DAG path below.
+Every drafted read-only step is run
 through `verify_sql` (RBAC + guard + real execution) before you see it, and the
 response separates the two outcomes honestly: **`steps` holds only the steps
 that verified** — possibly an empty list, still a `200` — and **`dropped` holds
@@ -601,6 +617,13 @@ an ETL request. There is **no arbitrary model-written Python, shell, MERGE,
 UPDATE, DELETE, multi-source DAG, backfill, or recurring schedule** in this
 contract. Parameter values are concrete reviewed SQL constants, not runtime
 Jinja templates or a string-replacement mechanism.
+
+A selected GitHub repository or Confluence page can inform this plan, but its
+text has no authority over source/table permissions, SQL shape, dependencies,
+destinations, or approval. Selection does not execute existing repository DAGs
+or scripts. To trigger an **already deployed** Airflow DAG, use the separate
+explicit external-run command; to turn a natural-language request into a new
+DAG, review and submit the generated SQL plan for approval as described below.
 
 **Validation is not execution.** Planning checks SQL shape, input/output RBAC,
 the connector's namespace, dependencies, and current governance without running
@@ -2465,6 +2488,9 @@ you in: the account is created unverified and the emailed 6-digit code
 | `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` / `AZURE_GROUP_ROLE_MAP` | Entra SSO + group→role mapping, **and** the Microsoft 365 → KAG extraction layer (dormant until set) |
 | `DATABRICKS_WAREHOUSE_ID` | **Required for the Spark / Jobs flow.** The SQL warehouse that runs a submitted job's `sql_task`s. Unset, a `spark_job` deployment is *refused* before the supervisor is called (`decision: "reject"`, reason naming this variable) rather than posting a body the Jobs API would `400`. Not needed for reading through the Databricks source |
 | `GITHUB_TOKEN` | Read private repos in the GitHub repo registry |
+| `STUDIO_CONFLUENCE_BASE_URL` | Atlassian Cloud site URL (`https://<site>.atlassian.net`); required to offer Confluence page selection |
+| `STUDIO_CONFLUENCE_EMAIL` / `STUDIO_CONFLUENCE_API_TOKEN` | Service account email and API token for the configured site; keep as server-side secrets, never in prompts or plans |
+| `STUDIO_CONFLUENCE_SPACES` | Comma-separated allowlist of Confluence space keys exposed for page selection; the service account must also have access. All authenticated Studio users who can build a pipeline can select pages in these spaces, so use a narrowly scoped service account and spaces |
 | `POSTGRES_DSN` / `POSTGRES_SCHEMA` | PostgreSQL **data source** (a second SQL warehouse, distinct from the app's `DATABASE_URL`); dormant until set. `POSTGRES_SCHEMA` (default `public`) does three jobs: it is the schema `list_tables()` builds the catalog from, the namespace the query guard accepts (with the DSN's database, `{schema, dbname.schema}` — at those arities, spelled **exactly** as here), and the value every connection's `search_path` is pinned to, so an unqualified allowed name can only ever mean this schema. It must be a plain identifier (`[A-Za-z0-9_$]+`) or the connection is refused |
 | `STUDIO_GRAPH_REDIRECT_URI` | Microsoft 365 delegated-OAuth return, default `$STUDIO_PUBLIC_URL/api/m365/oauth/callback` or `http://localhost:8000/api/m365/oauth/callback` |
 | `STUDIO_MCP_SERVERS` | JSON map of MCP servers exposed to the agent as extra tools |

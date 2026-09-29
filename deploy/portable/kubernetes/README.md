@@ -102,6 +102,17 @@ disabled as well; startup alone registers the fixed recovery endpoint.
 The default resources are starting points, not capacity promises. Measure
 warehouse query concurrency, DAG parse latency and model latency before scaling.
 
+For optional GitHub/Confluence-backed pipeline planning, put a read-only
+`GITHUB_TOKEN` (private repos only), `STUDIO_CONFLUENCE_EMAIL`, and
+`STUDIO_CONFLUENCE_API_TOKEN` in `studio-app-secrets`. Set the fixed Atlassian
+Cloud `STUDIO_CONFLUENCE_BASE_URL` and comma-separated allowlist
+`STUDIO_CONFLUENCE_SPACES` in `studio-runtime-config`. Both Studio web and
+worker load those same objects. An admin registers the exact GitHub repository
+in Governance; a builder selects it and up to three allowed Confluence pages
+in Chat or Pipelines. These are bounded, untrusted planning references, not
+code to run; SQL verification and Airflow approval remain mandatory. Keep the
+Confluence service account limited to spaces all permitted builders may read.
+
 ## 1. Build and publish immutable images
 
 From the repository root:

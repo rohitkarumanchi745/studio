@@ -133,6 +133,18 @@ existing password. Use the coordinated procedure below. Compose
 binds Studio to `127.0.0.1` by default. Set `STUDIO_BIND_ADDRESS=0.0.0.0` only
 behind an authenticated TLS reverse proxy or equivalent private ingress.
 
+To let builders select a registered GitHub repository and Confluence pages as
+pipeline planning references, add `GITHUB_TOKEN` to the private `.env` only for
+private repos, and set `STUDIO_CONFLUENCE_BASE_URL`,
+`STUDIO_CONFLUENCE_EMAIL`, `STUDIO_CONFLUENCE_API_TOKEN`, and
+`STUDIO_CONFLUENCE_SPACES` (comma-separated allowlist) to enable Confluence.
+Compose passes these to both Studio web and worker. An admin registers the
+exact GitHub repository URL in Governance; builders choose that repository and
+up to three allowed Confluence pages in Chat or Pipelines. Source text is
+untrusted, bounded planning context, never executable code. The resulting SQL
+still needs verification or Airflow approval; a prompt-supplied URL does not
+enlarge the configured allowlists.
+
 Render the final configuration before creating anything:
 
 ```sh
