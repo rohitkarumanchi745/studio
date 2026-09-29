@@ -519,6 +519,39 @@ def test_dpo_never_pairs_distinct_case_sensitive_canonical_inputs(tmp_path):
     assert module.dpo_candidates([upper, lower]) == []
 
 
+def test_dpo_consumption_and_digest_bind_exact_source_revisions(tmp_path):
+    module = _load(tmp_path, {"STUDIO_TRAJECTORY_TRAIN_MODE": "dpo"})
+    contract = module.CONTRACTS[0]
+    old_rows = [
+        dict(_row(module, contract, 1, revision=1, reward=1.0, prompt="same"),
+             token_count=50),
+        dict(_row(
+            module, contract, 2, revision=2, reward=0.0, prompt="same",
+            target={"answer": "rejected", "version": 1}), token_count=50),
+    ]
+    pair = module.dpo_candidates(old_rows)[0]
+    newer_pending = [dict(row, revision=row["revision"] + 10) for row in old_rows]
+
+    consumed, retained = module.partition_pending_for_dataset(
+        newer_pending, [pair], "dpo")
+
+    assert consumed == []
+    assert retained == newer_pending
+    changed = dict(pair, trajectory_identities=[
+        {"id": item["id"], "revision": item["revision"] + 10}
+        for item in pair["trajectory_identities"]
+    ])
+    assert module.dataset_sha256([pair], "dpo") != \
+        module.dataset_sha256([changed], "dpo")
+
+    legacy = dict(pair)
+    legacy.pop("trajectory_identities")
+    with pytest.raises(SystemExit, match="exact source"):
+        module.partition_pending_for_dataset(newer_pending, [legacy], "dpo")
+    with pytest.raises(SystemExit, match="exact source"):
+        module.dataset_sha256([legacy], "dpo")
+
+
 def test_independent_evaluation_requires_exact_five_capabilities_and_point_nine(tmp_path):
     module = _load(tmp_path)
     evidence = module.validate_evaluation_report(
@@ -608,10 +641,22 @@ def test_saturated_replay_reserves_pending_candidates_before_clearing_state(
                     _row(module, contract, revision, revision=revision),
                     id=f"a_old_{contract}_{suffix}"))
                 revision += 1
-            pending_rows.append(dict(
-                _row(module, contract, revision, revision=revision),
-                id=f"z_pending_{contract}"))
-            revision += 1
+            for prefix in ("z", "zz"):
+                pending_rows.append(dict(
+                    _row(module, contract, revision, revision=revision),
+                    id=f"{prefix}_pending_{contract}"))
+                revision += 1
+            if contract == module.CONTRACTS[0]:
+                pending_rows.append(dict(
+                    _row(module, contract, revision, revision=revision, reward=0.0),
+                    id="retained_below_reward"))
+                revision += 1
+            if contract == module.CONTRACTS[1]:
+                pending_rows.append(dict(
+                    _row(module, contract, revision, revision=revision,
+                         prompt="x" * 5000),
+                    id="retained_overlength"))
+                revision += 1
         else:
             prompt = f"historical preference for {contract}"
             old_rows.extend([
@@ -627,20 +672,28 @@ def test_saturated_replay_reserves_pending_candidates_before_clearing_state(
                     id=f"b_old_{contract}_rejected"),
             ])
             revision += 2
-            prompt = f"pending preference for {contract}"
-            pending_rows.extend([
-                dict(_row(
-                    module, contract, revision, revision=revision, reward=1.0,
-                    prompt=prompt,
-                    target={"answer": "pending chosen", "version": 1}),
-                    id=f"z_pending_{contract}_chosen"),
-                dict(_row(
-                    module, contract, revision + 1, revision=revision + 1,
-                    reward=0.0, prompt=prompt,
-                    target={"answer": "pending rejected", "version": 1}),
-                    id=f"zz_pending_{contract}_rejected"),
-            ])
-            revision += 2
+            for pair_index, prefix in enumerate(("z", "zz"), start=1):
+                prompt = f"pending preference {pair_index} for {contract}"
+                pending_rows.extend([
+                    dict(_row(
+                        module, contract, revision, revision=revision, reward=1.0,
+                        prompt=prompt,
+                        target={"answer": f"pending chosen {pair_index}", "version": 1}),
+                        id=f"{prefix}_pending_{contract}_{pair_index}_chosen"),
+                    dict(_row(
+                        module, contract, revision + 1, revision=revision + 1,
+                        reward=0.0, prompt=prompt,
+                        target={"answer": f"pending rejected {pair_index}", "version": 1}),
+                        id=f"{prefix}q_pending_{contract}_{pair_index}_rejected"),
+                ])
+                revision += 2
+            if contract == module.CONTRACTS[0]:
+                pending_rows.append(dict(
+                    _row(module, contract, revision, revision=revision, reward=1.0,
+                         prompt="unpaired pending preference",
+                         target={"answer": "no rejected sibling", "version": 1}),
+                    id="retained_unpaired"))
+                revision += 1
 
     old_usable, _ = module.preflight_full_context(old_rows, FakeTokenizer())
     old_candidates = module.dpo_candidates(old_usable) if mode == "dpo" \
@@ -675,6 +728,12 @@ def test_saturated_replay_reserves_pending_candidates_before_clearing_state(
 
     trained = selected["items"]
     pending_ids = {row["id"] for row in pending_rows}
+    if mode == "sft":
+        consumed_ids = pending_ids.intersection(item["id"] for item in trained)
+    else:
+        consumed_ids = pending_ids.intersection(
+            identifier for item in trained for identifier in item["trajectory_ids"])
+    retained_ids = pending_ids - consumed_ids
     assert result["published"] is True
     assert result["dataset_sha256"] != old_digest
     assert result["selected_new_counts"] == {
@@ -682,10 +741,17 @@ def test_saturated_replay_reserves_pending_candidates_before_clearing_state(
     assert result["contract_counts"] == {
         contract: per_contract_cap for contract in module.CONTRACTS}
     if mode == "sft":
-        assert pending_ids <= {item["id"] for item in trained}
+        assert len(consumed_ids) == len(module.CONTRACTS)
+        assert {"retained_below_reward", "retained_overlength"} <= retained_ids
     else:
-        assert all(pending_ids.intersection(item["trajectory_ids"]) for item in trained)
-    assert module.load_state(_scope()) == (revision, [])
+        assert len(consumed_ids) == 2 * len(module.CONTRACTS)
+        assert "retained_unpaired" in retained_ids
+    assert result["consumed_pending"] == len(consumed_ids)
+    assert result["retained_pending"] == len(retained_ids)
+    assert result["pending_consumption_applied"] is True
+    saved_cursor, saved_pending = module.load_state(_scope())
+    assert saved_cursor == revision
+    assert {row["id"] for row in saved_pending} == retained_ids
 
 
 def test_round_preflights_then_balances_digests_evaluates_and_publishes(
@@ -786,9 +852,14 @@ def test_deferred_peft_release_binds_cursor_dataset_and_pending(tmp_path, monkey
 
     manifest = module._load_manifest(_scope())
     assert result["published"] is False
+    assert result["pending_consumption_applied"] is False
+    assert result["consumed_pending"] == 5
+    assert result["retained_pending"] == 0
     assert manifest["cursor"] == 5
     assert manifest["dataset_sha256"] == result["dataset_sha256"]
     assert len(manifest["pending"]) == 5
+    assert len(manifest["consumed_pending"]) == 5
+    assert manifest["pending_sha256"] == module._pending_state_sha256(rows)
     assert module.load_state(_scope()) == (5, rows)
 
 
@@ -824,7 +895,8 @@ def test_manual_ack_verifies_active_final_artifact_and_evidence_before_clearing(
     module.save_state(_scope(), 5, rows)
     dataset, artifact = "c" * 64, "e" * 64
     module._manifest(
-        _scope(), cursor=5, pending=rows, adapter_dir=str(tmp_path / "peft"),
+        _scope(), cursor=5, pending=rows, consumed_pending=rows,
+        adapter_dir=str(tmp_path / "peft"),
         artifact_sha256="b" * 64, dataset_digest=dataset, mode="sft",
         counts={contract: 1 for contract in module.CONTRACTS}, metrics={})
     metrics = _passing_metrics(module, _scope(), artifact, dataset)
@@ -840,7 +912,55 @@ def test_manual_ack_verifies_active_final_artifact_and_evidence_before_clearing(
 
     assert result["acknowledged"] is True
     assert result["cleared_pending"] == 5
+    assert result["consumed_pending"] == 5
+    assert result["retained_pending"] == 0
     assert module.load_state(_scope()) == (5, [])
+    assert not os.path.exists(module.state_paths(_scope())["release"])
+
+
+def test_deferred_ack_consumes_only_rows_in_the_balanced_dataset(tmp_path, monkeypatch):
+    module = _load(tmp_path)
+    selected = _five(module)
+    below_threshold = dict(
+        _row(module, module.CONTRACTS[0], 99, revision=99, reward=0.0),
+        id="retained_below_threshold")
+    rows = [*selected, below_threshold]
+    _stub_pull(module, monkeypatch, rows, cursor=99)
+    adapter = tmp_path / "candidate-retention"
+    adapter.mkdir()
+    (adapter / "adapter.bin").write_bytes(b"weights")
+    monkeypatch.setattr(module, "train_sft", lambda samples: (str(adapter), {"loss": 0.1}))
+    monkeypatch.setattr(module, "_tree_sha256", lambda path: "b" * 64)
+
+    deferred = module.run_once(
+        "token", _scope(), defer_publish=True, tokenizer=FakeTokenizer())
+    manifest = module._load_manifest(_scope())
+
+    assert deferred["consumed_pending"] == 5
+    assert deferred["retained_pending"] == 1
+    assert manifest["pending"] == [module._pending_identity(row) for row in rows]
+    assert manifest["consumed_pending"] == [
+        module._pending_identity(row) for row in selected]
+    assert module.load_state(_scope()) == (99, rows)
+
+    final_artifact = "e" * 64
+    metrics = _passing_metrics(
+        module, _scope(), final_artifact, deferred["dataset_sha256"])
+    monkeypatch.setattr(module, "active_adapter", lambda token, scope: {
+        "scope": scope, "kind": module.ADAPTER_KIND,
+        "uri": "https://models/policy.gguf", "version": 8,
+        "sha256": final_artifact, "base_model": module.BASE_MODEL,
+        "base_identity": module.base_identity(), "status": "active",
+        "metrics": metrics,
+    })
+
+    acknowledged = module.acknowledge_published_release(
+        "token", _scope(), "https://models/policy.gguf", 8, final_artifact)
+
+    assert acknowledged["consumed_pending"] == 5
+    assert acknowledged["retained_pending"] == 1
+    assert acknowledged["cleared_pending"] == 5
+    assert module.load_state(_scope()) == (99, [below_threshold])
     assert not os.path.exists(module.state_paths(_scope())["release"])
 
 
@@ -850,6 +970,8 @@ def test_manual_ack_verifies_active_final_artifact_and_evidence_before_clearing(
     ("dataset", "retained five-capability dataset"),
     ("capability", "exact five-contract evidence"),
     ("cursor", "changed since deferred"),
+    ("content", "changed since deferred"),
+    ("consumption", "exact pending subset"),
 ])
 def test_manual_ack_mismatch_never_consumes_pending(tmp_path, monkeypatch, mutation, match):
     module = _load(tmp_path)
@@ -857,7 +979,8 @@ def test_manual_ack_mismatch_never_consumes_pending(tmp_path, monkeypatch, mutat
     module.save_state(_scope(), 5, rows)
     dataset, artifact = "c" * 64, "e" * 64
     module._manifest(
-        _scope(), cursor=5, pending=rows, adapter_dir=str(tmp_path / "peft"),
+        _scope(), cursor=5, pending=rows, consumed_pending=rows,
+        adapter_dir=str(tmp_path / "peft"),
         artifact_sha256="b" * 64, dataset_digest=dataset, mode="sft",
         counts={contract: 1 for contract in module.CONTRACTS}, metrics={})
     metrics = _passing_metrics(module, _scope(), artifact, dataset)
@@ -868,6 +991,12 @@ def test_manual_ack_mismatch_never_consumes_pending(tmp_path, monkeypatch, mutat
         metrics["promotion_evidence"]["contracts"].pop(module.CONTRACTS[-1])
     if mutation == "cursor":
         module.save_state(_scope(), 6, rows)
+    if mutation == "content":
+        module.save_state(_scope(), 5, [dict(rows[0], reward=0.75), *rows[1:]])
+    if mutation == "consumption":
+        manifest = module._load_manifest(_scope())
+        manifest["consumed_pending"].append({"id": "not-pending", "revision": 999})
+        monkeypatch.setattr(module, "_load_manifest", lambda scope: manifest)
     active_base = ({**module.base_identity(), "serving_sha256": "9" * 64}
                    if mutation == "base" else module.base_identity())
     monkeypatch.setattr(module, "active_adapter", lambda token, scope: {
@@ -879,7 +1008,10 @@ def test_manual_ack_mismatch_never_consumes_pending(tmp_path, monkeypatch, mutat
     with pytest.raises(SystemExit, match=match):
         module.acknowledge_published_release(
             "token", _scope(), "https://models/policy.gguf", 7, artifact)
-    assert module.load_state(_scope())[1] == rows
+    retained = module.load_state(_scope())[1]
+    assert len(retained) == len(rows)
+    if mutation != "content":
+        assert retained == rows
 
 
 def test_shared_sft_feature_path_can_forbid_any_prompt_truncation():

@@ -132,7 +132,7 @@ _MAX_WIRE_TEXT = 2 * 1024 * 1024
 _MAX_REPORT_BYTES = 1024 * 1024
 _STATE_VERSION = 1
 _REPLAY_VERSION = 1
-_RELEASE_VERSION = 2
+_RELEASE_VERSION = 3
 _online_module = None
 
 
@@ -696,12 +696,14 @@ def _candidate_identity(item):
     """Return the stable identity used to reserve candidates during balancing."""
     trajectory_ids = item.get("trajectory_ids")
     if trajectory_ids is None:
+        if item.get("trajectory_identities") is not None:
+            raise _fail("balancer received inconsistent candidate source identities")
         trajectory_ids = ()
-    elif not isinstance(trajectory_ids, (list, tuple)) \
-            or not all(isinstance(value, str) and value for value in trajectory_ids):
-        raise _fail("balancer received invalid candidate trajectory identities")
+        source_identities = ()
+    else:
+        source_identities = _dpo_source_identities(item)
     return (item.get("contract"), item.get("id"), item.get("revision"),
-            tuple(trajectory_ids))
+            tuple(trajectory_ids), source_identities)
 
 
 def balance_contracts(items, per_contract_cap=MAX_PER_CONTRACT, *,
@@ -798,17 +800,85 @@ def dpo_candidates(rows):
                 "reward": chosen["reward"], "margin": margin,
                 "token_count": max(chosen["token_count"], rejected["token_count"]),
                 "trajectory_ids": [chosen["id"], rejected["id"]],
+                "trajectory_identities": [
+                    {"id": chosen["id"], "revision": chosen["revision"]},
+                    {"id": rejected["id"], "revision": rejected["revision"]},
+                ],
             })
     return pairs
+
+
+def _dpo_source_identities(pair):
+    trajectory_ids = pair.get("trajectory_ids")
+    identities = pair.get("trajectory_identities")
+    if not isinstance(trajectory_ids, (list, tuple)) or len(trajectory_ids) != 2 \
+            or not all(isinstance(value, str) and value for value in trajectory_ids) \
+            or not isinstance(identities, (list, tuple)) or len(identities) != 2:
+        raise _fail("DPO pair has no exact source trajectory identities")
+    normalized = []
+    for identifier, item in zip(trajectory_ids, identities):
+        if not isinstance(item, dict) or set(item) != {"id", "revision"} \
+                or item.get("id") != identifier \
+                or type(item.get("revision")) is not int or item["revision"] < 1:
+            raise _fail("DPO pair has invalid source trajectory identities")
+        normalized.append((identifier, item["revision"]))
+    if len(set(normalized)) != 2:
+        raise _fail("DPO pair must identify two distinct source trajectories")
+    return tuple(normalized)
+
+
+def _pending_identity(row):
+    return {"id": row["id"], "revision": row["revision"]}
+
+
+def _pending_state_sha256(rows):
+    """Bind every canonical pending row, not only its public identity."""
+    return hashlib.sha256(
+        b"studio-trajectory-pending-v1\0" + _json_bytes(rows)).hexdigest()
+
+
+def partition_pending_for_dataset(pending, balanced, mode):
+    """Split pending rows by actual representation in the final dataset."""
+    if mode not in {"sft", "dpo"}:
+        raise _fail("pending consumption mode must be sft or dpo")
+    pending_by_id = {row["id"]: row for row in pending}
+    consumed_keys = set()
+    if mode == "sft":
+        for sample in balanced:
+            row = pending_by_id.get(sample.get("id"))
+            if row is not None and sample.get("revision") == row["revision"]:
+                consumed_keys.add((row["id"], row["revision"]))
+    else:
+        for pair in balanced:
+            for identifier, revision in _dpo_source_identities(pair):
+                row = pending_by_id.get(identifier)
+                if row is not None and row["revision"] == revision:
+                    consumed_keys.add((identifier, revision))
+    consumed, retained = [], []
+    for row in pending:
+        target = consumed if (row["id"], row["revision"]) in consumed_keys else retained
+        target.append(row)
+    return consumed, retained
 
 
 def dataset_sha256(items, mode):
     if mode not in {"sft", "dpo"}:
         raise _fail("dataset digest mode must be sft or dpo")
-    fields = ("id", "contract", "system", "prompt", "completion", "reward") \
-        if mode == "sft" else \
-        ("id", "contract", "system", "prompt", "chosen", "rejected", "margin")
-    canonical = [{key: item[key] for key in fields} for item in items]
+    if mode == "sft":
+        fields = ("id", "contract", "system", "prompt", "completion", "reward")
+        canonical = [{key: item[key] for key in fields} for item in items]
+    else:
+        fields = ("id", "contract", "system", "prompt", "chosen", "rejected", "margin")
+        canonical = []
+        for item in items:
+            identities = _dpo_source_identities(item)
+            canonical.append({
+                **{key: item[key] for key in fields},
+                "trajectory_identities": [
+                    {"id": identifier, "revision": revision}
+                    for identifier, revision in identities
+                ],
+            })
     return hashlib.sha256(
         b"studio-trajectory-dataset-v1\0" + _json_bytes({"mode": mode, "rows": canonical})
     ).hexdigest()
@@ -1096,9 +1166,15 @@ def _uri_join(base, name):
     return base + separator + name
 
 
-def _manifest(scope, *, cursor, pending, adapter_dir, artifact_sha256,
+def _manifest(scope, *, cursor, pending, consumed_pending, adapter_dir, artifact_sha256,
               dataset_digest, mode, counts, metrics):
     identity = base_identity()
+    pending_identities = [_pending_identity(row) for row in pending]
+    consumed_identities = [_pending_identity(row) for row in consumed_pending]
+    pending_keys = {(item["id"], item["revision"]) for item in pending_identities}
+    consumed_keys = {(item["id"], item["revision"]) for item in consumed_identities}
+    if len(consumed_keys) != len(consumed_identities) or not consumed_keys <= pending_keys:
+        raise _fail("deferred release consumption is not an exact pending subset")
     value = {
         "version": _RELEASE_VERSION,
         "scope": scope,
@@ -1106,7 +1182,9 @@ def _manifest(scope, *, cursor, pending, adapter_dir, artifact_sha256,
         "base_model": identity["training_model"],
         "base_identity": identity,
         "cursor": cursor,
-        "pending": [{"id": row["id"], "revision": row["revision"]} for row in pending],
+        "pending": pending_identities,
+        "pending_sha256": _pending_state_sha256(pending),
+        "consumed_pending": consumed_identities,
         "peft_adapter": os.path.abspath(adapter_dir),
         "peft_sha256": artifact_sha256,
         "dataset_sha256": dataset_digest,
@@ -1193,7 +1271,7 @@ def _validate_recorded_evidence(metrics, *, scope, artifact_sha256,
 
 
 def acknowledge_published_release(token, scope, uri, version, sha256):
-    """Clear a deferred batch only after exact active-registry attestation."""
+    """Consume the trained subset only after exact active-registry attestation."""
     scope = require_complete_policy_scope(resolve_scope(token, scope))
     manifest = _load_manifest(scope)
     uri = str(uri or "").strip()
@@ -1224,10 +1302,27 @@ def acknowledge_published_release(token, scope, uri, version, sha256):
         dataset_sha256=manifest["dataset_sha256"],
         base_identity=manifest["base_identity"])
     cursor, pending = load_state(scope)
-    identity = [{"id": row["id"], "revision": row["revision"]} for row in pending]
-    if cursor != manifest["cursor"] or identity != manifest["pending"]:
+    pending_identities = [_pending_identity(row) for row in pending]
+    if cursor != manifest["cursor"] or pending_identities != manifest.get("pending") \
+            or _pending_state_sha256(pending) != manifest.get("pending_sha256"):
         raise _fail("retained cursor/pending batch changed since deferred training")
-    save_state(scope, cursor, [])
+    consumed_identities = manifest.get("consumed_pending")
+    if not isinstance(consumed_identities, list):
+        raise _fail("deferred release has no exact pending-consumption identity")
+    consumed_keys = set()
+    pending_keys = {(row["id"], row["revision"]) for row in pending}
+    for item in consumed_identities:
+        if not isinstance(item, dict) or set(item) != {"id", "revision"} \
+                or not isinstance(item["id"], str) or not item["id"] \
+                or type(item["revision"]) is not int or item["revision"] < 1:
+            raise _fail("deferred release has malformed pending-consumption identity")
+        key = (item["id"], item["revision"])
+        if key in consumed_keys or key not in pending_keys:
+            raise _fail("deferred release consumption is not an exact pending subset")
+        consumed_keys.add(key)
+    retained = [row for row in pending
+                if (row["id"], row["revision"]) not in consumed_keys]
+    save_state(scope, cursor, retained)
     try:
         os.unlink(state_paths(scope)["release"])
     except OSError:
@@ -1237,7 +1332,9 @@ def acknowledge_published_release(token, scope, uri, version, sha256):
         "version": version, "uri": uri, "sha256": sha256,
         "base_identity": manifest["base_identity"],
         "dataset_sha256": manifest["dataset_sha256"],
-        "cleared_pending": len(pending), "cursor": cursor,
+        "consumed_pending": len(consumed_keys),
+        "retained_pending": len(retained),
+        "cleared_pending": len(consumed_keys), "cursor": cursor,
     }
 
 
@@ -1277,9 +1374,11 @@ def run_once(token, scope, *, dry_run=False, defer_publish=False, tokenizer=None
     pending_usable, _ = preflight_full_context(pending, tokenizer)
     if MODE == "dpo":
         candidates = dpo_candidates(usable)
-        pending_ids = {row["id"] for row in pending_usable}
+        pending_identities = {
+            (row["id"], row["revision"]) for row in pending_usable}
         pending_candidates = [pair for pair in candidates
-                              if pending_ids.intersection(pair["trajectory_ids"])]
+                              if pending_identities.intersection(
+                                  _dpo_source_identities(pair))]
         minimum = MIN_PAIRS_PER_CONTRACT
     else:
         candidates = sft_candidates(usable)
@@ -1304,13 +1403,19 @@ def run_once(token, scope, *, dry_run=False, defer_publish=False, tokenizer=None
         "incoming": len(incoming), "pending": len(pending), "replay": len(replay),
         "preflight_usable": len(usable), "preflight_dropped": dropped,
         "new_counts": new_counts, "selected_new_counts": selected_new_counts,
-        "contract_counts": counts,
+        "contract_counts": counts, "consumed_pending": 0,
+        "retained_pending": len(pending), "pending_consumption_applied": False,
     }
     if not ready:
         summary["reason"] = (
             f"need at least {minimum} new full-context "
             f"{'pairs' if MODE == 'dpo' else 'samples'} for every contract")
         return summary
+    consumed_pending, retained_pending = partition_pending_for_dataset(
+        pending, balanced, MODE)
+    summary.update(
+        consumed_pending=len(consumed_pending),
+        retained_pending=len(retained_pending))
     digest = dataset_sha256(balanced, MODE)
     data_path = _write_jsonl(
         state_paths(scope)["pairs" if MODE == "dpo" else "samples"], balanced)
@@ -1329,11 +1434,13 @@ def run_once(token, scope, *, dry_run=False, defer_publish=False, tokenizer=None
     })
     if defer_publish:
         _manifest(
-            scope, cursor=cursor, pending=pending, adapter_dir=adapter_dir,
+            scope, cursor=cursor, pending=pending, consumed_pending=consumed_pending,
+            adapter_dir=adapter_dir,
             artifact_sha256=artifact_digest, dataset_digest=digest, mode=MODE,
             counts=counts, metrics=training_metrics)
         return {
             **summary, "trained": True, "published": False,
+            "pending_consumption_applied": False,
             "peft_adapter": adapter_dir, "peft_sha256": artifact_digest,
             "release_requires": [
                 "peft_to_served_artifact_conversion", "five_capability_evaluation",
@@ -1359,9 +1466,10 @@ def run_once(token, scope, *, dry_run=False, defer_publish=False, tokenizer=None
             or published.get("base_identity") != identity \
             or type(published.get("version")) is not int or published["version"] < 1:
         raise _fail("adapter registry returned a mismatched publication identity")
-    save_state(scope, cursor, [])
+    save_state(scope, cursor, retained_pending)
     return {
         **summary, "trained": True, "published": True,
+        "pending_consumption_applied": True,
         "adapter": uri, "version": published.get("version"),
         "artifact_sha256": evaluation["artifact_sha256"], "metrics": metrics,
     }
