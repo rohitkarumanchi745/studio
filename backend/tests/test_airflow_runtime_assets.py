@@ -156,6 +156,34 @@ def test_portable_compose_keeps_lightning_token_out_of_public_web():
     assert "http://127.0.0.1:8000/readyz" in web
 
 
+def test_whole_trajectory_training_is_opt_in_scoped_and_separately_routed():
+    compose = (ROOT / "deploy" / "portable" / "compose.yaml").read_text()
+    shared = compose.split("x-studio-runtime:", 1)[1].split("\nservices:", 1)[0]
+    trainer = compose.split("  trajectory-trainer:", 1)[1].split("\nvolumes:", 1)[0]
+
+    assert "STUDIO_TENANT_ID: ${STUDIO_TENANT_ID:?" in shared
+    assert "STUDIO_TRAJECTORY_TRAINING: ${STUDIO_TRAJECTORY_TRAINING:-off}" in shared
+    assert "STUDIO_POLICY_LLM_BASE_URL: ${STUDIO_POLICY_LLM_BASE_URL:-}" in shared
+    assert 'profiles: ["trajectory-training"]' in trainer
+    assert "STUDIO_TRAJECTORY_SCOPE: ${STUDIO_TRAJECTORY_SCOPE:-}" in trainer
+    assert "STUDIO_TRAJECTORY_EVALUATOR_COMMAND:" in trainer
+    assert "STUDIO_TRAJECTORY_EVAL_SUITE_SHA256:" in trainer
+    assert "trajectory-training:/var/lib/studio-trajectory" in trainer
+    assert "STUDIO_AGL_TOKEN" not in trainer
+
+    generator_path = ROOT / "deploy" / "portable" / "generate_env.py"
+    spec = importlib.util.spec_from_file_location("portable_generate_env", generator_path)
+    generator = importlib.util.module_from_spec(spec)
+    assert spec.loader
+    spec.loader.exec_module(generator)
+    values = dict(line.split("=", 1) for line in generator.document().splitlines())
+    assert values["STUDIO_TRAJECTORY_TRAINING"] == "off"
+    assert values["STUDIO_TENANT_ID"].startswith("studio-")
+    assert values["STUDIO_ADMIN_PASSWORD"] == values["STUDIO_TRAINER_PASSWORD"]
+    assert values["STUDIO_POLICY_LLM_BASE_URL"] == ""
+    assert values["STUDIO_POLICY_LLM_API_KEY"]
+
+
 @pytest.mark.parametrize("role", ["init", "api-server", "scheduler", "dag-processor", "triggerer"])
 def test_runtime_accepts_explicit_airflow3_roles(role, tmp_path):
     env = _env(tmp_path, role)

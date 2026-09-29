@@ -297,3 +297,41 @@ def test_example_separates_studio_reader_from_airflow_pipeline_writer():
     text = (KUBE / "secrets.example.yaml").read_text()
     assert "POSTGRES_DSN: postgresql://warehouse_reader:" in text
     assert "AIRFLOW_CONN_STUDIO_POSTGRES: postgresql://warehouse_pipeline_writer:" in text
+
+
+def test_whole_trajectory_trainer_is_an_explicit_zero_replica_example():
+    base = _documents("base/kustomization.yaml")[0]
+    assert "../trajectory-trainer.example.yaml" not in base["resources"]
+
+    config = _resource("base/config.yaml", "ConfigMap", "studio-runtime-config")
+    assert config["data"]["STUDIO_TENANT_ID"] == "studio-system"
+    assert config["data"]["STUDIO_TRAJECTORY_TRAINING"] == "off"
+    assert config["data"]["STUDIO_POLICY_LLM_BASE_URL"] == ""
+
+    pvc = _resource(
+        "trajectory-trainer.example.yaml", "PersistentVolumeClaim",
+        "studio-trajectory-training",
+    )
+    assert pvc["spec"]["accessModes"] == ["ReadWriteOnce"]
+    deployment = _resource(
+        "trajectory-trainer.example.yaml", "Deployment",
+        "studio-trajectory-trainer",
+    )
+    assert deployment["spec"]["replicas"] == 0
+    assert deployment["spec"]["strategy"] == {"type": "Recreate"}
+    pod = deployment["spec"]["template"]["spec"]
+    assert pod["automountServiceAccountToken"] is False
+    trainer = _named(pod["containers"], "trainer")
+    assert trainer["securityContext"]["allowPrivilegeEscalation"] is False
+    assert trainer["securityContext"]["capabilities"]["drop"] == ["ALL"]
+    assert trainer["envFrom"] == [
+        {"configMapRef": {"name": "studio-trajectory-trainer-config"}},
+        {"secretRef": {"name": "studio-trajectory-trainer-secrets"}},
+    ]
+
+    secret = _resource(
+        "secrets.example.yaml", "Secret", "studio-trajectory-trainer-secrets"
+    )
+    assert "STUDIO_TRAINER_PASSWORD" in secret["stringData"]
+    app_secret = _resource("secrets.example.yaml", "Secret", "studio-app-secrets")
+    assert "STUDIO_POLICY_LLM_API_KEY" in app_secret["stringData"]
