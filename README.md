@@ -549,6 +549,16 @@ claiming to have used material it did not read. Source selection is a planning
 input, not a command to clone, import, deploy, or run code from GitHub or
 Confluence. Execution uses newly verified read-only SQL through Studio's data
 gateway, or the separately approved, trusted-compiled Airflow DAG path below.
+Selected file excerpts and page text are sent to the configured planning
+model provider, which may be external; choose only material approved for that
+provider and the intended Studio users.
+The GitHub registry is global: treat eligible files in a registered repo as
+readable by every Studio analyst who can build pipelines. Register only repos
+appropriate for that audience and give `GITHUB_TOKEN` read-only access. Studio
+redacts lines matching common credential markers, but this cannot guarantee
+arbitrary secrets are absent. Likewise, analysts can select pages readable by
+the Confluence service account within the configured spaces; scope that
+account and allowlist accordingly.
 Every drafted read-only step is run
 through `verify_sql` (RBAC + guard + real execution) before you see it, and the
 response separates the two outcomes honestly: **`steps` holds only the steps
@@ -2487,7 +2497,7 @@ you in: the account is created unverified and the emailed 6-digit code
 | `AZURE_REDIRECT_URI` | Entra SSO redirect, default `http://localhost:8000/api/auth/azure/callback` — register that exact URI in the app registration |
 | `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` / `AZURE_GROUP_ROLE_MAP` | Entra SSO + group→role mapping, **and** the Microsoft 365 → KAG extraction layer (dormant until set) |
 | `DATABRICKS_WAREHOUSE_ID` | **Required for the Spark / Jobs flow.** The SQL warehouse that runs a submitted job's `sql_task`s. Unset, a `spark_job` deployment is *refused* before the supervisor is called (`decision: "reject"`, reason naming this variable) rather than posting a body the Jobs API would `400`. Not needed for reading through the Databricks source |
-| `GITHUB_TOKEN` | Read private repos in the GitHub repo registry |
+| `GITHUB_TOKEN` | Optional read-only token for private registered repos. The registry is global to Studio analysts; register only repos whose eligible files they may use as planning context. Credential-line redaction is best effort, not a secret-scanning guarantee |
 | `STUDIO_CONFLUENCE_BASE_URL` | Atlassian Cloud site URL (`https://<site>.atlassian.net`); required to offer Confluence page selection |
 | `STUDIO_CONFLUENCE_EMAIL` / `STUDIO_CONFLUENCE_API_TOKEN` | Service account email and API token for the configured site; keep as server-side secrets, never in prompts or plans |
 | `STUDIO_CONFLUENCE_SPACES` | Comma-separated allowlist of Confluence space keys exposed for page selection; the service account must also have access. All authenticated Studio users who can build a pipeline can select pages in these spaces, so use a narrowly scoped service account and spaces |
