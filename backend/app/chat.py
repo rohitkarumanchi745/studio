@@ -528,6 +528,13 @@ def _answer(ctx, result):
     reply_to = ctx.get("reply_to")
     if not reply_to:
         return db.add_message(ctx["cid"], "assistant", result)
+    # Keep the completed activity available after a refresh without copying
+    # SQL snippets and error details from the owner-only task feed into a
+    # conversation that may later be shared. The task API checks its owner on
+    # every read; this is just an opaque reference to that record.
+    task_id = progress.current()
+    if task_id:
+        result["activity_task_id"] = task_id
     result["reply_to"] = reply_to
     jobs.check_claim()
     mid = db.add_message(ctx["cid"], "assistant", result, reply_to=reply_to)
@@ -2115,8 +2122,15 @@ def _visible_messages(cid, user, access):
     # Redaction keys off the READER's role, never ownership: a viewer who
     # owns a chat and invites an analyst would otherwise inherit whatever
     # the analyst queried into it.
+    messages = db.list_messages(cid)
+    owned_activity = set()
+    if any((m.get("content") or {}).get("activity_task_id") for m in messages):
+        with db.connect() as c:
+            owned_activity = {r["id"] for r in c.execute(
+                "SELECT id FROM chat_tasks WHERE conversation_id=? AND user_id=?",
+                (cid, user["id"])).fetchall()}
     out = []
-    for m in db.list_messages(cid):
+    for m in messages:
         content = m.get("content") or {}
         artifact = content.get("platform_run")
         workflow = content.get("pipeline")
@@ -2166,6 +2180,10 @@ def _visible_messages(cid, user, access):
             }}
         if not m["content"].get("redacted") and m["content"].get("pipeline"):
             m = {**m, "content": _pipeline_diagnostics(m["content"], user["role"])}
+        activity_id = m["content"].get("activity_task_id")
+        if activity_id and activity_id not in owned_activity:
+            m = {**m, "content": {k: v for k, v in m["content"].items()
+                                  if k != "activity_task_id"}}
         out.append(m)
     return out
 

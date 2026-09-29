@@ -1771,7 +1771,9 @@ measurable.
   chart rendering, DAG execution, fan-out fallback / aggregation. Steps are
   appended to the task row (`chat_tasks.steps`, capped) by `progress.py` from the worker running the
   turn and returned by the same `GET /tasks/{id}` poll; reopening a chat
-  mid-run picks the feed back up.
+  mid-run picks the feed back up. Finished answers link to their task's
+  owner-only activity feed, so the expandable activity view survives refresh
+  without copying SQL snippets or errors into shared conversation messages.
 - **Chat folders** — personal, per-user organization of the sidebar: create /
   rename / delete folders, file a chat via its right-click menu, collapsible
   groups with running / unseen indicators. Filing is owner-only and never

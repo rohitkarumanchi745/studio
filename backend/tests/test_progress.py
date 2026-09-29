@@ -35,12 +35,12 @@ def _tables():
     yield
 
 
-def _task(user=USER):
+def _task(user=USER, cid="conv-1", user_message_id=None):
     tid = str(uuid.uuid4())
     c = db._conn()
     c.execute("INSERT INTO chat_tasks (id, conversation_id, user_id, prompt, status, "
-              "seen, created_at) VALUES (?,?,?,?,?,?,?)",
-              (tid, "conv-1", user["id"], "q", "running", 0, time.time()))
+              "seen, user_message_id, created_at) VALUES (?,?,?,?,?,?,?,?)",
+              (tid, cid, user["id"], "q", "running", 0, user_message_id, time.time()))
     c.commit()
     c.close()
     return tid
@@ -91,6 +91,32 @@ def test_feed_is_capped():
 def test_stranger_still_404s_on_the_task():
     tid = _task()
     progress.emit_for(tid, "private step")
+    with pytest.raises(HTTPException) as e:
+        chat.task_status(tid, user=STRANGER)
+    assert e.value.status_code == 404
+
+
+def test_finished_answer_links_owner_only_activity_without_copying_steps(monkeypatch):
+    cid = db.create_conversation(USER["id"], "Activity test")
+    user_mid = db.add_message(cid, "user", {"text": "show revenue"})
+    tid = _task(cid=cid, user_message_id=user_mid)
+    progress.emit_for(tid, "demo agent: running SQL — SELECT secret FROM sales")
+    monkeypatch.setattr(chat.jobs, "check_claim", lambda: None)
+    result = {"text": "Revenue is up.", "author_role": USER["role"]}
+    progress.bind(tid)
+    try:
+        chat._answer({"cid": cid, "reply_to": user_mid}, result)
+    finally:
+        progress.bind(None)
+
+    stored = db.list_messages(cid)[-1]["content"]
+    assert stored["activity_task_id"] == tid
+    assert "activity_steps" not in stored
+    assert "SELECT secret" not in str(stored)
+    assert chat._visible_messages(cid, USER, "owner")[-1]["content"]["activity_task_id"] == tid
+    # A shared reader may see this answer, but only its author can open the
+    # task feed; even the opaque task reference is omitted for other readers.
+    assert "activity_task_id" not in chat._visible_messages(cid, STRANGER, "view")[-1]["content"]
     with pytest.raises(HTTPException) as e:
         chat.task_status(tid, user=STRANGER)
     assert e.value.status_code == 404
