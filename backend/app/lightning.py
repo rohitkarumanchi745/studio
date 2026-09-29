@@ -458,13 +458,18 @@ def record_pipeline_outcome(user, *, run_id, prompt, source, action, status,
         tid = str(uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(
             ["studio-pipeline-outcome", str(user["id"]), str(run_id)])))
         meta = {"action": action, "run_id": str(run_id), "status": status,
-                "agents": ["Pipeline executor"], "errors": [str(error)[:500]] if error else []}
+                "agents": ["Pipeline executor"], "errors": [str(error)[:500]] if error else [],
+                # Complete bundles/platform payloads are not labels for the
+                # generic one-query tool adapter. Airflow has its own typed
+                # encrypted trajectory below; the other recipes remain local
+                # owner-scoped execution memory only.
+                "global_train_eligible": False}
         if repairs_run_id and str(repairs_run_id) != str(run_id):
             meta["repairs_run_id"] = str(repairs_run_id)
         now = time.time()
         with db.connect() as c:
             revision = db.next_training_revision(c)
-            cur = c.execute(
+            c.execute(
                 "INSERT INTO agent_traces (id,user_id,email,role,conversation_id,prompt,"
                 "mode,source,sql,ok,error,panel_count,duration_ms,reward,reward_source,meta,"
                 "updated_at,training_revision,created_at) "
@@ -474,11 +479,43 @@ def record_pipeline_outcome(user, *, run_id, prompt, source, action, status,
                  int(success), str(error)[:500] if error else None,
                  len(action.get("steps") or []), duration_ms, 1.0 if success else 0.0,
                  "pipeline_outcome", json.dumps(meta), now, revision, now))
-            if cur.rowcount == 1:
-                # The trace and its delivery job commit together. If the
-                # queue is unavailable, the caller can retry this run id.
-                _enqueue_emit(tid, conn=c)
+            # Keep the observed owner trace local. Sending this complete
+            # pipeline bundle to the generic Agent Lightning tool-policy
+            # stream would mislabel it as a scalar run_sql trajectory.
             c.commit()
+        if kind == "airflow_dag":
+            try:
+                from . import policy_trajectories
+                plan = action["plan"]
+                target_tasks = []
+                for task in plan["tasks"]:
+                    projected = {key: task[key] for key in
+                                 ("id", "name", "source", "sql", "depends_on")}
+                    if task.get("produces"):
+                        projected["produces"] = task["produces"]
+                    target_tasks.append(projected)
+                target = {
+                    "version": 1, "name": plan["name"],
+                    "dag_id": plan["dag_id"], "source": plan["source"],
+                    "schedule": None, "parameters": plan.get("parameters") or {},
+                    "tasks": target_tasks, "missing": [],
+                }
+                contract_input = {"prompt": str(prompt or ""),
+                                  "source": plan["source"]}
+                policy_trajectories.validate_contract_payload(
+                    policy_trajectories.AIRFLOW_DAG, contract_input, target)
+                policy_trajectories.capture(
+                    policy_trajectories.AIRFLOW_DAG, contract_input, target,
+                    user=user, scope=policy_trajectories.training_mode(),
+                    lineage=[str(value) for value in
+                             (run_id, repairs_run_id) if value],
+                    reward=1.0 if success else 0.0,
+                    training_opt_in=True,
+                    metadata={"teacher": "observed_airflow_plan",
+                              "physical_outcome": status})
+            except Exception:
+                # Learning may never change an already observed platform result.
+                pass
         return tid
     except Exception:
         log.warning("pipeline outcome could not be recorded for run %s", run_id, exc_info=True)

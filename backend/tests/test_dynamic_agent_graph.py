@@ -92,9 +92,9 @@ def test_worker_spawns_child_absent_from_seed_in_next_wave_with_bounded_parent_r
     assert "REFERENCE DATA" in child_prompt
     assert '"acct-0"' in child_prompt and '"acct-19"' in child_prompt
     assert '"acct-20"' not in child_prompt and '"acct-54"' not in child_prompt
-    assert "rows (20 of 55)" in child_prompt
+    assert '"rows":[["acct-0"' in child_prompt
     assert "x" * 200 not in child_prompt and "…" in child_prompt
-    assert child_prompt.endswith("Question: price the returned account ids")
+    assert child_prompt.endswith("NODE TASK:\nprice the returned account ids")
 
     assert out["order"] == ["seed", "seed_snowflake"]
     child = out["runtime_plan"]["nodes"][1]

@@ -99,47 +99,39 @@ def test_corrected_success_is_a_new_trace_linked_to_the_failure():
     assert fixed["meta"]["action"] == ACTION
 
 
-def test_configured_delivery_is_atomic_and_idempotent(monkeypatch):
+def test_configured_generic_delivery_does_not_receive_pipeline_bundles(monkeypatch):
     monkeypatch.setenv("STUDIO_AGL_URL", "https://agl.invalid")
     first = record()
     assert record() == first
-    queued = rows("background_jobs")
-    assert len(queued) == 1 and queued[0]["kind"] == "agl_emit"
-    assert json.loads(queued[0]["payload"])["trace_id"] == first
+    assert rows("background_jobs") == []
     assert len(rows("agent_traces")) == 1
+    assert lightning._trace(first)["meta"]["global_train_eligible"] is False
 
 
-def test_failed_enqueue_rolls_back_outcome_and_can_be_retried(monkeypatch):
+def test_generic_delivery_queue_failure_cannot_erase_local_pipeline_outcome(monkeypatch):
     monkeypatch.setenv("STUDIO_AGL_URL", "https://agl.invalid")
-    enqueue = jobs.enqueue
     monkeypatch.setattr(jobs, "enqueue", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("queue unavailable")))
-    assert record() is None
-    assert rows("agent_traces") == []
-    monkeypatch.setattr(jobs, "enqueue", enqueue)
     assert record() is not None
-    assert len(rows("agent_traces")) == len(rows("background_jobs")) == 1
+    assert len(rows("agent_traces")) == 1
+    assert rows("background_jobs") == []
 
 
-def test_concurrent_terminal_callbacks_create_one_trace_and_one_delivery(monkeypatch):
+def test_concurrent_terminal_callbacks_create_one_local_trace(monkeypatch):
     monkeypatch.setenv("STUDIO_AGL_URL", "https://agl.invalid")
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         callbacks = [pool.submit(record) for _ in range(2)]
         ids = [f.result(timeout=10) for f in callbacks]
     assert ids[0] and ids[0] == ids[1]
-    assert len(rows("agent_traces")) == len(rows("background_jobs")) == 1
+    assert len(rows("agent_traces")) == 1
+    assert rows("background_jobs") == []
 
 
-def test_stream_and_agl_events_keep_platform_actions_out_of_scalar_sql():
+def test_platform_actions_stay_out_of_generic_training_stream_and_scalar_sql():
     action = {"type": "platform_run", "target": "airflow", "payload": {"dag_id": "daily_revenue"}}
     tid = record("platform-1:remote-run-7", source="airflow", action=action,
                  repairs_run_id="platform-1:remote-run-6")
     trace = lightning._trace(tid)
-    sample = trainer.stream()["rollouts"][0]
-    assert sample["action"] == action and "sql" not in sample["action"]
-    assert sample["meta"]["action"] == action
-    assert sample["run_id"] == "platform-1:remote-run-7"
-    assert sample["repairs_run_id"] == "platform-1:remote-run-6"
-    assert sample["execution_status"] == "success"
+    assert trainer.stream()["rollouts"] == []
     assert trace["sql"] is None
     schemas = SimpleNamespace(EventCreate=lambda **kwargs: SimpleNamespace(**kwargs))
     events = lightning.trajectory_events(trace, schemas)

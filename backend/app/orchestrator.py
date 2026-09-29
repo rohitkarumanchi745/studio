@@ -20,7 +20,8 @@ import json
 import os
 import re
 
-from . import agent, agent_graph, jobs, lightning, progress, rbac, roster, skills, util
+from . import (agent, agent_graph, jobs, lightning, policy_trajectories,
+               progress, rbac, roster, skills, util)
 from .connectors import all_sources, get_connector
 
 MAX_PARALLEL = 6
@@ -124,6 +125,7 @@ def run_orchestrated(prompt, user, history, model=None, conversation_id=None,
     # for the kill switch.
     graph = None
     plan = None
+    seed_plan = None
     run = None
     if graph_enabled:
         try:
@@ -159,6 +161,14 @@ def run_orchestrated(prompt, user, history, model=None, conversation_id=None,
                 },
             }
         if plan.get("planned"):
+            # Preserve the validated seed topology for outcome-labelled policy
+            # capture. execute() may append dynamic children; those are runtime
+            # delegation outcomes, not a different seed-planning label.
+            seed_plan = {
+                "nodes": [{**node, "depends_on": list(node.get("depends_on") or [])}
+                          for node in plan["nodes"]],
+                "combine": plan.get("combine", "reason"),
+            }
             formation = plan.get("formation") or {}
             council = formation.get("planners") or []
             if council:
@@ -220,7 +230,8 @@ def run_orchestrated(prompt, user, history, model=None, conversation_id=None,
     progress.emit("Aggregator: synthesizing one answer from "
                   f"{len(subs)} agents' results")
     reasoner_spec = agent_graph.reasoning_model_spec(spec)
-    text = _aggregate(prompt, subs, user, reasoner_spec)
+    text = _aggregate(prompt, subs, user, reasoner_spec,
+                      conversation_id=conversation_id)
     # The provider can block while the durable background claim is reclaimed.
     # A stale owner may not publish a terminal answer or a training trace.
     jobs.check_claim()
@@ -275,6 +286,26 @@ def run_orchestrated(prompt, user, history, model=None, conversation_id=None,
         user, conversation_id, prompt, roster.AGGREGATOR["name"], "aggregator",
         reward_result, conditioning_prompt=_aggregate_prompt(prompt, subs),
         graph_meta={"aggregate": True})
+
+    if seed_plan is not None:
+        try:
+            graph_input = agent_graph.trajectory_input(prompt, sources)
+            graph_target = agent_graph.trajectory_target(seed_plan)
+            policy_trajectories.validate_contract_payload(
+                policy_trajectories.AGENT_GRAPH, graph_input, graph_target)
+            policy_trajectories.capture(
+                policy_trajectories.AGENT_GRAPH, graph_input, graph_target,
+                user=user, scope=policy_trajectories.training_mode(),
+                lineage=[str(conversation_id)] if conversation_id else [],
+                reward=0.0 if errors else 1.0, training_opt_in=True,
+                metadata={
+                    "teacher": "independent_planner_council",
+                    "physical_outcome": "failed" if errors else "succeeded",
+                })
+        except Exception:
+            # Learning is downstream of the answer and may never make a
+            # completed governed graph fail.
+            pass
 
     executed_subs = [r for r in subs if r.get("_status") != "skipped"]
     planner_agents = [
@@ -357,12 +388,63 @@ Rules:
 - Their charts and tables are already shown to the user as panels; don't paste raw tables.
 - 2–5 sentences, direct, with concrete numbers."""
 
+def _aggregate_contract_input(prompt, subs):
+    """Bounded evidence shared by inference, validation, and capture."""
+    contributions = []
+    for index, sub in enumerate(subs[:policy_trajectories.MAX_EVIDENCE]):
+        node_id = sub.get("_node") or f"{sub.get('_source') or 'source'}_{index + 1}"
+        columns = [str(value) for value in (sub.get("columns") or [])[
+            :policy_trajectories.MAX_COLUMNS]]
+        rows = []
+        for row in (sub.get("rows") or [])[:policy_trajectories.MAX_ROWS_PER_EVIDENCE]:
+            if isinstance(row, dict):
+                rows.append(dict(list(row.items())[:policy_trajectories.MAX_COLUMNS]))
+            else:
+                rows.append(list(row)[:policy_trajectories.MAX_COLUMNS])
+        contributions.append({
+            "id": str(node_id), "source": str(sub.get("_source") or "unknown"),
+            "text": str(sub.get("text") or "")[:2000],
+            "columns": columns, "rows": rows,
+        })
+    return {"prompt": str(prompt or ""), "contributions": contributions}
 
-def _aggregate(prompt, subs, user, spec):
+
+def _grounded_aggregate(input_payload, target_payload):
+    """Apply the canonical grounding gate and exact contribution coverage."""
+    normalized_input, normalized_target = policy_trajectories.validate_contract_payload(
+        policy_trajectories.AGGREGATOR_OUTPUT, input_payload, target_payload)
+    expected = {item["id"] for item in normalized_input["contributions"]}
+    if set(normalized_target["citations"]) != expected:
+        raise policy_trajectories.ContractRejected(
+            "aggregator output must cite every exact contribution once")
+    return normalized_input, normalized_target
+
+
+def _capture_aggregate(user, input_payload, target_payload, conversation_id=None):
+    try:
+        return policy_trajectories.capture(
+            policy_trajectories.AGGREGATOR_OUTPUT, input_payload, target_payload,
+            user=user, scope="user",
+            lineage=[str(conversation_id)] if conversation_id else [],
+            reward=1.0, training_opt_in=True,
+            metadata={"teacher": "frontier_reasoner",
+                      "physical_outcome": "succeeded"})
+    except Exception:
+        return None
+
+
+def _aggregate(prompt, subs, user, spec, conversation_id=None):
     """Reduce: synthesize the independent answers into one. LLM if available,
     else a deterministic per-source summary."""
     named = [s for s in subs if (s.get("text") or "").strip()]
     summary = "\n\n".join(f"**{s['_source']}** — {s['text'].strip()}" for s in named)
+    contract_input = _aggregate_contract_input(prompt, subs)
+
+    # Aggregator inputs contain worker answers and bounded result rows. They are
+    # captured only in the encrypted user scope for offline training/eval; a
+    # newly configured policy endpoint is not an authorization to send that raw
+    # evidence to another destination. The existing reasoner below remains the
+    # only live synthesis path.
 
     # The deployed self-hosted adapter emits guarded tool actions, not prose
     # synthesis. Without a separately configured frontier, deterministic
@@ -386,7 +468,22 @@ def _aggregate(prompt, subs, user, spec):
                             ("user", _aggregate_prompt(prompt, subs))])
         text = reply.content if isinstance(reply.content, str) else "".join(
             b.get("text", "") for b in reply.content if isinstance(b, dict))
-        return text.strip() or summary
+        text = text.strip()
+        if not text:
+            return summary
+        # A frontier answer is useful teacher data only when it is grounded in
+        # the same exact contributions. Provider-error and deterministic
+        # fallbacks never enter the learned policy store.
+        normalized_input = policy_trajectories.normalize_contract_input(
+            policy_trajectories.AGGREGATOR_OUTPUT, contract_input)
+        target = {"version": 1, "text": text,
+                  "citations": [item["id"]
+                                for item in normalized_input["contributions"]]}
+        normalized_input, normalized_target = _grounded_aggregate(
+            contract_input, target)
+        _capture_aggregate(user, normalized_input, normalized_target,
+                           conversation_id)
+        return normalized_target["text"]
     except Exception:
         return summary or "Combined results — see the panels for each database."
 

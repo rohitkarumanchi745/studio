@@ -226,7 +226,7 @@ def test_terminal_success_records_full_dag_for_requester_not_polling_admin(plan,
     assert meta["run_id"] == row["id"] + ":" + json.loads(row["result"])["run_ref"]
     with db.connect() as connection:
         emitted = connection.execute("SELECT * FROM background_jobs WHERE kind='agl_emit'").fetchall()
-    assert len(emitted) == 1
+    assert emitted == []
     supervisor.live_job(row["id"], ANALYST)
     assert len(_traces()) == 1
 

@@ -69,6 +69,7 @@ def test_controller_entrypoint_produces_decision_without_execution_reward(server
     assert first["decision"] == "pending" and not requests
     assert diagnose() == first
     rid = first["rollout_id"]
+    assert server[0].get(f"/api/rollouts/{rid}").json()["rollout"]["is_train"] is False
     run_agent(server, monkeypatch, rid)
     decision = diagnose()
     assert decision["decision"] == "retry" and decision["rollout_id"] == rid
@@ -82,6 +83,11 @@ def test_controller_entrypoint_produces_decision_without_execution_reward(server
 @pytest.mark.parametrize("status,reward", [("failed", 0), ("success", 1)])
 def test_physical_outcome_rewards_same_decision_once(server, monkeypatch, status, reward):
     client, _, _ = server
+    captured = []
+    monkeypatch.setattr(
+        planner, "_capture_decision",
+        lambda user, task, decision, **kwargs: captured.append(
+            (user, task, decision, kwargs)))
     rid = diagnose()["rollout_id"]
     run_agent(server, monkeypatch, rid)
     for _ in range(2):
@@ -89,8 +95,30 @@ def test_physical_outcome_rewards_same_decision_once(server, monkeypatch, status
     events = client.get(f"/api/rollouts/{rid}/events").json()
     assert len(events) == 3
     assert next(e["data"]["value"] for e in events if e["event_type"] == "reward") == reward
+    assert captured and all(item[3]["reward"] == reward for item in captured)
+    assert all(item[3]["outcome"] == ("failed" if not reward else "succeeded")
+               for item in captured)
     with pytest.raises(ValueError, match="cannot change"):
         planner.record_outcome(rid, run_id="child-run", status="success" if status == "failed" else "failed")
+
+
+def test_safe_escalation_is_captured_without_a_child_run(server, monkeypatch):
+    server[2].update(decision="escalate", reason="Human approval is required.")
+    captured = []
+    monkeypatch.setattr(
+        planner, "_capture_decision",
+        lambda user, task, decision, **kwargs: captured.append(
+            (user, task, decision, kwargs)))
+    rid = diagnose()["rollout_id"]
+    run_agent(server, monkeypatch, rid)
+
+    result = diagnose()
+
+    assert result["decision"] == "escalate"
+    assert len(captured) == 1
+    assert captured[0][2]["decision"] == "escalate"
+    assert captured[0][3]["reward"] == 1.0
+    assert captured[0][3]["outcome"] == "escalated"
 
 
 def test_repair_contains_typed_action_not_local_second_model(server, monkeypatch):

@@ -174,6 +174,55 @@ def _task_input(*, prompt, action, error, history, schema, model):
     return payload
 
 
+def _trajectory_input(task):
+    """Project one redacted Lightning diagnostic onto the offline contract."""
+    action = _action_context(task.get("action"))
+    if action["type"] == "airflow_dag":
+        source = action["plan"].get("source")
+    else:
+        sources = {step.get("source") for step in action.get("steps") or []
+                   if step.get("source")}
+        source = next(iter(sources)) if len(sources) == 1 else "multi"
+    history, truncated = _history_context(task.get("history"))
+    return {
+        "prompt": _text(task.get("original_request"), MAX_PROMPT),
+        "source": source,
+        "failed_action": action,
+        "failure": {
+            "state": "failed",
+            "error": _text(task.get("error"), MAX_ERROR),
+            "diagnostics_truncated": bool(task.get("diagnostics_truncated")) or truncated,
+        },
+        "attempt": min(len(history), 100),
+        "history": history,
+    }
+
+
+def _capture_decision(user, task, decision, *, lineage, reward, outcome):
+    """Best-effort private capture; never changes recovery execution."""
+    try:
+        from . import policy_trajectories
+        if policy_trajectories.training_mode() == "off":
+            return None
+        target = {"version": 1, "decision": decision["decision"],
+                  "reason": decision["reason"]}
+        if decision["decision"] == "repair":
+            target["action"] = decision["action"]
+        input_payload = _trajectory_input(task)
+        policy_trajectories.validate_contract_payload(
+            policy_trajectories.RECOVERY_DECISION, input_payload, target)
+        return policy_trajectories.capture(
+            policy_trajectories.RECOVERY_DECISION, input_payload, target,
+            user=user, scope=policy_trajectories.training_mode(),
+            lineage=[str(value) for value in lineage if value],
+            reward=reward, training_opt_in=True,
+            metadata={"physical_outcome": outcome,
+                      "teacher": "agent_lightning",
+                      "live_runtime": "agent_lightning"})
+    except Exception:
+        return None
+
+
 def diagnose(user, *, prompt, action, error, history=None, model=None, request_id=None, schema=None):
     """Enqueue/poll one Lightning agent rollout, without waiting for completion.
 
@@ -200,7 +249,12 @@ def diagnose(user, *, prompt, action, error, history=None, model=None, request_i
         return _escalate("Recovery diagnostics are incomplete or unsupported; human review is required.")
     try:
         schemas = lightning._schemas()
-        create = schemas.RolloutCreate(rollout_id=rollout_id, input=payload, is_train=True,
+        # This rollout performs the live recovery diagnosis.  It is inference,
+        # not a permission to let Agent Lightning train on the diagnostic
+        # payload in its shared store.  A separately encrypted, scoped policy
+        # trajectory is captured only after Studio observes a safe escalation
+        # or the physical child run's terminal outcome.
+        create = schemas.RolloutCreate(rollout_id=rollout_id, input=payload, is_train=False,
             config=schemas.RolloutConfig(timeout_seconds=timeout_seconds(), local=schemas.RolloutLocalConfig(
                 agent_class=AGENT_CLASS, env_map={"STUDIO_RECOVERY_TASK_JSON": "input"})),
             metadata={"mode": "pipeline_recovery", "studio_user_id": str(user["id"]),
@@ -227,6 +281,13 @@ def diagnose(user, *, prompt, action, error, history=None, model=None, request_i
                 if len(decisions) != 1:
                     raise ValueError("Missing or ambiguous agent decision")
                 decision = _decision(json.dumps(decisions[0].get("data")))
+                # Escalation is itself the safe terminal action: it performs no
+                # retry/write and therefore needs no child-run outcome. Retry
+                # and repair labels wait for record_outcome's physical result.
+                if decision["decision"] == "escalate":
+                    _capture_decision(
+                        user, payload, decision, lineage=[rollout_id],
+                        reward=1.0, outcome="escalated")
                 return dict(decision, rollout_id=rollout_id)
             if state not in ("queuing", "running"):
                 raise ValueError("Invalid rollout state")
@@ -327,6 +388,11 @@ def record_outcome(rollout_id, *, run_id, status, error=None):
         response = client.get(f"/api/rollouts/{rollout_id}/events")
         response.raise_for_status()
         events = response.json()
+        decisions = [event for event in events
+                     if event.get("event_type") == DECISION_EVENT]
+        if len(decisions) != 1:
+            raise ValueError("A single recovery decision is required")
+        decision = _decision(json.dumps(decisions[0].get("data")))
         have = [e for e in events if (e.get("data") or {}).get("run_id") == str(run_id)]
         if any(e["event_type"] == OUTCOME_EVENT and e["data"].get("status") != normalized for e in have):
             raise ValueError("A physical run cannot change its recorded terminal outcome")
@@ -339,4 +405,9 @@ def record_outcome(rollout_id, *, run_id, status, error=None):
                 continue
             response = client.post(f"/api/rollouts/{rollout_id}/attempt/{attempt}/events", json=event.model_dump(mode="json"))
             response.raise_for_status()
+        _capture_decision(
+            {"id": str((row.get("metadata") or {}).get("studio_user_id") or "")},
+            row.get("input") or {}, decision,
+            lineage=[rollout_id, str(run_id)], reward=value,
+            outcome=normalized)
     return {"rollout_id": rollout_id, "run_id": str(run_id), "reward": value}

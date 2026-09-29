@@ -164,7 +164,11 @@ def _studio_recovery_create_allowed(raw: dict[str, Any], config: "RuntimeConfig"
     """Verify the one local-Python contract Studio permits on this server."""
     from . import recovery_planner
 
-    if set(raw) != _RECOVERY_TOP_KEYS or raw.get("is_train") is not True:
+    # The executable rollout is a live inference request.  Training examples
+    # are emitted through Studio's typed, encrypted trajectory store after an
+    # observed outcome; accepting is_train=true here would create an unscoped
+    # second training path containing recovery diagnostics.
+    if set(raw) != _RECOVERY_TOP_KEYS or raw.get("is_train") is not False:
         return False
     rollout_id = raw.get("rollout_id")
     if not isinstance(rollout_id, str) or not _RECOVERY_ID_RE.fullmatch(rollout_id):

@@ -52,7 +52,7 @@ def recovery_create():
     task["recovery_rollout_id"] = rollout_id
     return {
         "input": task,
-        "is_train": True,
+        "is_train": False,
         "config": {"timeout_seconds": 300, "local": {
             "agent_class": recovery_planner.AGENT_CLASS,
             "env_map": {"STUDIO_RECOVERY_TASK_JSON": "input"}}, "k8s": None},
@@ -218,6 +218,7 @@ def test_exact_recovery_agent_contract_is_admitted(configured, upstream_ready):
     lambda body: body["metadata"].update(mode="other"),
     lambda body: body["metadata"].update(input_digest="0" * 64),
     lambda body: body.update(rollout_id="studio-recovery-" + str(uuid.uuid4())),
+    lambda body: body.update(is_train=True),
 ])
 def test_executable_rollout_variants_are_rejected_without_persistence(
         configured, upstream_ready, mutation):
