@@ -352,6 +352,23 @@ def test_balancer_requires_and_equalizes_all_five_contracts(tmp_path):
     assert counts[module.CONTRACTS[-1]] == 0
 
 
+def test_balancer_fails_closed_when_required_pending_quota_exceeds_cap(tmp_path):
+    module = _load(tmp_path)
+    rows = []
+    for index, contract in enumerate(module.CONTRACTS):
+        rows.extend([
+            _row(module, contract, index * 10 + 1),
+            _row(module, contract, index * 10 + 2),
+        ])
+
+    balanced, counts = module.balance_contracts(
+        rows, per_contract_cap=1, required_items=rows,
+        min_required_per_contract=2)
+
+    assert balanced == []
+    assert counts == {contract: 2 for contract in module.CONTRACTS}
+
+
 def test_dataset_digest_is_deterministic_and_binds_complete_target(tmp_path):
     module = _load(tmp_path)
     rows = _five(module)
@@ -460,6 +477,105 @@ def _stub_pull(module, monkeypatch, rows, cursor=None):
         "cursor": cursor if cursor is not None else max((r["revision"] for r in rows), default=since),
         "count": len(rows), "has_more": False,
     })
+
+
+@pytest.mark.parametrize("mode,per_contract_cap", [("sft", 2), ("dpo", 1)])
+def test_saturated_replay_reserves_pending_candidates_before_clearing_state(
+        tmp_path, monkeypatch, mode, per_contract_cap):
+    module = _load(tmp_path, {
+        "STUDIO_TRAJECTORY_TRAIN_MODE": mode,
+        "STUDIO_TRAJECTORY_TRAIN_MAX_PER_CONTRACT": str(per_contract_cap),
+    })
+    # Make the historical candidates rank ahead of all pending candidates.
+    # The unconstrained balancer therefore reproduces the previously trained
+    # digest and demonstrates the exact full-cap failure mode deterministically.
+    monkeypatch.setattr(module, "_stable_rank", lambda item: item["id"])
+    old_rows, pending_rows = [], []
+    revision = 1
+    for contract in module.CONTRACTS:
+        if mode == "sft":
+            for suffix in ("a", "b"):
+                old_rows.append(dict(
+                    _row(module, contract, revision, revision=revision),
+                    id=f"a_old_{contract}_{suffix}"))
+                revision += 1
+            pending_rows.append(dict(
+                _row(module, contract, revision, revision=revision),
+                id=f"z_pending_{contract}"))
+            revision += 1
+        else:
+            prompt = f"historical preference for {contract}"
+            old_rows.extend([
+                dict(_row(
+                    module, contract, revision, revision=revision, reward=1.0,
+                    prompt=prompt,
+                    target={"answer": "historical chosen", "version": 1}),
+                    id=f"a_old_{contract}_chosen"),
+                dict(_row(
+                    module, contract, revision + 1, revision=revision + 1,
+                    reward=0.0, prompt=prompt,
+                    target={"answer": "historical rejected", "version": 1}),
+                    id=f"b_old_{contract}_rejected"),
+            ])
+            revision += 2
+            prompt = f"pending preference for {contract}"
+            pending_rows.extend([
+                dict(_row(
+                    module, contract, revision, revision=revision, reward=1.0,
+                    prompt=prompt,
+                    target={"answer": "pending chosen", "version": 1}),
+                    id=f"z_pending_{contract}_chosen"),
+                dict(_row(
+                    module, contract, revision + 1, revision=revision + 1,
+                    reward=0.0, prompt=prompt,
+                    target={"answer": "pending rejected", "version": 1}),
+                    id=f"zz_pending_{contract}_rejected"),
+            ])
+            revision += 2
+
+    old_usable, _ = module.preflight_full_context(old_rows, FakeTokenizer())
+    old_candidates = module.dpo_candidates(old_usable) if mode == "dpo" \
+        else module.sft_candidates(old_usable)
+    old_balanced, _ = module.balance_contracts(old_candidates)
+    old_digest = module.dataset_sha256(old_balanced, mode)
+    module.save_replay(_scope(), old_rows)
+    _stub_pull(module, monkeypatch, pending_rows, cursor=revision)
+
+    adapter = tmp_path / f"{mode}-candidate"
+    adapter.mkdir()
+    (adapter / "adapter.bin").write_bytes(b"weights")
+    selected = {}
+
+    def train(items):
+        selected["items"] = items
+        return str(adapter), {"loss": 0.1}
+
+    monkeypatch.setattr(module, "train_dpo" if mode == "dpo" else "train_sft", train)
+    artifact = "b" * 64
+    monkeypatch.setattr(module, "_tree_sha256", lambda path: artifact)
+    monkeypatch.setattr(module, "evaluate_candidate", lambda *args: {
+        "artifact_sha256": artifact,
+    })
+    monkeypatch.setattr(module, "publish_adapter", lambda token, scope, uri, sha, metrics: {
+        "scope": scope, "kind": module.ADAPTER_KIND, "uri": uri,
+        "sha256": sha, "version": 1,
+    })
+
+    result = module.run_once("token", _scope(), tokenizer=FakeTokenizer())
+
+    trained = selected["items"]
+    pending_ids = {row["id"] for row in pending_rows}
+    assert result["published"] is True
+    assert result["dataset_sha256"] != old_digest
+    assert result["selected_new_counts"] == {
+        contract: 1 for contract in module.CONTRACTS}
+    assert result["contract_counts"] == {
+        contract: per_contract_cap for contract in module.CONTRACTS}
+    if mode == "sft":
+        assert pending_ids <= {item["id"] for item in trained}
+    else:
+        assert all(pending_ids.intersection(item["trajectory_ids"]) for item in trained)
+    assert module.load_state(_scope()) == (revision, [])
 
 
 def test_round_preflights_then_balances_digests_evaluates_and_publishes(

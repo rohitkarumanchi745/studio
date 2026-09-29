@@ -641,22 +641,73 @@ def _stable_rank(row):
     return hashlib.sha256(material).hexdigest()
 
 
-def balance_contracts(items, per_contract_cap=MAX_PER_CONTRACT):
-    """Return equal deterministic coverage of every capability, or no dataset."""
+def _candidate_identity(item):
+    """Return the stable identity used to reserve candidates during balancing."""
+    trajectory_ids = item.get("trajectory_ids")
+    if trajectory_ids is None:
+        trajectory_ids = ()
+    elif not isinstance(trajectory_ids, (list, tuple)) \
+            or not all(isinstance(value, str) and value for value in trajectory_ids):
+        raise _fail("balancer received invalid candidate trajectory identities")
+    return (item.get("contract"), item.get("id"), item.get("revision"),
+            tuple(trajectory_ids))
+
+
+def balance_contracts(items, per_contract_cap=MAX_PER_CONTRACT, *,
+                      required_items=None, min_required_per_contract=0):
+    """Return equal deterministic coverage while reserving new contributions.
+
+    ``required_items`` is the eligible pending subset.  When a replay contract
+    is already at its cap, stable ranking alone could otherwise select only old
+    rows, train an unchanged dataset and then clear pending state.  The
+    configured minimum is therefore selected first for every contract; the
+    remaining equal-width slots are filled from the complete replay corpus.
+    """
     if type(per_contract_cap) is not int or per_contract_cap < 1:
         raise _fail("STUDIO_TRAJECTORY_TRAIN_MAX_PER_CONTRACT must be positive")
+    if type(min_required_per_contract) is not int or min_required_per_contract < 0:
+        raise _fail("minimum required pending contributions must be non-negative")
     groups = {contract: [] for contract in CONTRACTS}
+    identities = set()
+    candidates_by_identity = {}
     for item in items:
         contract = item.get("contract")
         if contract not in groups:
             raise _fail("balancer received an unknown trajectory contract")
+        identity = _candidate_identity(item)
+        if identity in identities:
+            raise _fail("balancer received a duplicate candidate identity")
+        identities.add(identity)
+        candidates_by_identity[identity] = item
         groups[contract].append(item)
+    required_groups = {contract: [] for contract in CONTRACTS}
+    required_identities = set()
+    for item in required_items or ():
+        contract = item.get("contract")
+        if contract not in required_groups:
+            raise _fail("balancer received an unknown required trajectory contract")
+        identity = _candidate_identity(item)
+        if identity in required_identities:
+            raise _fail("balancer received a duplicate required candidate identity")
+        if identity not in identities:
+            raise _fail("required pending candidate is absent from the replay candidates")
+        required_identities.add(identity)
+        required_groups[contract].append(candidates_by_identity[identity])
     if any(not group for group in groups.values()):
         return [], {contract: len(groups[contract]) for contract in CONTRACTS}
     width = min(per_contract_cap, *(len(group) for group in groups.values()))
+    if min_required_per_contract > width or any(
+            len(required_groups[contract]) < min_required_per_contract
+            for contract in CONTRACTS):
+        return [], {contract: len(groups[contract]) for contract in CONTRACTS}
     selected = []
     for contract in CONTRACTS:
-        selected.extend(sorted(groups[contract], key=_stable_rank)[:width])
+        reserved = sorted(required_groups[contract], key=_stable_rank)[
+            :min_required_per_contract]
+        reserved_identities = {_candidate_identity(item) for item in reserved}
+        remainder = [item for item in sorted(groups[contract], key=_stable_rank)
+                     if _candidate_identity(item) not in reserved_identities]
+        selected.extend([*reserved, *remainder[:width - len(reserved)]])
     selected.sort(key=lambda item: (CONTRACTS.index(item["contract"]), _stable_rank(item)))
     return selected, {contract: width for contract in CONTRACTS}
 
@@ -1169,13 +1220,23 @@ def run_once(token, scope, *, dry_run=False, defer_publish=False, tokenizer=None
     new_counts = {contract: 0 for contract in CONTRACTS}
     for item in pending_candidates:
         new_counts[item["contract"]] += 1
-    balanced, counts = balance_contracts(candidates)
-    ready = bool(balanced) and all(new_counts[c] >= minimum for c in CONTRACTS)
+    balanced, counts = balance_contracts(
+        candidates, required_items=pending_candidates,
+        min_required_per_contract=minimum)
+    pending_candidate_ids = {_candidate_identity(item) for item in pending_candidates}
+    selected_new_counts = {contract: 0 for contract in CONTRACTS}
+    for item in balanced:
+        if _candidate_identity(item) in pending_candidate_ids:
+            selected_new_counts[item["contract"]] += 1
+    ready = bool(balanced) \
+        and all(new_counts[c] >= minimum for c in CONTRACTS) \
+        and all(selected_new_counts[c] >= minimum for c in CONTRACTS)
     summary = {
         "trained": False, "mode": MODE, "scope": scope, "cursor": cursor,
         "incoming": len(incoming), "pending": len(pending), "replay": len(replay),
         "preflight_usable": len(usable), "preflight_dropped": dropped,
-        "new_counts": new_counts, "contract_counts": counts,
+        "new_counts": new_counts, "selected_new_counts": selected_new_counts,
+        "contract_counts": counts,
     }
     if not ready:
         summary["reason"] = (
