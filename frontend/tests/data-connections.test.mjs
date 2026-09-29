@@ -17,7 +17,7 @@ const require = createRequire(import.meta.url);
 let hooks = null;
 const bundle = await build({
   stdin: {
-    contents: `export {default as DataConnections, buildTiles, suggestName, planConnections, connectionReadiness, Namespaces, namespaceKey, remainingPickedNamespaces}
+    contents: `export {default as DataConnections, buildTiles, suggestName, planConnections, connectionReadiness, Namespaces, namespaceKey, remainingPickedNamespaces, GithubPanel, githubRegistrationReady}
       from "./src/components/DataConnections.jsx";
       export {metaFor} from "./src/components/sourceCatalog.jsx";`,
     resolveDir: frontend, loader: "jsx",
@@ -36,7 +36,8 @@ compiled.require = (id) => id === "react" ? {
 } : require(id);
 compiled._compile(bundle.outputFiles[0].text, compiled.filename);
 const { DataConnections, buildTiles, suggestName, planConnections, connectionReadiness,
-        Namespaces, namespaceKey, remainingPickedNamespaces, metaFor } = compiled.exports;
+        Namespaces, namespaceKey, remainingPickedNamespaces, GithubPanel,
+        githubRegistrationReady, metaFor } = compiled.exports;
 
 // What the four endpoints answer on a deployment with Postgres configured from
 // the environment, one user-added Snowflake, and S3 keys that were never set.
@@ -59,6 +60,8 @@ const SOURCES = [
   { name: "s3", dialect: "duckdb", configured: false, allowed: false },
   { name: "sales-sf", dialect: "snowflake", configured: true, allowed: true },
 ];
+const REPOS = [{ id: "r1", name: "sales-pipelines", url: "https://github.com/acme/sales-pipelines",
+                 default_branch: "main", description: "Curated SQL examples" }];
 
 const byId = (tiles) => Object.fromEntries(tiles.map((t) => [t.id, t]));
 
@@ -78,6 +81,8 @@ test("every source lands on exactly one tile, and user connections fold into the
   assert.equal(tiles.s3.connectable, false);
   assert.equal(tiles.s3.instances.length, 1);
   assert.equal(tiles.m365.instances.length, 0);
+  assert.equal(tiles.github.instances.length, 0);
+  assert.equal(tiles.github.connectable, false); // not a warehouse connection
 
   // Sources the catalog serves but this bundle has never heard of still render.
   const unknown = byId(buildTiles({ sources: [{ name: "duck_lake", configured: true }] }));
@@ -89,6 +94,9 @@ test("search matches the display name, not just the backend identifier", () => {
   assert.deepEqual(hit.map((t) => t.id), ["postgres"]);
   // "Microsoft 365" is findable even though its id is "m365".
   assert.deepEqual(buildTiles({ types: TYPES, sources: [], q: "microsoft" }).map((t) => t.id), ["m365"]);
+  assert.deepEqual(buildTiles({ repos: REPOS, q: "github" }).map((t) => t.id), ["github"]);
+  assert.equal(buildTiles({ repos: REPOS }).find((t) => t.id === "github").instances[0].name,
+               "sales-pipelines");
   assert.deepEqual(buildTiles({ types: TYPES, sources: SOURCES, q: "zzz" }), []);
 });
 
@@ -101,11 +109,25 @@ test("a new connection never collides with an existing source name", () => {
 });
 
 test("metaFor never returns a hole", () => {
-  for (const id of ["postgres", "m365", "s3", "", null, "something_new"]) {
+  for (const id of ["postgres", "m365", "github", "s3", "", null, "something_new"]) {
     const m = metaFor(id);
     assert.ok(m.label, `no label for ${id}`);
     assert.match(m.color, /^#[0-9a-f]{6}$/);
   }
+  assert.equal(metaFor("github").label, "GitHub");
+});
+
+test("GitHub registration only enables canonical GitHub repository URLs and new names", () => {
+  const form = { name: "sales-pipelines", url: "https://github.com/acme/pipelines", default_branch: "main" };
+  assert.equal(githubRegistrationReady(form), true);
+  assert.equal(githubRegistrationReady({ ...form, url: "https://github.com/acme/pipelines.git" }), true);
+  assert.equal(githubRegistrationReady(form, REPOS), false); // POST would replace its ID
+  for (const url of ["http://github.com/acme/pipelines", "https://github.com.evil.test/acme/pipelines",
+                     "https://github.com/acme/pipelines?token=x", "https://github.com/acme/..",
+                     "https://github.com/acme/.git", "https://github.com/acme/pipelines/subdir"]) {
+    assert.equal(githubRegistrationReady({ ...form, url }), false, url);
+  }
+  assert.equal(githubRegistrationReady({ ...form, default_branch: "../main" }), false);
 });
 
 // ── Rendering ───────────────────────────────────────────────────────────
@@ -132,35 +154,56 @@ function harness(component, props) {
     },
     start() { return effects.map((e) => e()).filter(Boolean); },
     set(index, value) { values[index] = value; },
+    tree() {
+      cursor = 0; memoCursor = 0;
+      hooks = stateHooks;
+      try { return component(props); } finally { hooks = null; }
+    },
   };
 }
 
-// State slot order in DataConnections: sources, types, conns, m365, picked, …
-const S = { sources: 0, types: 1, conns: 2, m365: 3, picked: 4 };
+function findNode(node, predicate) {
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const found = findNode(child, predicate);
+      if (found) return found;
+    }
+  } else if (node && typeof node === "object") {
+    if (predicate(node)) return node;
+    return findNode(node.props?.children, predicate);
+  }
+  return null;
+}
+
+// State slot order in DataConnections: sources, types, conns, m365, picked, …, repos.
+const S = { sources: 0, types: 1, conns: 2, m365: 3, picked: 4, repos: 8 };
 
 async function withApi(routes, work) {
   const originals = { fetch: globalThis.fetch, localStorage: globalThis.localStorage,
-                      window: globalThis.window };
-  const requests = [];
+                      window: globalThis.window, confirm: globalThis.confirm };
+  const requests = [], calls = [];
   globalThis.localStorage = { getItem: (k) => k === "studio_user" ? routes.__user : null };
   globalThis.window = { location: { search: "", pathname: "/", hash: "" },
                         history: { replaceState() {} } };
-  globalThis.fetch = async (url) => {
+  globalThis.fetch = async (url, options = {}) => {
     requests.push(url);
+    calls.push({ url, ...options });
     const key = Object.keys(routes).find((r) => url === `/api${r}`);
     return { status: 200, ok: true, json: async () => routes[key] ?? [] };
   };
   try {
-    await work({ requests, flush: async () => { for (let n = 0; n < 8; n++) await Promise.resolve(); } });
+    await work({ requests, calls, flush: async () => { for (let n = 0; n < 8; n++) await Promise.resolve(); } });
   } finally { Object.assign(globalThis, originals); }
 }
 
 const ADMIN = JSON.stringify({ id: "u1", role: "admin" });
 const ANALYST = JSON.stringify({ id: "u2", role: "analyst" });
+const VIEWER = JSON.stringify({ id: "u3", role: "viewer" });
 
 test("the grid renders a tile per source with an honest status", async () => {
   await withApi({ __user: ADMIN, "/catalog/sources": SOURCES, "/connections/types": TYPES,
-                  "/connections": CONNS, "/m365/status": { configured: true, connected: false } },
+                  "/connections": CONNS, "/m365/status": { configured: true, connected: false },
+                  "/settings/repos": { repos: REPOS } },
     async ({ requests, flush }) => {
       const panel = harness(DataConnections, { onClose() {} });
       panel.render();
@@ -169,7 +212,8 @@ test("the grid renders a tile per source with an honest status", async () => {
       const html = panel.render();
 
       assert.deepEqual(requests.sort(), ["/api/catalog/sources", "/api/connections",
-                                         "/api/connections/types", "/api/m365/status"]);
+                                         "/api/connections/types", "/api/m365/status",
+                                         "/api/settings/repos"]);
       // Section headings, so the grid reads as a map rather than a flat wall.
       assert.match(html, /Databases and warehouses/);
       assert.match(html, /Cloud file storage/);
@@ -179,16 +223,18 @@ test("the grid renders a tile per source with an honest status", async () => {
       assert.match(html, /PostgreSQL<\/span><span class="conn-tile-status">1 connected/);
       // …and S3, which this screen cannot set up, says so instead of vanishing.
       assert.match(html, /Amazon S3<\/span><span class="conn-tile-status">Not configured/);
+      assert.match(html, /GitHub<\/span><span class="conn-tile-status">1 registered/);
       assert.match(html, /conn-tile-off/);
       // Tiles are icon-led: one inline mark each, no missing-image holes.
       assert.equal((html.match(/class="srcicon"/g) || []).length,
-                   buildTiles({ types: TYPES, conns: CONNS, sources: SOURCES }).length);
+                   buildTiles({ types: TYPES, conns: CONNS, sources: SOURCES, repos: REPOS }).length);
     });
 });
 
 test("picking a source asks for that source's fields, and only that source's", async () => {
   await withApi({ __user: ADMIN, "/catalog/sources": SOURCES, "/connections/types": TYPES,
-                  "/connections": CONNS, "/m365/status": { configured: true, connected: false } },
+                  "/connections": CONNS, "/m365/status": { configured: true, connected: false },
+                  "/settings/repos": { repos: REPOS } },
     async ({ flush }) => {
       const panel = harness(DataConnections, { onClose() {} });
       panel.render();
@@ -223,9 +269,27 @@ test("picking a source asks for that source's fields, and only that source's", a
     });
 });
 
+test("GitHub has a distinct admin registration panel, not warehouse credentials", async () => {
+  await withApi({ __user: ADMIN, "/catalog/sources": SOURCES, "/connections/types": TYPES,
+                  "/connections": CONNS, "/m365/status": { configured: false },
+                  "/settings/repos": { repos: REPOS } },
+    async ({ flush }) => {
+      const panel = harness(DataConnections, { onClose() {} });
+      panel.render(); panel.start(); await flush();
+      panel.set(S.picked, "github");
+      const html = panel.render();
+      assert.match(html, /Register repository/);
+      assert.match(html, /GITHUB_TOKEN/);
+      assert.match(html, /not warehouse data connections/);
+      assert.match(html, /Studio analysts and administrators/);
+      assert.doesNotMatch(html, /Test connection|Connection string \(DSN\)/);
+    });
+});
+
 test("a non-admin sees the map of sources but never a credential form", async () => {
   await withApi({ __user: ANALYST, "/catalog/sources": SOURCES,
-                  "/m365/status": { configured: true, connected: false } },
+                  "/m365/status": { configured: true, connected: false },
+                  "/repos": { repos: REPOS } },
     async ({ requests, flush }) => {
       const panel = harness(DataConnections, { onClose() {} });
       panel.render();
@@ -235,6 +299,8 @@ test("a non-admin sees the map of sources but never a credential form", async ()
       // The admin-only endpoints are not even called.
       assert.ok(!requests.includes("/api/connections/types"));
       assert.ok(!requests.includes("/api/connections"));
+      assert.ok(!requests.includes("/api/settings/repos"));
+      assert.ok(requests.includes("/api/repos"));
 
       const html = panel.render();
       assert.match(html, /PostgreSQL/);                 // still sees what exists
@@ -244,7 +310,82 @@ test("a non-admin sees the map of sources but never a credential form", async ()
       const detail = panel.render();
       assert.doesNotMatch(detail, /Connection string|Test connection/);
       assert.match(detail, /An administrator connects sources/);
+
+      panel.set(S.picked, "github");
+      const github = panel.render();
+      assert.match(github, /sales-pipelines/);
+      assert.doesNotMatch(github, /Register repository|GITHUB_TOKEN/);
     });
+});
+
+test("viewers see the GitHub tile but no repository metadata or registration call", async () => {
+  await withApi({ __user: VIEWER, "/catalog/sources": SOURCES,
+                  "/m365/status": { configured: true, connected: false } },
+    async ({ requests, flush }) => {
+      const panel = harness(DataConnections, { onClose() {} });
+      panel.render(); panel.start(); await flush();
+      assert.ok(!requests.includes("/api/repos"));
+      assert.ok(!requests.includes("/api/settings/repos"));
+      const grid = panel.render();
+      assert.match(grid, /GitHub<\/span><span class="conn-tile-status">Ask an admin/);
+      panel.set(S.picked, "github");
+      const detail = panel.render();
+      assert.match(detail, /An administrator registers repositories/);
+      assert.doesNotMatch(detail, /sales-pipelines|GITHUB_TOKEN|Register repository/);
+    });
+});
+
+test("the GitHub panel registers through the admin API without sending a token", async () => {
+  await withApi({ __user: ADMIN, "/settings/repos": { repos: [] } }, async ({ calls }) => {
+    const notes = [];
+    const panel = harness(GithubPanel, {
+      repos: [], isAdmin: true, reload() {}, onNote: (note) => notes.push(note), onError() {},
+    });
+    for (const [placeholder, value] of [["sales-pipelines", "orders"],
+                                        ["https://github.com/org/repo", "https://github.com/acme/orders"],
+                                        ["What pipeline examples live here?", "Curated DAG examples"]]) {
+      const input = findNode(panel.tree(), (n) => n.type === "input" && n.props.placeholder === placeholder);
+      input.props.onChange({ target: { value } });
+    }
+    const button = findNode(panel.tree(), (n) => n.type === "button" &&
+      n.props.children === "＋ Register repository");
+    assert.equal(button.props.disabled, false);
+    await button.props.onClick();
+    const post = calls.find((call) => call.url === "/api/settings/repos" && call.method === "POST");
+    assert.deepEqual(JSON.parse(post.body), {
+      name: "orders", url: "https://github.com/acme/orders", description: "Curated DAG examples",
+      default_branch: "main",
+    });
+    assert.doesNotMatch(JSON.stringify(post), /GITHUB_TOKEN|github_pat_|ghp_/);
+    assert.ok(notes.some((note) => note.includes("registered")));
+  });
+});
+
+test("the GitHub panel removes a registered name using its encoded API path", async () => {
+  await withApi({ __user: ADMIN }, async ({ calls }) => {
+    globalThis.confirm = () => true;
+    const panel = harness(GithubPanel, {
+      repos: [{ ...REPOS[0], name: "sales pipelines" }], isAdmin: true,
+      reload() {}, onNote() {}, onError() {},
+    });
+    const button = findNode(panel.tree(), (n) => n.type === "button" &&
+      n.props["aria-label"] === "Remove sales pipelines");
+    await button.props.onClick();
+    assert.ok(calls.some((call) => call.url === "/api/settings/repos/sales%20pipelines" &&
+      call.method === "DELETE"));
+  });
+});
+
+test("non-admin GitHub panel has no registration or removal mutation controls", async () => {
+  await withApi({ __user: ANALYST }, async ({ calls }) => {
+    const panel = harness(GithubPanel, {
+      repos: REPOS, isAdmin: false, reload() {}, onNote() {}, onError() {},
+    });
+    const tree = panel.tree();
+    assert.equal(findNode(tree, (n) => n.type === "input"), null);
+    assert.equal(findNode(tree, (n) => n.type === "button"), null);
+    assert.equal(calls.length, 0);
+  });
 });
 
 

@@ -4,7 +4,9 @@
 // source's credentials. The form is not hand-written per source: the backend's
 // /connections/types serves a field spec per connectable type and this renders
 // it, so a connector gained on the server shows up here with the right fields
-// and no frontend change. The tile art comes from sourceCatalog.jsx.
+// and no frontend change. GitHub is a separate pipeline-planning context, not
+// a SQL data connector; its registry has a dedicated panel. The tile art comes
+// from sourceCatalog.jsx.
 //
 // The grid deliberately shows sources this screen cannot set up — object stores
 // and the marketing APIs are configured by an operator through environment
@@ -52,7 +54,7 @@ export function suggestName(ctype, taken) {
  * Exported because it is the only real logic on this screen, and a pure
  * function is worth testing directly.
  */
-export function buildTiles({ types = [], conns = [], sources = [], q = "" }) {
+export function buildTiles({ types = [], conns = [], sources = [], repos = [], q = "" }) {
   const byId = new Map();
   const put = (id, extra) => {
     if (!byId.has(id)) {
@@ -63,6 +65,18 @@ export function buildTiles({ types = [], conns = [], sources = [], q = "" }) {
 
   for (const t of types) put(t.ctype, { connectable: true, fields: t.fields, ns: t.ns || {} });
   put("m365");
+  put("github");
+
+  for (const repo of repos) {
+    put("github").instances.push({
+      name: repo.name,
+      url: repo.url,
+      description: repo.description || "",
+      defaultBranch: repo.default_branch || "main",
+      configured: true,
+      kind: "repository",
+    });
+  }
 
   const connByName = new Map(conns.map((c) => [c.name, c]));
   for (const s of sources) {
@@ -100,10 +114,16 @@ export default function DataConnections({ onClose }) {
   const [q, setQ] = useState("");
   const [error, setError] = useState("");
   const [note, setNote] = useState("");
+  const [repos, setRepos] = useState([]);       // configured GitHub planning repositories
 
   function load() {
     api("/catalog/sources").then((d) => setSources(Array.isArray(d) ? d : [])).catch(() => {});
     api("/m365/status").then(setM365).catch(() => setM365({ configured: false }));
+    if (isAdmin) {
+      api("/settings/repos").then((d) => setRepos(d.repos || [])).catch((e) => setError(e.message));
+    } else if (user?.role === "analyst") {
+      api("/repos").then((d) => setRepos(d.repos || [])).catch((e) => setError(e.message));
+    }
     if (isAdmin) {
       api("/connections/types").then((d) => setTypes(Array.isArray(d) ? d : [])).catch(() => {});
       api("/connections").then((d) => setConns(Array.isArray(d) ? d : [])).catch(() => {});
@@ -132,8 +152,8 @@ export default function DataConnections({ onClose }) {
     load();
   }, [isAdmin]);
 
-  const tiles = useMemo(() => buildTiles({ types, conns, sources, q }),
-                        [types, conns, sources, q]);
+  const tiles = useMemo(() => buildTiles({ types, conns, sources, repos, q }),
+                        [types, conns, sources, repos, q]);
 
   const takenNames = useMemo(() => new Set(sources.map((s) => s.name)), [sources]);
   const tile = picked ? tiles.find((t) => t.id === picked) : null;
@@ -158,7 +178,7 @@ export default function DataConnections({ onClose }) {
             <div className="meta">
               {tile
                 ? tile.meta.blurb || `Connect Studio to ${tile.meta.label}.`
-                : "Pick a source. Connected sources appear in the chat picker, and credentials are encrypted at rest — never shown again."}
+                : "Pick a data source or pipeline planning context. Warehouse connections appear in the chat data picker; GitHub repositories are selected when building a pipeline."}
             </div>
           </div>
           <div className="conn-head-right">
@@ -179,7 +199,8 @@ export default function DataConnections({ onClose }) {
 
         <div className="conn-body">
           {!tile ? (
-            <Grid tiles={tiles} onPick={(id) => { setPicked(id); setError(""); setNote(""); }} />
+            <Grid tiles={tiles} isAdmin={isAdmin}
+              onPick={(id) => { setPicked(id); setError(""); setNote(""); }} />
           ) : tile.id === "m365" ? (
             <M365Panel
               state={m365}
@@ -187,6 +208,9 @@ export default function DataConnections({ onClose }) {
               onNote={setNote}
               onError={setError}
             />
+          ) : tile.id === "github" ? (
+            <GithubPanel repos={repos} isAdmin={isAdmin} reload={load}
+              onNote={setNote} onError={setError} />
           ) : tile.connectable && isAdmin ? (
             <ConnectForm
               tile={tile}
@@ -207,7 +231,7 @@ export default function DataConnections({ onClose }) {
 
 // ── The grid ────────────────────────────────────────────────────────────
 
-function Grid({ tiles, onPick }) {
+function Grid({ tiles, isAdmin, onPick }) {
   const groups = CATEGORIES
     .map((c) => ({ ...c, items: tiles.filter((t) => t.meta.category === c.key) }))
     .filter((g) => g.items.length);
@@ -225,7 +249,7 @@ function Grid({ tiles, onPick }) {
             {g.items
               .slice()
               .sort((a, b) => a.meta.label.localeCompare(b.meta.label))
-              .map((t) => <Tile key={t.id} tile={t} onPick={onPick} />)}
+              .map((t) => <Tile key={t.id} tile={t} isAdmin={isAdmin} onPick={onPick} />)}
           </div>
         </section>
       ))}
@@ -233,9 +257,9 @@ function Grid({ tiles, onPick }) {
   );
 }
 
-function Tile({ tile, onPick }) {
+function Tile({ tile, isAdmin, onPick }) {
   const live = tile.instances.filter((i) => i.configured);
-  const dormant = !live.length && !tile.connectable;
+  const dormant = !live.length && !tile.connectable && !(tile.id === "github" && isAdmin);
   return (
     <button
       className={`conn-tile${dormant ? " conn-tile-off" : ""}`}
@@ -245,7 +269,9 @@ function Tile({ tile, onPick }) {
       <SourceIcon id={tile.id} size={36} />
       <span className="conn-tile-name">{tile.meta.label}</span>
       <span className="conn-tile-status">
-        {live.length
+        {tile.id === "github"
+          ? live.length ? `${live.length} registered` : isAdmin ? "Register repository" : "Ask an admin"
+          : live.length
           ? `${live.length} connected`
           : tile.connectable
             ? "Connect"
@@ -632,6 +658,145 @@ function Instances({ tile, onRemove }) {
           )}
         </div>
       ))}
+    </div>
+  );
+}
+
+// ── GitHub: registered, untrusted pipeline planning context ────────────
+
+const GITHUB_URL_RE = /^https:\/\/github\.com\/[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\/([A-Za-z0-9_.-]{1,100})\/?$/;
+const GITHUB_BRANCH_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,119}$/;
+
+export function githubRegistrationReady(form, repos = []) {
+  const name = String(form.name || "").trim();
+  const url = String(form.url || "").trim();
+  const branch = String(form.default_branch || "").trim() || "main";
+  const repoName = GITHUB_URL_RE.exec(url)?.[1] || "";
+  const canonicalRepoName = repoName.endsWith(".git") ? repoName.slice(0, -4) : repoName;
+  return !!name && name.length <= 120 && !repos.some((repo) => repo.name === name)
+    && !!canonicalRepoName && ![".", ".."].includes(canonicalRepoName)
+    && GITHUB_BRANCH_RE.test(branch) && !branch.includes("..")
+    && !branch.includes("//") && !branch.endsWith("/") && !branch.endsWith(".")
+    && branch.split("/").every((part) => !part.startsWith(".") && !part.endsWith(".lock"));
+}
+
+export function GithubPanel({ repos, isAdmin, reload, onNote, onError }) {
+  const [form, setForm] = useState({ name: "", url: "", description: "", default_branch: "main" });
+  const [busy, setBusy] = useState("");
+
+  async function register() {
+    if (!isAdmin || !githubRegistrationReady(form, repos)) return;
+    setBusy("register");
+    onError("");
+    onNote("");
+    try {
+      await api("/settings/repos", {
+        method: "POST",
+        body: JSON.stringify({
+          name: form.name.trim(),
+          url: form.url.trim(),
+          description: form.description.trim(),
+          default_branch: form.default_branch.trim() || "main",
+        }),
+      });
+      setForm({ name: "", url: "", description: "", default_branch: "main" });
+      onNote("Repository registered. Analysts can now select it when building a pipeline.");
+      reload();
+    } catch (e) {
+      onError(e.message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function remove(name) {
+    if (!isAdmin || !confirm(`Remove “${name}” from pipeline planning sources?`)) return;
+    setBusy(name);
+    onError("");
+    onNote("");
+    try {
+      await api(`/settings/repos/${encodeURIComponent(name)}`, { method: "DELETE" });
+      onNote(`Removed “${name}” from future pipeline builds.`);
+      reload();
+    } catch (e) {
+      onError(e.message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  return (
+    <div className="conn-detail">
+      <div className="meta">
+        GitHub repositories provide bounded file excerpts as untrusted planning context for
+        prompt-built pipelines. They are not warehouse data connections, and Studio does not
+        execute code from the repository. Select a registered repository in Chat or Pipelines
+        when building a draft.
+      </div>
+
+      {isAdmin ? (
+        <>
+          <div className="meta">
+            Register an HTTPS github.com repository below. For private repositories, set
+            <code> GITHUB_TOKEN </code>on the Studio server and worker; never enter it in this browser.
+            Registration does not check GitHub access. Studio reads a pinned snapshot when a
+            repository is selected for a build. Registered repositories are selectable by
+            Studio analysts and administrators, so add only repositories suitable for them.
+          </div>
+          <div className="conn-form">
+            <label className="conn-field">
+              <span className="conn-label">Name in Studio</span>
+              <input placeholder="sales-pipelines" value={form.name} disabled={!!busy}
+                onChange={(e) => setForm((prev) => ({ ...prev, name: e.target.value }))} />
+            </label>
+            <label className="conn-field">
+              <span className="conn-label">GitHub repository URL</span>
+              <input type="url" placeholder="https://github.com/org/repo" value={form.url}
+                disabled={!!busy} onChange={(e) => setForm((prev) => ({ ...prev, url: e.target.value }))} />
+            </label>
+            <label className="conn-field">
+              <span className="conn-label">Default branch</span>
+              <input value={form.default_branch} disabled={!!busy}
+                onChange={(e) => setForm((prev) => ({ ...prev, default_branch: e.target.value }))} />
+            </label>
+            <label className="conn-field conn-field-wide">
+              <span className="conn-label">Description (optional)</span>
+              <input placeholder="What pipeline examples live here?" value={form.description}
+                disabled={!!busy} onChange={(e) => setForm((prev) => ({ ...prev, description: e.target.value }))} />
+            </label>
+          </div>
+          {repos.some((repo) => repo.name === form.name.trim()) && (
+            <div className="meta conn-warn">That name is already registered. Choose a new name.</div>
+          )}
+          <div className="m365-actions">
+            <button className="primary" onClick={register}
+              disabled={!!busy || !githubRegistrationReady(form, repos)}>
+              {busy === "register" ? "registering…" : "＋ Register repository"}
+            </button>
+          </div>
+        </>
+      ) : (
+        <div className="meta">An administrator registers repositories. Analysts can select
+          registered repositories when building pipelines.</div>
+      )}
+
+      {repos.length ? (
+        <div className="conn-instances">
+          {repos.map((repo) => (
+            <div key={repo.id || repo.name} className="dbconn-row">
+              <SourceIcon id="github" size={20} />
+              <b>{repo.name}</b>
+              <span className="query-tag">{repo.default_branch || "main"}</span>
+              <span className="meta">{repo.url}{repo.description ? ` — ${repo.description}` : ""}</span>
+              <span className="m365-badge m365-badge-on">registered</span>
+              {isAdmin && (
+                <button className="chip ctx-danger" onClick={() => remove(repo.name)} disabled={!!busy}
+                  aria-label={`Remove ${repo.name}`}>✕</button>
+              )}
+            </div>
+          ))}
+        </div>
+      ) : <div className="meta">No repositories registered yet.</div>}
     </div>
   );
 }
