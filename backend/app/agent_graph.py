@@ -1122,8 +1122,7 @@ def execute(plan, sources, prompt, user, model=None, conversation_id=None,
             pending.clear()
             break
 
-        names = ", ".join(roster.name_for(n["source"]) for n in wave)
-        progress.emit(f"running {len(wave)} agent(s): {names}")
+        progress.emit(f"running {len(wave)} agent(s)")
 
         def _one(node):
             progress.bind(tid)
@@ -1205,7 +1204,7 @@ def execute(plan, sources, prompt, user, model=None, conversation_id=None,
                 progress.emit_for(tid, f"{roster.name_for(node['source'])}: finished "
                                        f"({len(sub.get('rows') or [])} rows)")
             except Exception as e:
-                progress.emit_for(tid, f"{roster.name_for(node['source'])}: failed ({str(e)[:80]})")
+                progress.emit_for(tid, f"{roster.name_for(node['source'])}: failed")
                 sub = {"text": f"(agent error: {e})", "sql": None, "columns": [], "rows": [],
                        "chart": None, "panels": [], "errors": [str(e)],
                        "_source": node["source"], "_node": node["id"],

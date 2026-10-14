@@ -102,7 +102,9 @@ def test_finished_answer_links_owner_only_activity_without_copying_steps(monkeyp
     tid = _task(cid=cid, user_message_id=user_mid)
     progress.emit_for(tid, "demo agent: running SQL — SELECT secret FROM sales")
     monkeypatch.setattr(chat.jobs, "check_claim", lambda: None)
-    result = {"text": "Revenue is up.", "author_role": USER["role"]}
+    result = {"text": "Revenue is up.", "author_role": USER["role"],
+              "graph": {"nodes": [{"id": "secret", "source": "private_warehouse",
+                                   "task": "inspect internal accounts"}]}}
     progress.bind(tid)
     try:
         chat._answer({"cid": cid, "reply_to": user_mid}, result)
@@ -113,10 +115,14 @@ def test_finished_answer_links_owner_only_activity_without_copying_steps(monkeyp
     assert stored["activity_task_id"] == tid
     assert "activity_steps" not in stored
     assert "SELECT secret" not in str(stored)
-    assert chat._visible_messages(cid, USER, "owner")[-1]["content"]["activity_task_id"] == tid
+    owner_content = chat._visible_messages(cid, USER, "owner")[-1]["content"]
+    assert owner_content["activity_task_id"] == tid
+    assert owner_content["graph"] == result["graph"]
     # A shared reader may see this answer, but only its author can open the
     # task feed; even the opaque task reference is omitted for other readers.
-    assert "activity_task_id" not in chat._visible_messages(cid, STRANGER, "view")[-1]["content"]
+    shared_content = chat._visible_messages(cid, STRANGER, "view")[-1]["content"]
+    assert "activity_task_id" not in shared_content
+    assert "graph" not in shared_content
     with pytest.raises(HTTPException) as e:
         chat.task_status(tid, user=STRANGER)
     assert e.value.status_code == 404

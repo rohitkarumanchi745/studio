@@ -556,7 +556,9 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         Args:
             sql: A single SELECT (or WITH...SELECT) statement. No DML/DDL.
         """
-        progress.emit_for(_tid, f"{_me}: running SQL on {connector.name} — {sql[:80]}")
+        # Activity is retained after the turn. Keep executable SQL out of the
+        # progress feed; the governed answer and audit log own the query text.
+        progress.emit_for(_tid, f"{_me}: running SQL on {connector.name}")
         # The gateway derives the table allowlist from this user's role itself;
         # `allowed_tables` here only shapes the prompt. Each call (rejected or
         # not) leaves its own audit row under the action "agent_sql".
@@ -590,7 +592,7 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
             x: Column for the x axis / category / label / source dimension.
             y: Numeric column(s) to plot; special shapes noted per type above.
         """
-        progress.emit_for(_tid, f"{_me}: rendering a {chart_type} chart — {title[:60]}")
+        progress.emit_for(_tid, f"{_me}: rendering a {chart_type} chart")
         if chart_type not in CHART_TYPES:
             return f"Unsupported chart_type. Use one of: {', '.join(CHART_TYPES)}"
         if ctx["sql"] is None:

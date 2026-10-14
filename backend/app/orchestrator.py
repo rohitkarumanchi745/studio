@@ -174,11 +174,9 @@ def run_orchestrated(prompt, user, history, model=None, conversation_id=None,
             if council:
                 progress.emit(
                     f"{len(council)} independent planner(s) formed a "
-                    f"{len(plan['nodes'])}-agent graph; the server selected "
-                    f"{formation.get('selected') or 'a validated proposal'}")
+                    f"{len(plan['nodes'])}-agent graph")
             else:
-                progress.emit(f"planned {len(plan['nodes'])} agent(s): "
-                              + (plan.get("why") or "").strip())
+                progress.emit(f"planned {len(plan['nodes'])} agent(s)")
         else:
             progress.emit("fanning out to " + ", ".join(
                 roster.name_for(s["connector"].name) for s in sources))
@@ -365,7 +363,7 @@ def _fanout(prompt, sources, user, model):
             progress.emit_for(tid, f"{roster.name_for(conn.name)}: finished "
                                    f"({len(sub.get('rows') or [])} rows)")
         except Exception as e:
-            progress.emit_for(tid, f"{roster.name_for(conn.name)}: failed ({str(e)[:80]})")
+            progress.emit_for(tid, f"{roster.name_for(conn.name)}: failed")
             sub = {"text": f"(agent error: {e})", "sql": None, "columns": [],
                    "rows": [], "chart": None, "panels": [], "errors": [str(e)]}
         sub["_source"] = conn.name

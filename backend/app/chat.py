@@ -2181,9 +2181,14 @@ def _visible_messages(cid, user, access):
         if not m["content"].get("redacted") and m["content"].get("pipeline"):
             m = {**m, "content": _pipeline_diagnostics(m["content"], user["role"])}
         activity_id = m["content"].get("activity_task_id")
-        if activity_id and activity_id not in owned_activity:
+        if activity_id not in owned_activity and (
+                "activity_task_id" in m["content"] or "graph" in m["content"]):
+            # The graph's source names, tasks and planner rationale are part
+            # of this author's activity, not a shared answer. Older messages
+            # may have a graph but no task reference; without an owner record,
+            # hide that graph too rather than granting it by inference.
             m = {**m, "content": {k: v for k, v in m["content"].items()
-                                  if k != "activity_task_id"}}
+                                  if k not in {"activity_task_id", "graph"}}}
         out.append(m)
     return out
 
