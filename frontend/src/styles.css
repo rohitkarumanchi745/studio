@@ -209,6 +209,9 @@ td { color: var(--ink-2); }
   flex: none; width: 9px; height: 9px; border-radius: 50%; background: var(--ok);
 }
 .activity-indicator.is-running { background: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); animation: activity-pulse 1.4s ease-in-out infinite; }
+.activity-indicator.is-failed { background: var(--bad); }
+.agent-activity-panel.is-failed .activity-current { color: var(--bad); }
+.agent-activity-panel.is-failed .activity-event:last-child::before { border-color: var(--bad); background: var(--bad); }
 @keyframes activity-pulse { 50% { box-shadow: 0 0 0 6px var(--accent-soft); } }
 .activity-summary-text { display: flex; flex: 1; flex-direction: column; min-width: 0; gap: 1px; }
 .activity-summary-text strong { color: var(--ink); font-size: 13px; font-weight: 600; }

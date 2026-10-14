@@ -47,7 +47,7 @@ function elapsedTime(seconds) {
 
 // Task progress is a record of observable work, not the model's reasoning.
 // Completed steps are loaded from the owner-only task endpoint on expansion.
-export function AgentActivity({ steps = [], graph, running = false, taskId, startedAt }) {
+export function AgentActivity({ steps = [], graph, running = false, failed = false, taskId, startedAt }) {
   const [loadedSteps, setLoadedSteps] = useState(null);
   const [loadError, setLoadError] = useState("");
   const [loading, setLoading] = useState(false);
@@ -63,6 +63,10 @@ export function AgentActivity({ steps = [], graph, running = false, taskId, star
   const current = events[events.length - 1]?.label;
   const nodes = Array.isArray(graph?.nodes) ? graph.nodes : [];
   const nodeNames = Object.fromEntries(nodes.map((node) => [node.id, node.agent || node.source || node.id]));
+  const recorded = events.length
+    ? `${events.length} ${events.length === 1 ? "event" : "events"}`
+    : loadedSteps !== null ? "No recorded events" : "View recorded steps";
+  const summaryStatus = failed ? `Run failed · ${recorded}` : running ? current || "Working…" : recorded;
 
   useEffect(() => {
     if (!running) return undefined;
@@ -88,13 +92,13 @@ export function AgentActivity({ steps = [], graph, running = false, taskId, star
 
   const canShowGraph = running || events.length > 0 || loadedSteps !== null;
   return (
-    <details className="agent-activity-panel" open={running} onToggle={onToggle}>
+    <details className={"agent-activity-panel" + (failed ? " is-failed" : "")} open={running} onToggle={onToggle}>
       <summary className="agent-activity-summary">
-        <span className={"activity-indicator" + (running ? " is-running" : "")} aria-hidden="true" />
+        <span className={"activity-indicator" + (running ? " is-running" : failed ? " is-failed" : "")} aria-hidden="true" />
         <span className="activity-summary-text">
           <strong>Agent activity</strong>
           <span className="activity-current" role={running ? "status" : undefined} aria-live={running ? "polite" : undefined}>
-            {running ? current || "Working…" : events.length ? `${events.length} ${events.length === 1 ? "event" : "events"}` : loadedSteps !== null ? "No recorded events" : "View recorded steps"}
+            {summaryStatus}
           </span>
         </span>
         {(running || events.length > 0) && <span className="activity-duration" aria-label={`${duration} elapsed`}>{duration}</span>}
@@ -119,7 +123,7 @@ export function AgentActivity({ steps = [], graph, running = false, taskId, star
           <p className="activity-note">Waiting for the first progress update…</p>
         )}
         {!loading && !loadError && !running && loadedSteps !== null && !events.length && (
-          <p className="activity-note">No progress events were recorded for this answer.</p>
+          <p className="activity-note">No progress events were recorded for this {failed ? "run" : "answer"}.</p>
         )}
         {canShowGraph && nodes.length > 0 && !loadError && (
           <section className="activity-graph" aria-label="Agent graph">
@@ -185,6 +189,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
   const [showPlatform, setShowPlatform] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [failedActivity, setFailedActivity] = useState(null);
   // Live activity: the steps the agent has emitted so far this turn, refreshed
   // by the task poll — so the "thinking" bubble shows what is actually happening.
   const [liveSteps, setLiveSteps] = useState([]);
@@ -200,6 +205,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
   const activeConvRef = useRef(conversationId);
   activeConvRef.current = conversationId;
   const pollingRef = useRef(null); // task id currently being polled (dedup)
+  const taskViewEpochRef = useRef(0); // invalidates an older reopen lookup after a new turn
 
   useEffect(() => {
     api("/catalog/sources").then(setSources).catch(() => {});
@@ -251,7 +257,9 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
   }, [source]);
 
   useEffect(() => {
+    const epoch = ++taskViewEpochRef.current;
     setError("");
+    setFailedActivity(null);
     setBusy(false);
     setLiveSteps([]);
     setActiveStartedAt(null);
@@ -262,20 +270,35 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
     }
     api(`/conversations/${conversationId}/messages`)
       .then((ms) => {
+        if (taskViewEpochRef.current !== epoch || activeConvRef.current !== conversationId) return;
         loadMessages(ms);
         // If a background task is still running here (e.g. after a refresh or a
         // chat switch), resume the live "working…" state. pollFor dedups, so
         // this never double-polls a task send() already started.
         api(`/conversations/${conversationId}/task`)
           .then((t) => {
+            if (taskViewEpochRef.current !== epoch || activeConvRef.current !== conversationId) return;
             if (t.status === "running") {
               setBusy(true);
               pollFor(t.id, conversationId);
+            } else if (t.status === "failed" && t.id) {
+              setError(t.error || "The task failed.");
+              setFailedActivity({taskId: t.id, steps: []});
+              // The latest-task endpoint gives the task ID and error. Fetch
+              // recorded steps from the owner-only task endpoint on reopen.
+              api(`/tasks/${encodeURIComponent(t.id)}`)
+                .then((st) => {
+                  if (taskViewEpochRef.current !== epoch || activeConvRef.current !== conversationId) return;
+                  setFailedActivity({taskId: t.id, steps: Array.isArray(st.steps) ? st.steps : []});
+                  setError(st.error || t.error || "The task failed.");
+                })
+                .catch(() => {}); // the disclosure can retry when opened
             }
           })
           .catch(() => {});
       })
       .catch(() => {
+        if (taskViewEpochRef.current !== epoch || activeConvRef.current !== conversationId) return;
         setMessages([]);
         setCanvas(null);
       });
@@ -289,8 +312,10 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
     e?.preventDefault();
     const q = prompt.trim();
     if (!q || busy) return;
+    taskViewEpochRef.current++;
     setPrompt("");
     setError("");
+    setFailedActivity(null);
     // Optimistically show the question + a working placeholder; the answer is
     // produced in the background, so the user can switch to another chat and
     // start a different task without waiting.
@@ -335,8 +360,10 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
     // may have changed since this pipeline was drafted.
     const pipelineSource = pipeline.source;
     if (!pipelineSource || (!workflow && (pipeline.dropped?.length || !pipeline.steps?.length || pipeline.steps.some((s) => !s.verified || !s.sql)))) return;
+    taskViewEpochRef.current++;
     const q = action === "status" ? "Check pipeline status" : workflow ? "Submit this pipeline" : "Run this pipeline";
     setError("");
+    setFailedActivity(null);
     setMessages((ms) => [...ms, { role: "user", text: q, source: pipelineSource, table: "*" }]);
     setBusy(true);
     setLiveSteps([]);
@@ -363,7 +390,9 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
 
   async function platformAction(fields, text) {
     if (busy) return;
+    taskViewEpochRef.current++;
     setError("");
+    setFailedActivity(null);
     setBusy(true);
     setLiveSteps([]);
     setActiveStartedAt(Date.now());
@@ -384,7 +413,9 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
   // sources side by side (allow_ambiguous skips the check for this ask).
   async function resend(q, opt) {
     if (busy) return;
+    taskViewEpochRef.current++;
     setError("");
+    setFailedActivity(null);
     const both = opt.source === "*";
     // The picker follows the choice both ways, so the toolbar always shows
     // where the question went and where the next typed one will go.
@@ -473,15 +504,19 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
       if (activeConvRef.current === cid && st.status === "done" && Array.isArray(st.steps)) {
         setActivityByTask((saved) => ({...saved, [taskId]: st.steps}));
       }
+      if (activeConvRef.current === cid && st.status === "failed") {
+        setFailedActivity({taskId, steps: Array.isArray(st.steps) ? st.steps : []});
+        setError(st.error || "The task failed.");
+      }
       // Clear the spinner even if the user switched chats — leaving busy set
       // is what made the composer look permanently stuck.
       setBusy(false);
       setLiveSteps([]);
       if (activeConvRef.current === cid) {
         try {
-          handleModelError(loadMessages(await api(`/conversations/${cid}/messages`)));
+          const ms = await api(`/conversations/${cid}/messages`);
+          if (activeConvRef.current === cid) handleModelError(loadMessages(ms));
         } catch { /* keep the optimistic messages rather than blank the view */ }
-        if (st.status === "failed") setError(st.error || "The task failed.");
       }
     };
     setTimeout(tick, 1500);
@@ -643,7 +678,12 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
             <AgentActivity running steps={liveSteps} startedAt={activeStartedAt} />
           </div>
         )}
-        {error && <div className="error">{error}</div>}
+        {!busy && (failedActivity || error) && (
+          <div className="msg">
+            {failedActivity && <AgentActivity key={failedActivity.taskId} failed taskId={failedActivity.taskId} steps={failedActivity.steps} />}
+            {error && <div className="error">{error}</div>}
+          </div>
+        )}
         <div ref={endRef} />
       </div>
 
