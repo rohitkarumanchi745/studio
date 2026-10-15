@@ -18,11 +18,13 @@ VERSION: int = 2
 TRANSFORM_ORDER: tuple = ("derive", "bin", "filters", "unpivot", "group", "having",
                           "table_calc", "top_n", "sort", "pivot", "limit")
 
-# Literal copy of agent.CHART_TYPES order (22 types).
+# Literal copy of agent.CHART_TYPES order (26 types; network, beeswarm,
+# calendar and circle_pack are drawn by the D3 engine).
 CHART_TYPES: tuple = (
     "bar", "hbar", "stacked_bar", "line", "area", "stacked_area", "combo",
     "pie", "donut", "scatter", "bubble", "heatmap", "treemap", "funnel",
     "radar", "gauge", "kpi", "histogram", "boxplot", "waterfall", "sankey",
+    "network", "beeswarm", "calendar", "circle_pack",
     "table",
 )
 

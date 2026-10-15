@@ -630,6 +630,14 @@ td { color: var(--ink-2); }
 .chip-on:disabled { opacity: 1; }
 .vega-fit .vega-embed, .vega-fit .vega-embed .chart-wrapper { width: 100%; height: 100%; }
 .vega-fit canvas { max-width: 100%; }
+.d3-chart { position: relative; overflow: hidden; }
+.d3-chart svg text { font-family: inherit; }
+.d3-tip {
+  position: absolute; pointer-events: none; opacity: 0; transition: opacity .12s;
+  background: var(--surface, #fff); color: var(--ink-2, #4a4844); border: 1px solid var(--line, #e3e1dd);
+  border-radius: 6px; padding: 6px 8px; font-size: 12px; line-height: 1.4;
+  white-space: pre; box-shadow: 0 4px 14px rgba(0, 0, 0, .08); max-width: 260px; overflow: hidden;
+}
 .kpi-card {
   display: flex; flex-direction: column; align-items: center; justify-content: center;
   padding: 36px 16px; margin-top: 6px;

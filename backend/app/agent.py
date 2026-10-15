@@ -31,16 +31,28 @@ from urllib.parse import urlsplit
 from . import db, email_service, gateway, grains, progress
 from .queryguard import QueryRejected
 
-# Full Power BI / Tableau-style catalog (rendered with ECharts client-side)
+# Full Power BI / Tableau-style catalog (rendered with ECharts client-side),
+# plus the types only the D3 engine draws: network, beeswarm, calendar,
+# circle_pack.
 CHART_TYPES = [
     "bar", "hbar", "stacked_bar", "line", "area", "stacked_area", "combo",
     "pie", "donut", "scatter", "bubble", "heatmap", "treemap", "funnel",
     "radar", "gauge", "kpi", "histogram", "boxplot", "waterfall", "sankey",
+    "network", "beeswarm", "calendar", "circle_pack",
     "table",
 ]
 
 # Phrase → type map for prompt edits without an LLM key ("stacked bar chart")
 _CHART_PHRASES = [
+    # The D3 types first, and only as unmistakable chart names: "by ad
+    # network" or "by calendar month" must not turn a chart into a graph.
+    ("network graph", "network"), ("network chart", "network"),
+    ("network diagram", "network"), ("force graph", "network"), ("node graph", "network"),
+    ("beeswarm", "beeswarm"), ("bee swarm", "beeswarm"), ("swarm plot", "beeswarm"),
+    ("calendar heatmap", "calendar"), ("calendar heat map", "calendar"),
+    ("calendar chart", "calendar"), ("calendar view", "calendar"),
+    ("circle pack", "circle_pack"), ("packed circle", "circle_pack"),
+    ("packed bubble", "circle_pack"),
     ("stacked bar", "stacked_bar"), ("stacked column", "stacked_bar"),
     ("stacked area", "stacked_area"), ("horizontal bar", "hbar"),
     ("box plot", "boxplot"), ("donut", "donut"), ("treemap", "treemap"),
@@ -587,7 +599,12 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
                 gauge (single-row value), kpi (single-row big number),
                 histogram (bins y[0]), boxplot (groups x, distribution of y[0]),
                 waterfall (x stages, y[0] deltas), sankey (x source,
-                y=[target, value]), table.
+                y=[target, value]), network (x source, y=[target] or
+                [target, weight] — who connects to whom), beeswarm (y[0]
+                numeric, one dot per row; x a category to split rows),
+                calendar (x a date, y[0] daily value — up to 3 years),
+                circle_pack (x category, y=[size] or [size, parent
+                category]), table.
             title: Short human-readable chart title.
             x: Column for the x axis / category / label / source dimension.
             y: Numeric column(s) to plot; special shapes noted per type above.
@@ -963,8 +980,10 @@ Rules:
 - After a successful query, call render_chart when a visualization would help.
   Pick the form for the job: trends → line/area/stacked_area, comparisons →
   bar/hbar/stacked_bar/combo, shares → pie/donut/treemap/funnel, correlations →
-  scatter/bubble, matrices → heatmap, distributions → histogram/boxplot,
-  bridges → waterfall, flows → sankey, single headline number → kpi/gauge.
+  scatter/bubble, matrices → heatmap, distributions → histogram/boxplot (or
+  beeswarm to show every point), bridges → waterfall, flows → sankey,
+  connections between entities → network, daily patterns → calendar, many
+  small shares → circle_pack, single headline number → kpi/gauge.
 - Multiple views: when the user asks for several breakdowns at once (e.g. day
   level AND month level AND year level), produce one chart per view — repeat
   run_sql then render_chart for each granularity. Each render_chart captures

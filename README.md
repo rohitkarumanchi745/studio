@@ -1845,9 +1845,22 @@ measurable.
 
 ## Visualization
 
-22 chart types across three engines (ECharts default, Plotly, Vega-Lite), with a
-data-shape fit check that hides types the current result can't support. A single
-prompt drives the full **chart spec v2** — one merge patch over data *and* pixels:
+26 chart types across four engines (ECharts default, Plotly, Vega-Lite, D3), with a
+data-shape fit check that hides types the current result can't support. Pick the
+engine per browser from the chart toolbar; a type an engine lacks falls back to
+ECharts. **D3** draws the core types as hand-built SVG and adds four that only it
+draws — whichever engine is picked:
+
+| Type | Data it takes | Good for |
+|---|---|---|
+| `network` | x = source, y = [target] or [target, weight] | who connects to whom — a force-directed graph you can drag apart (Neo4j results, service calls, referrals) |
+| `beeswarm` | y[0] = a number (x = optional category) | a distribution with every point visible, not binned |
+| `calendar` | x = a date, y[0] = the daily value (≤ 3 years) | weekly and seasonal patterns in daily data |
+| `circle_pack` | x = category, y = [size] or [size, parent] | shares across many categories, optionally grouped |
+
+d3 is loaded on demand, like Plotly and Vega, so it costs nothing until a D3
+chart is drawn; chart values are written as text, never markup. A single prompt
+drives the full **chart spec v2** — one merge patch over data *and* pixels:
 
 | Layer | Where | What |
 |---|---|---|

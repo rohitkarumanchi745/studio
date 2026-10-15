@@ -526,7 +526,7 @@ SANITIZED_BAD = ({'v': 2,
 
 VALIDATE_BAD = ["chart type 'rocket' is not one of bar, hbar, stacked_bar, line, area, stacked_area, combo, "
  'pie, donut, scatter, bubble, heatmap, treemap, funnel, radar, gauge, kpi, histogram, '
- 'boxplot, waterfall, sankey, table',
+ 'boxplot, waterfall, sankey, network, beeswarm, calendar, circle_pack, table',
  "derive 'x': unknown function '__import__'",
  "filters column 'nope' does not exist",
  "group by column 'ghost' does not exist",
@@ -693,13 +693,13 @@ MATCH = [[True, False, True, False, False, False, True, False],
 FILTERED = (['order_date', 'region', 'revenue', 'units'],
  [['2024-03-10', 'West', 90, 2], ['2024-03-22', 'North', 60, 1]])
 
-PROMPT_LEN = 10264
+PROMPT_LEN = 10302
 PROMPT_FIRST = 'THE SPEC'
-PROMPT_SHA = '8f0d2ab6ac2500bb4f477746bf441c7c03e2dbbfe5e57c53ab24cd19f6688ff3'
-SCHEMA_SHA = '77a4af3fe74fd3cffd1a4b0aabd00d2683336fd3225ca775b0a8683454e53d9f'
+PROMPT_SHA = 'e9ecd56a084bb9076a80a0f43c9ad486e12300bfcdef3a9223b9672cfa5a7322'
+SCHEMA_SHA = '6f95167a10c41908ded4977785b5b5b97e930e8e653d1ae41484ae63bf60cc32'
 VERSION = 2
 TRANSFORM_ORDER = ('derive', 'bin', 'filters', 'unpivot', 'group', 'having', 'table_calc', 'top_n', 'sort', 'pivot', 'limit')
-CHART_TYPES = ('bar', 'hbar', 'stacked_bar', 'line', 'area', 'stacked_area', 'combo', 'pie', 'donut', 'scatter', 'bubble', 'heatmap', 'treemap', 'funnel', 'radar', 'gauge', 'kpi', 'histogram', 'boxplot', 'waterfall', 'sankey', 'table')
+CHART_TYPES = ('bar', 'hbar', 'stacked_bar', 'line', 'area', 'stacked_area', 'combo', 'pie', 'donut', 'scatter', 'bubble', 'heatmap', 'treemap', 'funnel', 'radar', 'gauge', 'kpi', 'histogram', 'boxplot', 'waterfall', 'sankey', 'network', 'beeswarm', 'calendar', 'circle_pack', 'table')
 OPS = ('eq', 'ne', 'gt', 'gte', 'lt', 'lte', 'in', 'nin', 'between', 'contains', 'ncontains', 'startswith', 'endswith', 'isnull', 'notnull', 'last_n')
 AGGS = ('sum', 'avg', 'min', 'max', 'count', 'count_distinct', 'median', 'p25', 'p75', 'p90', 'stddev', 'first', 'last')
 TABLE_CALCS = ('percent_of_total', 'running_total', 'cumulative_percent', 'difference', 'percent_difference', 'rank', 'dense_rank', 'percentile', 'moving_average', 'index', 'percent_of_max', 'z_score')
