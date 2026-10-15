@@ -88,6 +88,9 @@ class Ask(BaseModel):
     platform_target: Optional[Literal["airflow", "databricks_jobs", "dbt_cloud", "k8s_spark"]] = None
     platform_payload: Optional[dict] = None
     platform_message_id: Optional[str] = None
+    # The D3 & artifacts window: the agent always visualizes, and every chart
+    # in the answer is drawn with D3 (agent.d3_only) — or is a custom visual.
+    visual: bool = False
 
 
 @router.get("/agents")
@@ -329,9 +332,16 @@ def _scope(body, user, before_message_id=None):
         raise HTTPException(400, "Choose a platform action for this job version")
     if body.pipeline_action and (body.platform_action or body.platform_target or body.platform_payload is not None):
         raise HTTPException(400, "Choose either a SQL pipeline action or a platform action")
+    if body.visual and (body.pipeline_action or body.pipeline_mode or body.platform_action
+                        or body.platform_target or body.platform_payload is not None
+                        or body.repository_id or body.confluence_page_ids):
+        raise HTTPException(400, "A D3 & artifacts turn draws an answer; it cannot also "
+                                 "build or run a pipeline or a platform job")
 
     workflow_previous = _workflow_context(body.conversation_id, user, body.pipeline_message_id, before_message_id)
-    workflow_action = chat_workflows.intent(prompt, workflow_previous)
+    # In the D3 & artifacts window every prompt asks for a visual, so commands
+    # that would build or submit work there are read as questions instead.
+    workflow_action = None if body.visual else chat_workflows.intent(prompt, workflow_previous)
     if body.pipeline_action == "build" and body.pipeline_mode:
         # An explicit UI/API mode is authoritative. Airflow accepts arbitrary
         # natural-language requirements without depending on a classifier;
@@ -360,7 +370,7 @@ def _scope(body, user, before_message_id=None):
                 "workflow_action": workflow_action, "workflow_previous": workflow_previous}
 
     previous = _platform_context(body.conversation_id, user, body.platform_message_id, before_message_id)
-    platform_request = chat_platforms.intent(
+    platform_request = None if body.visual else chat_platforms.intent(
         prompt, previous, target=body.platform_target,
         payload=body.platform_payload, action=body.platform_action)
     if platform_request and not body.pipeline_action:
@@ -440,6 +450,8 @@ def _record_user_turn(body, user, scope=None):
     prompt = scope["prompt"]
     # Shared conversation titles must not echo private platform parameters.
     title_prompt = "Platform pipeline" if scope["mode"] in ("platform", "workflow") else prompt
+    if body.visual:                     # never platform/workflow (see _scope)
+        title_prompt = "🎨 " + title_prompt          # marks a D3 & artifacts conversation
     cid, _history = _conversation(body.conversation_id, user, title_prompt)
     if scope["mode"] in ("platform", "workflow"):
         mid = db.add_message(cid, "user", {"text": prompt, "source": "*",
@@ -473,6 +485,7 @@ def _build_ctx(body, user, cid, scope=None, user_message_id=None):
                 "pipeline_message_id": body.pipeline_message_id,
                 "repository_id": body.repository_id,
                 "confluence_page_ids": body.confluence_page_ids or [],
+                "visual": bool(body.visual),
                 "selected_tables": body.tables or ([body.table] if body.table != "*" else None)})
     return ctx
 
@@ -819,6 +832,8 @@ def _pipeline_turn(ctx, user, action, previous):
 
 
 def _attach_pipeline(ctx, user, result):
+    if ctx.get("visual"):
+        return          # the D3 & artifacts window answers with the visual alone
     draft = chat_pipelines.from_result(user, ctx["prompt"], result)
     if draft is not None:
         result["pipeline"] = draft
@@ -834,7 +849,8 @@ def _run_turn(ctx, user):
     if ctx["mode"] == "workflow":
         return _workflow_turn(ctx, user)
     previous = _pipeline_context(ctx, user)
-    action = ctx.get("pipeline_action") or chat_pipelines.intent(prompt, previous)
+    action = ctx.get("pipeline_action") or (
+        None if ctx.get("visual") else chat_pipelines.intent(prompt, previous))
     if action:
         return _pipeline_turn(ctx, user, action, previous)
 
@@ -855,6 +871,8 @@ def _run_turn(ctx, user):
         if clash and ctx.get("allow_ambiguous"):
             result["resolved_tables"] = [c["table"] for c in clash]   # sticky for this chat
         result.setdefault("source", "*")
+        if ctx.get("visual"):
+            agent.d3_only(result)
         result["table"] = "all sources"
         result["matched_tables"] = []
         result["inputs"] = _query_inputs(result)
@@ -878,16 +896,26 @@ def _run_turn(ctx, user):
     connector = ctx["connector"]
     skill_md = skills.get_skill(connector, user["role"], ctx["allowed"], ctx["schemas"])
 
-    def _run(spec, kag_first=False):
+    def _run(spec, kag_first=False, visual=False):
         return agent.run_agent(
             prompt=prompt, connector=connector, table=ctx["table_param"],
             allowed_tables=ctx["allowed"], schemas=ctx["schemas"], history=ctx["history"],
-            user=user, model=spec, skill_md=skill_md, kag_first=kag_first)
+            user=user, model=spec, skill_md=skill_md, kag_first=kag_first,
+            visual_mode=visual)
 
+    if ctx.get("visual"):
+        # The D3 & artifacts window goes straight to the frontier agent: the
+        # semantic layer, the plan cache and BitNet return stock charts and
+        # cannot write a custom visual. (BitNet/KAG are engines, not models,
+        # so the configured frontier model stands in for them here.)
+        progress.emit("drawing the answer with D3")
+        result = _run(None if model in ("bitnet", "kag") else model, visual=True)
+        result.setdefault("served_by", "frontier")
+        agent.d3_only(result)
     # Explicit engine chosen in the model selector: honor it directly, ahead of the
     # automatic tiers. 'bitnet' forces the self-hosted engine; 'kag' forces a
     # documents-first turn grounded in the user's own knowledge collections.
-    if model == "bitnet" and model_router.bitnet_ready(user):
+    elif model == "bitnet" and model_router.bitnet_ready(user):
         progress.emit("routing to the self-hosted BitNet engine")
         # Explicitly choosing BitNet picks WHO answers first, not whether the
         # turn is allowed to fail. The automatic tier below already escalates a

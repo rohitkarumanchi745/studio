@@ -4,7 +4,7 @@ import { api, exchangeSsoCode, getToken, getUser, setSession } from "./api";
 import Activity from "./components/Activity";
 import Agents from "./components/Agents";
 import Autopilot from "./components/Autopilot";
-import Chat from "./components/Chat";
+import Chat, { isVisualConversation } from "./components/Chat";
 import Dashboard from "./components/Dashboard";
 import DashboardList from "./components/DashboardList";
 import Flow from "./components/Flow";
@@ -69,6 +69,24 @@ function ChatPage({ modelsEpoch, onConversationCreated }) {
   );
 }
 
+// "/visuals" and "/visuals/c/:conversationId": the D3 & artifacts window — the
+// same Chat, in visual mode. One element for both routes, for the same reason
+// as ChatPage: the first answer creates the conversation mid-stream.
+function VisualChatPage({ modelsEpoch, onConversationCreated }) {
+  const { conversationId = null } = useParams();
+  const navigate = useNavigate();
+  return (
+    <Chat
+      conversationId={conversationId}
+      onConversationCreated={onConversationCreated}
+      onOpenDashboard={(id) => navigate(id ? `/dashboards/${id}` : "/dashboards")}
+      modelsEpoch={modelsEpoch}
+      visualMode
+      onOpenCharts={() => navigate("/visuals/charts")}
+    />
+  );
+}
+
 function DashboardPage({ user }) {
   const { dashboardId } = useParams();
   const navigate = useNavigate();
@@ -83,6 +101,13 @@ export default function App() {
   const [convsLoaded, setConvsLoaded] = useState(false);
   // The active conversation IS the URL; nothing else may hold it.
   const activeId = useMatch("/c/:conversationId")?.params.conversationId ?? null;
+  // A D3 & artifacts conversation is highlighted in the sidebar too, but kept
+  // out of activeId: that one is restored on reload into the ordinary chat.
+  const visualId = useMatch("/visuals/c/:conversationId")?.params.conversationId ?? null;
+  const openConversation = (id) => {
+    const conv = conversations.find((c) => c.id === id);
+    navigate(isVisualConversation(conv) ? `/visuals/c/${id}` : `/c/${id}`);
+  };
   const onChatRoot = location.pathname === "/";
   const convKey = "studio_conv:" + (user?.id || "");
 
@@ -167,6 +192,12 @@ export default function App() {
       onConversationCreated={(id) => { navigate(`/c/${id}`); refresh(); }}
     />
   );
+  const visualChat = (
+    <VisualChatPage
+      modelsEpoch={modelsEpoch}
+      onConversationCreated={(id) => { navigate(`/visuals/c/${id}`); refresh(); }}
+    />
+  );
 
   return (
     <div className="layout">
@@ -179,14 +210,15 @@ export default function App() {
       {sidebarOpen && (
       <Sidebar
         conversations={conversations}
-        activeId={activeId}
-        onSelect={(id) => navigate(`/c/${id}`)}
+        activeId={activeId || visualId}
+        onSelect={openConversation}
         onNew={home}
         onRefresh={refresh}
         onCollapse={() => setSidebarOpen(false)}
         onDelete={async (id) => {
           await api(`/conversations/${id}`, { method: "DELETE" });
           if (id === activeId) navigate("/");
+          if (id === visualId) navigate("/visuals");
           refresh();
         }}
         onActivity={() => setShowActivity(true)}
@@ -244,8 +276,10 @@ export default function App() {
         <Route path="/semantic" element={<Semantic user={user} onClose={home} />} />
         <Route path="/pipelines" element={<Pipelines onClose={home} />} />
         <Route path="/queries" element={<QueryLibrary onClose={home} />} />
-        <Route path="/visuals"
-               element={<Visuals onClose={home} onOpenChat={(cid) => navigate(`/c/${cid}`)} />} />
+        <Route path="/visuals" element={visualChat} />
+        <Route path="/visuals/c/:conversationId" element={visualChat} />
+        <Route path="/visuals/charts"
+               element={<Visuals onClose={go("/visuals")} onOpenChat={openConversation} />} />
         <Route
           path="/dashboards"
           element={<DashboardList onOpen={(id) => navigate(`/dashboards/${id}`)} onClose={home} />}

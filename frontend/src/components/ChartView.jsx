@@ -35,6 +35,10 @@ const TYPE_GROUPS = [
   ["KPI", ["kpi", "gauge"]],
   ["Data", ["table"]],
 ];
+// The picker in d3Only mode: the same groups, holding only what D3 draws.
+const D3_GROUPS = TYPE_GROUPS
+  .map(([g, ts]) => [g, ts.filter((t) => D3_TYPES.has(t))])
+  .filter(([, ts]) => ts.length);
 export const LABELS = {
   bar: "Bar", hbar: "Horizontal bar", stacked_bar: "Stacked bar", combo: "Combo (bar+line)",
   line: "Line", area: "Area", stacked_area: "Stacked area",
@@ -147,16 +151,20 @@ export default function ChartView({
   // The engine chosen for THIS chart on the Visuals screen; it overrides the
   // browser-wide default (the toolbar can still switch for this session).
   engine: chosenEngine,
+  // The D3 & artifacts window: draw with D3 alone — no engine picker, only
+  // the types D3 draws, and no table standing in for a chart.
+  d3Only = false,
   // Dashboard tile props: identify the tile, apply a cross-filter highlight,
   // report clicks upward, and surface format warnings. All optional.
   tileId, highlight, onSelect, onWarnings,
 }) {
-  const [type, setType] = useState(chart?.type || "table");
-  useEffect(() => setType(chart?.type || "table"), [chart]);
+  const pickType = (t) => (d3Only && !D3_TYPES.has(t) ? "bar" : t || "table");
+  const [type, setType] = useState(pickType(chart?.type));
+  useEffect(() => setType(pickType(chart?.type)), [chart]);
 
   const [engine, setEngine] = useState(
-    chosenEngine || localStorage.getItem("studio_renderer") || "echarts");
-  useEffect(() => { if (chosenEngine) setEngine(chosenEngine); }, [chosenEngine]);
+    d3Only ? "d3" : chosenEngine || localStorage.getItem("studio_renderer") || "echarts");
+  useEffect(() => { if (chosenEngine && !d3Only) setEngine(chosenEngine); }, [chosenEngine, d3Only]);
 
   const spec = useMemo(() => (chart ? { ...chart, type } : null), [chart, type]);
 
@@ -206,7 +214,7 @@ export default function ChartView({
   // The chosen engine draws the chart when it supports the type; otherwise
   // ECharts (which covers the full catalog) steps in.
   const drawEngine =
-    D3_ONLY.has(type) ? "d3"
+    D3_ONLY.has(type) || (d3Only && D3_TYPES.has(type)) ? "d3"
     : engine === "plotly" && PLOTLY_TYPES.has(type) ? "plotly"
     : engine === "vega" && VEGA_TYPES.has(type) ? "vega"
     : engine === "d3" && D3_TYPES.has(type) ? "d3"
@@ -239,6 +247,9 @@ export default function ChartView({
         {visual?.code && (
           <button className="chip" onClick={() => setShowVisual(true)}>✨ custom visual</button>
         )}
+        {d3Only ? (
+          <span className="artifact-badge" title="Everything here is drawn with D3">D3</span>
+        ) : (
         <select
           className="type-select"
           value={engine}
@@ -249,8 +260,9 @@ export default function ChartView({
             <option key={v} value={v}>{l}</option>
           ))}
         </select>
+        )}
         <select className="type-select" value={type} onChange={(e) => setType(e.target.value)}>
-          {TYPE_GROUPS.map(([g, ts]) => (
+          {(d3Only ? D3_GROUPS : TYPE_GROUPS).map(([g, ts]) => (
             <optgroup key={g} label={g}>
               {ts.map((t) => (
                 <option key={t} value={t} title={fit[t]?.reason}>
@@ -265,8 +277,9 @@ export default function ChartView({
       )}
       {!typeOk && (
         <div className="chart-note">
-          {LABELS[type]} doesn’t fit this data — {fit[type]?.reason}. Showing the table;
-          pick a compatible type or reshape the data with a prompt.
+          {LABELS[type]} doesn’t fit this data — {fit[type]?.reason}.
+          {d3Only ? " Pick another D3 chart above, or ask for a custom visual."
+            : " Showing the table; pick a compatible type or reshape the data with a prompt."}
         </div>
       )}
       {plottable && engine !== "echarts" && drawEngine === "echarts" && (
@@ -283,7 +296,7 @@ export default function ChartView({
         <VegaView columns={columns} rows={rows} spec={spec} tall={tall} />
       ) : plottable && drawEngine === "d3" ? (
         <D3View columns={columns} rows={rows} spec={spec} tall={tall} />
-      ) : option ? (
+      ) : d3Only ? null : option ? (
         <Echart option={option} tall={tall} spec={spec} onSelect={onSelect} tileId={tileId} />
       ) : (
         <DataTable columns={columns} rows={rows} />

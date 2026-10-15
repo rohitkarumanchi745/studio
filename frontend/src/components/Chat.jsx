@@ -148,7 +148,16 @@ export function AgentActivity({ steps = [], graph, running = false, failed = fal
   );
 }
 
-export default function Chat({ conversationId, onConversationCreated, onOpenDashboard, modelsEpoch }) {
+/** A D3 & artifacts conversation (its title carries the 🎨 the server gave it). */
+export function isVisualConversation(c) {
+  return typeof c?.title === "string" && c.title.startsWith("🎨");
+}
+
+// visualMode: the D3 & artifacts window. Same agent, sources, history and
+// tasks as the chat — but every answer is visualized, drawn with D3 alone (or
+// as a custom visual the AI writes), and shown right in the thread.
+export default function Chat({ conversationId, onConversationCreated, onOpenDashboard, modelsEpoch,
+                               visualMode = false, onOpenCharts }) {
   const [canvas, setCanvas] = useState(null);
   const [chatOpen, setChatOpen] = useState(true);
   const [models, setModels] = useState([]);
@@ -333,8 +342,8 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
           tables: !orchestrated && sel.length > 1 ? sel : undefined,
           conversation_id: conversationId,
           model: model || undefined,
-          ...chatPipelineFields(buildPipeline, buildAirflow, repositoryId,
-            confluencePageIds),
+          ...(visualMode ? { visual: true } : chatPipelineFields(buildPipeline, buildAirflow,
+            repositoryId, confluencePageIds)),
         }),
       });
       // Building is a one-turn action; follow-ups such as "run this pipeline"
@@ -436,6 +445,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
           conversation_id: conversationId,
           model: model || undefined,
           allow_ambiguous: both,
+          ...(visualMode ? { visual: true } : {}),
         }),
       });
       if (!conversationId) onConversationCreated(data.conversation_id);
@@ -451,9 +461,11 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
     setMessages(loaded);
     // Reopening a conversation restores its charts to the canvas — the
     // visualization is part of the saved conversation, not a transient view.
+    // (The D3 & artifacts window draws them in the thread instead: the canvas
+    // offers every engine, and that window is D3 alone.)
     const last = [...loaded].reverse().find(
       (m) => m.role === "assistant" && (m.panels?.length || (m.chart && m.rows?.length)));
-    setCanvas(last ? buildCanvas(last) : null);
+    setCanvas(last && !visualMode ? buildCanvas(last) : null);
     return loaded;
   }
 
@@ -576,7 +588,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
           💬
         </button>
       )}
-      <main className="chatpane">
+      <main className={"chatpane" + (visualMode ? " visual-chat" : "")}>
       <div className="toolbar">
         <label>Source</label>
         <select value={source} onChange={(e) => setSource(e.target.value)}>
@@ -621,16 +633,34 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
             </div>
           )}
         </div>
+        {visualMode && (
+          <span className="visual-toolbar-right">
+            <span className="artifact-badge">🎨 D3 &amp; artifacts</span>
+            {onOpenCharts && (
+              <button type="button" className="chip" onClick={onOpenCharts}
+                      title="Choose a D3 chart or a custom visual for a chart you already have">
+                ⊞ your charts
+              </button>
+            )}
+          </span>
+        )}
       </div>
 
       <div className="messages">
         {messages.length === 0 && !busy && (
           <div className="empty">
             <div className="empty-title">
-              <span className="brand-mark">◆</span> What do you want to know?
+              {visualMode ? <>🎨 What do you want to see?</>
+                : <><span className="brand-mark">◆</span> What do you want to know?</>}
             </div>
             <div className="empty-sub">
-              {orchestrated
+              {visualMode ? (
+                <>
+                  Describe a visualization of any data source above. Every answer is drawn
+                  with D3 — a D3 chart, or a custom interactive visual the AI writes for it.
+                  {orchestrated && " Pick one source (not all) for custom visuals."}
+                </>
+              ) : orchestrated
                 ? "Ask across every database you can see — agents route the question."
                 : `Ask about ${sel.length ? sel.join(", ") : "your data"} in plain English. The agent writes the SQL, runs it, and charts the answer.`}
             </div>
@@ -669,6 +699,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
                 action === "status" ? "Check this platform job's status" : "Submit this platform job again for approval")}
               busy={busy}
               activitySteps={activityByTask[m.activity_task_id]}
+              visualMode={visualMode}
             />
           )
         )}
@@ -694,7 +725,9 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
             placeholder={
-              orchestrated
+              visualMode
+                ? "Describe the visualization — e.g. “revenue by region as circle packing” or “a custom radial timeline of orders”…"
+                : orchestrated
                 ? "Ask across all your databases — agents route the question…"
                 : tables.length ? `Ask about ${sel.length ? sel.join(", ") : "your data"}…` : "Choose a data source, or ask to run a platform job…"
             }
@@ -716,6 +749,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
             ➤
           </button>
         </div>
+        {!visualMode && (<>
         <label className="composer-pipeline-option">
           <input type="checkbox" checked={buildPipeline} disabled={busy} onChange={(e) => {
             setBuildPipeline(e.target.checked);
@@ -738,13 +772,14 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
         )}
         <button type="button" className="chip" disabled={busy} onClick={() => setShowPlatform((v) => !v)}>Run on Airflow / another platform</button>
         {showPlatform && <PlatformComposer busy={busy} onSubmit={platformAction} onClose={() => setShowPlatform(false)} />}
+        </>)}
       </form>
       </main>
     </div>
   );
 }
 
-export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRunPipeline, onPipelineStatus, onPlatformAction, busy, activitySteps }) {
+export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRunPipeline, onPipelineStatus, onPlatformAction, busy, activitySteps, visualMode = false }) {
   const [showSql, setShowSql] = useState(false);
   const [columns, setColumns] = useState(m.columns);
   const [rows, setRows] = useState(m.rows);
@@ -846,6 +881,18 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
         </div>
         {m.activity_task_id && <AgentActivity key={m.activity_task_id} taskId={m.activity_task_id} steps={activitySteps || []} graph={m.graph} />}
         {m.text && <p className="answer">{m.text}</p>}
+        {/* The D3 & artifacts window draws every chart right in the thread,
+            with D3 alone, under the answer it illustrates. */}
+        {visualMode && (m.panels?.length > 0 || (m.chart && rows?.length > 0)) && (
+          <div className="msg-visuals">
+            {(m.panels?.length ? m.panels : [{ columns, rows, chart: m.chart }]).map((p, i) => (
+              <div key={i} className="msg-visual">
+                <ChartView columns={p.columns} rows={p.rows} chart={p.chart} visual={p.visual}
+                           engine="d3" d3Only tall />
+              </div>
+            ))}
+          </div>
+        )}
         <PlanningSources sources={m.pipeline?.planning_sources} />
         {m.pipeline?.execution_mode === "airflow_dag"
           ? <ChatWorkflow key={m.pipeline.job_id || m.message_id} pipeline={m.pipeline} messageId={m.message_id} busy={busy} onRun={onRunPipeline} onStatus={onPipelineStatus} />
@@ -928,7 +975,8 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
             <div className="meta">▦ {sample.table} — latest data, fetched {sample.at}</div>
             <div className="msg-panels">
               {sample.panels.map((p, i) => (
-                <ChartView key={i} columns={p.columns} rows={p.rows} chart={p.chart} />
+                <ChartView key={i} columns={p.columns} rows={p.rows} chart={p.chart}
+                           {...(visualMode ? { engine: "d3", d3Only: true } : {})} />
               ))}
             </div>
           </div>
@@ -944,7 +992,7 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
             <button className="chip" onClick={emailReport} title="Email this report to yourself">
               ✉ email report
             </button>{" "}
-            {m.chart && (
+            {m.chart && !visualMode && (
               <button className="chip" onClick={onOpenCanvas} title="Open on the main screen">
                 ⤢ canvas
               </button>
@@ -978,7 +1026,7 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
         )}
         {/* Charts always live in the canvas (center stage), never inline in the
             chat column — chat keeps a button to bring this message's view back. */}
-        {(m.panels?.length > 0 || (m.chart && rows?.length > 0)) && (
+        {!visualMode && (m.panels?.length > 0 || (m.chart && rows?.length > 0)) && (
           <button className="chip chart-open" onClick={onOpenCanvas}>
             ⤢ {m.panels?.length > 1 ? `${m.panels.length} charts` : "chart"} in canvas
           </button>

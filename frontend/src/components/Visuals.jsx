@@ -134,14 +134,14 @@ export default function Visuals({ onClose, onOpenChat }) {
     <section className="dashboard visuals-screen">
       <div className="canvas-head">
         <div>
-          <div className="canvas-title">Visuals — D3 &amp; artifacts</div>
+          <div className="canvas-title">Your charts — D3 &amp; artifacts</div>
           <div className="meta">
             Every chart from your chats, drawn every way D3 can. Pick the one each chart
             should use — as a D3 chart type, or a custom visual the AI writes for it.
           </div>
         </div>
         <div className="canvas-actions">
-          <button className="chip" onClick={onClose}>✕ close</button>
+          <button className="chip" onClick={onClose}>← back to the prompt</button>
         </div>
       </div>
 
