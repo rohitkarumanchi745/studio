@@ -1244,6 +1244,21 @@ skill files all apply to it unchanged.
   stored connections lazily, so a UI-added source flows through catalog, RBAC and
   the agent exactly like a built-in one. `connections.py` holds the encrypted
   store and the per-type form contracts.
+- **Built-in sources are managed here too.** The env-configured warehouse
+  sources (`databricks`, `postgres`, `snowflake`, `bigquery`, `neo4j`, `powerbi`)
+  get row actions: **Change** (or **Set up**, when the environment never
+  configured them) points the source at a credential entered on the screen;
+  **Disconnect** / **Reconnect** take it offline and back; **Back to
+  environment** forgets both. The source keeps its **name** throughout, so the
+  roles granted it and the chats, dashboards and pipelines written against it
+  follow it to the new connection — the same operator power as editing the
+  deployment's variables, and admin-only like the rest of this screen. The
+  setting is stored encrypted (`env_source_settings`) and applied inside
+  `connectors.get_connector` / `all_sources`, so every path that reaches a
+  source sees it. A disconnected source — or a replacement whose credential no
+  longer decrypts — is unconfigured and fails closed with its reason; it never
+  falls back to the environment's credential. Databricks Jobs / Spark
+  deployment still reads the `DATABRICKS_*` variables directly.
 
 ### Power BI semantic models
 
@@ -2557,7 +2572,10 @@ you in: the account is created unverified and the emailed 6-digit code
 
 Warehouse credentials (`SNOWFLAKE_*`, `DATABRICKS_*`, `NEO4J_*`, `POWERBI_*`) and the
 marketing connectors are listed in `backend/.env.example`; sources appear in the
-picker automatically once configured. The schema / catalog / dataset variables
+picker automatically once configured — and an admin can change, disconnect or set
+up any of these warehouse sources from **Data connections** without touching the
+variables; a source set there overrides them until **Back to environment**. The
+schema / catalog / dataset variables
 do double duty: they also define the **namespace the query guard accepts** for
 that source — `POSTGRES_SCHEMA` (plus the database named in `POSTGRES_DSN`),
 `SNOWFLAKE_DATABASE` + `SNOWFLAKE_SCHEMA`, `DATABRICKS_CATALOG` +

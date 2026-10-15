@@ -17,7 +17,7 @@ const require = createRequire(import.meta.url);
 let hooks = null;
 const bundle = await build({
   stdin: {
-    contents: `export {default as DataConnections, buildTiles, suggestName, planConnections, connectionReadiness, Namespaces, namespaceKey, remainingPickedNamespaces, GithubPanel, githubRegistrationReady}
+    contents: `export {default as DataConnections, buildTiles, suggestName, planConnections, connectionReadiness, Namespaces, namespaceKey, remainingPickedNamespaces, GithubPanel, githubRegistrationReady, ConnectForm, instanceBadge, envActions}
       from "./src/components/DataConnections.jsx";
       export {metaFor} from "./src/components/sourceCatalog.jsx";`,
     resolveDir: frontend, loader: "jsx",
@@ -37,7 +37,7 @@ compiled.require = (id) => id === "react" ? {
 compiled._compile(bundle.outputFiles[0].text, compiled.filename);
 const { DataConnections, buildTiles, suggestName, planConnections, connectionReadiness,
         Namespaces, namespaceKey, remainingPickedNamespaces, GithubPanel,
-        githubRegistrationReady, metaFor } = compiled.exports;
+        githubRegistrationReady, metaFor, ConnectForm, instanceBadge, envActions } = compiled.exports;
 
 // What the four endpoints answer on a deployment with Postgres configured from
 // the environment, one user-added Snowflake, and S3 keys that were never set.
@@ -193,8 +193,8 @@ function findNode(node, predicate) {
   return null;
 }
 
-// State slot order in DataConnections: sources, types, conns, m365, picked, …, repos.
-const S = { sources: 0, types: 1, conns: 2, m365: 3, picked: 4, repos: 8 };
+// State slot order in DataConnections: sources, types, conns, envs, m365, picked, …, repos.
+const S = { sources: 0, types: 1, conns: 2, envs: 3, m365: 4, picked: 5, repos: 9 };
 
 async function withApi(routes, work) {
   const originals = { fetch: globalThis.fetch, localStorage: globalThis.localStorage,
@@ -229,9 +229,10 @@ test("the grid renders a tile per source with an honest status", async () => {
       await flush();
       const html = panel.render();
 
+      // /connections/env: how each built-in source is set (admin only).
       assert.deepEqual(requests.sort(), ["/api/catalog/sources", "/api/connections",
-                                         "/api/connections/types", "/api/m365/status",
-                                         "/api/settings/repos"]);
+                                         "/api/connections/env", "/api/connections/types",
+                                         "/api/m365/status", "/api/settings/repos"]);
       // Section headings, so the grid reads as a map rather than a flat wall.
       assert.match(html, /Databases and warehouses/);
       assert.match(html, /Cloud file storage/);
@@ -623,4 +624,98 @@ test("a connection form never invites the browser to fill the Studio login", asy
       assert.match(dsn, /autocomplete="new-password"/i);   // HTML attribute names are case-insensitive
       assert.match(schema, /autocomplete="off"/i);
     });
+});
+
+
+// ── Built-in sources, managed from the screen ───────────────────────────
+
+const ENVS = [{ name: "postgres", mode: "environment", hint: "" },
+              { name: "snowflake", mode: "environment", hint: "" }];
+
+test("a built-in source's row offers what an admin can do to it", () => {
+  const tiles = byId(buildTiles({ types: TYPES, conns: CONNS, sources: SOURCES, envs: ENVS }));
+  const pg = tiles.postgres.instances.find((i) => i.name === "postgres");
+  assert.equal(pg.mode, "environment");
+  assert.equal(instanceBadge(pg), "configured by environment");
+  assert.deepEqual(envActions(pg), ["change", "disconnect"]);
+  // Not configured by the environment: it can be set up here instead.
+  const sf = tiles.snowflake.instances.find((i) => i.name === "snowflake");
+  assert.equal(instanceBadge(sf), "not configured");
+  assert.deepEqual(envActions(sf), ["setup"]);
+  // A user connection keeps its own remove and gets none of these.
+  const own = tiles.snowflake.instances.find((i) => i.name === "sales-sf");
+  assert.equal(own.mode, undefined);
+  assert.deepEqual(envActions(own), []);
+  const replaced = { kind: "env", mode: "replaced", configured: true };
+  assert.equal(instanceBadge(replaced), "set up here");
+  assert.deepEqual(envActions(replaced), ["change", "disconnect", "revert"]);
+  const off = { kind: "env", mode: "disconnected", configured: false };
+  assert.equal(instanceBadge(off), "disconnected here");
+  assert.deepEqual(envActions(off), ["reconnect", "revert"]);
+  // Non-admins never load /connections/env: no mode, so no actions.
+  const plain = byId(buildTiles({ types: TYPES, conns: CONNS, sources: SOURCES }));
+  assert.deepEqual(envActions(plain.postgres.instances.find((i) => i.name === "postgres")), []);
+});
+
+test("the built-in row shows its actions on the connect screen", async () => {
+  await withApi({ __user: ADMIN, "/catalog/sources": SOURCES, "/connections/types": TYPES,
+                  "/connections": CONNS, "/connections/env": ENVS,
+                  "/m365/status": { configured: true, connected: false },
+                  "/settings/repos": { repos: REPOS } },
+    async ({ flush }) => {
+      const panel = harness(DataConnections, { onClose() {} });
+      panel.render();
+      panel.start();
+      await flush();
+      panel.set(S.picked, "postgres");
+      const html = panel.render();
+      assert.match(html, /configured by environment/);
+      assert.match(html, /✎ Change/);
+      assert.match(html, /⏸ Disconnect/);
+    });
+});
+
+function connectForm(done = []) {
+  const tile = byId(buildTiles({ types: TYPES, sources: SOURCES, envs: ENVS })).postgres;
+  return harness(ConnectForm, { tile, defaultName: "postgres-2", takenNames: new Set(["postgres"]),
+                                onDone: (m) => done.push(m), onError() {}, onRemoved() {} });
+}
+
+test("Change re-points the built-in source under its own name", async () => {
+  await withApi({ __user: ADMIN }, async ({ calls }) => {
+    const done = [];
+    const panel = connectForm(done);
+    const rows = findNode(panel.tree(), (n) => n.type?.name === "Instances");
+    rows.props.onManage({ name: "postgres", kind: "env", mode: "environment", configured: true },
+                        "change");
+    let tree = panel.tree();
+    // It stays `postgres`: there is no name to choose.
+    assert.equal(findNode(tree, (n) => n.type === "input" && n.props.value === "postgres-2"), null);
+    findNode(tree, (n) => n.type === "input" && n.props.name === "conn-postgres-dsn")
+      .props.onChange({ target: { value: "postgresql://u:p@db.example/sales" } });
+    tree = panel.tree();
+    const save = findNode(tree, (n) => n.type === "button" && n.props.className === "primary");
+    assert.equal(save.props.disabled, false);
+    await save.props.onClick();
+    const put = calls.find((c) => c.url === "/api/connections/env/postgres" && c.method === "PUT");
+    assert.deepEqual(JSON.parse(put.body),
+                     { config: { dsn: "postgresql://u:p@db.example/sales", schema: "public" } });
+    assert.equal(calls.some((c) => c.url === "/api/connections" && c.method === "POST"), false);
+    assert.ok(done[0].includes("“postgres” now reads"));
+  });
+});
+
+test("Disconnect and Back to environment act on the built-in source at once", async () => {
+  await withApi({ __user: ADMIN }, async ({ calls }) => {
+    globalThis.confirm = () => true;
+    const panel = connectForm();
+    const rows = findNode(panel.tree(), (n) => n.type?.name === "Instances");
+    const pg = { name: "postgres", kind: "env", mode: "replaced", configured: true };
+    await rows.props.onManage(pg, "disconnect");
+    await rows.props.onManage(pg, "revert");
+    assert.ok(calls.some((c) => c.url === "/api/connections/env/postgres/disconnect" &&
+                                c.method === "POST"));
+    assert.ok(calls.some((c) => c.url === "/api/connections/env/postgres" &&
+                                c.method === "DELETE"));
+  });
 });

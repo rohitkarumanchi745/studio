@@ -64,7 +64,7 @@ export function suggestName(ctype, taken) {
  * Exported because it is the only real logic on this screen, and a pure
  * function is worth testing directly.
  */
-export function buildTiles({ types = [], conns = [], sources = [], repos = [], q = "" }) {
+export function buildTiles({ types = [], conns = [], sources = [], repos = [], envs = [], q = "" }) {
   const byId = new Map();
   const put = (id, extra) => {
     if (!byId.has(id)) {
@@ -89,6 +89,7 @@ export function buildTiles({ types = [], conns = [], sources = [], repos = [], q
   }
 
   const connByName = new Map(conns.map((c) => [c.name, c]));
+  const envByName = new Map(envs.map((e) => [e.name, e]));
   for (const s of sources) {
     const own = connByName.get(s.name);
     // A user connection whose ctype this bundle doesn't know (server ahead of
@@ -101,7 +102,11 @@ export function buildTiles({ types = [], conns = [], sources = [], repos = [], q
       dialect: s.dialect,
       kind: own || s.ctype ? "user" : "env",
       connId: own?.id,
-      hint: own?.hint || "",
+      hint: own?.hint || envByName.get(s.name)?.hint || "",
+      // How an admin set a built-in source on this screen (/connections/env):
+      // "environment" | "replaced" | "disconnected". Absent for user
+      // connections — and for everyone but admins, who alone can change it.
+      mode: own || s.ctype ? undefined : envByName.get(s.name)?.mode,
     });
   }
 
@@ -119,6 +124,7 @@ export default function DataConnections({ onClose }) {
   const [sources, setSources] = useState([]);   // /catalog/sources — every source
   const [types, setTypes] = useState([]);       // /connections/types — connectable
   const [conns, setConns] = useState([]);       // /connections — user-created
+  const [envs, setEnvs] = useState([]);         // /connections/env — built-in sources' settings
   const [m365, setM365] = useState(null);       // /m365/status
   const [picked, setPicked] = useState(null);   // tile id being viewed, or null
   const [q, setQ] = useState("");
@@ -137,6 +143,7 @@ export default function DataConnections({ onClose }) {
     if (isAdmin) {
       api("/connections/types").then((d) => setTypes(Array.isArray(d) ? d : [])).catch(() => {});
       api("/connections").then((d) => setConns(Array.isArray(d) ? d : [])).catch(() => {});
+      api("/connections/env").then((d) => setEnvs(Array.isArray(d) ? d : [])).catch(() => {});
     }
   }
 
@@ -162,8 +169,8 @@ export default function DataConnections({ onClose }) {
     load();
   }, [isAdmin]);
 
-  const tiles = useMemo(() => buildTiles({ types, conns, sources, repos, q }),
-                        [types, conns, sources, repos, q]);
+  const tiles = useMemo(() => buildTiles({ types, conns, sources, repos, envs, q }),
+                        [types, conns, sources, repos, envs, q]);
 
   const takenNames = useMemo(() => new Set(sources.map((s) => s.name)), [sources]);
   const tile = picked ? tiles.find((t) => t.id === picked) : null;
@@ -391,7 +398,8 @@ export function connectionReadiness({ fields = [], ns = {}, cfg = {}, chosen = [
   };
 }
 
-function ConnectForm({ tile, defaultName, takenNames, onDone, onError, onRemoved }) {
+/** The connect form for one tile. Exported for testing. */
+export function ConnectForm({ tile, defaultName, takenNames, onDone, onError, onRemoved }) {
   const fields = tile.fields || [];
   const ns = tile.ns || {};
   const [name, setName] = useState(defaultName);
@@ -403,6 +411,9 @@ function ConnectForm({ tile, defaultName, takenNames, onDone, onError, onRemoved
   const [landedNames, setLandedNames] = useState([]); // successes from a partial batch
   const [busy, setBusy] = useState("");
   const [progress, setProgress] = useState("");
+  // A built-in source being re-pointed with this form (its name), or "".
+  const [replacing, setReplacing] = useState("");
+  const [rowBusy, setRowBusy] = useState("");
 
   // A credential edit invalidates everything downstream of it.
   function setField(k, v) {
@@ -447,6 +458,7 @@ function ConnectForm({ tile, defaultName, takenNames, onDone, onError, onRemoved
   const chosen = found.filter((n) => picked.includes(key(n)));
 
   async function save() {
+    if (replacing) return saveReplacement();
     setBusy("save");
     onError("");
     const effectiveTaken = new Set([...takenNames, ...landedNames]);
@@ -488,6 +500,63 @@ function ConnectForm({ tile, defaultName, takenNames, onDone, onError, onRemoved
       : `Connected ${done.length} sources — ${done.join(", ")} — each scoped to its own schema.`);
   }
 
+  // Re-point a built-in source. ONE namespace: it stays one source with one
+  // name — the reason to replace instead of adding a second connection.
+  async function saveReplacement() {
+    setBusy("save");
+    onError("");
+    const config = chosen.length === 1
+      ? planConnections({ cfg, ns, name: replacing, chosen })[0].config : cfg;
+    try {
+      await api(`/connections/env/${encodeURIComponent(replacing)}`, {
+        method: "PUT", body: JSON.stringify({ config }),
+      });
+      onDone(`“${replacing}” now reads from the connection entered here — same name, `
+        + "so the roles granted it and the work saved against it follow it.");
+    } catch (e) {
+      onError(e.message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  function startReplacing(sourceName) {
+    setReplacing(sourceName);
+    setCfg(Object.fromEntries(fields.filter((f) => f.default).map((f) => [f.key, f.default])));
+    setTest(null);
+    setBrowse(null);
+    setPicked([]);
+    onError("");
+  }
+
+  // A built-in source's row: Change / Set up opens this form for it; the rest
+  // act at once. Nothing here edits the deployment's environment.
+  async function manage(inst, verb) {
+    if (verb === "change" || verb === "setup") {
+      startReplacing(inst.name);
+      return;
+    }
+    const ask = {
+      disconnect: `Disconnect “${inst.name}”? Chats, dashboards and pipelines that read it stop `
+        + "until it is reconnected. The deployment's environment is left as it is.",
+      revert: `Switch “${inst.name}” back to the deployment's environment settings? `
+        + "What was set up for it here is forgotten.",
+    }[verb];
+    if (ask && !confirm(ask)) return;
+    setRowBusy(`${verb}:${inst.name}`);
+    onError("");
+    try {
+      const path = `/connections/env/${encodeURIComponent(inst.name)}`;
+      await api(verb === "revert" ? path : `${path}/${verb}`,
+                { method: verb === "revert" ? "DELETE" : "POST" });
+      onRemoved();
+    } catch (e) {
+      onError(e.message);
+    } finally {
+      setRowBusy("");
+    }
+  }
+
   async function remove(inst) {
     if (!confirm(`Remove the “${inst.name}” connection? Queries against it will stop working.`)) return;
     try {
@@ -508,7 +577,19 @@ function ConnectForm({ tile, defaultName, takenNames, onDone, onError, onRemoved
 
   return (
     <div className="conn-detail">
-      <Instances tile={tile} onRemove={remove} />
+      <Instances tile={tile} onRemove={remove} onManage={manage} busy={rowBusy} />
+
+      {replacing && (
+        <div className="meta share-notice conn-replacing">
+          Setting up <b>{replacing}</b> here. It keeps its name, so the roles granted it and
+          the chats, dashboards and pipelines that read it follow it to the connection
+          entered below. “Back to environment” on its row undoes this.{" "}
+          <button className="chip" disabled={!!busy}
+            onClick={() => { setReplacing(""); setTest(null); setBrowse(null); setPicked([]); }}>
+            Cancel
+          </button>
+        </div>
+      )}
 
       <div className="conn-form">
         {fields.map((f) => (
@@ -528,16 +609,22 @@ function ConnectForm({ tile, defaultName, takenNames, onDone, onError, onRemoved
             />
           </label>
         ))}
-        <label className="conn-field">
-          <span className="conn-label">
-            {chosen.length > 1 ? "Name these in Studio (prefix)" : "Name it in Studio"}
-          </span>
-          <input value={name} onChange={(e) => setName(e.target.value)}
-                 disabled={!!busy} {...NO_AUTOFILL} autoComplete="off" />
-        </label>
+        {!replacing && (
+          <label className="conn-field">
+            <span className="conn-label">
+              {chosen.length > 1 ? "Name these in Studio (prefix)" : "Name it in Studio"}
+            </span>
+            <input value={name} onChange={(e) => setName(e.target.value)}
+                   disabled={!!busy} {...NO_AUTOFILL} autoComplete="off" />
+          </label>
+        )}
       </div>
 
-      {trimmed && !nameUsable && (
+      {replacing && chosen.length > 1 && (
+        <div className="meta conn-warn">Pick one — “{replacing}” reads exactly one schema.</div>
+      )}
+
+      {!replacing && trimmed && !nameUsable && (
         <div className="meta conn-warn">
           {effectiveTakenNames.has(trimmed) && !chosen.length
             ? `A source named “${trimmed}” already exists — pick another name.`
@@ -562,8 +649,10 @@ function ConnectForm({ tile, defaultName, takenNames, onDone, onError, onRemoved
           {busy === "test" ? "signing in…" : busy === "browse" ? "reading schemas…"
             : canBrowse ? "⚡ Sign in and list schemas" : "⚡ Test connection"}
         </button>
-        <button className="primary" onClick={save} disabled={!!busy || !saveFilled || !nameUsable}>
+        <button className="primary" onClick={save}
+          disabled={!!busy || !saveFilled || (replacing ? chosen.length > 1 : !nameUsable)}>
           {busy === "save" ? (progress || "connecting…")
+            : replacing ? `✓ Use for “${replacing}”`
             : chosen.length > 1 ? `✓ Connect ${chosen.length} schemas` : "✓ Connect"}
         </button>
       </div>
@@ -653,7 +742,34 @@ function DetailPanel({ tile, isAdmin }) {
   );
 }
 
-function Instances({ tile, onRemove }) {
+/** The status a source row shows. Exported for tests. */
+export function instanceBadge(i) {
+  if (i.kind !== "env") return i.configured ? "connected" : "needs reconnect";
+  if (i.mode === "disconnected") return "disconnected here";
+  if (i.mode === "replaced") return i.configured ? "set up here" : "credential unreadable";
+  return i.configured ? "configured by environment" : "not configured";
+}
+
+/**
+ * What an admin can do to a built-in source from its row, in button order.
+ * Only rows that carry a `mode` (admins load /connections/env) get any.
+ * Exported for tests.
+ */
+export function envActions(i) {
+  if (i.kind !== "env" || !i.mode) return [];
+  if (i.mode === "disconnected") return ["reconnect", "revert"];
+  const out = [i.configured || i.mode === "replaced" ? "change" : "setup"];
+  if (i.configured) out.push("disconnect");
+  if (i.mode === "replaced") out.push("revert");
+  return out;
+}
+
+const ENV_ACTION_LABEL = {
+  change: "✎ Change", setup: "✎ Set up", disconnect: "⏸ Disconnect",
+  reconnect: "↻ Reconnect", revert: "↺ Back to environment",
+};
+
+function Instances({ tile, onRemove, onManage, busy = "" }) {
   if (!tile.instances.length) return null;
   return (
     <div className="conn-instances">
@@ -663,8 +779,14 @@ function Instances({ tile, onRemove }) {
           <b>{i.name}</b>
           {i.hint && <span className="meta">{i.hint}</span>}
           <span className={`m365-badge${i.configured ? " m365-badge-on" : " m365-badge-off"}`}>
-            {i.configured ? (i.kind === "env" ? "configured by environment" : "connected") : "needs reconnect"}
+            {instanceBadge(i)}
           </span>
+          {onManage && envActions(i).map((verb) => (
+            <button key={verb} className={`chip${verb === "disconnect" ? " ctx-danger" : ""}`}
+              onClick={() => onManage(i, verb)} disabled={!!busy}>
+              {busy === `${verb}:${i.name}` ? "working…" : ENV_ACTION_LABEL[verb]}
+            </button>
+          ))}
           {onRemove && i.kind === "user" && (
             <button className="chip ctx-danger" onClick={() => onRemove(i)}>✕</button>
           )}
