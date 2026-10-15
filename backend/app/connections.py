@@ -17,6 +17,11 @@ Security model:
   source; other roles see a new source only once a governance policy grants it.
 - Create/delete is admin-only: pointing the server at an arbitrary DSN is
   operator power and stays behind the admin gate.
+- The BUILT-IN (env-configured) warehouse sources can be managed here too —
+  replaced, disconnected, reconnected or handed back to the environment —
+  keeping their names (see "Built-in sources, managed from this screen").
+  Same encryption, same admin gate; a disconnected or unreadable one fails
+  closed and never falls back to the environment's credential.
 """
 import base64
 import json
@@ -35,6 +40,7 @@ from pydantic import BaseModel
 
 from . import db
 from .auth import current_user
+from .connectors.base import Connector
 from .connectors.bigquery_conn import BigQueryConnector
 from .connectors.databricks_conn import DatabricksConnector
 from .connectors.graph_conn import GraphConnector
@@ -254,6 +260,17 @@ def init_tables():
             created_at REAL,
             enabled INTEGER NOT NULL DEFAULT 1
         );
+        -- What an admin set on the Data connections screen for a BUILT-IN
+        -- (env-configured) source: a replacement credential (config, encrypted
+        -- exactly like a connection's) and/or a switch that takes it offline.
+        -- No row = the deployment's environment decides.
+        CREATE TABLE IF NOT EXISTS env_source_settings (
+            name TEXT PRIMARY KEY,
+            config TEXT,
+            disabled INTEGER NOT NULL DEFAULT 0,
+            updated_by TEXT NOT NULL,
+            updated_at REAL
+        );
         """)
         c.commit()
 
@@ -350,6 +367,123 @@ def source_entries():
                     "configured": cfg is not None,
                     "type_label": t["label"], "ctype": row["ctype"],
                     "namespace": _namespace(row["ctype"], cfg) if cfg else ""})
+    return out
+
+
+# ── Built-in sources, managed from this screen ───────────────────────────
+#
+# The env-configured warehouse sources (`databricks`, `postgres`, …) used to be
+# changeable only in the deployment's environment. An admin can now replace one
+# with a credential entered here, switch it off and on, or hand it back to the
+# environment. It keeps its NAME throughout — governance grants, dashboards and
+# pipelines written against `databricks` follow it — and connectors.get_connector
+# applies the setting ahead of the environment, so every path that reaches a
+# source (gateway, RBAC, catalog, agents) sees the same one.
+
+class _Offline(Connector):
+    """A built-in source switched off here, or replaced by a credential this
+    process can no longer decrypt. Unconfigured on purpose: every read path
+    already fails closed on an unconfigured source, and
+    sources.connector_or_400 reports `unconfigured_reason`. It never falls back
+    to the environment's credential — that would silently re-point a source an
+    admin had moved or turned off."""
+
+    def __init__(self, name, dialect, reason):
+        self.name = name
+        self.dialect = dialect
+        self.unconfigured_reason = reason
+
+    def configured(self):
+        return False
+
+    def list_tables(self):
+        return []
+
+    def get_schema(self, table):
+        raise ValueError(self.unconfigured_reason)
+
+    def run_query(self, sql):
+        raise RuntimeError(self.unconfigured_reason)
+
+
+_ENV_CACHE = {}      # name -> ((updated_at, ciphertext), connector)
+
+
+def _env_type(name):
+    """The connection type a built-in source can be managed as, or None. The
+    warehouse sources share their type's key — `databricks` is a Databricks SQL
+    source — so a form exists for exactly those; demo, the object stores and
+    the API connectors stay environment-only."""
+    from . import connectors
+    return name if name in TYPES and name in connectors._REGISTRY else None
+
+
+def _env_rows(names):
+    names = tuple(n for n in names if _env_type(n))
+    if not names:
+        return {}
+    marks = ",".join("?" * len(names))
+    with db.connect() as c:
+        rows = c.execute(f"SELECT * FROM env_source_settings WHERE name IN ({marks})",
+                         names).fetchall()
+    return {r["name"]: dict(r) for r in rows}
+
+
+def _evict_env(name):
+    with _LOCK:
+        hit = _ENV_CACHE.pop(name, None)
+    if hit:
+        _close_connector(hit[1])
+
+
+def _env_connector(name, row, cfg):
+    """The replacement connector, built once per setting version."""
+    key = (row["updated_at"], row["config"])
+    with _LOCK:
+        hit = _ENV_CACHE.get(name)
+        if hit and hit[0] == key:
+            return hit[1]
+    conn = TYPES[name]["build"](name, cfg)
+    with _LOCK:
+        hit = _ENV_CACHE.get(name)
+        if hit and hit[0] == key:
+            winner, old = hit[1], None
+        else:
+            winner, old = None, (hit[1] if hit else None)
+            _ENV_CACHE[name] = (key, conn)
+    if winner is not None:
+        _close_connector(conn)
+        return winner
+    _close_connector(old)
+    return conn
+
+
+def managed_sources(names):
+    """{name: connector} for the built-in sources among `names` that an admin
+    replaced or switched off here — what the registry uses INSTEAD of the
+    environment. A source with no setting is absent: the environment applies.
+    Read on every call, like resolve(): a change made on another replica, or a
+    rotated STUDIO_SECRET, takes effect at once; only the built connector is
+    cached, per setting version."""
+    out = {}
+    for name, row in _env_rows(names).items():
+        dialect = TYPES[name]["dialect"]
+        if row["disabled"]:
+            out[name] = _Offline(name, dialect, (
+                f"Source '{name}' was disconnected on the Data connections screen — "
+                "reconnect it there."))
+            continue
+        if not row["config"]:
+            continue
+        cfg = _decrypt(row["config"])
+        if cfg is None:
+            _evict_env(name)
+            out[name] = _Offline(name, dialect, (
+                f"Source '{name}' was set up on the Data connections screen, but its "
+                "stored credential can no longer be read (STUDIO_SECRET changed) — set it "
+                "up again there, or switch it back to the environment."))
+            continue
+        out[name] = _env_connector(name, row, cfg)
     return out
 
 
@@ -577,6 +711,18 @@ def browse_connection(body: TestIn, user=Depends(current_user)):
     return _browse(body.ctype, {k: str(v) for k, v in (body.config or {}).items()})
 
 
+def _require_pin(ctype, cfg, why):
+    """A source is pinned to ONE namespace. Discovery signs in with it blank
+    (Power BI: tenant + app, no semantic model yet); saved that way it would be
+    a source with nothing in it, so say which field is missing instead of
+    letting the probe report a generic "unconfigured"."""
+    pin = (TYPES[ctype].get("ns") or {}).get("schema")
+    if pin:
+        field = next((f for f in TYPES[ctype]["fields"] if f["key"] == pin), {})
+        if not str(cfg.get(pin) or field.get("default") or "").strip():
+            raise HTTPException(400, f"pick a {field.get('label', pin).lower()} to connect {why}")
+
+
 @router.post("", status_code=201)
 def create_connection(body: ConnIn, user=Depends(current_user)):
     _admin(user)
@@ -589,16 +735,7 @@ def create_connection(body: ConnIn, user=Depends(current_user)):
     if body.ctype not in TYPES:
         raise HTTPException(400, f"unknown connection type '{body.ctype}'")
     cfg = {k: str(v) for k, v in (body.config or {}).items()}
-    # A source is pinned to ONE namespace. Discovery signs in with it blank
-    # (Power BI: tenant + app, no semantic model yet); saved that way it would
-    # be a source with nothing in it, so say which field is missing instead of
-    # letting the probe report a generic "unconfigured".
-    pin = (TYPES[body.ctype].get("ns") or {}).get("schema")
-    if pin:
-        field = next((f for f in TYPES[body.ctype]["fields"] if f["key"] == pin), {})
-        if not str(cfg.get(pin) or field.get("default") or "").strip():
-            raise HTTPException(400, f"pick a {field.get('label', pin).lower()} to connect "
-                                     "— each one becomes its own source")
+    _require_pin(body.ctype, cfg, "— each one becomes its own source")
     probe = _probe(body.ctype, cfg)
     if not probe["ok"]:
         raise HTTPException(400, f"connection test failed: {probe['error']}")
@@ -615,6 +752,127 @@ def create_connection(body: ConnIn, user=Depends(current_user)):
     _evict_cached(name)
     db.log_activity(user, "connection_create", prompt=name, source=body.ctype)
     return _public(row)
+
+
+# ── Routes: built-in sources ─────────────────────────────────────────────
+
+class EnvIn(BaseModel):
+    config: dict
+
+
+def _env_or_404(name):
+    ctype = _env_type(name)
+    if ctype is None:
+        raise HTTPException(404, f"'{name}' is not a built-in source that can be managed here")
+    return ctype
+
+
+def _env_write(name, user, *, config, disabled):
+    with db.connect() as c:
+        c.execute("INSERT INTO env_source_settings (name, config, disabled, updated_by, "
+                  "updated_at) VALUES (?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET "
+                  "config=excluded.config, disabled=excluded.disabled, "
+                  "updated_by=excluded.updated_by, updated_at=excluded.updated_at",
+                  (name, config, 1 if disabled else 0, user["id"], time.time()))
+        c.commit()
+    _evict_env(name)
+
+
+def _env_delete(name):
+    with db.connect() as c:
+        c.execute("DELETE FROM env_source_settings WHERE name=?", (name,))
+        c.commit()
+    _evict_env(name)
+
+
+def _env_public(name):
+    """How a built-in source is set now — never its credential."""
+    from . import connectors
+    row = _env_rows([name]).get(name)
+    cfg = _decrypt(row["config"]) if row and row["config"] else None
+    replaced = bool(row and row["config"])
+    mode = ("disconnected" if row and row["disabled"]
+            else "replaced" if replaced else "environment")
+    return {"name": name, "ctype": name, "type_label": TYPES[name]["label"], "mode": mode,
+            "replaced": replaced, "readable": (cfg is not None) if replaced else None,
+            "env_configured": bool(connectors._REGISTRY[name].configured()),
+            "hint": _hint(name, cfg) if cfg else "",
+            "namespace": _namespace(name, cfg) if cfg else "",
+            "updated_at": row["updated_at"] if row else None}
+
+
+@router.get("/env")
+def env_sources(user=Depends(current_user)):
+    """The built-in sources this screen can manage and how each is set:
+    by the environment, replaced here, or disconnected here."""
+    _admin(user)
+    from . import connectors
+    return [_env_public(n) for n in TYPES if n in connectors._REGISTRY]
+
+
+@router.put("/env/{name}")
+def replace_env_source(name: str, body: EnvIn, user=Depends(current_user)):
+    """Point a built-in source at a credential entered here. It keeps its name
+    — that is the point: grants, dashboards and pipelines written against it
+    follow it to the new connection — so this is the same operator power as
+    editing the deployment's environment. Probed before it is saved."""
+    _admin(user)
+    ctype = _env_or_404(name)
+    cfg = {k: str(v) for k, v in (body.config or {}).items()}
+    _require_pin(ctype, cfg, f"— '{name}' reads exactly one")
+    probe = _probe(ctype, cfg)
+    if not probe["ok"]:
+        raise HTTPException(400, f"connection test failed: {probe['error']}")
+    _env_write(name, user, config=_fernet().encrypt(json.dumps(cfg).encode()).decode(),
+               disabled=False)
+    db.log_activity(user, "connection_env_replace", prompt=name, source=ctype)
+    return _env_public(name)
+
+
+@router.post("/env/{name}/disconnect")
+def disconnect_env_source(name: str, user=Depends(current_user)):
+    """Take a built-in source offline. A replacement credential is kept, so
+    reconnecting needs no re-typed secret."""
+    _admin(user)
+    ctype = _env_or_404(name)
+    row = _env_rows([name]).get(name)
+    _env_write(name, user, config=(row or {}).get("config"), disabled=True)
+    db.log_activity(user, "connection_env_disconnect", prompt=name, source=ctype)
+    return _env_public(name)
+
+
+@router.post("/env/{name}/reconnect")
+def reconnect_env_source(name: str, user=Depends(current_user)):
+    """Back online: on the replacement if there is one — re-probed first, since
+    its password may have rotated while it was off — else on the environment."""
+    _admin(user)
+    ctype = _env_or_404(name)
+    row = _env_rows([name]).get(name)
+    if row and row["config"]:
+        cfg = _decrypt(row["config"])
+        if cfg is None:
+            raise HTTPException(400, "the stored credential can no longer be read "
+                                     "(STUDIO_SECRET changed) — set the source up again, "
+                                     "or switch it back to the environment")
+        probe = _probe(ctype, cfg)
+        if not probe["ok"]:
+            raise HTTPException(400, f"connection test failed: {probe['error']}")
+        _env_write(name, user, config=row["config"], disabled=False)
+    else:
+        _env_delete(name)            # only the switch was set here: the environment applies
+    db.log_activity(user, "connection_env_reconnect", prompt=name, source=ctype)
+    return _env_public(name)
+
+
+@router.delete("/env/{name}")
+def revert_env_source(name: str, user=Depends(current_user)):
+    """Forget everything this screen set for a built-in source — replacement
+    and switch alike — so the deployment's environment decides again."""
+    _admin(user)
+    ctype = _env_or_404(name)
+    _env_delete(name)
+    db.log_activity(user, "connection_env_revert", prompt=name, source=ctype)
+    return _env_public(name)
 
 
 @router.delete("/{cid}")

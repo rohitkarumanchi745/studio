@@ -32,8 +32,25 @@ for _mc in MARKETING_CONNECTORS:
     _REGISTRY[_mc.name] = _mc
 
 
+def _managed(names):
+    """{name: connector} for the env-configured sources an admin has changed or
+    disconnected on the Data connections screen (connections.managed_sources).
+    That setting wins over the environment, for every caller: this registry is
+    how the gateway, RBAC, the catalog and the agents all reach a source.
+    Lazy import, like resolve() below: connections is built on these classes.
+    A failure to read the setting leaves the environment's config in place —
+    a read with no audit row returns nothing anyway."""
+    try:
+        from .. import connections
+        return connections.managed_sources(names)
+    except Exception:
+        return {}
+
+
 def get_connector(name):
     conn = _REGISTRY.get(name)
+    if conn is not None:
+        conn = _managed([name]).get(name, conn)
     if conn is None:
         # User-connected sources (added from the UI, stored encrypted) resolve
         # here so every existing chokepoint — gateway, RBAC, catalog — treats
@@ -50,9 +67,10 @@ def get_connector(name):
 
 
 def all_sources():
+    managed = _managed(list(_REGISTRY))
     out = [
         {"name": c.name, "dialect": c.dialect, "configured": c.configured()}
-        for c in _REGISTRY.values()
+        for c in (managed.get(n, base) for n, base in _REGISTRY.items())
     ]
     try:
         from .. import connections

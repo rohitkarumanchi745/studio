@@ -17,9 +17,13 @@ def connector_or_400(source):
     except KeyError:
         raise HTTPException(404, f"Unknown source '{source}'")
     if not conn.configured():
+        # A source an admin switched off on the Data connections screen says
+        # so; telling them to go set environment variables would send them to
+        # the wrong place.
+        reason = getattr(conn, "unconfigured_reason", None)
         raise HTTPException(
             400,
-            f"Source '{source}' is not configured. Set its credentials in the "
+            reason or f"Source '{source}' is not configured. Set its credentials in the "
             f"backend environment (see .env.example) and install its connector package.",
         )
     return conn
