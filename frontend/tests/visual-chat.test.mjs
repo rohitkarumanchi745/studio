@@ -17,7 +17,7 @@ const bundle = await build({
     contents: `export {default as Chat, AssistantMessage, isVisualConversation}
                  from "./src/components/Chat.jsx";
                export {default as ChartView} from "./src/components/ChartView.jsx";
-               export {D3_TYPES} from "./src/components/renderers/D3View.jsx";`,
+               export {D3_TYPES, VISUAL_TYPES} from "./src/components/renderers/D3View.jsx";`,
     resolveDir: frontend, loader: "jsx",
   },
   bundle: true, write: false, format: "cjs", platform: "node", jsx: "automatic",
@@ -58,7 +58,8 @@ compiled.require = (id) => id === "react" ? {
   useMemo: (...a) => (hooks ? hooks.useMemo(...a) : React.useMemo(...a)),
 } : id === "echarts" ? { init() { return {}; } } : require(id);
 compiled._compile(bundle.outputFiles[0].text, compiled.filename);
-const { Chat, AssistantMessage, isVisualConversation, ChartView, D3_TYPES } = compiled.exports;
+const { Chat, AssistantMessage, isVisualConversation, ChartView, D3_TYPES, VISUAL_TYPES } =
+  compiled.exports;
 
 globalThis.localStorage = { getItem() { return null; }, setItem() {}, removeItem() {} };
 const html = (component, props) => renderToStaticMarkup(React.createElement(component, props));
@@ -68,20 +69,27 @@ const COLUMNS = ["region", "revenue"];
 const ROWS = [["West", 120], ["East", 90], ["North", 60]];
 const BAR = { type: "bar", x: "region", y: ["revenue"], title: "By region" };
 
-test("a D3-only chart has no engine picker and offers exactly the D3 types", () => {
+test("a D3-only chart has no engine picker and offers D3 without the line chart", () => {
   const markup = html(ChartView, { columns: COLUMNS, rows: ROWS, chart: BAR, d3Only: true });
   assert.match(markup, /class="echart d3-chart"/);
   assert.match(markup, /class="artifact-badge"[^>]*>D3</);
   assert.doesNotMatch(markup, /ECharts|Plotly|Altair/);
-  assert.deepEqual(new Set(offered(markup)), D3_TYPES);
+  assert.deepEqual(new Set(offered(markup)), VISUAL_TYPES);
+  assert.deepEqual([...D3_TYPES].filter((t) => !VISUAL_TYPES.has(t)), ["line"]);
 
   // The ordinary chart keeps its engine picker and the whole catalog.
   const ordinary = html(ChartView, { columns: COLUMNS, rows: ROWS, chart: BAR });
   for (const engine of ["echarts", "plotly", "vega", "d3"]) assert.ok(offered(ordinary).includes(engine));
-  for (const type of ["treemap", "sankey", "table", "kpi"]) assert.ok(offered(ordinary).includes(type));
+  for (const type of ["treemap", "sankey", "table", "kpi", "line"]) assert.ok(offered(ordinary).includes(type));
 });
 
-test("a type D3 lacks opens as a D3 bar, never the table or another engine", () => {
+test("a line chart opens as a D3 area; a type D3 lacks as a D3 bar", () => {
+  const line = html(ChartView, { columns: COLUMNS, rows: ROWS, d3Only: true,
+                                 chart: { ...BAR, type: "line" } });
+  assert.match(line, /<option value="area" selected=""/);
+  assert.doesNotMatch(line, /<option value="line"/);
+  assert.match(line, /d3-chart/);
+
   for (const type of ["table", "treemap", "kpi", "sankey"]) {
     const markup = html(ChartView, { columns: COLUMNS, rows: ROWS, d3Only: true,
                                      chart: { ...BAR, type } });

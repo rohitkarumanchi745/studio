@@ -6,10 +6,12 @@ Locked in here:
 - loading a chart and writing a visual for it read the governed SERVER copy,
   under the reader's current access — a client never supplies the data;
 - choosing a D3 chart saves a new canvas version: that panel's type and engine
-  change, its old visual goes, every sibling (and its visual/engine) stays, and
-  the version is a valid parent for the next canvas edit, which keeps the engine;
+  change (D3 only, never a line chart or another engine), its old visual goes,
+  every sibling (and its visual/engine) stays, and the version is a valid
+  parent for the next canvas edit, which keeps the engine;
 - choosing a custom visual accepts only code this server wrote (signature) and
-  still lints it; view-only access cannot choose; bad choices are refused.
+  still lints it; a visual written here is told no line charts; view-only
+  access cannot choose; bad choices are refused.
 """
 import json
 import os
@@ -113,16 +115,18 @@ def test_choosing_a_d3_chart_saves_a_new_version_and_keeps_siblings():
 def test_choosing_a_chart_for_a_visual_panel_drops_the_visual():
     cid, mid = _seed()
     out = chat.visual_apply(chat.VisualChoice(
-        conversation_id=cid, message_id=mid, panel_index=1, chart_type="bar",
-        engine="echarts"), user=ANA)
+        conversation_id=cid, message_id=mid, panel_index=1, chart_type="bar"), user=ANA)
     panel = out["message"]["panels"][1]
-    assert "visual" not in panel and panel["engine"] == "echarts"
+    assert "visual" not in panel and panel["engine"] == "d3"
     assert panel["chart"]["x"] == "month" and panel["chart"]["y"] == ["revenue"]
 
 
 @pytest.mark.parametrize("choice,status", [
     ({"chart_type": "rocket"}, 400),
     ({"chart_type": "bar", "engine": "flash"}, 400),
+    ({"chart_type": "bar", "engine": "echarts"}, 400),      # D3 alone here
+    ({"chart_type": "line", "engine": "d3"}, 400),          # and no line charts
+    ({"chart_type": "treemap"}, 400),                        # nor what D3 lacks
     ({}, 400),
     ({"chart_type": "bar", "visual": VISUAL}, 400),
 ])
@@ -167,6 +171,7 @@ def test_a_visual_is_written_from_the_server_copy_and_saved_signed(monkeypatch):
         conversation_id=cid, message_id=mid, panel_index=0, request="rings"), user=ANA)
     sent = json.loads(llm.calls[0][1][1])
     assert sent["sample_rows"] == [["EU", 125], ["US", 90]]       # the stored rows
+    assert "Do not draw a line chart" in llm.calls[0][0][1]       # none on this screen
     assert gen["code"] == CODE and gen["signature"]
 
     out = chat.visual_apply(chat.VisualChoice(

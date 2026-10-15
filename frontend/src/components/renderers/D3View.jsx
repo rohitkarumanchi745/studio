@@ -20,6 +20,10 @@ export const D3_TYPES = new Set([
   "pie", "donut", "scatter", "bubble", "heatmap",
   ...D3_ONLY,
 ]);
+// What the D3 & artifacts screens draw: D3 without the line chart (backend
+// agent.VISUAL_CHART_TYPES). A line chart there becomes an area.
+export const VISUAL_TYPES = new Set([...D3_TYPES].filter((t) => t !== "line"));
+export const visualType = (t) => (VISUAL_TYPES.has(t) ? t : t === "line" ? "area" : "bar");
 
 // Size limits, shared with ChartView's fit rules so a chart is only offered
 // when it will stay readable (and a force layout stays fast).

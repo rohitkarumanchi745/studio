@@ -70,7 +70,9 @@ test("the D3 options are exactly the D3 types this data fits", () => {
   for (const t of ["bar", "hbar", "pie", "donut", "beeswarm", "circle_pack"]) assert.ok(opts.includes(t), t);
   for (const t of ["network", "calendar", "table", "kpi", "treemap"]) assert.ok(!opts.includes(t), t);
   const days = d3Options(["day", "sessions"], [["2024-01-01", 3], ["2024-01-02", 5]], null);
-  assert.ok(days.includes("calendar") && days.includes("line"));
+  assert.ok(days.includes("calendar") && days.includes("area"));
+  // No line charts on this screen, whatever the data.
+  assert.ok(!opts.includes("line") && !days.includes("line"));
 });
 
 test("the list groups by conversation and searches title, source and type", () => {
@@ -81,10 +83,11 @@ test("the list groups by conversation and searches title, source and type", () =
 });
 
 test("how a chart is drawn now, in words", () => {
-  assert.equal(nowDrawn(CHART), "Bar · your default engine");
-  assert.equal(nowDrawn({ ...CHART, engine: "d3" }), "Bar · d3");
+  assert.equal(nowDrawn(CHART), "Bar · not D3 yet");
+  assert.equal(nowDrawn({ ...CHART, engine: "d3" }), "Bar · D3");
   assert.equal(nowDrawn({ ...CHART, visual: { code: "x" } }), "a custom visual");
-  assert.equal(nowDrawn({ ...CHART, chart: { type: "network" } }), "Network (D3) · d3");
+  assert.equal(nowDrawn({ ...CHART, chart: { type: "network" } }), "Network (D3) · D3");
+  assert.equal(nowDrawn({ ...CHART, engine: "echarts" }), "Bar · not D3 yet");
 });
 
 // ── Rendering and choosing ──────────────────────────────────────────────
@@ -162,7 +165,8 @@ test("the screen lists charts, then every D3 option and the visual composer", as
     screen.set(S.sel, CHARTS[0]);
     screen.set(S.data, CHART);
     html = screen.render();
-    assert.match(html, /now drawn as <b>Bar · your default engine<\/b>/);
+    assert.match(html, /now drawn as <b>Bar · not D3 yet<\/b>/);
+    assert.doesNotMatch(html, /echarts|ECharts|plotly|Plotly|vega|Altair|default engine/);
     const useButtons = (html.match(/>Use this</g) || []).length;
     assert.equal(useButtons, d3Options(COLUMNS, ROWS, CHART.chart).length);
     assert.match(html, /✨ Write it/);

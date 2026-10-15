@@ -7,7 +7,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
 import { LABELS, computeFit } from "./ChartView";
-import D3View, { D3_ONLY, D3_TYPES } from "./renderers/D3View";
+import D3View, { D3_ONLY, VISUAL_TYPES } from "./renderers/D3View";
 import ArtifactView, { downloadArtifact } from "./renderers/ArtifactView";
 
 const keyOf = (c) => `${c.message_id}:${c.panel_index}`;
@@ -23,11 +23,14 @@ export function baseSpec(columns, rows, chart) {
   return { ...(chart || {}), title: chart?.title || "", x, y };
 }
 
-/** Every D3 chart type this data fits, in catalog order. */
+/** Every D3 chart type this data fits, in catalog order (no line charts:
+ * this screen, like the D3 & artifacts window, uses none). */
 export function d3Options(columns, rows, chart) {
   const fit = computeFit(columns, rows, baseSpec(columns, rows, chart));
-  return Object.keys(LABELS).filter((t) => D3_TYPES.has(t) && fit[t]?.ok);
+  return Object.keys(LABELS).filter((t) => VISUAL_TYPES.has(t) && fit[t]?.ok);
 }
+
+const isD3 = (type, engine) => engine === "d3" || D3_ONLY.has(type);
 
 /** The chart list grouped by conversation (newest first), filtered by `q`. */
 export function groupCharts(charts, q = "") {
@@ -46,12 +49,12 @@ export function groupCharts(charts, q = "") {
   return groups;
 }
 
-/** How a loaded chart is drawn now, in words. */
+/** How a loaded chart is drawn now, in words — D3 or not yet; this screen
+ * names no other engine. */
 export function nowDrawn(data) {
   if (data.visual) return "a custom visual";
   const type = data.chart?.type || "table";
-  const engine = D3_ONLY.has(type) ? "d3" : data.engine;
-  return `${LABELS[type] || type}${engine ? ` · ${engine}` : " · your default engine"}`;
+  return `${LABELS[type] || type} · ${isD3(type, data.engine) ? "D3" : "not D3 yet"}`;
 }
 
 export default function Visuals({ onClose, onOpenChat }) {
@@ -167,7 +170,7 @@ export default function Visuals({ onClose, onOpenChat }) {
                   <b>{c.title}</b>
                   <span className="meta">
                     {c.has_visual ? "✨ custom visual"
-                      : `${LABELS[c.type] || c.type}${c.engine ? ` · ${c.engine}` : ""}`}
+                      : `${LABELS[c.type] || c.type}${isD3(c.type, c.engine) ? " · D3" : ""}`}
                     {" · "}{c.row_count} rows{c.can_edit ? "" : " · view only"}
                   </span>
                 </button>

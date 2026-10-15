@@ -43,28 +43,31 @@ CHART_TYPES = [
 ]
 
 # What the D3 engine draws (frontend renderers/D3View.jsx D3_TYPES — keep the
-# two in step). The D3 & artifacts window renders ONLY these, plus custom
-# visuals; d3_only() maps any other type to its nearest D3 stand-in.
+# two in step).
 D3_CHART_TYPES = (
     "bar", "hbar", "stacked_bar", "line", "area", "stacked_area", "pie", "donut",
     "scatter", "bubble", "heatmap", "network", "beeswarm", "calendar", "circle_pack",
 )
+# What the D3 & artifacts window draws: D3 without the line chart (frontend
+# VISUAL_TYPES). It renders ONLY these, plus custom visuals; d3_only() maps any
+# other type to its nearest stand-in.
+VISUAL_CHART_TYPES = tuple(t for t in D3_CHART_TYPES if t != "line")
 _D3_STAND_IN = {
-    "combo": "bar", "treemap": "circle_pack", "funnel": "hbar", "radar": "bar",
-    "gauge": "bar", "kpi": "bar", "histogram": "beeswarm", "boxplot": "beeswarm",
-    "waterfall": "bar", "sankey": "network", "table": "bar",
+    "line": "area", "combo": "bar", "treemap": "circle_pack", "funnel": "hbar",
+    "radar": "bar", "gauge": "bar", "kpi": "bar", "histogram": "beeswarm",
+    "boxplot": "beeswarm", "waterfall": "bar", "sankey": "network", "table": "bar",
 }
 
 
 def d3_only(result):
-    """Make every chart in a result drawable by D3 alone: a type D3 lacks
-    becomes its stand-in (a sankey's flows → a network, a boxplot's spread → a
-    beeswarm, a treemap → circle packing), and every panel draws with the D3
-    engine. Custom visuals are D3 code already. Covers answers that did not
+    """Make every chart in a result one the D3 & artifacts window draws: any
+    other type becomes its stand-in (a line → an area, a sankey's flows → a
+    network, a boxplot's spread → a beeswarm, a treemap → circle packing), and
+    every panel draws with the D3 engine. Custom visuals are D3 code already. Covers answers that did not
     come from a visual-mode agent — a cached plan, the keyless fallback, the
     multi-source orchestrator."""
     def fix(chart):
-        if isinstance(chart, dict) and chart.get("type") not in D3_CHART_TYPES:
+        if isinstance(chart, dict) and chart.get("type") not in VISUAL_CHART_TYPES:
             chart = {**chart, "type": _D3_STAND_IN.get(chart.get("type"), "bar")}
         return chart
 
@@ -653,9 +656,9 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         progress.emit_for(_tid, f"{_me}: rendering a {chart_type} chart")
         if chart_type not in CHART_TYPES:
             return f"Unsupported chart_type. Use one of: {', '.join(CHART_TYPES)}"
-        if visual_mode and chart_type not in D3_CHART_TYPES:
-            return ("In this window every chart is drawn with D3, which has: "
-                    f"{', '.join(D3_CHART_TYPES)}. Pick one of those"
+        if visual_mode and chart_type not in VISUAL_CHART_TYPES:
+            return ("In this window every chart is drawn with D3, and only these types "
+                    f"are used: {', '.join(VISUAL_CHART_TYPES)}. Pick one of those"
                     + (", or call render_visual for anything else." if offers_visual else "."))
         if ctx["sql"] is None:
             return "No query result yet — call run_sql first."
@@ -694,7 +697,7 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
             return "No query result yet — call run_sql first."
         try:
             out = visuals.generate(make_llm(spec, user), ctx["columns"], ctx["rows"],
-                                   request, title)
+                                   request, title, no_line_charts=visual_mode)
         except visuals.VisualError as e:
             return f"Could not write the visual ({e}). Use render_chart instead."
         # A panel like render_chart's: the same rows and SQL (so read-time
@@ -848,8 +851,10 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
                "or bespoke, or when no D3 chart type fits; otherwise call render_chart"
                if offers_visual else "Call render_chart")
         system += ("\n\nD3 & ARTIFACTS WINDOW: every answer here is drawn with D3 only. "
-                   f"After run_sql, ALWAYS visualize. {how} with one of the D3 types: "
-                   f"{', '.join(D3_CHART_TYPES)}. No other chart type is available here. "
+                   f"After run_sql, ALWAYS visualize. {how} with one of these types: "
+                   f"{', '.join(VISUAL_CHART_TYPES)}. No other chart type is available here. "
+                   "Never draw a line chart here — not with render_chart and not in a custom "
+                   "visual; show change over time as an area, bars or a calendar. "
                    "Keep the text brief — the visual is the answer.")
     if kag_first:
         # User explicitly chose the KAG engine: ground the answer in their own
@@ -904,7 +909,7 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
                 proposed = _auto_chart(ctx["columns"], ctx["rows"], table)
                 if proposed:
                     chart_type = actions[1]["chart_type"]
-                    if visual_mode and chart_type not in D3_CHART_TYPES:
+                    if visual_mode and chart_type not in VISUAL_CHART_TYPES:
                         # One shot, no retry: take the D3 stand-in rather
                         # than let render_chart refuse the only chart.
                         chart_type = _D3_STAND_IN.get(chart_type, "bar")

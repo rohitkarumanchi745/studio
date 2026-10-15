@@ -1653,7 +1653,8 @@ def visual_generate(body: VisualRequest, user=Depends(current_user)):
     columns, rows = _frame_data(frame, content)
     try:
         out = visuals.generate(agent.make_llm(agent.llm_spec(), user), columns, rows,
-                               request, _frame_title(frame, content, body.panel_index))
+                               request, _frame_title(frame, content, body.panel_index),
+                               no_line_charts=True)
     except visuals.VisualError as e:
         raise HTTPException(422, f"Could not write the visual: {e}")
     db.log_activity(user, "visual_generate", prompt=request[:300], row_count=len(rows))
@@ -1692,6 +1693,10 @@ def visual_apply(body: VisualChoice, user=Depends(current_user)):
         engine = body.engine or "d3"
         if engine not in ENGINES:
             raise HTTPException(400, f"Unknown engine '{engine}'")
+        # The D3 & artifacts screens draw with D3 alone, and use no line charts.
+        if engine != "d3" or body.chart_type not in agent.VISUAL_CHART_TYPES:
+            raise HTTPException(400, "Choose a D3 chart: "
+                                     + ", ".join(agent.VISUAL_CHART_TYPES))
         chart = dict(panel.get("chart") or {})
         chart["type"] = body.chart_type
         chart.setdefault("title", title)
