@@ -43,8 +43,14 @@ export async function api(path, options = {}) {
   }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    const error = new Error(data.detail || `Request failed (${res.status})`);
+    // A detail may be structured ({error, fields} from the connect form,
+    // {message, …} elsewhere): its sentence becomes the message, and the whole
+    // object rides along for callers that can show more.
+    const detail = data.detail;
+    const said = typeof detail === "string" ? detail : detail?.error || detail?.message;
+    const error = new Error(said || `Request failed (${res.status})`);
     error.status = res.status;
+    error.detail = detail;
     throw error;
   }
   return data;

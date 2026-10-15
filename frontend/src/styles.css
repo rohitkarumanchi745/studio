@@ -1185,6 +1185,8 @@ input:focus, select:focus, .composer-pill:focus-within { box-shadow: 0 0 0 1px v
 .conn-field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
 .conn-field-wide { grid-column: 1 / -1; }
 .conn-label { font-size: 12px; color: var(--ink-2); }
+.conn-input-bad { border-color: var(--bad) !important; }
+.conn-field-error { font-size: 12px; line-height: 1.4; color: var(--bad); }
 
 /* The schema picker: what this credential can see, grouped by database. */
 .conn-ns {

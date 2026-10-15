@@ -1237,6 +1237,17 @@ skill files all apply to it unchanged.
   credentials but does not save them. Each selected or typed namespace is then
   persisted only after its own `list_tables()` probe succeeds, so one credential
   can create several separately scoped sources without saving a broken scope.
+- **Checked before any sign-in (Databricks).** The form's usual mix-ups are
+  refused at once, each marked on its own field with where the right value is: a
+  token or secret pasted as the Server hostname, a browser address as the HTTP
+  path, a service principal's OAuth secret (`dose…`) or client ID in place of a
+  personal access token (`dapi…`). A pasted workspace URL is reduced to its
+  hostname, and a full warehouse URL to its `/sql/…` path — the tidy form is what
+  gets stored. A hostname that does not resolve fails on a DNS lookup. The test
+  sign-in itself is bounded to about a minute (the driver's defaults retry for
+  15), and a failure is named from its HTTP status — a rejected token, a missing
+  **Can Use** on the warehouse, a wrong path, a warehouse still starting — with
+  fixed sentences that never echo what was typed.
 - **Admin-only, governance-aware.** Create / list / delete are admin-only
   (pointing the server at a DSN is operator power). A new source is reachable by
   admin by default; other roles get it only through an explicit governance grant.

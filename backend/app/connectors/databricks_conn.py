@@ -166,9 +166,96 @@ def api_body(config):
     return {k: v for k, v in config.items() if k not in STUDIO_KEYS}
 
 
+#: Bounds for a sign-in TEST on the connect screen: give up within about a
+#: minute. The driver's defaults (30 attempts over 15 minutes, a 900 s socket
+#: timeout) left "connecting…" spinning on a mistyped host. The driver waits
+#: at least _retry_delay_max between retries (60 s by default), which would
+#: leave no retry inside a minute; 10 s gives a starting warehouse a few.
+#: One that is still starting after that gets "try again shortly".
+PROBE_LIMITS = {
+    "_retry_stop_after_attempts_count": 6,
+    "_retry_stop_after_attempts_duration": 60,
+    "_retry_delay_max": 10,
+    "_socket_timeout": 60,
+}
+
+# Fixed sentences for a failed sign-in, keyed on the HTTP status or the kind of
+# network failure. Never built from the exception's text, which can carry the
+# submitted host or token — so they are safe to show as they are.
+_SAY_STATUS = {
+    400: ("The workspace refused the sign-in request — check the HTTP path (it looks "
+          "like /sql/1.0/warehouses/1a2b3c4d5e6f7a8b)."),
+    401: "The workspace rejected the access token — it may be mistyped, expired or revoked.",
+    403: ("The token signed in but may not use this SQL warehouse (it needs Can Use on it), "
+          "or the workspace's IP access list blocks this server."),
+    404: ("There is no SQL warehouse at that HTTP path — copy it again from the "
+          "warehouse's Connection details tab."),
+    429: "The workspace is busy right now — try again in a minute.",
+    503: "The SQL warehouse is starting or unavailable — try again in a minute.",
+}
+_SAY_RESOLVE = ("That Server hostname does not resolve — copy it from the SQL warehouse's "
+                "Connection details tab (it looks like dbc-1234abcd-5678.cloud.databricks.com).")
+_SAY_TIMEOUT = ("No answer from the workspace within a minute. If the SQL warehouse was "
+                "stopped it may still be starting — try again shortly.")
+_SAY_GAVE_UP = ("The workspace did not accept the sign-in in time. If the SQL warehouse was "
+                "stopped it may still be starting — try again shortly; otherwise check the "
+                "Server hostname and HTTP path.")
+_SAY_CONNECT = "Could not open a connection to that host on port 443."
+# The driver's own fixed phrases, for when it hands over only text (its retry
+# policy reports a refused status as a sentence, not a code).
+_DRIVER_SAYS = (
+    ("Received 400", 400), ("Received 401", 401), ("UNAUTHORIZED", 401),
+    ("403 codes are not retried", 403), ("FORBIDDEN", 403),
+    ("Received 404", 404), ("NOT_FOUND", 404),
+)
+_SAY_TLS = "The secure (TLS) handshake with that host failed — is it a Databricks workspace?"
+
+
+def describe_error(exc):
+    """A plain sentence for why a Databricks sign-in failed, or None. Walks the
+    exception chain (the driver wraps urllib3's errors, which wrap the socket's)
+    and decides from the HTTP status and the exception TYPES only."""
+    seen, stack, codes, kinds, texts = set(), [exc], set(), set(), []
+    while stack:
+        e = stack.pop()
+        if isinstance(e, str):
+            texts.append(e)
+            continue
+        if e is None or id(e) in seen or not isinstance(e, BaseException):
+            continue
+        seen.add(id(e))
+        kinds.update(t.__name__ for t in type(e).__mro__)
+        texts.append(str(e))
+        ctx = getattr(e, "context", None)
+        if isinstance(ctx, dict):
+            code = ctx.get("http-code")
+            if isinstance(code, int):
+                codes.add(code)
+            stack += [ctx.get("original-exception"), ctx.get("no-retry-reason")]
+        stack += [e.__cause__, e.__context__, getattr(e, "reason", None)]
+    text = " ".join(t for t in texts if t)
+    codes.update(code for phrase, code in _DRIVER_SAYS if phrase in text)
+    for code in (401, 403, 404, 400, 429, 503):
+        if code in codes:
+            return _SAY_STATUS[code]
+    if kinds & {"NameResolutionError", "gaierror"}:
+        return _SAY_RESOLVE
+    if "MaxRetryDurationError" in kinds or "max retry duration" in text:
+        return _SAY_GAVE_UP
+    if kinds & {"ConnectTimeoutError", "ReadTimeoutError", "TimeoutError", "timeout"}:
+        return _SAY_TIMEOUT
+    if kinds & {"SSLError", "SSLCertVerificationError"}:
+        return _SAY_TLS
+    if kinds & {"NewConnectionError", "ConnectionRefusedError"}:
+        return _SAY_CONNECT
+    return None
+
+
 class DatabricksConnector(Connector):
     name = "databricks"
     dialect = "databricks"
+    #: Extra sql.connect() settings; PROBE_LIMITS for a connect-screen test.
+    connect_limits = {}
 
     def __init__(self):
         self._pool_conn = None
@@ -233,6 +320,7 @@ class DatabricksConnector(Connector):
             kwargs["catalog"] = cfg["catalog"]
         if cfg["schema"]:
             kwargs["schema"] = cfg["schema"]
+        kwargs.update(self.connect_limits)
         return sql.connect(**kwargs)
 
 
@@ -242,19 +330,22 @@ class DatabricksConnector(Connector):
         """Run `fn(connection)` on the pooled connection; reconnect once on
         failure (expired/killed sessions). Serialized by a lock — good enough
         for a prototype; swap for a real pool under heavy concurrency."""
+        # A sign-in test does not reconnect: it would only double the wait.
+        attempts = (1,) if self.connect_limits else (1, 2)
         with self._pool_lock:
-            for attempt in (1, 2):
+            for attempt in attempts:
                 if self._pool_conn is None:
                     self._pool_conn = self._conn()
                 try:
                     return fn(self._pool_conn)
                 except Exception:
                     try:
-                        self._pool_conn.close()
+                        if self._pool_conn is not None:
+                            self._pool_conn.close()
                     except Exception:
                         pass
                     self._pool_conn = None
-                    if attempt == 2:
+                    if attempt == attempts[-1]:
                         raise
 
     def close(self):
