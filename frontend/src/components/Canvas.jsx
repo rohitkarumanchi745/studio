@@ -207,7 +207,11 @@ export default function Canvas({ state, setState, onClose, chatOpen, onToggleCha
           >
             {(() => {
               const rd = deriveRenderData(cur.columns, cur.rows, spec);
-              return <ChartView columns={rd.columns} rows={rd.rows} chart={rd.spec} tall />;
+              // The visual draws the panel's own rows; the chart may draw a
+              // reshaped copy (a Color channel pivots the data).
+              const visual = cur.visual && { ...cur.visual, columns: cur.columns, rows: cur.rows };
+              return <ChartView columns={rd.columns} rows={rd.rows} chart={rd.spec}
+                                visual={visual} tall />;
             })()}
           </EncodingShelf>
         ) : (
@@ -218,7 +222,7 @@ export default function Canvas({ state, setState, onClose, chatOpen, onToggleCha
                 className={"panel" + (i === selected ? " panel-selected" : "")}
                 onClick={() => setState({ ...state, selected: i })}
               >
-                <ChartView columns={p.columns} rows={p.rows} chart={p.chart} />
+                <ChartView columns={p.columns} rows={p.rows} chart={p.chart} visual={p.visual} />
               </div>
             ))}
           </div>

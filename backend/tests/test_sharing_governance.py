@@ -513,6 +513,38 @@ def test_multi_panel_canvas_versions_keep_siblings_and_can_chain_edits(monkeypat
     assert seen[1][0] == ["month", "revenue"] and seen[1][1] == [["Jan", 300]]
 
 
+def test_canvas_edits_keep_a_siblings_custom_visual_and_drop_the_edited_ones(monkeypatch):
+    visual = {"title": "Rings", "code": "d3.select(el)", "explanation": "", "request": "rings"}
+    parent = {
+        "text": "two views", "source": "demo", "table": "sales",
+        "author_role": "analyst", "sql": "SELECT region, revenue FROM sales",
+        "columns": ["region", "revenue"], "rows": [["EU", 125]],
+        "chart": {"type": "bar"},
+        "panels": [
+            {"source": "demo", "sql": "SELECT region, revenue FROM sales",
+             "columns": ["region", "revenue"], "rows": [["EU", 125]],
+             "chart": {"type": "table"}, "visual": visual},
+            {"source": "demo", "sql": "SELECT month, revenue FROM sales",
+             "columns": ["month", "revenue"], "rows": [["Jan", 300]],
+             "chart": {"type": "line"}},
+        ],
+    }
+    cid, parent_id = _chat_with(ANA, parent)
+    monkeypatch.setattr(chat.agent, "llm_available", lambda *a, **k: False)
+    monkeypatch.setattr(chat.agent, "edit_canvas", lambda _i, columns, rows, chart, **_k: {
+        "note": "edited", "columns": columns, "rows": rows, "chart": {"type": "area"}})
+    sibling = chat.canvas_edit(chat.CanvasEdit(
+        instruction="change the monthly panel", columns=[], rows=[],
+        conversation_id=cid, parent_message_id=parent_id, parent_panel_index=1), user=ANA)
+    assert sibling["panels"][0]["visual"] == visual          # untouched sibling keeps it
+    edited = chat.canvas_edit(chat.CanvasEdit(
+        instruction="make the rings a bar", columns=[], rows=[],
+        conversation_id=cid, parent_message_id=sibling["message_id"],
+        parent_panel_index=0), user=ANA)
+    # A chart edit shows the chart: the edited panel's old visual is gone.
+    assert "visual" not in edited["panels"][0] and edited["panels"][0]["chart"] == {"type": "area"}
+
+
 def test_conversation_session_read_resume_and_fork_rebuild_visible_transcript(monkeypatch):
     current = {"identity": "gov-a"}
     monkeypatch.setattr(governance, "identity", lambda: current["identity"])

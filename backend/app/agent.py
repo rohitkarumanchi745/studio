@@ -28,7 +28,7 @@ import re
 from typing import List
 from urllib.parse import urlsplit
 
-from . import db, email_service, gateway, grains, progress
+from . import db, email_service, gateway, grains, progress, visuals
 from .queryguard import QueryRejected
 
 # Full Power BI / Tableau-style catalog (rendered with ECharts client-side),
@@ -631,6 +631,39 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         return f"Chart panel {len(ctx['panels'])} recorded."
 
     @tool
+    def render_visual(title: str, request: str) -> str:
+        """Write a CUSTOM interactive D3 visualization of the most recent
+        run_sql result, as code (an artifact). Use it when the user asks for a
+        custom, interactive or D3 visual, or when nothing in render_chart's
+        catalog fits (radial or timeline layouts, annotated stories, small
+        multiples). Prefer render_chart whenever a standard type answers.
+
+        Args:
+            title: Short human-readable title.
+            request: What to draw and how — encodings, interactions, emphasis —
+                in plain words; the code is written from this.
+        """
+        progress.emit_for(_tid, f"{_me}: writing a custom visual")
+        if ctx["sql"] is None:
+            return "No query result yet — call run_sql first."
+        try:
+            out = visuals.generate(make_llm(spec, user), ctx["columns"], ctx["rows"],
+                                   request, title)
+        except visuals.VisualError as e:
+            return f"Could not write the visual ({e}). Use render_chart instead."
+        # A panel like render_chart's: the same rows and SQL (so read-time
+        # authorization covers it), a table as its plain view, and the code.
+        ctx["panels"].append({
+            "sql": ctx["sql"],
+            "columns": ctx["columns"],
+            "rows": ctx["rows"],
+            "chart": {"type": "table", "title": out["title"]},
+            "visual": {"title": out["title"], "code": out["code"],
+                       "explanation": out["explanation"], "request": request},
+        })
+        return f"Custom visual panel {len(ctx['panels'])} recorded: {out['title']}."
+
+    @tool
     def data_freshness(table: str) -> str:
         """How current a table's data is — the latest value of its load/update
         timestamp (or date) column and the row count. Use this to answer
@@ -776,6 +809,10 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         base_tools = [run_sql, render_chart, data_freshness]
         if tool_profile == "full":
             base_tools += [remember, email_report]
+            if not self_hosted(spec):
+                # Writing D3 code is a frontier-model job; the self-hosted
+                # adapter is trained on run_sql/render_chart only.
+                base_tools.append(render_visual)
         if delegation is not None and not self_hosted(spec):
             # The current BitNet adapter is trained on run_sql/render_chart JSON
             # only. Do not advertise delegation until it has its own action
@@ -978,6 +1015,9 @@ Rules:
   aggregate answers the question; always LIMIT raw listings.
 - Only SELECT statements; only the tables listed above.
 - After a successful query, call render_chart when a visualization would help.
+  If the user asks for a custom, interactive or D3 visualization — or nothing
+  in render_chart's catalog fits — and a render_visual tool is available, call
+  render_visual instead; it writes the visual as code.
   Pick the form for the job: trends → line/area/stacked_area, comparisons →
   bar/hbar/stacked_bar/combo, shares → pie/donut/treemap/funnel, correlations →
   scatter/bubble, matrices → heatmap, distributions → histogram/boxplot (or
