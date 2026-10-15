@@ -1879,8 +1879,25 @@ depth, not the boundary. The panel keeps its SQL and rows, so read-time
 authorization covers the visual exactly as it covers a chart. Offered on full
 chat turns with a frontier model; a visual is not yet pinnable to a dashboard.
 
-**The Visuals screen** (sidebar → *Visuals — D3 & artifacts*) puts the two side
-by side for every chart in your conversations. Pick a chart and it shows every
+**The D3 & artifacts window** (sidebar → *Visuals — D3 & artifacts*) is a chat
+for visuals: type what you want to see, over any source (or all of them, through
+the multi-agent path), and the answer comes back in the thread drawn by **D3
+alone**, as a D3 chart or a custom visual the AI writes. It is the chat's own
+turn (`visual: true` on `/api/chat/background`), so queries, permissions,
+governance, history and sharing work exactly as they do there. What changes: the
+agent always visualizes; `render_chart` takes only the types D3 draws
+(`agent.D3_CHART_TYPES`, kept in step with the frontend's list); and
+`agent.d3_only` gives any other chart its D3 stand-in (a sankey becomes a
+network, a treemap circle packing, a boxplot a beeswarm) and puts every panel on
+the D3 engine, including answers from the keyless fallback and the multi-agent
+orchestrator. Custom visuals need one source; the multi-agent workers draw D3
+charts. The turn skips the semantic layer, the plan cache and BitNet routing,
+which return stock charts and cannot write a visual. Commands are read as
+questions there, so the window never builds a pipeline or submits a platform
+job, and its conversations carry a 🎨 in the title so they reopen in it.
+
+**Your charts** (⊞ in that window's toolbar) puts the two side by side for
+every chart in your conversations. Pick a chart and it shows every
 D3 chart type its data fits, drawn live, plus any custom visuals — describe one
 and the AI writes it there. **Use this** saves the choice as a new canvas version
 of that answer (`chat.visual_apply`): the same server-side rules as a canvas edit

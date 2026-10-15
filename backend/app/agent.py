@@ -42,6 +42,43 @@ CHART_TYPES = [
     "table",
 ]
 
+# What the D3 engine draws (frontend renderers/D3View.jsx D3_TYPES — keep the
+# two in step). The D3 & artifacts window renders ONLY these, plus custom
+# visuals; d3_only() maps any other type to its nearest D3 stand-in.
+D3_CHART_TYPES = (
+    "bar", "hbar", "stacked_bar", "line", "area", "stacked_area", "pie", "donut",
+    "scatter", "bubble", "heatmap", "network", "beeswarm", "calendar", "circle_pack",
+)
+_D3_STAND_IN = {
+    "combo": "bar", "treemap": "circle_pack", "funnel": "hbar", "radar": "bar",
+    "gauge": "bar", "kpi": "bar", "histogram": "beeswarm", "boxplot": "beeswarm",
+    "waterfall": "bar", "sankey": "network", "table": "bar",
+}
+
+
+def d3_only(result):
+    """Make every chart in a result drawable by D3 alone: a type D3 lacks
+    becomes its stand-in (a sankey's flows → a network, a boxplot's spread → a
+    beeswarm, a treemap → circle packing), and every panel draws with the D3
+    engine. Custom visuals are D3 code already. Covers answers that did not
+    come from a visual-mode agent — a cached plan, the keyless fallback, the
+    multi-source orchestrator."""
+    def fix(chart):
+        if isinstance(chart, dict) and chart.get("type") not in D3_CHART_TYPES:
+            chart = {**chart, "type": _D3_STAND_IN.get(chart.get("type"), "bar")}
+        return chart
+
+    if isinstance(result.get("chart"), dict):
+        result["chart"] = fix(result["chart"])
+    panels = result.get("panels")
+    if isinstance(panels, list):
+        result["panels"] = [
+            {**p, "chart": fix(p.get("chart")), "engine": "d3"} if isinstance(p, dict) else p
+            for p in panels]
+    result["visual_mode"] = True
+    return result
+
+
 # Phrase → type map for prompt edits without an LLM key ("stacked bar chart")
 _CHART_PHRASES = [
     # The D3 types first, and only as unmistakable chart names: "by ad
@@ -516,7 +553,8 @@ def _single_reply_usage(reply):
 
 
 def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, model=None,
-              skill_md=None, kag_first=False, delegation=None, tool_profile="full"):
+              skill_md=None, kag_first=False, delegation=None, tool_profile="full",
+              visual_mode=False):
     """One analytics turn.
 
     schemas: {table_name: [{"name","type"}, ...]} — one entry for single-table
@@ -554,6 +592,9 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
     # including headless/autopilot calls that bypass chat's router — executes
     # the trained JSON action contract instead of treating it as prose.
     spec = concrete_model_spec(spec)
+    # Writing D3 code is a frontier-model job; the self-hosted adapter is
+    # trained on run_sql/render_chart only.
+    offers_visual = tool_profile == "full" and not self_hosted(spec)
 
     ctx = {"sql": None, "columns": [], "rows": [], "chart": None, "email": None, "panels": [],
            "citations": [],
@@ -612,6 +653,10 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         progress.emit_for(_tid, f"{_me}: rendering a {chart_type} chart")
         if chart_type not in CHART_TYPES:
             return f"Unsupported chart_type. Use one of: {', '.join(CHART_TYPES)}"
+        if visual_mode and chart_type not in D3_CHART_TYPES:
+            return ("In this window every chart is drawn with D3, which has: "
+                    f"{', '.join(D3_CHART_TYPES)}. Pick one of those"
+                    + (", or call render_visual for anything else." if offers_visual else "."))
         if ctx["sql"] is None:
             return "No query result yet — call run_sql first."
         missing = [c for c in [x] + list(y) if c not in ctx["columns"]]
@@ -627,6 +672,7 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
             "columns": ctx["columns"],
             "rows": ctx["rows"],
             "chart": spec,
+            **({"engine": "d3"} if visual_mode else {}),
         })
         return f"Chart panel {len(ctx['panels'])} recorded."
 
@@ -796,6 +842,15 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
             "yourself."
         )
         volatile = f"{volatile}\n\n{delegation_note}" if volatile else delegation_note
+    if visual_mode:
+        # The D3 & artifacts window: the visual IS the answer, and it is D3.
+        how = ("Call render_visual when the user asks for something custom, interactive "
+               "or bespoke, or when no D3 chart type fits; otherwise call render_chart"
+               if offers_visual else "Call render_chart")
+        system += ("\n\nD3 & ARTIFACTS WINDOW: every answer here is drawn with D3 only. "
+                   f"After run_sql, ALWAYS visualize. {how} with one of the D3 types: "
+                   f"{', '.join(D3_CHART_TYPES)}. No other chart type is available here. "
+                   "Keep the text brief — the visual is the answer.")
     if kag_first:
         # User explicitly chose the KAG engine: ground the answer in their own
         # documents first, and only touch the warehouse if the docs can't answer.
@@ -809,10 +864,8 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         base_tools = [run_sql, render_chart, data_freshness]
         if tool_profile == "full":
             base_tools += [remember, email_report]
-            if not self_hosted(spec):
-                # Writing D3 code is a frontier-model job; the self-hosted
-                # adapter is trained on run_sql/render_chart only.
-                base_tools.append(render_visual)
+        if offers_visual:
+            base_tools.append(render_visual)
         if delegation is not None and not self_hosted(spec):
             # The current BitNet adapter is trained on run_sql/render_chart JSON
             # only. Do not advertise delegation until it has its own action
@@ -850,7 +903,12 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
             if len(actions) == 2:
                 proposed = _auto_chart(ctx["columns"], ctx["rows"], table)
                 if proposed:
-                    proposed = {**proposed, "type": actions[1]["chart_type"]}
+                    chart_type = actions[1]["chart_type"]
+                    if visual_mode and chart_type not in D3_CHART_TYPES:
+                        # One shot, no retry: take the D3 stand-in rather
+                        # than let render_chart refuse the only chart.
+                        chart_type = _D3_STAND_IN.get(chart_type, "bar")
+                    proposed = {**proposed, "type": chart_type}
                     render_chart.invoke({
                         "chart_type": proposed["type"],
                         "title": proposed["title"],

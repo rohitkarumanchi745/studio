@@ -637,6 +637,13 @@ td { color: var(--ink-2); }
   border-radius: 999px; padding: 1px 8px; margin-left: 4px;
 }
 .artifact-note { margin: 4px 0 0; }
+/* D3 & artifacts window: the chat, with every answer drawn in the thread */
+.visual-chat .msg { max-width: 1040px; }
+.visual-chat .toolbar { flex-wrap: wrap; }
+.visual-toolbar-right { margin-left: auto; display: inline-flex; gap: 8px; align-items: center; }
+.msg-visuals { display: grid; gap: 12px; margin: 10px 0 12px; }
+.msg-visual { border: 1px solid var(--line); border-radius: 10px; padding: 10px; background: var(--surface); min-width: 0; }
+.msg-visual .chartview { border-top: none; padding-top: 0; }
 /* Visuals screen: chart list on the left, every way to draw it on the right */
 .visuals-layout { display: grid; grid-template-columns: 260px minmax(0, 1fr); gap: 16px; margin-top: 10px;
   min-height: 0; flex: 1; }
