@@ -719,3 +719,85 @@ test("Disconnect and Back to environment act on the built-in source at once", as
                                 c.method === "DELETE"));
   });
 });
+
+// ── The Databricks form: wrong values are marked where they were typed ──
+
+const DBX = { ctype: "databricks", label: "Databricks SQL", dialect: "databricks",
+  ns: { schema: "schema", database: "catalog" },
+  fields: [
+    { key: "server_hostname", label: "Server hostname", required: true, secret: false, default: "", placeholder: "" },
+    { key: "http_path", label: "HTTP path", required: true, secret: false, default: "", placeholder: "" },
+    { key: "access_token", label: "Access token", required: true, secret: true, default: "", placeholder: "" },
+    { key: "catalog", label: "Catalog", required: false, secret: false, default: "", placeholder: "" },
+    { key: "schema", label: "Schema", required: false, secret: false, default: "default", placeholder: "" },
+  ] };
+const HOST_SAYS = "This looks like a token or secret, not a host name.";
+const PATH_SAYS = "That is a browser address, not the warehouse's HTTP path.";
+
+function dbxForm(errors) {
+  const tile = byId(buildTiles({
+    types: [DBX], sources: [{ name: "databricks", dialect: "databricks", configured: true, allowed: true }],
+    envs: [{ name: "databricks", mode: "environment", hint: "" }] })).databricks;
+  const panel = harness(ConnectForm, { tile, defaultName: "databricks-2",
+    takenNames: new Set(["databricks"]), onDone() {}, onError: (m) => errors.push(m), onRemoved() {} });
+  const type = (key, value) => findNode(panel.tree(),
+    (n) => n.type === "input" && n.props.name === `conn-databricks-${key}`)
+    .props.onChange({ target: { value } });
+  type("server_hostname", "dose0123456789abcdef0123");
+  type("http_path", "https://dbc-1.cloud.databricks.com/settings/workspace");
+  type("access_token", "dapi-token");
+  return { panel, type };
+}
+
+test("a refused sign-in marks each wrong field and says nothing was sent", async () => {
+  const refused = { ok: false, namespaces: [], error: `${HOST_SAYS} ${PATH_SAYS}`,
+                    fields: { server_hostname: HOST_SAYS, http_path: PATH_SAYS } };
+  await withApi({ __user: ADMIN, "/connections/browse": refused }, async () => {
+    const errors = [];
+    const { panel, type } = dbxForm(errors);
+    const signIn = findNode(panel.tree(), (n) => n.type === "button"
+      && String(n.props.children).includes("Sign in and list schemas"));
+    await signIn.props.onClick();
+    let html = panel.render();
+    assert.equal((html.match(/class="conn-input-bad"/g) || []).length, 2);
+    assert.equal((html.match(/aria-invalid="true"/g) || []).length, 2);
+    assert.ok(html.includes(HOST_SAYS) && html.includes("That is a browser address"));
+    assert.match(html, /Fix the marked fields — nothing\s+was sent to Databricks SQL yet/);
+    // Not the picker's "couldn't list schemas — only affects the picker" note.
+    assert.doesNotMatch(html, /list schemas \(/);
+    // Editing a field clears the marks: the next sign-in decides again.
+    type("server_hostname", "dbc-1.cloud.databricks.com");
+    html = panel.render();
+    assert.doesNotMatch(html, /conn-input-bad|Fix the marked/);
+  });
+});
+
+test("a save refused for its fields marks them instead of a banner", async () => {
+  await withApi({ __user: ADMIN }, async () => {
+    const puts = [];
+    globalThis.fetch = async (url, options = {}) => {
+      if (url === "/api/connections/env/databricks" && options.method === "PUT") {
+        puts.push(JSON.parse(options.body));
+        return { status: 400, ok: false, json: async () => ({ detail: {
+          error: `connection test failed: ${PATH_SAYS}`, fields: { http_path: PATH_SAYS } } }) };
+      }
+      return { status: 200, ok: true, json: async () => [] };
+    };
+    const errors = [];
+    const { panel, type } = dbxForm(errors);
+    findNode(panel.tree(), (n) => n.type?.name === "Instances").props.onManage(
+      { name: "databricks", kind: "env", mode: "environment", configured: true }, "change");
+    // "Change" starts from a blank form; fill it with one wrong field.
+    type("server_hostname", "dbc-1.cloud.databricks.com");
+    type("http_path", "https://dbc-1.cloud.databricks.com/settings/workspace");
+    type("access_token", "dapi-token");
+    const save = findNode(panel.tree(), (n) => n.type === "button" && n.props.className === "primary");
+    await save.props.onClick();
+    assert.equal(puts.length, 1);
+    const html = panel.render();
+    assert.equal((html.match(/class="conn-input-bad"/g) || []).length, 1);
+    assert.ok(html.includes("That is a browser address"));
+    assert.match(html, /Fix the marked field — nothing/);
+    assert.ok(errors.every((e) => e === ""), errors.join(" | "));
+  });
+});

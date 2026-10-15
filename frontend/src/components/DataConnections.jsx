@@ -456,6 +456,20 @@ export function ConnectForm({ tile, defaultName, takenNames, onDone, onError, on
 
   const found = browse?.namespaces || [];
   const chosen = found.filter((n) => picked.includes(key(n)));
+  // Problems the server found in the form itself, by field — before it signed
+  // in anywhere. Editing a field clears them (setField resets test/browse).
+  const fieldProblems = browse?.fields || test?.fields || {};
+  const formRefused = Object.keys(fieldProblems).length > 0;
+
+  // A save refused for the form's fields marks them, like a sign-in would.
+  function refusedSave(e) {
+    if (e.detail?.fields) {
+      setTest({ ok: false, error: e.detail.error, fields: e.detail.fields });
+      onError("");
+      return true;
+    }
+    return false;
+  }
 
   async function save() {
     if (replacing) return saveReplacement();
@@ -479,6 +493,7 @@ export function ConnectForm({ tile, defaultName, takenNames, onDone, onError, on
       } catch (e) {
         setBusy("");
         setProgress("");
+        if (!done.length && refusedSave(e)) return;
         onError(done.length
           ? `Connected ${done.join(", ")}, then “${p.name}” failed: ${e.message}`
           : e.message);
@@ -514,7 +529,7 @@ export function ConnectForm({ tile, defaultName, takenNames, onDone, onError, on
       onDone(`“${replacing}” now reads from the connection entered here — same name, `
         + "so the roles granted it and the work saved against it follow it.");
     } catch (e) {
-      onError(e.message);
+      if (!refusedSave(e)) onError(e.message);
     } finally {
       setBusy("");
     }
@@ -600,6 +615,8 @@ export function ConnectForm({ tile, defaultName, takenNames, onDone, onError, on
             <input
               type={f.secret ? "password" : "text"}
               name={`conn-${tile.id}-${f.key}`}
+              className={fieldProblems[f.key] ? "conn-input-bad" : undefined}
+              aria-invalid={fieldProblems[f.key] ? "true" : undefined}
               placeholder={f.placeholder || ""}
               value={cfg[f.key] ?? ""}
               onChange={(e) => setField(f.key, e.target.value)}
@@ -607,6 +624,7 @@ export function ConnectForm({ tile, defaultName, takenNames, onDone, onError, on
               {...NO_AUTOFILL}
               autoComplete={f.secret ? "new-password" : "off"}
             />
+            {fieldProblems[f.key] && <span className="conn-field-error">{fieldProblems[f.key]}</span>}
           </label>
         ))}
         {!replacing && (
@@ -632,7 +650,12 @@ export function ConnectForm({ tile, defaultName, takenNames, onDone, onError, on
         </div>
       )}
 
-      {test && (test.ok
+      {formRefused ? (
+        <div className="error">
+          Fix the marked {Object.keys(fieldProblems).length > 1 ? "fields" : "field"} — nothing
+          was sent to {tile.meta?.label || "the server"} yet.
+        </div>
+      ) : test && (test.ok
         ? <div className="meta share-notice">
             {test.discovery
               ? `✓ Signed in — ${browse?.namespaces?.length || 0} schemas visible`
@@ -641,7 +664,12 @@ export function ConnectForm({ tile, defaultName, takenNames, onDone, onError, on
         : <div className="error">{test.error}</div>)}
 
       {busy === "browse" && <div className="meta">Looking up schemas…</div>}
-      {browse && <Namespaces
+      {busy && tile.id === "databricks" && (
+        <div className="meta">
+          Signing in to the workspace — up to a minute if the SQL warehouse is starting.
+        </div>
+      )}
+      {browse && !formRefused && <Namespaces
         browse={browse} picked={picked} setPicked={setPicked} keyOf={key} />}
 
       <div className="m365-actions">

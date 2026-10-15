@@ -26,6 +26,7 @@ Security model:
 import base64
 import json
 import re
+import socket
 import threading
 import time
 import uuid
@@ -42,7 +43,9 @@ from . import db
 from .auth import current_user
 from .connectors.base import Connector
 from .connectors.bigquery_conn import BigQueryConnector
+from .connectors.databricks_conn import PROBE_LIMITS as DATABRICKS_PROBE_LIMITS
 from .connectors.databricks_conn import DatabricksConnector
+from .connectors.databricks_conn import describe_error as describe_databricks_error
 from .connectors.graph_conn import GraphConnector
 from .connectors.postgres_conn import PostgresConnector
 from .connectors.powerbi_conn import PowerBIConnector, PowerBIError
@@ -117,6 +120,8 @@ class _DynDatabricks(DatabricksConnector):
         self.name = name
         self._dyn = cfg
         self._browsing = name == "__browse__"
+        if name in ("__probe__", "__browse__"):
+            self.connect_limits = DATABRICKS_PROBE_LIMITS   # a test: about a minute, not 15
 
     def _cfg(self):
         base = {"server_hostname": "", "http_path": "", "access_token": "",
@@ -168,6 +173,129 @@ def _field(key, label, required=False, secret=False, default="", placeholder="")
             "default": default, "placeholder": placeholder}
 
 
+# ── Form checks, before any sign-in ─────────────────────────────────────
+#
+# A sign-in with a value in the wrong field (a token in the hostname, a
+# browser address as the HTTP path) used to go to the driver, which retried
+# for minutes. A check catches the usual mix-ups at once and says which field
+# and where the right value is. Messages never repeat what was typed in a
+# field: the "hostname" may well be a secret pasted into the wrong box.
+
+_HOSTNAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$")
+_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+_DBX_WHERE = "the SQL warehouse's Connection details tab"
+
+
+def _looks_secret(value):
+    v = value.lower()
+    return v.startswith(("dapi", "dose", "eyj")) or ("." not in v and len(v) >= 20)
+
+
+def _check_databricks(cfg):
+    """(normalized cfg, {field: problem}). A pasted workspace address becomes
+    its hostname, and a full URL whose path is the warehouse's /sql/… path
+    becomes that path, so copying from the browser just works."""
+    cfg = dict(cfg)
+    problems = {}
+    host = str(cfg.get("server_hostname") or "").strip()
+    path = str(cfg.get("http_path") or "").strip()
+    token = str(cfg.get("access_token") or "").strip()
+
+    if "://" in host:
+        try:
+            host = urlsplit(host).hostname or ""
+        except ValueError:
+            host = ""
+    host = host.split("/")[0].split("?")[0].lower()
+    if host.endswith(":443"):
+        host = host[:-4]
+    path_host = ""
+    if "://" in path:
+        try:
+            parts = urlsplit(path)
+            path_host = (parts.hostname or "").lower()
+            if parts.path.startswith("/sql/"):
+                path = parts.path
+                if not host and _HOSTNAME.match(path_host):
+                    host = path_host
+        except ValueError:
+            pass
+    cfg.update(server_hostname=host, http_path=path, access_token=token)
+
+    if host and not _HOSTNAME.match(host):
+        problems["server_hostname"] = (
+            ("This looks like a token or secret, not a host name. " if _looks_secret(host)
+             else "This is not a host name. ")
+            + f"Copy the Server hostname from {_DBX_WHERE} — it looks like "
+              "dbc-1234abcd-5678.cloud.databricks.com."
+            + (f" Your workspace looks like {path_host}." if _HOSTNAME.match(path_host) else ""))
+    if path and not path.startswith("/sql/"):
+        problems["http_path"] = (
+            ("That is a browser address, not the warehouse's HTTP path. " if "://" in path else "")
+            + f"Copy the HTTP path from {_DBX_WHERE} — it looks like "
+              "/sql/1.0/warehouses/1a2b3c4d5e6f7a8b.")
+    if token:
+        low = token.lower()
+        if low.startswith("dose"):
+            problems["access_token"] = (
+                "This is a service principal's OAuth secret (it starts with “dose”). This "
+                "connection signs in with a personal access token, which starts with “dapi” "
+                "(Settings → Developer → Access tokens).")
+        elif _UUID.match(token):
+            problems["access_token"] = (
+                "This looks like an application (client) ID, not an access token — use a "
+                "personal access token, which starts with “dapi”.")
+        elif "://" in token or low.endswith((".databricks.com", ".azuredatabricks.net",
+                                             ".gcp.databricks.com")):
+            problems["access_token"] = ("This looks like a host or URL, not an access token — "
+                                        "it starts with “dapi”.")
+    return cfg, problems
+
+
+def _resolves(host, wait=5.0):
+    """Does `host` resolve? Unknown (a slow resolver) counts as yes, so the
+    sign-in itself decides. Resolving a name the admin typed is no more reach
+    than the sign-in that follows it."""
+    out = {}
+
+    def look():
+        try:
+            socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+            out["ok"] = True
+        except OSError:
+            out["ok"] = False
+
+    t = threading.Thread(target=look, daemon=True)
+    t.start()
+    t.join(wait)
+    return out.get("ok", True)
+
+
+def _preflight(ctype, cfg):
+    """(cfg, {field: problem}) for one connection type, before any sign-in:
+    the type's form check, then — for a type that names its host field — a
+    DNS lookup, so a mistyped host fails in a second, not after retries."""
+    t = TYPES[ctype]
+    problems = {}
+    if t.get("check"):
+        cfg, problems = t["check"](cfg)
+    host_key = t.get("resolve")
+    if not problems and host_key and cfg.get(host_key) and not _resolves(cfg[host_key]):
+        problems[host_key] = t["resolve_says"]
+    return cfg, problems
+
+
+def _normalized(ctype, cfg):
+    """The config as it will be stored: the type's form check's tidy-up."""
+    check = (TYPES.get(ctype) or {}).get("check")
+    return check(cfg)[0] if check else cfg
+
+
+def _refused(problems):
+    """A probe/browse result for a form that failed its checks."""
+    return {"ok": False, "error": " ".join(problems.values()), "fields": problems}
+
+
 #: Connectable types: how to build one, its dialect, and the form the UI renders.
 TYPES = {
     "postgres": {
@@ -195,6 +323,10 @@ TYPES = {
     },
     "databricks": {
         "label": "Databricks SQL", "dialect": "databricks", "build": _DynDatabricks,
+        "check": _check_databricks, "explain": describe_databricks_error,
+        "resolve": "server_hostname",
+        "resolve_says": ("That Server hostname does not resolve — copy it from "
+                         f"{_DBX_WHERE} (it looks like dbc-1234abcd-5678.cloud.databricks.com)."),
         "hint_key": "server_hostname",
         "ns": {"schema": "schema", "database": "catalog"},
         "fields": [
@@ -541,6 +673,9 @@ def _probe(ctype, cfg):
     missing = [f["key"] for f in t["fields"] if f["required"] and not (cfg.get(f["key"]) or "").strip()]
     if missing:
         return {"ok": False, "error": "missing required fields: " + ", ".join(missing)}
+    cfg, problems = _preflight(ctype, cfg)
+    if problems:
+        return _refused(problems)
     conn = None
     try:
         conn = t["build"]("__probe__", cfg)
@@ -577,6 +712,13 @@ def _safe_connection_error(exc, connection_type, cfg):
     # principal sign-in nearly always needs on the first try.
     if isinstance(exc, PowerBIError):
         return str(exc)[:300]
+    # A type may name the failure from its status code and exception types
+    # alone (Databricks: a rejected token, a wrong HTTP path, a timeout) —
+    # fixed sentences that cannot carry a submitted secret.
+    explain = connection_type.get("explain")
+    said = explain(exc) if explain else None
+    if said:
+        return said
     if any(field.get("secret") and str((cfg or {}).get(field["key"], "") or "")
            for field in connection_type.get("fields", [])):
         return "connection failed (credential details redacted)"
@@ -622,6 +764,9 @@ def _browse(ctype, cfg):
     if missing:
         return {"ok": False, "error": "missing required fields: " + ", ".join(missing),
                 "namespaces": []}
+    cfg, problems = _preflight(ctype, cfg)
+    if problems:
+        return {**_refused(problems), "namespaces": []}
     conn = None
     try:
         # The leaf namespace is deliberately cleared even when its input has a
@@ -723,6 +868,15 @@ def _require_pin(ctype, cfg, why):
             raise HTTPException(400, f"pick a {field.get('label', pin).lower()} to connect {why}")
 
 
+def _refuse_save(probe):
+    """A failed probe blocks a save. A form that failed its checks says which
+    fields, so the screen can mark them; a failed sign-in stays one sentence."""
+    said = f"connection test failed: {probe['error']}"
+    if probe.get("fields"):
+        raise HTTPException(400, {"error": said, "fields": probe["fields"]})
+    raise HTTPException(400, said)
+
+
 @router.post("", status_code=201)
 def create_connection(body: ConnIn, user=Depends(current_user)):
     _admin(user)
@@ -734,11 +888,11 @@ def create_connection(body: ConnIn, user=Depends(current_user)):
         raise HTTPException(400, f"a source named '{name}' already exists")
     if body.ctype not in TYPES:
         raise HTTPException(400, f"unknown connection type '{body.ctype}'")
-    cfg = {k: str(v) for k, v in (body.config or {}).items()}
+    cfg = _normalized(body.ctype, {k: str(v) for k, v in (body.config or {}).items()})
     _require_pin(body.ctype, cfg, "— each one becomes its own source")
     probe = _probe(body.ctype, cfg)
     if not probe["ok"]:
-        raise HTTPException(400, f"connection test failed: {probe['error']}")
+        _refuse_save(probe)
     row = {"id": str(uuid.uuid4()), "name": name, "ctype": body.ctype,
            "label": (body.label or "").strip()[:80],
            "config": _fernet().encrypt(json.dumps(cfg).encode()).decode(),
@@ -818,11 +972,11 @@ def replace_env_source(name: str, body: EnvIn, user=Depends(current_user)):
     editing the deployment's environment. Probed before it is saved."""
     _admin(user)
     ctype = _env_or_404(name)
-    cfg = {k: str(v) for k, v in (body.config or {}).items()}
+    cfg = _normalized(ctype, {k: str(v) for k, v in (body.config or {}).items()})
     _require_pin(ctype, cfg, f"— '{name}' reads exactly one")
     probe = _probe(ctype, cfg)
     if not probe["ok"]:
-        raise HTTPException(400, f"connection test failed: {probe['error']}")
+        _refuse_save(probe)
     _env_write(name, user, config=_fernet().encrypt(json.dumps(cfg).encode()).decode(),
                disabled=False)
     db.log_activity(user, "connection_env_replace", prompt=name, source=ctype)
