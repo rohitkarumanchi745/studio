@@ -1420,25 +1420,13 @@ def canvas_edit(body: CanvasEdit, user=Depends(current_user)):
         # otherwise a second edit of panel N would point at a new message that
         # only contains panel 0 and be rejected (or drift from what the UI
         # still displays).
-        trusted_parent_panels = []
-        for parent_frame in frames:
-            parent_frame = dict(parent_frame)
-            parent_source = parent_frame.get("source") or parent_content.get("source")
-            parent_sql = parent_frame.get("sql") or parent_content.get("sql")
-            trusted_parent_panels.append({
-                "sql": parent_sql,
-                "columns": parent_frame.get("columns") or [],
-                "rows": parent_frame.get("rows") or [],
-                "chart": parent_frame.get("chart"),
-                "source": parent_source,
-                **({"agent": parent_frame["agent"]} if parent_frame.get("agent") else {}),
-                # A sibling's custom visual came from the trusted stored parent;
-                # editing another panel must not drop it. (The edited panel
-                # itself is replaced by the edit's frames: a chart edit shows
-                # the chart, not the old visual.)
-                **({"visual": parent_frame["visual"]}
-                   if isinstance(parent_frame.get("visual"), dict) else {}),
-            })
+        trusted_parent_panels = [_trusted_frame(f, parent_content) for f in frames]
+        # The edited panel is replaced by the edit's frames: a chart edit shows
+        # the chart, not the old visual — but the engine chosen to draw it
+        # (on the Visuals screen) is a presentation choice that carries over.
+        parent_engine = trusted_parent_panels[body.parent_panel_index].get("engine")
+        if parent_engine:
+            normalized_panels[0].setdefault("engine", parent_engine)
         panels = (trusted_parent_panels[:body.parent_panel_index]
                   + normalized_panels
                   + trusted_parent_panels[body.parent_panel_index + 1:])
@@ -1467,6 +1455,273 @@ def canvas_edit(body: CanvasEdit, user=Depends(current_user)):
         message_id = db.add_message(body.conversation_id, "assistant", message)
 
     return {**result, "message": message, "message_id": message_id}
+
+
+# ── Visuals screen: choose how each chart is drawn ────────────────────────
+#
+# The Visuals screen (frontend Visuals.jsx) lists the charts in the user's
+# conversations and, for one, offers every D3 chart type that fits its data
+# and custom visuals written as code (app/visuals.py). Choosing one saves a NEW
+# canvas version of that answer exactly as canvas_edit does — the governed
+# server copy of the data, the same provenance, every sibling panel kept — so
+# the history still holds the old version and every viewer sees the choice.
+
+ENGINES = ("echarts", "plotly", "vega", "d3")
+_MAX_LISTED_CONVERSATIONS = 40
+_MAX_LISTED_CHARTS = 200
+
+
+def _trusted_frame(frame, content):
+    """A stored frame as a persisted panel: its data and provenance (from the
+    trusted server copy), plus the presentation choices made for it — a custom
+    visual, the engine that draws it. Never anything a client asserted."""
+    frame = dict(frame)
+    return {
+        "sql": frame.get("sql") or content.get("sql"),
+        "columns": frame.get("columns") or [],
+        "rows": frame.get("rows") or [],
+        "chart": frame.get("chart"),
+        "source": frame.get("source") or content.get("source"),
+        **({"agent": frame["agent"]} if frame.get("agent") else {}),
+        **({"visual": frame["visual"]} if isinstance(frame.get("visual"), dict) else {}),
+        **({"engine": frame["engine"]} if frame.get("engine") in ENGINES else {}),
+    }
+
+
+def _content_frames(content):
+    frames = content.get("panels") or [content]
+    return frames if isinstance(frames, list) else []
+
+
+def _frame_data(frame, content):
+    columns = frame.get("columns") or content.get("columns") or []
+    rows = frame.get("rows")
+    if rows is None:
+        rows = content.get("rows") or []
+    return columns, rows
+
+
+def _frame_title(frame, content, index):
+    chart = frame.get("chart") if isinstance(frame.get("chart"), dict) else {}
+    visual = frame.get("visual") if isinstance(frame.get("visual"), dict) else {}
+    first_line = (content.get("text") or "").strip().split("\n")[0][:80]
+    return visual.get("title") or chart.get("title") or first_line or f"Chart {index + 1}"
+
+
+def _stored_chart(conversation_id, message_id, panel_index, user, need):
+    """One stored chart, loaded the way canvas_edit loads its parent: access
+    first (404 for an invisible conversation), then the message under the
+    reader's CURRENT access. Returns (access, content, frames, frame)."""
+    access = _own_or_404(conversation_id, user, need=need)
+    parent = next((m for m in _visible_messages(conversation_id, user, access)
+                   if m.get("id") == message_id), None)
+    if (not parent or parent.get("role") != "assistant"
+            or (parent.get("content") or {}).get("redacted")):
+        raise HTTPException(404, "That chart is unavailable under current access")
+    content = parent.get("content") or {}
+    frames = _content_frames(content)
+    if not (0 <= panel_index < len(frames)) or not isinstance(frames[panel_index], dict):
+        raise HTTPException(404, "That chart panel is unavailable")
+    columns, rows = _frame_data(frames[panel_index], content)
+    if not columns or not isinstance(rows, list) or not rows:
+        raise HTTPException(400, "That chart has no data left to draw")
+    return access, content, frames, frames[panel_index]
+
+
+def _visual_signature(code):
+    """HMAC over code this server's model wrote, so a saved visual can only be
+    one /visuals/generate produced — never JavaScript typed into a request.
+    Domain-separated from the JWT and Fernet uses of the same secret."""
+    import hashlib
+    import hmac
+    from . import bootstrap
+    key = ("studio-visual-sign-v1|" + (bootstrap.jwt_secret() or "")).encode()
+    return hmac.new(key, code.encode(), hashlib.sha256).hexdigest()
+
+
+@router.get("/visuals/charts")
+def visual_charts(user=Depends(current_user)):
+    """The charts in the user's conversations, newest first — metadata only.
+    A version replaced by a newer canvas version of the same answer is left
+    out: the newest version carries the whole sheet."""
+    out = []
+    for conv in db.list_conversations(user["id"])[:_MAX_LISTED_CONVERSATIONS]:
+        try:
+            access = _own_or_404(conv["id"], user)
+            messages = _visible_messages(conv["id"], user, access)
+        except HTTPException:
+            continue
+        replaced = {(m.get("content") or {}).get("canvas_provenance", {}).get("parent_message_id")
+                    for m in messages
+                    if isinstance((m.get("content") or {}).get("canvas_provenance"), dict)}
+        for m in reversed(messages):
+            content = m.get("content") or {}
+            if (m.get("role") != "assistant" or content.get("redacted")
+                    or m.get("id") in replaced):
+                continue
+            for i, frame in enumerate(_content_frames(content)):
+                if not isinstance(frame, dict):
+                    continue
+                columns, rows = _frame_data(frame, content)
+                if not columns or not rows:
+                    continue
+                chart = frame.get("chart") if isinstance(frame.get("chart"), dict) else {}
+                out.append({
+                    "conversation_id": conv["id"], "conversation_title": conv["title"],
+                    "message_id": m.get("id"), "panel_index": i,
+                    "title": _frame_title(frame, content, i),
+                    "type": chart.get("type") or "table",
+                    "engine": frame.get("engine") if frame.get("engine") in ENGINES else None,
+                    "has_visual": isinstance(frame.get("visual"), dict),
+                    "source": frame.get("source") or content.get("source"),
+                    "columns": columns, "row_count": len(rows),
+                    "created_at": m.get("created_at"),
+                    "can_edit": access in ("owner", "edit"),
+                })
+                if len(out) >= _MAX_LISTED_CHARTS:
+                    return out
+    return out
+
+
+@router.get("/visuals/chart")
+def visual_chart(conversation_id: str, message_id: str, panel_index: int = 0,
+                 user=Depends(current_user)):
+    """One chart's governed data and how it is drawn now."""
+    access, content, _frames, frame = _stored_chart(
+        conversation_id, message_id, panel_index, user, need="view")
+    columns, rows = _frame_data(frame, content)
+    return {"conversation_id": conversation_id, "message_id": message_id,
+            "panel_index": panel_index, "title": _frame_title(frame, content, panel_index),
+            "columns": columns, "rows": rows,
+            "chart": frame.get("chart") if isinstance(frame.get("chart"), dict) else None,
+            "engine": frame.get("engine") if frame.get("engine") in ENGINES else None,
+            "visual": frame.get("visual") if isinstance(frame.get("visual"), dict) else None,
+            "source": frame.get("source") or content.get("source"),
+            "can_edit": access in ("owner", "edit")}
+
+
+class VisualRequest(BaseModel):
+    conversation_id: str
+    message_id: str
+    panel_index: int = 0
+    request: str
+
+
+@router.post("/visuals/generate")
+def visual_generate(body: VisualRequest, user=Depends(current_user)):
+    """Write a custom visual for one stored chart. The model sees a sample of
+    the governed server copy — never rows a client sent."""
+    from . import visuals
+    request = (body.request or "").strip()
+    if not request:
+        raise HTTPException(400, "Describe the visual you want")
+    if len(request) > 2000:
+        raise HTTPException(400, "Keep the description under 2,000 characters")
+    _access, content, _frames, frame = _stored_chart(
+        body.conversation_id, body.message_id, body.panel_index, user, need="view")
+    if not agent.llm_available(user=user):
+        raise HTTPException(400, "Writing a custom visual needs a model — add an API key "
+                                 "in settings, or ask an admin to configure one")
+    columns, rows = _frame_data(frame, content)
+    try:
+        out = visuals.generate(agent.make_llm(agent.llm_spec(), user), columns, rows,
+                               request, _frame_title(frame, content, body.panel_index))
+    except visuals.VisualError as e:
+        raise HTTPException(422, f"Could not write the visual: {e}")
+    db.log_activity(user, "visual_generate", prompt=request[:300], row_count=len(rows))
+    return {**out, "request": request, "signature": _visual_signature(out["code"])}
+
+
+class VisualChoice(BaseModel):
+    conversation_id: str
+    message_id: str
+    panel_index: int = 0
+    chart_type: Optional[str] = None
+    engine: Optional[str] = None
+    visual: Optional[dict] = None
+
+
+@router.post("/visuals/apply")
+def visual_apply(body: VisualChoice, user=Depends(current_user)):
+    """Use a D3 chart type, or a custom visual, for one chart: a new canvas
+    version of the answer with that panel redrawn and every sibling kept."""
+    from . import visuals
+    if (body.chart_type is None) == (body.visual is None):
+        raise HTTPException(400, "Choose either a chart type or a custom visual")
+    _access, content, frames, frame = _stored_chart(
+        body.conversation_id, body.message_id, body.panel_index, user, need="edit")
+    if content.get("mode") == "canvas_edit":
+        cp = content.get("canvas_provenance")
+        if not isinstance(cp, dict) or cp.get("kind") != "canvas_v1":
+            raise HTTPException(400, "This legacy canvas can only be edited locally")
+    title = _frame_title(frame, content, body.panel_index)
+    panel = _trusted_frame(frame, content)
+    columns, rows = panel["columns"], panel["rows"]
+
+    if body.chart_type is not None:
+        if body.chart_type not in agent.CHART_TYPES:
+            raise HTTPException(400, f"Unknown chart type '{body.chart_type}'")
+        engine = body.engine or "d3"
+        if engine not in ENGINES:
+            raise HTTPException(400, f"Unknown engine '{engine}'")
+        chart = dict(panel.get("chart") or {})
+        chart["type"] = body.chart_type
+        chart.setdefault("title", title)
+        if not chart.get("x"):
+            chart["x"] = columns[0]
+        if not chart.get("y"):
+            first = rows[0] if rows else []
+            chart["y"] = [c for i, c in enumerate(columns)
+                          if i < len(first) and isinstance(first[i], (int, float))
+                          and not isinstance(first[i], bool) and c != chart["x"]][:2]
+        panel["chart"] = chart
+        panel["engine"] = engine
+        panel.pop("visual", None)                 # a chart was chosen: draw the chart
+        what = f"a {body.chart_type.replace('_', ' ')} chart ({engine})"
+    else:
+        v = body.visual if isinstance(body.visual, dict) else {}
+        code = v.get("code")
+        if not isinstance(code, str) or not code.strip() or len(code) > visuals.MAX_CODE_CHARS:
+            raise HTTPException(400, "The visual has no usable code")
+        import hmac
+        if not hmac.compare_digest(str(v.get("signature") or ""), _visual_signature(code)):
+            raise HTTPException(400, "Only a visual written here can be saved — generate it again")
+        problems = visuals.lint(code)
+        if problems:
+            raise HTTPException(400, "The visual's code uses " + "; ".join(problems))
+        panel["visual"] = {
+            "title": str(v.get("title") or title).strip()[:120],
+            "code": code,
+            "explanation": str(v.get("explanation") or "").strip()[:600],
+            "request": str(v.get("request") or "").strip()[:2000],
+        }
+        what = "a custom visual"
+
+    trusted = [_trusted_frame(f, content) for f in frames]
+    trusted[body.panel_index] = panel
+    message = {
+        "text": f"🎨 “{title}” now uses {what}",
+        "sql": panel.get("sql"),
+        "columns": columns,
+        "rows": rows,
+        "chart": panel.get("chart"),
+        "panels": trusted,
+        "mode": "canvas_edit",
+        "model": None,
+        "source": content.get("source"),
+        "table": content.get("table"),
+        "author_role": user["role"],
+        "canvas_provenance": {
+            "kind": "canvas_v1", "parent_message_id": body.message_id,
+            "parent_panel_index": body.panel_index,
+        },
+    }
+    if content.get("blend_provenance") is not None:
+        message["blend_provenance"] = content["blend_provenance"]
+        message["blend_sql"] = content.get("blend_sql")
+    message_id = db.add_message(body.conversation_id, "assistant", message)
+    db.log_activity(user, "visual_choice", prompt=what, row_count=len(rows))
+    return {"message_id": message_id, "message": message, "panel_index": body.panel_index}
 
 
 class EmailReport(BaseModel):

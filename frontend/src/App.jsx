@@ -16,6 +16,7 @@ import Kag from "./components/Kag";
 import PyBuild from "./components/PyBuild";
 import Pipelines from "./components/Pipelines";
 import QueryLibrary from "./components/QueryLibrary";
+import Visuals from "./components/Visuals";
 import RedTeam from "./components/RedTeam";
 import Sessions from "./components/Sessions";
 import Skills from "./components/Skills";
@@ -191,6 +192,7 @@ export default function App() {
         onActivity={() => setShowActivity(true)}
         onDashboards={go("/dashboards")}
         onQueries={go("/queries")}
+        onVisuals={go("/visuals")}
         onPipelines={go("/pipelines")}
         onGovernance={go("/governance")}
         onSemantic={go("/semantic")}
@@ -242,6 +244,8 @@ export default function App() {
         <Route path="/semantic" element={<Semantic user={user} onClose={home} />} />
         <Route path="/pipelines" element={<Pipelines onClose={home} />} />
         <Route path="/queries" element={<QueryLibrary onClose={home} />} />
+        <Route path="/visuals"
+               element={<Visuals onClose={home} onOpenChat={(cid) => navigate(`/c/${cid}`)} />} />
         <Route
           path="/dashboards"
           element={<DashboardList onOpen={(id) => navigate(`/dashboards/${id}`)} onClose={home} />}

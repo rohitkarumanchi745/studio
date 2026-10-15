@@ -144,6 +144,9 @@ export default function ChartView({
   // code was written for the panel's ORIGINAL columns, so visual.columns /
   // visual.rows, when given, are what it draws — not a reshaped copy.
   visual,
+  // The engine chosen for THIS chart on the Visuals screen; it overrides the
+  // browser-wide default (the toolbar can still switch for this session).
+  engine: chosenEngine,
   // Dashboard tile props: identify the tile, apply a cross-filter highlight,
   // report clicks upward, and surface format warnings. All optional.
   tileId, highlight, onSelect, onWarnings,
@@ -151,7 +154,9 @@ export default function ChartView({
   const [type, setType] = useState(chart?.type || "table");
   useEffect(() => setType(chart?.type || "table"), [chart]);
 
-  const [engine, setEngine] = useState(localStorage.getItem("studio_renderer") || "echarts");
+  const [engine, setEngine] = useState(
+    chosenEngine || localStorage.getItem("studio_renderer") || "echarts");
+  useEffect(() => { if (chosenEngine) setEngine(chosenEngine); }, [chosenEngine]);
 
   const spec = useMemo(() => (chart ? { ...chart, type } : null), [chart, type]);
 
