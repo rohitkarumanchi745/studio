@@ -109,7 +109,7 @@ flowchart TB
     end
 
     subgraph data["Data connectors — run_query reachable only inside the gateway"]
-        src[("demo · Snowflake · Databricks<br/>Neo4j · marketing")]
+        src[("demo · Snowflake · Databricks<br/>Neo4j · Power BI · marketing")]
         obj[("Object store · S3 / Azure / GCS<br/>DuckDB views")]
         bq[("BigQuery · cost-capped")]
     end
@@ -210,7 +210,7 @@ prefix at its own arity only:
 | Snowflake | `SNOWFLAKE_SCHEMA` (a schema) | `database.schema` | folded **UP**, the name Snowflake stores |
 | Databricks | `DATABRICKS_SCHEMA` (a schema) | `catalog.schema` | folded **down** (Spark folds everything) |
 | BigQuery | `BIGQUERY_DATASET` | `project.dataset` | verbatim — BigQuery ids are case-**sensitive** |
-| demo · object store · marketing · Neo4j | — | — | **empty**: a source that cannot vouch for a namespace accepts no qualifier at all |
+| demo · object store · marketing · Neo4j · Power BI | — | — | **empty**: a source that cannot vouch for a namespace accepts no qualifier at all |
 
 **Identifiers are compared the way the engine resolves them.** `"CUSTOMERS"`
 and `customers` are two different tables on PostgreSQL and Snowflake, and a
@@ -1219,8 +1219,8 @@ flowchart LR
 
 An admin connects a warehouse straight from the **Data connections** screen — no
 env vars, no redeploy. Pick a type (PostgreSQL, Snowflake, Databricks SQL,
-BigQuery, Neo4j), enter its credentials, and test them. For SQL warehouses the
-test also lists the visible schemas/datasets; select one or several, and Studio
+BigQuery, Neo4j, Power BI), enter its credentials, and test them. For SQL
+warehouses and Power BI the test also lists the visible schemas/datasets/models; select one or several, and Studio
 saves **one independently named and governed source per namespace**. A namespace
 that cannot be listed can still be typed explicitly and probed before save.
 Neo4j keeps the direct **Test** then **Save** flow. Every saved connection becomes
@@ -1244,6 +1244,47 @@ skill files all apply to it unchanged.
   stored connections lazily, so a UI-added source flows through catalog, RBAC and
   the agent exactly like a built-in one. `connections.py` holds the encrypted
   store and the per-type form contracts.
+
+### Power BI semantic models
+
+A Power BI (or Fabric) **semantic model** is a source like any warehouse: its
+tables are the source's tables under SQL-friendly names —
+`'Sales Order Lines'[Order Date]` is `sales_order_lines.order_date` — so the
+agent, the guard, RBAC, governance, charts and dashboards work over it
+unchanged (`connectors/powerbi_conn.py`).
+
+**Connect.** Data connections → **Power BI** → the tenant ID, app (client) ID and
+client secret of a service principal → **Sign in and list schemas** lists every
+workspace and semantic model the app can see, and each one picked becomes its
+own source. Or set all five `POWERBI_*` connection variables in the environment
+(`backend/.env.example`). The Microsoft side is a one-time setup: register an
+Entra app with a client secret; in the Power BI admin portal let service
+principals use the Power BI APIs and turn on *Semantic model Execute Queries
+REST API*; add the app to each workspace as Contributor (or Viewer plus Build
+on the model). Sign-in errors are shown as Power BI and Entra return them (an
+`AADSTS…` code, the tenant setting to change) — the connector's messages never
+carry the secret, so they are not redacted like other drivers'.
+
+**How a question is answered.** Power BI answers DAX, not SQL, so the connector
+copies the tables a query reads — and of those, only the columns it names —
+into an in-memory SQLite database and runs the SQL there. What gets copied is
+read off the guard-approved SQL with the guard's own tokenizer
+(`queryguard.base_tables`), so a table RBAC refused is never fetched.
+
+**Honest about size.** Aggregating part of a table gives a wrong number that
+looks right, so a table over `POWERBI_MAX_ROWS` (default 250,000) is refused,
+never truncated. A bare `SELECT … FROM t LIMIT n` — every preview — asks Power
+BI for only n rows. Reads use `executeDaxQueries` (Apache Arrow via `pyarrow`;
+model metadata from `INFO.VIEW.*`) and fall back to `executeQueries` (JSON: at
+most 100,000 rows or 1,000,000 values per read; column types inferred from
+`COLUMNSTATISTICS()`) where Arrow is unavailable.
+
+**Not yet.** DAX **measures** are not exposed — a measure is a calculation in a
+filter context, not a column SQL can select — and nothing is pushed down to
+Power BI, so a fact table larger than the cap stays out of reach until the
+model is landed in a warehouse or a DAX query path is added. Power BI does not
+let a service principal read a model with **row-level security** or SSO;
+Studio's own RBAC and governance are this source's access boundary.
 
 ---
 
@@ -2506,12 +2547,15 @@ you in: the account is created unverified and the emailed 6-digit code
 | `STUDIO_CONFLUENCE_BASE_URL` | Atlassian Cloud site URL (`https://<site>.atlassian.net`); required to offer Confluence page selection |
 | `STUDIO_CONFLUENCE_EMAIL` / `STUDIO_CONFLUENCE_API_TOKEN` | Service account email and API token for the configured site; keep as server-side secrets, never in prompts or plans |
 | `STUDIO_CONFLUENCE_SPACES` | Comma-separated allowlist of Confluence space keys exposed for page selection; the service account must also have access. All authenticated Studio users who can build a pipeline can select pages in these spaces, so use a narrowly scoped service account and spaces |
+| `POWERBI_TENANT_ID` / `POWERBI_CLIENT_ID` / `POWERBI_CLIENT_SECRET` | Service principal for the env-configured `powerbi` source (the tenant falls back to `AZURE_TENANT_ID`). Admins can instead connect semantic models with their own credential from Data connections |
+| `POWERBI_WORKSPACE` / `POWERBI_DATASET` | The semantic model the `powerbi` source reads — a name or an ID each. The source stays unconfigured until both are set |
+| `POWERBI_MAX_ROWS` / `POWERBI_SCHEMA_TTL` / `POWERBI_API` | Largest table one query may copy (default 250000; larger is refused, not truncated) · seconds to cache model metadata (default 600) · `auto` (default), `arrow` or `json` transport |
 | `POSTGRES_DSN` / `POSTGRES_SCHEMA` | PostgreSQL **data source** (a second SQL warehouse, distinct from the app's `DATABASE_URL`); dormant until set. `POSTGRES_SCHEMA` (default `public`) does three jobs: it is the schema `list_tables()` builds the catalog from, the namespace the query guard accepts (with the DSN's database, `{schema, dbname.schema}` — at those arities, spelled **exactly** as here), and the value every connection's `search_path` is pinned to, so an unqualified allowed name can only ever mean this schema. It must be a plain identifier (`[A-Za-z0-9_$]+`) or the connection is refused |
 | `STUDIO_GRAPH_REDIRECT_URI` | Microsoft 365 delegated-OAuth return, default `$STUDIO_PUBLIC_URL/api/m365/oauth/callback` or `http://localhost:8000/api/m365/oauth/callback` |
 | `STUDIO_MCP_SERVERS` | JSON map of MCP servers exposed to the agent as extra tools |
 | `STUDIO_PUBLIC_URL` | Public origin of the deployment; combined with `/api/m365/webhook` for Graph change notifications (webhooks are skipped when unset) |
 
-Warehouse credentials (`SNOWFLAKE_*`, `DATABRICKS_*`, `NEO4J_*`) and the
+Warehouse credentials (`SNOWFLAKE_*`, `DATABRICKS_*`, `NEO4J_*`, `POWERBI_*`) and the
 marketing connectors are listed in `backend/.env.example`; sources appear in the
 picker automatically once configured. The schema / catalog / dataset variables
 do double duty: they also define the **namespace the query guard accepts** for

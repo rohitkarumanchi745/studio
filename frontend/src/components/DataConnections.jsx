@@ -32,6 +32,16 @@ const STATUS_LABEL = {
 
 const NAME_RE = /^[a-z0-9][a-z0-9_-]{1,30}$/;
 
+// A connection form is not a login form, but browsers treat any password input
+// as one: autoComplete="off" is ignored there, and the SAVED Studio login lands
+// in the form — the email in whatever text field precedes the secret (an HTTP
+// path, an app ID) and the Studio password in the token field, ready to be
+// sent to a warehouse. "new-password" tells the browser it has no saved value
+// for this field; the data-* flags do the same for 1Password, LastPass,
+// Bitwarden and Dashlane, which run their own heuristics.
+const NO_AUTOFILL = { "data-1p-ignore": "true", "data-lpignore": "true",
+                      "data-bwignore": "true", "data-form-type": "other" };
+
 function fmtWhen(epoch) {
   if (!epoch) return "never";
   return new Date(epoch * 1000).toLocaleString();
@@ -508,11 +518,13 @@ function ConnectForm({ tile, defaultName, takenNames, onDone, onError, onRemoved
             </span>
             <input
               type={f.secret ? "password" : "text"}
+              name={`conn-${tile.id}-${f.key}`}
               placeholder={f.placeholder || ""}
               value={cfg[f.key] ?? ""}
               onChange={(e) => setField(f.key, e.target.value)}
               disabled={!!busy}
-              autoComplete="off"
+              {...NO_AUTOFILL}
+              autoComplete={f.secret ? "new-password" : "off"}
             />
           </label>
         ))}
@@ -521,7 +533,7 @@ function ConnectForm({ tile, defaultName, takenNames, onDone, onError, onRemoved
             {chosen.length > 1 ? "Name these in Studio (prefix)" : "Name it in Studio"}
           </span>
           <input value={name} onChange={(e) => setName(e.target.value)}
-                 disabled={!!busy} autoComplete="off" />
+                 disabled={!!busy} {...NO_AUTOFILL} autoComplete="off" />
         </label>
       </div>
 

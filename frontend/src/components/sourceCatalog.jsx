@@ -175,6 +175,8 @@ const META = {
               blurb: "A BigQuery dataset, read with a service account." },
   neo4j: { label: "Neo4j", color: "#018bff", mark: "graph", category: "warehouse",
            blurb: "A property graph queried with Cypher." },
+  powerbi: { label: "Power BI", color: "#c8a415", mark: "panel", category: "warehouse",
+             blurb: "Semantic models in a Power BI or Fabric workspace, read with a service principal." },
 
   // Connected through their own flow rather than a credential form.
   m365: { label: "Microsoft 365", color: "#0f6cbd", mark: "tiles", category: "workspace",
@@ -205,8 +207,6 @@ const META = {
                blurb: "Survey responses as tables." },
   sprinklr: { label: "Sprinklr", color: "#0d9ddb", mark: "petals", category: "marketing",
               blurb: "Social listening and engagement reports." },
-  powerbi_sap: { label: "Power BI / SAP", color: "#c8a415", mark: "panel", category: "marketing",
-                 blurb: "Datasets published to a Power BI workspace." },
   dynamic_yield: { label: "Dynamic Yield", color: "#00a3b5", mark: "chevrons", category: "marketing",
                    blurb: "Experiment and personalisation results." },
 

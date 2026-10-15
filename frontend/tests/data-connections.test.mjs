@@ -108,6 +108,24 @@ test("a new connection never collides with an existing source name", () => {
   assert.equal(suggestName("azure_blob", taken), "azure-blob");
 });
 
+test("Power BI sits on the warehouse shelf as a connectable source", () => {
+  // It began as a marketing-shelf placeholder (powerbi_sap) that only ever
+  // raised a setup message; the real connector is the `powerbi` ctype.
+  const m = metaFor("powerbi");
+  assert.equal(m.label, "Power BI");
+  assert.equal(m.category, "warehouse");
+  const tiles = buildTiles({
+    types: [{ ctype: "powerbi", label: "Power BI", dialect: "sqlite", fields: [],
+              ns: { schema: "dataset", database: "workspace" } }],
+    sources: [{ name: "powerbi", dialect: "sqlite", configured: true }],
+  });
+  const tile = tiles.find((t) => t.id === "powerbi");
+  assert.ok(tile.connectable);
+  assert.equal(tile.instances.length, 1);          // the env source lands on the same tile
+  assert.equal(tile.instances[0].kind, "env");
+  assert.equal(metaFor("powerbi_sap").category, "other");    // the old id is just unknown now
+});
+
 test("metaFor never returns a hole", () => {
   for (const id of ["postgres", "m365", "github", "s3", "", null, "something_new"]) {
     const m = metaFor(id);
@@ -577,4 +595,32 @@ test("a listing the warehouse refused does not block connecting", () => {
   // And an account that simply sees nothing says so rather than looking broken.
   assert.match(renderNs({ browse: { ok: true, namespaces: [] } }),
                /No schemas visible to this account/);
+});
+
+test("a connection form never invites the browser to fill the Studio login", async () => {
+  // A password input reads as a login to the browser, which then fills the
+  // saved Studio email into the field before it and the Studio password into
+  // the secret. autocomplete="off" is ignored there; "new-password" is not.
+  await withApi({ __user: ADMIN, "/catalog/sources": SOURCES, "/connections/types": TYPES,
+                  "/connections": CONNS, "/m365/status": { configured: true, connected: false },
+                  "/settings/repos": { repos: REPOS } },
+    async ({ flush }) => {
+      const panel = harness(DataConnections, { onClose() {} });
+      panel.render();
+      panel.start();
+      await flush();
+      panel.set(S.picked, "postgres");
+      const inputs = (panel.render().match(/<input[^>]*>/g) || [])
+        .filter((tag) => /name="conn-postgres-/.test(tag));
+      assert.equal(inputs.length, 2);                           // dsn + schema
+      for (const tag of inputs) {
+        assert.match(tag, /data-1p-ignore="true"/);
+        assert.match(tag, /data-lpignore="true"/);
+        assert.match(tag, /data-bwignore="true"/);
+      }
+      const [dsn, schema] = inputs;
+      assert.match(dsn, /type="password"/);
+      assert.match(dsn, /autocomplete="new-password"/i);   // HTML attribute names are case-insensitive
+      assert.match(schema, /autocomplete="off"/i);
+    });
 });

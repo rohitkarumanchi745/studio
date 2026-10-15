@@ -16,6 +16,10 @@ langchain-openai>=0.2
 databricks-sql-connector>=3.0
 duckdb>=1.0                      # object storage: s3 / azure_blob / gcs views
 google-cloud-bigquery>=3.25
+# Power BI source: executeDaxQueries answers in Apache Arrow. Without pyarrow
+# the connector still works, over the older JSON executeQueries API (100,000
+# rows per read instead of POWERBI_MAX_ROWS, and inferred column types).
+pyarrow>=15
 python-dotenv>=1.0
 langchain-mcp-adapters>=0.1
 cryptography>=42.0

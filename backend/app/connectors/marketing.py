@@ -1,5 +1,6 @@
-"""Marketing-stack connectors: GA4, Braze, PowerBI/SAP, Dynamic Yield,
-Qualtrics, Google Ads, Microsoft Ads, Sprinklr, Algolia.
+"""Marketing-stack connectors: GA4, Braze, Dynamic Yield, Qualtrics,
+Google Ads, Microsoft Ads, Sprinklr, Algolia. (Power BI, which began here as a
+placeholder, is a real source now: connectors/powerbi_conn.py.)
 
 Design: each tool is a Studio *source* whose "tables" are its standard
 reports. When the agent runs SQL, the connector fetches the referenced
@@ -9,7 +10,7 @@ over API data.
 
 Each connector is enabled by its env keys (see .env.example). Unconfigured
 tools show as "not configured" in the source picker, exactly like Snowflake.
-Tools whose auth needs a full OAuth app (GA4, Google/Microsoft Ads, PowerBI,
+Tools whose auth needs a full OAuth app (GA4, Google/Microsoft Ads,
 Sprinklr) raise a clear setup message rather than pretending to work.
 
 The long-term ingestion path from the JD still applies: land these tools in
@@ -279,24 +280,8 @@ class SprinklrConnector(_OAuthPendingConnector):
         return bool(os.getenv("SPRINKLR_ACCESS_TOKEN"))
 
 
-class PowerBISAPConnector(_OAuthPendingConnector):
-    name = "powerbi_sap"
-    REPORTS = {
-        "ecommerce_revenue": [("date", "TEXT"), ("channel", "TEXT"), ("orders", "INTEGER"),
-                              ("revenue", "REAL"), ("aov", "REAL")],
-        "sap_invoices": [("date", "TEXT"), ("invoice_id", "TEXT"), ("customer", "TEXT"),
-                         ("amount", "REAL"), ("status", "TEXT")],
-    }
-    SETUP = ("needs an Azure AD app with Power BI REST permissions: set "
-             "POWERBI_CLIENT_ID / POWERBI_TENANT_ID / POWERBI_CLIENT_SECRET and a "
-             "dataset ID; SAP data is usually better landed in Snowflake via pipeline")
-
-    def configured(self):
-        return bool(os.getenv("POWERBI_CLIENT_ID"))
-
-
 MARKETING_CONNECTORS = [
-    GA4Connector(), BrazeConnector(), PowerBISAPConnector(), DynamicYieldConnector(),
+    GA4Connector(), BrazeConnector(), DynamicYieldConnector(),
     QualtricsConnector(), GoogleAdsConnector(), MicrosoftAdsConnector(),
     SprinklrConnector(), AlgoliaConnector(),
 ]
