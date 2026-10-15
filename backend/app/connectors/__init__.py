@@ -13,6 +13,7 @@ from .marketing import MARKETING_CONNECTORS
 # becomes a cycle.
 from .objectstore import OBJECT_STORE_CONNECTORS
 from .postgres_conn import PostgresConnector
+from .powerbi_conn import PowerBIConnector
 from .snowflake_conn import SnowflakeConnector
 
 _REGISTRY = {
@@ -22,6 +23,7 @@ _REGISTRY = {
     "databricks": DatabricksConnector(),
     "bigquery": BigQueryConnector(),
     "neo4j": GraphConnector(),
+    "powerbi": PowerBIConnector(),
 }
 # One source per object store (s3 / azure_blob / gcs), all DuckDB-backed.
 for _oc in OBJECT_STORE_CONNECTORS:

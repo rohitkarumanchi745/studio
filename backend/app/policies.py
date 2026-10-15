@@ -17,7 +17,7 @@ Invariants:
     Azure AD group mapping later.
 """
 
-_MARKETING = ["ga4", "braze", "powerbi_sap", "dynamic_yield", "qualtrics",
+_MARKETING = ["ga4", "braze", "dynamic_yield", "qualtrics",
               "google_ads", "microsoft_ads", "sprinklr", "algolia"]
 
 # Object stores are one Studio source each; their "tables" are the datasets an
@@ -28,13 +28,13 @@ _OBJECT_STORES = ["s3", "azure_blob", "gcs"]
 POLICIES = {
     "admin": {
         "demo": "*", "snowflake": "*", "postgres": "*", "databricks": "*",
-        "bigquery": "*", "neo4j": "*",
+        "bigquery": "*", "neo4j": "*", "powerbi": "*",
         **{o: "*" for o in _OBJECT_STORES},
         **{m: "*" for m in _MARKETING},
     },
     "analyst": {
         "demo": "*", "snowflake": "*", "postgres": "*", "databricks": "*",
-        "bigquery": "*", "neo4j": "*",
+        "bigquery": "*", "neo4j": "*", "powerbi": "*",
         **{o: "*" for o in _OBJECT_STORES},
         **{m: "*" for m in _MARKETING},
     },

@@ -108,6 +108,24 @@ test("a new connection never collides with an existing source name", () => {
   assert.equal(suggestName("azure_blob", taken), "azure-blob");
 });
 
+test("Power BI sits on the warehouse shelf as a connectable source", () => {
+  // It began as a marketing-shelf placeholder (powerbi_sap) that only ever
+  // raised a setup message; the real connector is the `powerbi` ctype.
+  const m = metaFor("powerbi");
+  assert.equal(m.label, "Power BI");
+  assert.equal(m.category, "warehouse");
+  const tiles = buildTiles({
+    types: [{ ctype: "powerbi", label: "Power BI", dialect: "sqlite", fields: [],
+              ns: { schema: "dataset", database: "workspace" } }],
+    sources: [{ name: "powerbi", dialect: "sqlite", configured: true }],
+  });
+  const tile = tiles.find((t) => t.id === "powerbi");
+  assert.ok(tile.connectable);
+  assert.equal(tile.instances.length, 1);          // the env source lands on the same tile
+  assert.equal(tile.instances[0].kind, "env");
+  assert.equal(metaFor("powerbi_sap").category, "other");    // the old id is just unknown now
+});
+
 test("metaFor never returns a hole", () => {
   for (const id of ["postgres", "m365", "github", "s3", "", null, "something_new"]) {
     const m = metaFor(id);

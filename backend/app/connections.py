@@ -39,6 +39,7 @@ from .connectors.bigquery_conn import BigQueryConnector
 from .connectors.databricks_conn import DatabricksConnector
 from .connectors.graph_conn import GraphConnector
 from .connectors.postgres_conn import PostgresConnector
+from .connectors.powerbi_conn import PowerBIConnector, PowerBIError
 from .connectors.snowflake_conn import SnowflakeConnector
 
 router = APIRouter(prefix="/connections", tags=["connections"])
@@ -143,6 +144,19 @@ class _DynGraph(GraphConnector):
         return base
 
 
+class _DynPowerBI(PowerBIConnector):
+    def __init__(self, name, cfg):
+        super().__init__()                      # per-connection metadata cache
+        self.name = name
+        self._dyn = cfg
+
+    def _cfg(self):
+        base = {"tenant_id": "", "client_id": "", "client_secret": "",
+                "workspace": "", "dataset": ""}
+        base.update({k: str(v).strip() for k, v in self._dyn.items() if k in base and v})
+        return base
+
+
 def _field(key, label, required=False, secret=False, default="", placeholder=""):
     return {"key": key, "label": label, "required": required, "secret": secret,
             "default": default, "placeholder": placeholder}
@@ -206,6 +220,22 @@ TYPES = {
             _field("user", "User", required=True),
             _field("password", "Password", required=True, secret=True),
             _field("database", "Database", default="neo4j"),
+        ],
+    },
+    # A service principal (Entra app registration) that the workspace has been
+    # shared with. The credential alone signs in and lists every semantic
+    # model the app can see; each one picked becomes its own source.
+    "powerbi": {
+        "label": "Power BI", "dialect": "sqlite", "build": _DynPowerBI,
+        "hint_key": "workspace",
+        "ns": {"schema": "dataset", "database": "workspace"},
+        "fields": [
+            _field("tenant_id", "Tenant (directory) ID", required=True,
+                   placeholder="GUID or contoso.onmicrosoft.com"),
+            _field("client_id", "App (client) ID", required=True),
+            _field("client_secret", "Client secret", required=True, secret=True),
+            _field("workspace", "Workspace", placeholder="name or ID — or pick below"),
+            _field("dataset", "Semantic model", placeholder="name or ID — or pick below"),
         ],
     },
 }
@@ -330,7 +360,8 @@ def _namespace(ctype, cfg):
     t = TYPES.get(ctype) or {}
     cfg = cfg or {}
     schema = (cfg.get("schema") or cfg.get("dataset") or "").strip()
-    database = (cfg.get("database") or cfg.get("catalog") or cfg.get("project") or "").strip()
+    database = (cfg.get("database") or cfg.get("catalog") or cfg.get("project")
+                or cfg.get("workspace") or "").strip()
     if not schema and not database:
         # Postgres carries its database inside the DSN and defaults the schema.
         if ctype == "postgres":
@@ -403,6 +434,15 @@ def _safe_connection_error(exc, connection_type, cfg):
     # nested JSON before interpolating a value into an exception, so there is
     # no finite set of byte spellings we can safely scrub.  Preserve useful
     # vendor details only for credential-less flows such as BigQuery ADC.
+    #
+    # The one exception is Power BI's own error type. Its messages are built in
+    # powerbi_conn.py from HTTP status codes, Microsoft's error text and the
+    # workspace/model names the admin typed; the secret is only ever sent to
+    # Entra's token endpoint, whose errors do not echo it. Hiding them would
+    # hide the setup fixes (an AADSTS code, a tenant setting) that service-
+    # principal sign-in nearly always needs on the first try.
+    if isinstance(exc, PowerBIError):
+        return str(exc)[:300]
     if any(field.get("secret") and str((cfg or {}).get(field["key"], "") or "")
            for field in connection_type.get("fields", [])):
         return "connection failed (credential details redacted)"
@@ -549,6 +589,16 @@ def create_connection(body: ConnIn, user=Depends(current_user)):
     if body.ctype not in TYPES:
         raise HTTPException(400, f"unknown connection type '{body.ctype}'")
     cfg = {k: str(v) for k, v in (body.config or {}).items()}
+    # A source is pinned to ONE namespace. Discovery signs in with it blank
+    # (Power BI: tenant + app, no semantic model yet); saved that way it would
+    # be a source with nothing in it, so say which field is missing instead of
+    # letting the probe report a generic "unconfigured".
+    pin = (TYPES[body.ctype].get("ns") or {}).get("schema")
+    if pin:
+        field = next((f for f in TYPES[body.ctype]["fields"] if f["key"] == pin), {})
+        if not str(cfg.get(pin) or field.get("default") or "").strip():
+            raise HTTPException(400, f"pick a {field.get('label', pin).lower()} to connect "
+                                     "— each one becomes its own source")
     probe = _probe(body.ctype, cfg)
     if not probe["ok"]:
         raise HTTPException(400, f"connection test failed: {probe['error']}")
