@@ -13,6 +13,7 @@ import {
 import { applyFormat } from "./renderers/format";
 import PlotlyView, { PLOTLY_TYPES } from "./renderers/PlotlyView";
 import VegaView, { VEGA_TYPES } from "./renderers/VegaView";
+import ArtifactView, { downloadArtifact } from "./renderers/ArtifactView";
 import D3View, {
   D3_ONLY, D3_TYPES, LIMITS as D3_LIMITS, beeswarmData, calendarData, networkData, packData,
 } from "./renderers/D3View";
@@ -138,6 +139,11 @@ export function computeFit(columns, rows, spec) {
 
 export default function ChartView({
   columns, rows, chart, tall, plain,
+  // A custom visual the agent wrote as code (backend app/visuals.py): shown
+  // in its sandbox by default, with the ordinary chart one click away. Its
+  // code was written for the panel's ORIGINAL columns, so visual.columns /
+  // visual.rows, when given, are what it draws — not a reshaped copy.
+  visual,
   // Dashboard tile props: identify the tile, apply a cross-filter highlight,
   // report clicks upward, and surface format warnings. All optional.
   tileId, highlight, onSelect, onWarnings,
@@ -149,7 +155,46 @@ export default function ChartView({
 
   const spec = useMemo(() => (chart ? { ...chart, type } : null), [chart, type]);
 
+  const [showVisual, setShowVisual] = useState(true);
+  const [showCode, setShowCode] = useState(false);
+  const [saveError, setSaveError] = useState("");
+  useEffect(() => { setShowVisual(true); setShowCode(false); setSaveError(""); }, [visual?.code]);
+
   if (!columns?.length || !rows?.length) return null;
+
+  if (visual?.code && showVisual) {
+    return (
+      <div className="chartview">
+        {!plain && (
+          <div className="chart-toolbar">
+            <span className="chart-title">
+              {visual.title || chart?.title || "Custom visual"}{" "}
+              <span className="artifact-badge" title="Written as code by the agent; runs sandboxed">
+                ✨ custom D3
+              </span>
+            </span>
+            <span className="toolbar-selects">
+              <button className="chip" onClick={() => setShowCode(!showCode)}>
+                {showCode ? "hide code" : "‹/› code"}
+              </button>
+              <button className="chip" title="Save as one HTML file that opens anywhere, offline"
+                onClick={() => downloadArtifact({ visual, columns: visual.columns || columns,
+                                                  rows: visual.rows || rows })
+                  .catch((e) => setSaveError(String(e?.message || e)))}>
+                ⬇ HTML
+              </button>
+              <button className="chip" onClick={() => setShowVisual(false)}>chart view</button>
+            </span>
+          </div>
+        )}
+        {visual.explanation && <div className="meta artifact-note">{visual.explanation}</div>}
+        {saveError && <div className="chart-note">Could not save the file: {saveError}</div>}
+        <ArtifactView visual={visual} columns={visual.columns || columns}
+                      rows={visual.rows || rows} tall={tall} />
+        {showCode && <pre className="artifact-code">{visual.code}</pre>}
+      </div>
+    );
+  }
 
   const fit = computeFit(columns, rows, spec);
   const typeOk = fit[type]?.ok !== false;
@@ -186,6 +231,9 @@ export default function ChartView({
       <div className="chart-toolbar">
         <span className="chart-title">{chart?.title || "Result"}</span>
         <span className="toolbar-selects">
+        {visual?.code && (
+          <button className="chip" onClick={() => setShowVisual(true)}>✨ custom visual</button>
+        )}
         <select
           className="type-select"
           value={engine}

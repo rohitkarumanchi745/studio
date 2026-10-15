@@ -1432,6 +1432,12 @@ def canvas_edit(body: CanvasEdit, user=Depends(current_user)):
                 "chart": parent_frame.get("chart"),
                 "source": parent_source,
                 **({"agent": parent_frame["agent"]} if parent_frame.get("agent") else {}),
+                # A sibling's custom visual came from the trusted stored parent;
+                # editing another panel must not drop it. (The edited panel
+                # itself is replaced by the edit's frames: a chart edit shows
+                # the chart, not the old visual.)
+                **({"visual": parent_frame["visual"]}
+                   if isinstance(parent_frame.get("visual"), dict) else {}),
             })
         panels = (trusted_parent_panels[:body.parent_panel_index]
                   + normalized_panels
@@ -1805,7 +1811,9 @@ def _sql_tables_allowed(role, source, content):
         text can still summarize the old values, so an empty ``rows`` list is
         not evidence that an unattributed panel is harmless.
         """
-        return bool(item.get("rows") or item.get("columns") or item.get("chart"))
+        # A custom visual's code may hold values it saw in the sample rows.
+        return bool(item.get("rows") or item.get("columns") or item.get("chart")
+                    or item.get("visual"))
 
     panels = content.get("panels") or []
     if not isinstance(panels, list):
@@ -1900,7 +1908,8 @@ def _blend_provenance_allowed(role, content):
         if not isinstance(panel, dict):
             return False
         src, sql = panel.get("source") or "*", panel.get("sql")
-        has_frame = bool(panel.get("rows") or panel.get("columns") or panel.get("chart"))
+        has_frame = bool(panel.get("rows") or panel.get("columns") or panel.get("chart")
+                         or panel.get("visual"))
         if src == "*" and not sql:
             continue                       # the derived blended frame
         if not sql:

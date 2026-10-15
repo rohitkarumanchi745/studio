@@ -631,6 +631,17 @@ td { color: var(--ink-2); }
 .vega-fit .vega-embed, .vega-fit .vega-embed .chart-wrapper { width: 100%; height: 100%; }
 .vega-fit canvas { max-width: 100%; }
 .d3-chart { position: relative; overflow: hidden; }
+.artifact-frame { border: 0; width: 100%; display: block; background: #fff; border-radius: 6px; }
+.artifact-badge {
+  font-size: 11px; font-weight: 600; color: var(--accent, #3987e5); background: var(--accent-soft, #e8f1fc);
+  border-radius: 999px; padding: 1px 8px; margin-left: 4px;
+}
+.artifact-note { margin: 4px 0 0; }
+.artifact-code {
+  max-height: 260px; overflow: auto; margin: 8px 0 0; padding: 10px; border-radius: 6px;
+  background: var(--surface-2, #f6f5f3); border: 1px solid var(--line, #e3e1dd);
+  font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre;
+}
 .d3-chart svg text { font-family: inherit; }
 .d3-tip {
   position: absolute; pointer-events: none; opacity: 0; transition: opacity .12s;

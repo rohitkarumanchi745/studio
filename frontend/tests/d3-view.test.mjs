@@ -15,6 +15,15 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 const frontend = fileURLToPath(new URL("../", import.meta.url));
 const require = createRequire(import.meta.url);
+// Vite's "?url" import (ArtifactView's d3 file) means nothing to esbuild.
+const urlStub = {
+  name: "url-stub",
+  setup(b) {
+    b.onResolve({ filter: /\?url$/ }, (a) => ({ path: a.path, namespace: "url-stub" }));
+    b.onLoad({ filter: /.*/, namespace: "url-stub" },
+             () => ({ contents: 'export default "/assets/d3.min.js";', loader: "js" }));
+  },
+};
 const bundle = await build({
   stdin: {
     contents: `export {default as ChartView, computeFit, LABELS} from "./src/components/ChartView.jsx";
@@ -23,6 +32,7 @@ const bundle = await build({
     resolveDir: frontend, loader: "jsx",
   },
   bundle: true, write: false, format: "cjs", platform: "node", jsx: "automatic",
+  plugins: [urlStub],
   // The engines load inside effects, which server rendering never runs; they
   // stay out of the bundle (Vega's Node canvas build cannot even be bundled
   // as CommonJS). echarts is imported eagerly, so it is stubbed below.

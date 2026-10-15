@@ -1859,8 +1859,28 @@ draws — whichever engine is picked:
 | `circle_pack` | x = category, y = [size] or [size, parent] | shares across many categories, optionally grouped |
 
 d3 is loaded on demand, like Plotly and Vega, so it costs nothing until a D3
-chart is drawn; chart values are written as text, never markup. A single prompt
-drives the full **chart spec v2** — one merge patch over data *and* pixels:
+chart is drawn; chart values are written as text, never markup.
+
+**Custom visuals (artifacts).** When nothing in the catalog fits — or the user
+asks for a custom, interactive or D3 visualization — the chat agent can *write*
+one: its `render_visual` tool asks the model for the body of
+`draw(d3, data, el, size)` (`app/visuals.py`), and the panel shows it in a
+sandboxed frame, with the plain chart one click away, the code on view, and
+**⬇ HTML** to save it as one self-contained file that opens offline. The frame
+is the boundary: `sandbox="allow-scripts"` only (an opaque origin — no access to
+Studio's page, cookies or login token, no navigation, popups or forms) and a
+Content-Security-Policy with **no network** (`connect-src 'none'`, no frames,
+fonts or remote images; scripts only inline and Studio's own d3). WebRTC, which
+CSP does not cover, is removed before the code runs. The data is the panel's own
+rows, already governed, embedded as escaped JSON; only a 30-row sample ever
+reaches the model. A server-side lint turns the usual mistakes (a fetch, data
+written as HTML, reaching for the parent window) into a retry — defense in
+depth, not the boundary. The panel keeps its SQL and rows, so read-time
+authorization covers the visual exactly as it covers a chart. Offered on full
+chat turns with a frontier model; a visual is not yet pinnable to a dashboard.
+
+A single prompt drives the full **chart spec v2** — one merge patch over data
+*and* pixels:
 
 | Layer | Where | What |
 |---|---|---|
@@ -2669,6 +2689,9 @@ way round from the feature list above:
   an arbitrary analytics bundle into ETL.
 - **Model-generated Python is compiled and delivered, never executed.** The staged
   flow's Validator only parses the artifact (`syntax_checked_not_executed`).
+  (Model-written JavaScript for a *custom visual* does run — only in the
+  viewer's browser, in a sandboxed frame with no network and no access to
+  Studio; see *Visualization*.)
   Nothing in Studio runs that model-written artifact in-process. Approved
   tool-builder MCP servers run inside their sandbox. The new Airflow path
   executes SQL through a trusted, fixed compiler-generated Python wrapper in
