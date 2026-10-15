@@ -15,7 +15,8 @@ import PlotlyView, { PLOTLY_TYPES } from "./renderers/PlotlyView";
 import VegaView, { VEGA_TYPES } from "./renderers/VegaView";
 import ArtifactView, { downloadArtifact } from "./renderers/ArtifactView";
 import D3View, {
-  D3_ONLY, D3_TYPES, LIMITS as D3_LIMITS, beeswarmData, calendarData, networkData, packData,
+  D3_ONLY, D3_TYPES, LIMITS as D3_LIMITS, VISUAL_TYPES, beeswarmData, calendarData, networkData,
+  packData, visualType,
 } from "./renderers/D3View";
 
 const ENGINES = [
@@ -35,9 +36,10 @@ const TYPE_GROUPS = [
   ["KPI", ["kpi", "gauge"]],
   ["Data", ["table"]],
 ];
-// The picker in d3Only mode: the same groups, holding only what D3 draws.
+// The picker in d3Only mode: the same groups, holding only what the D3 &
+// artifacts window draws (D3, no line chart).
 const D3_GROUPS = TYPE_GROUPS
-  .map(([g, ts]) => [g, ts.filter((t) => D3_TYPES.has(t))])
+  .map(([g, ts]) => [g, ts.filter((t) => VISUAL_TYPES.has(t))])
   .filter(([, ts]) => ts.length);
 export const LABELS = {
   bar: "Bar", hbar: "Horizontal bar", stacked_bar: "Stacked bar", combo: "Combo (bar+line)",
@@ -152,13 +154,13 @@ export default function ChartView({
   // browser-wide default (the toolbar can still switch for this session).
   engine: chosenEngine,
   // The D3 & artifacts window: draw with D3 alone — no engine picker, only
-  // the types D3 draws, and no table standing in for a chart.
+  // the types that window draws (no line chart), and no table standing in.
   d3Only = false,
   // Dashboard tile props: identify the tile, apply a cross-filter highlight,
   // report clicks upward, and surface format warnings. All optional.
   tileId, highlight, onSelect, onWarnings,
 }) {
-  const pickType = (t) => (d3Only && !D3_TYPES.has(t) ? "bar" : t || "table");
+  const pickType = (t) => (d3Only ? visualType(t) : t || "table");
   const [type, setType] = useState(pickType(chart?.type));
   useEffect(() => setType(pickType(chart?.type)), [chart]);
 
