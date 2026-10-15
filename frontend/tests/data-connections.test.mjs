@@ -596,3 +596,31 @@ test("a listing the warehouse refused does not block connecting", () => {
   assert.match(renderNs({ browse: { ok: true, namespaces: [] } }),
                /No schemas visible to this account/);
 });
+
+test("a connection form never invites the browser to fill the Studio login", async () => {
+  // A password input reads as a login to the browser, which then fills the
+  // saved Studio email into the field before it and the Studio password into
+  // the secret. autocomplete="off" is ignored there; "new-password" is not.
+  await withApi({ __user: ADMIN, "/catalog/sources": SOURCES, "/connections/types": TYPES,
+                  "/connections": CONNS, "/m365/status": { configured: true, connected: false },
+                  "/settings/repos": { repos: REPOS } },
+    async ({ flush }) => {
+      const panel = harness(DataConnections, { onClose() {} });
+      panel.render();
+      panel.start();
+      await flush();
+      panel.set(S.picked, "postgres");
+      const inputs = (panel.render().match(/<input[^>]*>/g) || [])
+        .filter((tag) => /name="conn-postgres-/.test(tag));
+      assert.equal(inputs.length, 2);                           // dsn + schema
+      for (const tag of inputs) {
+        assert.match(tag, /data-1p-ignore="true"/);
+        assert.match(tag, /data-lpignore="true"/);
+        assert.match(tag, /data-bwignore="true"/);
+      }
+      const [dsn, schema] = inputs;
+      assert.match(dsn, /type="password"/);
+      assert.match(dsn, /autocomplete="new-password"/i);   // HTML attribute names are case-insensitive
+      assert.match(schema, /autocomplete="off"/i);
+    });
+});
