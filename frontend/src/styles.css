@@ -637,6 +637,33 @@ td { color: var(--ink-2); }
   border-radius: 999px; padding: 1px 8px; margin-left: 4px;
 }
 .artifact-note { margin: 4px 0 0; }
+/* Visuals screen: chart list on the left, every way to draw it on the right */
+.visuals-layout { display: grid; grid-template-columns: 260px minmax(0, 1fr); gap: 16px; margin-top: 10px;
+  min-height: 0; flex: 1; }
+.visuals-list { display: flex; flex-direction: column; gap: 6px; overflow-y: auto; max-height: calc(100vh - 160px);
+  border-right: 1px solid var(--line, #e3e1dd); padding-right: 10px; }
+.visuals-group { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+.visuals-item { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; text-align: left;
+  border: 1px solid transparent; background: transparent; border-radius: 8px; padding: 6px 8px; cursor: pointer;
+  color: var(--ink-2, #4a4844); font: inherit; }
+.visuals-item:hover { background: var(--surface-2, #f6f5f3); }
+.visuals-item-on { border-color: var(--accent, #3987e5); background: var(--accent-soft, #e8f1fc); }
+.visuals-main { min-width: 0; overflow-y: auto; max-height: calc(100vh - 160px); }
+.visuals-empty { padding: 40px 0; text-align: center; }
+.visuals-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
+.visuals-h { font-size: 14px; margin: 18px 0 8px; color: var(--ink-1, #1b1a19); }
+.visuals-h .meta { font-weight: 400; }
+.visuals-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
+.visuals-card { padding: 10px; min-width: 0; }
+.visuals-card .echart { height: 220px; }
+.visuals-card-wide { grid-column: 1 / -1; }
+.visuals-card-wide .echart { height: 340px; }
+.visuals-card-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 4px; }
+.visuals-composer { margin: 0 0 12px; }
+@media (max-width: 820px) {
+  .visuals-layout { grid-template-columns: 1fr; }
+  .visuals-list { border-right: 0; max-height: 240px; padding-right: 0; }
+}
 .artifact-code {
   max-height: 260px; overflow: auto; margin: 8px 0 0; padding: 10px; border-radius: 6px;
   background: var(--surface-2, #f6f5f3); border: 1px solid var(--line, #e3e1dd);

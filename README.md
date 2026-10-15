@@ -1879,6 +1879,19 @@ depth, not the boundary. The panel keeps its SQL and rows, so read-time
 authorization covers the visual exactly as it covers a chart. Offered on full
 chat turns with a frontier model; a visual is not yet pinnable to a dashboard.
 
+**The Visuals screen** (sidebar → *Visuals — D3 & artifacts*) puts the two side
+by side for every chart in your conversations. Pick a chart and it shows every
+D3 chart type its data fits, drawn live, plus any custom visuals — describe one
+and the AI writes it there. **Use this** saves the choice as a new canvas version
+of that answer (`chat.visual_apply`): the same server-side rules as a canvas edit
+— the governed stored data, the trusted parent, every sibling panel kept — so
+the chat and everyone it is shared with see the chosen chart, and the earlier
+version stays in the history. A D3 choice records the engine on that panel, so
+it draws with D3 for every viewer; a custom visual is accepted only if this
+server wrote it (an HMAC over the code from `/visuals/generate`), so nobody can
+save hand-written JavaScript into a shared chat. View-only access can browse
+but not choose.
+
 A single prompt drives the full **chart spec v2** — one merge patch over data
 *and* pixels:
 
