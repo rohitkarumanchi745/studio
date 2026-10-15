@@ -1,4 +1,6 @@
 // ECharts renderer covering the Power BI / Tableau-style catalog (22 types),
+// plus the D3-only types (network, beeswarm, calendar, circle packing), which
+// always draw with D3 because no other engine here can.
 // with a grouped type picker per chart. Palette + mark rules follow the
 // validated dark-surface reference palette: fixed categorical order, 2px lines,
 // rounded bar data-ends, ink-colored text, recessive grid, tooltips on.
@@ -11,19 +13,23 @@ import {
 import { applyFormat } from "./renderers/format";
 import PlotlyView, { PLOTLY_TYPES } from "./renderers/PlotlyView";
 import VegaView, { VEGA_TYPES } from "./renderers/VegaView";
+import D3View, {
+  D3_ONLY, D3_TYPES, LIMITS as D3_LIMITS, beeswarmData, calendarData, networkData, packData,
+} from "./renderers/D3View";
 
 const ENGINES = [
   ["echarts", "ECharts"],
   ["plotly", "Plotly"],
   ["vega", "Altair"],
+  ["d3", "D3"],
 ];
 
 const TYPE_GROUPS = [
   ["Comparison", ["bar", "hbar", "stacked_bar", "combo"]],
-  ["Trend", ["line", "area", "stacked_area"]],
-  ["Part-to-whole", ["pie", "donut", "treemap", "funnel"]],
-  ["Distribution", ["histogram", "boxplot"]],
-  ["Relationship", ["scatter", "bubble", "heatmap", "radar"]],
+  ["Trend", ["line", "area", "stacked_area", "calendar"]],
+  ["Part-to-whole", ["pie", "donut", "treemap", "funnel", "circle_pack"]],
+  ["Distribution", ["histogram", "boxplot", "beeswarm"]],
+  ["Relationship", ["scatter", "bubble", "heatmap", "radar", "network"]],
   ["Flow & bridge", ["waterfall", "sankey"]],
   ["KPI", ["kpi", "gauge"]],
   ["Data", ["table"]],
@@ -36,6 +42,9 @@ export const LABELS = {
   scatter: "Scatter", bubble: "Bubble", heatmap: "Heatmap", radar: "Radar",
   waterfall: "Waterfall", sankey: "Sankey",
   kpi: "KPI card", gauge: "Gauge", table: "Table",
+  // Drawn by D3 whichever engine is picked.
+  network: "Network (D3)", beeswarm: "Beeswarm (D3)", calendar: "Calendar heatmap (D3)",
+  circle_pack: "Circle packing (D3)",
 };
 
 
@@ -110,6 +119,19 @@ export function computeFit(columns, rows, spec) {
         return { ok: false, reason: "too many distinct categories for a heatmap" };
       return { ok: true };
     })(),
+    // The D3 types: a builder that returns data means the chart can draw it.
+    network: (() => {
+      if (xi < 0 || yis.length < 1 || kinds[yis[0]] === "num")
+        return { ok: false, reason: "needs source + target category columns (optional weight)" };
+      return ok(spec && networkData(columns, rows, spec),
+                `needs links between ≤${D3_LIMITS.networkNodes} distinct nodes`);
+    })(),
+    beeswarm: ok(spec && beeswarmData(columns, rows, spec),
+                 `needs a numeric column, ≤${D3_LIMITS.beeswarm} rows and ≤12 groups`),
+    calendar: ok(spec && calendarData(columns, rows, spec),
+                 `needs a date column + numeric value spanning ≤3 years`),
+    circle_pack: ok(spec && packData(columns, rows, spec),
+                    `needs a category column + positive values (≤${D3_LIMITS.packLeaves})`),
   };
   return fit;
 }
@@ -134,8 +156,10 @@ export default function ChartView({
   // The chosen engine draws the chart when it supports the type; otherwise
   // ECharts (which covers the full catalog) steps in.
   const drawEngine =
-    engine === "plotly" && PLOTLY_TYPES.has(type) ? "plotly"
+    D3_ONLY.has(type) ? "d3"
+    : engine === "plotly" && PLOTLY_TYPES.has(type) ? "plotly"
     : engine === "vega" && VEGA_TYPES.has(type) ? "vega"
+    : engine === "d3" && D3_TYPES.has(type) ? "d3"
     : "echarts";
   const plottable = typeOk && spec && type !== "table" && type !== "kpi";
   let option = plottable && drawEngine === "echarts" ? buildOption(columns, rows, spec) : null;
@@ -204,6 +228,8 @@ export default function ChartView({
         <PlotlyView columns={columns} rows={rows} spec={spec} tall={tall} />
       ) : plottable && drawEngine === "vega" ? (
         <VegaView columns={columns} rows={rows} spec={spec} tall={tall} />
+      ) : plottable && drawEngine === "d3" ? (
+        <D3View columns={columns} rows={rows} spec={spec} tall={tall} />
       ) : option ? (
         <Echart option={option} tall={tall} spec={spec} onSelect={onSelect} tileId={tileId} />
       ) : (
