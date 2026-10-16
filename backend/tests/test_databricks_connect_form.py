@@ -229,8 +229,59 @@ def test_a_probe_shows_the_named_failure_never_the_token(monkeypatch):
     monkeypatch.setitem(connections.TYPES["databricks"], "build", _Failing)
     monkeypatch.setattr(connections, "_resolves", lambda host, wait=5.0: True)
     out = _probe()
-    assert out == {"ok": False, "error": databricks_conn._SAY_STATUS[401]}
+    said = databricks_conn._SAY_STATUS[401]
+    assert out == {"ok": False, "error": said, "fields": {"access_token": said},
+                   "stage": "sign_in"}
     assert "dapi-test-token" not in out["error"]
+
+
+# ── A failure is put on the field it is about ───────────────────────────
+#
+# Databricks names a missing schema SCHEMA_NOT_FOUND inside an ordinary
+# error; matching a bare "NOT_FOUND" once told an admin there was no SQL
+# warehouse at a perfectly good HTTP path.
+
+@pytest.mark.parametrize("text,field,stage,says", [
+    ("[SCHEMA_NOT_FOUND] The schema `main`.`default` cannot be found. SQLSTATE: 42704",
+     "schema", "signed_in", "that schema does not exist"),
+    ("[NO_SUCH_CATALOG_EXCEPTION] Catalog 'finance' was not found. SQLSTATE: 42704",
+     "catalog", "signed_in", "that catalog does not exist"),
+    ("[INSUFFICIENT_PERMISSIONS] User does not have USE CATALOG on Catalog 'finance'.",
+     None, "signed_in", "USE CATALOG, USE SCHEMA and SELECT"),
+    ("Received 404 - NOT_FOUND. The requested resource does not exist.",
+     "http_path", "sign_in", "no SQL warehouse at that HTTP path"),
+    ("Received 401 - UNAUTHORIZED. Confirm your authentication credentials.",
+     "access_token", "sign_in", "rejected the access token"),
+])
+def test_a_failure_is_named_and_put_on_its_field(text, field, stage, says):
+    found = databricks_conn.classify_error(_RequestError("Error during request", original=text))
+    assert says in found["said"] and found["field"] == field and found["stage"] == stage
+    assert "finance" not in found["said"] and "main" not in found["said"]   # never echoed
+
+
+def test_a_missing_schema_is_not_called_a_missing_warehouse():
+    exc = _RequestError("[SCHEMA_NOT_FOUND] The schema `default` cannot be found.", code=None)
+    assert "HTTP path" not in databricks_conn.describe_error(exc)
+    # A real 404 status is still the path.
+    assert databricks_conn.classify_error(_RequestError("x", code=404))["field"] == "http_path"
+
+
+def test_the_probe_marks_the_field_the_workspace_complained_about(monkeypatch):
+    class _NoSchema:
+        def __init__(self, name, cfg):
+            pass
+
+        def configured(self):
+            return True
+
+        def list_tables(self):
+            raise _RequestError("[SCHEMA_NOT_FOUND] The schema `sales` cannot be found.")
+
+    monkeypatch.setitem(connections.TYPES["databricks"], "build", _NoSchema)
+    monkeypatch.setattr(connections, "_resolves", lambda host, wait=5.0: True)
+    out = _probe()
+    assert list(out["fields"]) == ["schema"] and out["stage"] == "signed_in"
+    assert out["error"].startswith("Signed in, but that schema does not exist")
 
 
 # ── What gets stored ────────────────────────────────────────────────────
@@ -294,3 +345,5 @@ def test_the_tidy_config_is_what_gets_saved(client, monkeypatch):
     t = client.post("/api/connections/test", json={"ctype": "databricks",
                                                    "config": {**GOOD, "http_path": SETTINGS_URL}})
     assert t.status_code == 200 and list(t.json()["fields"]) == ["http_path"]
+    assert t.json()["stage"] == "check"
+    assert detail["stage"] == "check"

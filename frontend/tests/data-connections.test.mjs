@@ -808,7 +808,7 @@ test("a save refused after signing in says so, and marks the schema", async () =
     globalThis.fetch = async (url, options = {}) => {
       if (url === "/api/connections/env/databricks" && options.method === "PUT") {
         return { status: 400, ok: false, json: async () => ({ detail: {
-          error: `connection test failed: ${said}`, fields: { schema: said }, signed_in: true } }) };
+          error: `connection test failed: ${said}`, fields: { schema: said }, stage: "signed_in" } }) };
       }
       return { status: 200, ok: true, json: async () => [] };
     };
@@ -826,5 +826,19 @@ test("a save refused after signing in says so, and marks the schema", async () =
     assert.ok(html.includes(said));
     assert.match(html, /Signed in, but not saved — fix the marked field\./);
     assert.doesNotMatch(html, /nothing\s+was sent/);
+  });
+});
+
+test("a sign-in the workspace refused marks the field and says it was refused", async () => {
+  const said = "There is no SQL warehouse at that HTTP path — copy it again from the warehouse's Connection details tab.";
+  await withApi({ __user: ADMIN, "/connections/browse": {
+    ok: false, error: said, fields: { http_path: said }, stage: "sign_in", namespaces: [] } }, async () => {
+    const { panel } = dbxForm([]);
+    await findNode(panel.tree(), (n) => n.type === "button"
+      && String(n.props.children).includes("Sign in and list schemas")).props.onClick();
+    const html = panel.render();
+    assert.match(html, /name="conn-databricks-http_path" class="conn-input-bad"/);
+    assert.match(html, /Databricks SQL refused the sign-in — fix the marked field\./);
+    assert.doesNotMatch(html, /nothing\s+was sent|Signed in, but not saved/);
   });
 });
