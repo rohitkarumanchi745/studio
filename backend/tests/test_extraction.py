@@ -807,6 +807,119 @@ def test_connect_delegated_returns_authorize_url(client, monkeypatch):
     assert "access_token" not in url
 
 
+# ── The callback finishes only in the browser that started the link ──────
+# A signed state alone let anyone start a link for their own account, forward
+# the Microsoft authorize URL, and have the recipient's mailbox bound to them.
+
+def _state_of(url):
+    import urllib.parse
+    return urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["state"][0]
+
+
+def _fake_token_exchange(monkeypatch):
+    """Microsoft's token + /me endpoints; returns the list of calls made."""
+    import requests
+    calls = []
+
+    def post(url, data=None, timeout=None, **kw):
+        calls.append(url)
+        return _FakeResp(payload={"access_token": "ACCESS-T", "refresh_token": "REFRESH-T",
+                                  "expires_in": 3600})
+
+    def get(url, headers=None, timeout=None, **kw):
+        calls.append(url)
+        return _FakeResp(payload={"id": "graph-oid-1"})
+
+    monkeypatch.setattr(requests, "post", post)
+    monkeypatch.setattr(requests, "get", get)
+    return calls
+
+
+def _callback(c, state, code="auth-code-1"):
+    return c.get("/api/m365/oauth/callback", params={"code": code, "state": state},
+                 follow_redirects=False)
+
+
+def test_connect_binds_the_sign_in_to_this_browser_without_putting_the_key_in_the_url(
+        client, monkeypatch):
+    import hashlib
+    import jwt
+    _configure_azure(monkeypatch)
+    monkeypatch.setenv("STUDIO_GRAPH_AUTH_MODE", "delegated")
+    _login(client)
+    r = client.post("/api/m365/connect")
+    cookie = r.headers["set-cookie"]
+    assert cookie.startswith("studio_m365_link=")
+    assert "HttpOnly" in cookie and "samesite=lax" in cookie.lower() and "Max-Age=600" in cookie
+    nonce = client.cookies["studio_m365_link"]
+    url = r.json()["authorize_url"]
+    # Only its hash travels: not in the URL, and not inside the (merely
+    # base64-encoded) state either.
+    claims = jwt.decode(_state_of(url), options={"verify_signature": False})
+    assert nonce not in url and nonce not in repr(claims)
+    assert claims["bnd"] == hashlib.sha256(nonce.encode()).hexdigest()
+
+
+def test_the_browser_that_started_the_link_finishes_it(client, monkeypatch):
+    _configure_azure(monkeypatch)
+    monkeypatch.setenv("STUDIO_GRAPH_AUTH_MODE", "delegated")
+    calls = _fake_token_exchange(monkeypatch)
+    _login(client)
+    me = client.get("/api/auth/me").json()
+    state = _state_of(client.post("/api/m365/connect").json()["authorize_url"])
+    r = _callback(client, state)
+    assert r.status_code in (302, 307) and "m365_connected=1" in r.headers["location"]
+    assert any("oauth2/v2.0/token" in u for u in calls)
+    from app.extraction import store
+    acct = store.get_account(me["id"])
+    assert acct is not None and acct["auth_mode"] == "delegated"
+    assert "studio_m365_link" not in client.cookies              # one sign-in per cookie
+
+
+def test_a_forwarded_authorize_link_cannot_bind_someone_elses_mailbox(client, monkeypatch):
+    _configure_azure(monkeypatch)
+    monkeypatch.setenv("STUDIO_GRAPH_AUTH_MODE", "delegated")
+    calls = _fake_token_exchange(monkeypatch)
+    _login(client)                                           # the attacker
+    attacker = client.get("/api/auth/me").json()
+    state = _state_of(client.post("/api/m365/connect").json()["authorize_url"])
+
+    victim = TestClient(client.app)                          # another browser
+    # 1. The victim was never in Studio's flow: no link cookie at all.
+    r = _callback(victim, state)
+    assert "m365_error=" in r.headers["location"]
+    assert "not%20started%20in%20this%20browser" in r.headers["location"]
+    # 2. The victim's browser has a link cookie of its own — still not this one.
+    _login(victim, "analyst@studio.local", "analyst123")
+    victim.post("/api/m365/connect")
+    assert "studio_m365_link" in victim.cookies
+    r = _callback(victim, state)
+    assert "not%20started%20in%20this%20browser" in r.headers["location"]
+
+    # Refused before the code was exchanged: no token was ever obtained, and
+    # nothing is bound to the attacker's account.
+    assert calls == []
+    from app.extraction import store
+    assert store.get_account(attacker["id"]) is None
+
+
+def test_a_forged_or_expired_state_is_still_refused(client, monkeypatch):
+    import jwt
+    from app import auth
+    _configure_azure(monkeypatch)
+    monkeypatch.setenv("STUDIO_GRAPH_AUTH_MODE", "delegated")
+    calls = _fake_token_exchange(monkeypatch)
+    _login(client)
+    client.post("/api/m365/connect")
+    for state in ("not-a-jwt",
+                  jwt.encode({"uid": "x", "aud": "m365-oauth", "bnd": "y", "exp": 1},
+                             auth.SECRET, algorithm=auth.ALGO)):
+        client.post("/api/m365/connect")
+        r = _callback(client, state)
+        assert "expired" in r.headers["location"]
+    assert calls == []
+
+
 def test_connect_app_mode_provisions_row(client, monkeypatch):
     _configure_azure(monkeypatch)
     monkeypatch.setenv("STUDIO_GRAPH_AUTH_MODE", "app")
