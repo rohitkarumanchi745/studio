@@ -588,8 +588,10 @@ def set_trace_reward(trace_id, reward, *, user_id, source="user", note=None):
                                + float(reward)) / (seen + 1)
                     seen += 1
                     # A second edit to the same feedback replaces the
-                    # contribution added above rather than adding it again.
+                    # contribution added above rather than adding it again;
+                    # taking the feedback back removes it (qcache_feedback_added).
                     meta["qcache_feedback_mode"] = "replace"
+                    meta["qcache_feedback_added"] = True
                     c.execute("UPDATE agent_traces SET meta=? WHERE id=? AND user_id=?",
                               (json.dumps(meta), trace_id, user_id))
                 elif isinstance(old_reward, (int, float)):
@@ -600,6 +602,56 @@ def set_trace_reward(trace_id, reward, *, user_id, source="user", note=None):
                 if revised is not None:
                     c.execute("UPDATE query_cache SET seen=?, avg_reward=?, updated_at=? WHERE id=?",
                               (seen, max(0.0, min(1.0, revised)), time.time(), qcache_id))
+        c.commit()
+    return True
+
+
+def clear_trace_reward(trace_id, *, user_id, restore):
+    """Take back one owner's feedback. The trace returns to the score
+    `restore(trace_row, meta)` gives (its own heuristic), and its part in the
+    semantic-cache aggregate is put back as it was before the feedback: a
+    contribution the feedback ADDED is removed, one it REPLACED is replaced
+    back. Idempotent — a trace without user feedback is left alone."""
+    with connect() as c:
+        if not IS_PG:
+            c.execute("PRAGMA busy_timeout = 30000")
+            c.execute("BEGIN IMMEDIATE")
+        trace_lock = " FOR UPDATE" if IS_PG else ""
+        row = c.execute("SELECT * FROM agent_traces WHERE id=? AND user_id=?" + trace_lock,
+                        (trace_id, user_id)).fetchone()
+        if not row:
+            return False
+        if row["reward_source"] != "user":
+            c.commit()
+            return True
+        trace = dict(row)
+        meta = json.loads(trace.get("meta") or "{}")
+        restored = restore(trace, meta)
+        meta.pop("feedback_note", None)
+        added = bool(meta.pop("qcache_feedback_added", False))
+        qcache_id = meta.get("qcache_id")
+        current = trace.get("reward")
+        if qcache_id and isinstance(current, (int, float)):
+            cache_lock = " FOR UPDATE" if IS_PG else ""
+            cached = c.execute("SELECT seen, avg_reward FROM query_cache WHERE id=?" + cache_lock,
+                               (qcache_id,)).fetchone()
+            if cached and (cached["seen"] or 0) > 0 and cached["avg_reward"] is not None:
+                seen, avg = int(cached["seen"]), float(cached["avg_reward"])
+                revised = None
+                if added and seen > 1:
+                    revised = (avg * seen - float(current)) / (seen - 1)
+                    seen -= 1
+                    meta["qcache_feedback_mode"] = "add"     # a new vote adds again
+                elif not added and isinstance(restored, (int, float)):
+                    revised = (avg * seen - float(current) + float(restored)) / seen
+                if revised is not None:
+                    c.execute("UPDATE query_cache SET seen=?, avg_reward=?, updated_at=? WHERE id=?",
+                              (seen, max(0.0, min(1.0, revised)), time.time(), qcache_id))
+        c.execute(
+            "UPDATE agent_traces SET reward=?, reward_source=?, meta=?, updated_at=?, "
+            "training_revision=? WHERE id=? AND user_id=?",
+            (restored, "heuristic", json.dumps(meta), time.time(),
+             next_training_revision(c), trace_id, user_id))
         c.commit()
     return True
 

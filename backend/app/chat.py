@@ -1795,14 +1795,23 @@ def audit(all: bool = False, limit: int = 200, user=Depends(current_user)):
 
 class Feedback(BaseModel):
     trace_id: str
-    score: Literal[-1, 1]  # 1 = helpful, -1 = wrong/unhelpful
+    # 1 = helpful, -1 = wrong/unhelpful, 0 = take my feedback back
+    score: Literal[-1, 0, 1]
     note: Optional[str] = None
 
 
 @router.post("/feedback")
 def feedback(body: Feedback, user=Depends(current_user)):
     """👍/👎 on an answer — the explicit reward signal the agent learns from
-    (overwrites the heuristic reward on that run's trace)."""
+    (overwrites the heuristic reward on that run's trace). Score 0 takes it
+    back: the run returns to its own heuristic score, as if never rated."""
+    if body.score == 0:
+        ok = db.clear_trace_reward(body.trace_id, user_id=user["id"],
+                                   restore=lightning.heuristic_reward_of_trace)
+        if not ok:
+            raise HTTPException(404, "Unknown trace")
+        db.log_activity(user, "feedback_cleared", prompt="", ok=True)
+        return {"ok": True, "cleared": True}
     ok = db.set_trace_reward(
         body.trace_id, 1.0 if body.score > 0 else 0.0,
         user_id=user["id"], source="user", note=body.note)

@@ -252,12 +252,19 @@ def test_feedback_cannot_mutate_another_users_trace_or_shared_cache(env, client)
     assert cache_after == cache_before
 
 
-@pytest.mark.parametrize("score", [-2, 0, 2, 999])
+@pytest.mark.parametrize("score", [-2, 2, 999])
 def test_feedback_accepts_only_literal_thumb_scores(env, client, score):
     trace_id = ask(client)["trace_id"]
     assert client.post(
         "/api/feedback", json={"trace_id": trace_id, "score": score}
     ).status_code == 422
+
+
+def test_score_zero_takes_feedback_back(env, client):
+    trace_id = ask(client)["trace_id"]
+    assert client.post("/api/feedback", json={"trace_id": trace_id, "score": 1}).status_code == 200
+    r = client.post("/api/feedback", json={"trace_id": trace_id, "score": 0})
+    assert r.status_code == 200 and r.json() == {"ok": True, "cleared": True}
 
 
 # ── 2. Configured: the turn only enqueues ────────────────────────────────
