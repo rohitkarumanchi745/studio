@@ -172,9 +172,11 @@ a source's connector plus the role-visible tables. There is no second way to
 reach the warehouse: a connector's `run_query` raises `RuntimeError` outside
 the gateway's scope at runtime, and `tests/test_gateway.py` fails the build on
 any `.run_query(` under `app/` outside `gateway.py` — a permission can never be
-skipped by taking a different route. Optional `STUDIO_QUERY_TIMEOUT_S` bounds a
-single warehouse query; `STUDIO_MAX_ROWS` (read by `limits.py`) is the server
-ceiling for any result.
+skipped by taking a different route. An interactive read is limited to 300s by
+default (`STUDIO_QUERY_TIMEOUT_S` overrides it) and cancelled on the warehouse
+when its connector supports that (Databricks does); each source allows
+`STUDIO_QUERY_CONCURRENCY` reads in flight. `STUDIO_MAX_ROWS` (read by
+`limits.py`) is the server ceiling for any result.
 
 This is Studio's row-returning read plane. Approved Airflow DAG tasks execute
 outside it, through the operator-mapped warehouse connection; their separate
@@ -2602,7 +2604,8 @@ you in: the account is created unverified and the emailed 6-digit code
 | `STUDIO_GOVERNANCE_REFRESH_S` | Seconds a process may apply its cached governance document before re-checking the store (default 5). Every accessor that gates a decision probes `governance_docs` at most this often, so a policy applied on any replica takes effect fleet-wide within one interval; `0` checks on every decision. Costs one single-row indexed read per process per interval |
 | `STUDIO_MAX_ROWS` | Server ceiling on rows in any result (default 50000; read by `limits.py`, applied by the gateway) |
 | `STUDIO_MESSAGE_ROWS_RETENTION_DAYS` | `0` (default) keeps chat result rows forever; `> 0` strips rows from assistant messages older than N days at startup, leaving text / SQL / chart / columns and setting `rows_purged` |
-| `STUDIO_QUERY_TIMEOUT_S` | Wall-clock timeout for one warehouse query through the gateway, in seconds; `0` (default) disables it. On expiry the caller gets a clear `QueryTimeout`; the driver call keeps running on its worker thread until it returns |
+| `STUDIO_QUERY_CONCURRENCY` | Reads in flight per source per process (default 8). A slot is held until the warehouse call really returns — abandoned queries still count — and a read that finds no slot within `STUDIO_QUERY_QUEUE_S` (default 60) fails with `QueryBusy` |
+| `STUDIO_QUERY_TIMEOUT_S` | Wall-clock limit for one warehouse read through the gateway, in seconds. Unset: 300 for interactive reads, none for reads inside approved supervised jobs. Set, it applies to every read (`0` = no limit). On expiry the caller gets a clear `QueryTimeout` and the query is cancelled on the warehouse where the connector supports it (Databricks: `cursor.cancel()`); elsewhere it is abandoned and runs until the driver returns |
 | `STUDIO_SEMANTIC_REFRESH_S` | The same, for the semantic layer's active model document (`semantic_models`, default 5) — without it two replicas can compile the same metric from two different definitions |
 
 **Background jobs & schedulers**

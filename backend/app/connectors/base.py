@@ -54,6 +54,68 @@ def current_scope():
     return _GATEWAY_SCOPE.get()
 
 
+class QueryCancelled(Exception):
+    """The gateway cancelled this query: its caller's time ran out."""
+
+
+class CancelToken:
+    """One query's cancel switch, shared by the gateway — which pulls it from
+    another thread when the query's time runs out — and the connector, which
+    attaches its driver's own cancel (a DB-API cursor.cancel(), say) once the
+    query is running. A connector that attaches nothing cannot be cancelled:
+    its run is abandoned, as before, and keeps its concurrency slot until the
+    warehouse returns.
+
+    Pulled before the connector got to attach (the query was still queued —
+    behind a connector's connection lock, for instance), attach() raises
+    QueryCancelled, so a query whose caller already gave up never starts."""
+
+    def __init__(self):
+        import threading
+        self._lock = threading.Lock()
+        self._cancels = []
+        self.cancelled = False
+
+    def attach(self, cancel):
+        with self._lock:
+            if not self.cancelled:
+                self._cancels.append(cancel)
+                return
+        raise QueryCancelled("the query was cancelled before it started")
+
+    def cancel(self):
+        """Pull the switch; True when a driver-level cancel was issued."""
+        with self._lock:
+            if self.cancelled:
+                return bool(self._cancels)
+            self.cancelled = True
+            cancels = list(self._cancels)
+        for fn in cancels:
+            try:
+                fn()
+            except Exception:
+                pass                # best effort: the timeout is reported either way
+        return bool(cancels)
+
+
+_CANCEL = contextvars.ContextVar("studio_query_cancel", default=None)
+
+
+@contextlib.contextmanager
+def cancel_scope(token):
+    """Make `token` the running query's cancel switch (gateway only)."""
+    reset = _CANCEL.set(token)
+    try:
+        yield
+    finally:
+        _CANCEL.reset(reset)
+
+
+def current_cancel():
+    """The running query's CancelToken, or None (outside a gateway query)."""
+    return _CANCEL.get()
+
+
 # Pre-gateway call sites were exempted here by (app module, function) while
 # they were migrated onto gateway.execute. The migration is complete: the set
 # is EMPTY and tests/test_gateway.py pins it to the static offenders (none), so

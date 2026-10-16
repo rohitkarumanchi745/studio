@@ -12,7 +12,7 @@ import os
 import re
 import threading
 
-from .base import Connector, jsonify_rows
+from .base import Connector, QueryCancelled, current_cancel, jsonify_rows
 from ..queryguard import FULL_NAMES
 
 #: Schema value meaning "every schema" — of the configured catalog, or of every
@@ -412,14 +412,20 @@ class DatabricksConnector(Connector):
                     self._pool_conn = self._conn()
                 try:
                     return fn(self._pool_conn)
+                except QueryCancelled:
+                    raise                   # never started: the connection is fine
                 except Exception:
+                    token = current_cancel()
+                    cancelled = token is not None and token.cancelled
                     try:
                         if self._pool_conn is not None:
                             self._pool_conn.close()
                     except Exception:
                         pass
                     self._pool_conn = None
-                    if attempt == attempts[-1]:
+                    # A query the gateway cancelled is over: retrying it would
+                    # run the very query whose time ran out a second time.
+                    if cancelled or attempt == attempts[-1]:
                         raise
 
     def close(self):
@@ -636,6 +642,11 @@ class DatabricksConnector(Connector):
     def run_query(self, sql_text):
         def go(con):
             cur = con.cursor()
+            token = current_cancel()
+            if token is not None:
+                # The driver's documented cancel: safe from another thread,
+                # it stops the statement on the warehouse, not just here.
+                token.attach(cur.cancel)
             cur.execute(sql_text)
             columns = [d[0] for d in cur.description]
             # Databricks returns date/datetime/Decimal — coerce to JSON-safe so
