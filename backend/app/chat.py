@@ -2516,58 +2516,71 @@ def _retention_days():
         return 0
 
 
-def purge_message_rows(max_age_days=None, batch=500):
+def _has_rows(content):
+    panels = content.get("panels")
+    return bool(content.get("rows")) or any(
+        isinstance(p, dict) and p.get("rows") for p in (panels or []))
+
+
+def expiring_messages(cutoff, batch=500):
+    """Assistant messages older than `cutoff` that still hold result rows, as
+    {id, conversation_id, created_at, content} — what a purge at that cutoff
+    would strip (and what retention backs up first). Keyset-paginated over the
+    id with dialect-neutral SQL, one short connection per batch, so a caller
+    may update the rows it is handed."""
+    last_id = ""
+    while True:
+        with db.connect() as c:
+            rows = c.execute(
+                "SELECT id, conversation_id, created_at, content FROM messages "
+                "WHERE role='assistant' AND created_at < ? AND id > ? AND content NOT LIKE ? "
+                "ORDER BY id LIMIT ?",
+                (cutoff, last_id, "%" + _PURGED_MARK + "%", batch)).fetchall()
+        for r in rows:
+            last_id = r["id"]
+            try:
+                content = json.loads(r["content"])
+            except Exception:
+                continue
+            if isinstance(content, dict) and _has_rows(content):
+                yield {"id": r["id"], "conversation_id": r["conversation_id"],
+                       "created_at": r["created_at"], "content": content}
+        if len(rows) < batch:
+            return
+
+
+def purge_message_rows(max_age_days=None, batch=500, raise_errors=False):
     """Strip result rows from assistant messages older than `max_age_days`
     (default: STUDIO_MESSAGE_ROWS_RETENTION_DAYS; 0 keeps rows forever).
 
     Text, SQL, chart and columns stay, so the history still renders; the
     message gains rows_purged=True and the UI shows a "rows expired" marker.
     The SQL is the durable artefact — a reader with access can rerun it for
-    fresh rows. Keyset-paginated over the id so a large table is never read
-    at once, dialect-neutral SQL (SQLite and the Postgres facade), and it
-    never raises: a retention hiccup must not stop the app from booting.
-    Returns the number of messages purged.
+    fresh rows. Called by the retention scheduler (retention.py), which owns
+    when the first purge may happen; raise_errors lets it record a failure
+    instead of reporting a partial count. Returns the number of messages purged.
     """
     days = _retention_days() if max_age_days is None else int(max_age_days)
     if days <= 0:
         return 0
     cutoff = time.time() - days * 86400
-    purged, last_id = 0, ""
+    purged = 0
     try:
-        with db.connect() as c:
-            while True:
-                rows = c.execute(
-                    "SELECT id, content FROM messages WHERE role='assistant' AND created_at < ? "
-                    "AND id > ? AND content NOT LIKE ? ORDER BY id LIMIT ?",
-                    (cutoff, last_id, "%" + _PURGED_MARK + "%", batch)).fetchall()
-                if not rows:
-                    break
-                for r in rows:
-                    last_id = r["id"]
-                    try:
-                        content = json.loads(r["content"])
-                    except Exception:
-                        continue
-                    if not isinstance(content, dict):
-                        continue
-                    panels = content.get("panels")
-                    has_rows = bool(content.get("rows")) or any(
-                        isinstance(p, dict) and p.get("rows") for p in (panels or []))
-                    if not has_rows:
-                        continue
-                    content["rows"] = []
-                    if isinstance(panels, list):
-                        content["panels"] = [
-                            {**p, "rows": []} if isinstance(p, dict) else p for p in panels]
-                    content["rows_purged"] = True
-                    c.execute("UPDATE messages SET content=? WHERE id=?",
-                              (json.dumps(content), r["id"]))
-                    purged += 1
+        for m in expiring_messages(cutoff, batch):
+            content = m["content"]
+            content["rows"] = []
+            if isinstance(content.get("panels"), list):
+                content["panels"] = [{**p, "rows": []} if isinstance(p, dict) else p
+                                     for p in content["panels"]]
+            content["rows_purged"] = True
+            with db.connect() as c:
+                c.execute("UPDATE messages SET content=? WHERE id=?",
+                          (json.dumps(content), m["id"]))
                 c.commit()
-                if len(rows) < batch:
-                    break
+            purged += 1
     except Exception:
-        pass
+        if raise_errors:
+            raise
     return purged
 
 

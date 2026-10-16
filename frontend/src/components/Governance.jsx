@@ -3,8 +3,115 @@
 // before applying; applying hot-reloads with no redeploy. Clearing reverts to
 // Studio's built-in RBAC.
 import { Fragment, useEffect, useState } from "react";
-import { api } from "../api";
+import { api, getToken } from "../api";
 import { PlanningContextPicker, usePlanningCatalog } from "./Pipelines";
+
+// Chat result-row retention (retention.py): what the scheduled pass removes,
+// and — before the first purge of existing history — the notice, a download of
+// exactly those rows, and the choice to start now or postpone.
+export function Retention() {
+  const [st, setSt] = useState(null);
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState("");
+
+  useEffect(() => {
+    api("/admin/retention").then(setSt).catch((e) => setErr(e.message));
+  }, []);
+
+  const when = (ts) => (ts ? new Date(ts * 1000).toLocaleString() : "—");
+
+  async function act(path, body) {
+    setErr("");
+    setBusy(path);
+    try {
+      setSt(await api(`/admin/retention/${path}`, { method: "POST", body: JSON.stringify(body || {}) }));
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function download() {
+    setErr("");
+    setBusy("backup");
+    try {
+      const res = await fetch("/api/admin/retention/backup",
+                              { headers: { Authorization: `Bearer ${getToken()}` } });
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || `download failed (${res.status})`);
+      const name = /filename="([^"]+)"/.exec(res.headers.get("content-disposition") || "")?.[1]
+        || "studio-result-rows.jsonl";
+      const url = URL.createObjectURL(await res.blob());
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = name;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  if (!st && !err) return null;
+  return (
+    <div className="mcp-block retention">
+      <div className="canvas-title" style={{ fontSize: 15 }}>Data retention — chat result rows</div>
+      {err && <div className="error">{err}</div>}
+      {st && !st.enabled && (
+        <div className="meta">
+          Off — result rows are kept forever. Set STUDIO_MESSAGE_ROWS_RETENTION_DAYS to start;
+          the first removal of existing history is announced here before it happens.
+        </div>
+      )}
+      {st?.enabled && (
+        <div className="meta">
+          Rows older than {st.days} days are removed by a scheduled pass every{" "}
+          {Math.max(1, Math.round(st.tick_seconds / 60))} min. Answer text, SQL and chart settings stay.
+        </div>
+      )}
+      {st?.first_purge_pending && (
+        <div className="retention-notice" role="status">
+          <div>
+            <b>Result rows of {st.eligible} {st.eligible === 1 ? "answer" : "answers"}</b>{" "}
+            (oldest from {when(st.oldest_eligible_at)}) will be removed{" "}
+            {st.first_purge_at ? `on ${when(st.first_purge_at)}` : "once the notice period starts on the next pass"}.
+            {st.acknowledged_by
+              ? ` Backup confirmed by ${st.acknowledged_by}: removal starts on the next pass.`
+              : " Back them up first."}
+          </div>
+          <div className="gov-actions">
+            <button className="chip" onClick={download} disabled={busy === "backup"}>
+              {busy === "backup" ? "preparing…" : "⇩ download these rows"}
+            </button>
+            {!st.acknowledged_by && (
+              <button className="chip" onClick={() => act("acknowledge")} disabled={busy === "acknowledge"}>
+                ✓ backup taken — start now
+              </button>
+            )}
+            <button className="chip" onClick={() => act("postpone", { days: 7 })} disabled={busy === "postpone"}>
+              ⏸ postpone 7 days
+            </button>
+          </div>
+        </div>
+      )}
+      {st?.runs?.length > 0 && (
+        <table className="retention-runs">
+          <thead><tr><th>pass</th><th>status</th><th>eligible</th><th>removed</th><th /></tr></thead>
+          <tbody>
+            {st.runs.slice(0, 5).map((r) => (
+              <tr key={r.started_at} className={r.status === "failed" ? "bad" : ""}>
+                <td>{when(r.started_at)}</td><td>{r.status.replace(/_/g, " ")}</td>
+                <td>{r.eligible ?? "—"}</td><td>{r.purged ?? "—"}</td><td>{r.error || ""}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
 
 function McpServers() {
   const [servers, setServers] = useState([]);
@@ -450,6 +557,7 @@ export default function Governance({ onClose }) {
         placeholder="Load the template to start from your current setup, or paste a governance document…"
       />
 
+      <Retention />
       <McpServers />
       <GithubRepos />
       <PlanningSourcesPreview />

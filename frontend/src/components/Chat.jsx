@@ -734,7 +734,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
               key={i}
               m={m}
               requirement={messages[i - 1]?.role === "user" ? messages[i - 1].text : ""}
-              onOpenCanvas={() => setCanvas(buildCanvas(m))}
+              onOpenCanvas={(view) => setCanvas(buildCanvas(view || m))}
               onClarify={resend}
               onRunPipeline={() => runPipeline(m)}
               onPipelineStatus={() => runPipeline(m, "status")}
@@ -826,6 +826,14 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
   const [showSql, setShowSql] = useState(false);
   const [columns, setColumns] = useState(m.columns);
   const [rows, setRows] = useState(m.rows);
+  // Stored result rows expire under the retention policy (rows_purged): the
+  // answer, SQL and chart stay, the rows do not. Re-running brings them back
+  // for this view; until then the answer says so instead of drawing nothing.
+  const [refreshed, setRefreshed] = useState(false);
+  const expired = Boolean(m.rows_purged) && !refreshed;
+  // The live re-run of an expired answer, for the canvas and the D3 window. Not
+  // tied to the stored message (whose rows are gone), so canvas edits stay local.
+  const freshView = () => ({ ...m, message_id: undefined, panels: undefined, columns, rows });
   const [status, setStatus] = useState("");
   const [voted, setVoted] = useState(0);
   const [sample, setSample] = useState(null);
@@ -874,9 +882,20 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
       });
       setColumns(data.columns);
       setRows(data.rows);
+      setRefreshed(true);
       setStatus(`refreshed ${new Date().toLocaleTimeString()}`);
+      return data;
     } catch (e) {
       setStatus(`refresh failed: ${e.message}`);
+      return null;
+    }
+  }
+
+  async function rerunExpired() {
+    const data = await refresh();
+    if (data && !visualMode) {
+      onOpenCanvas?.({ ...m, message_id: undefined, panels: undefined,
+                       columns: data.columns, rows: data.rows });
     }
   }
 
@@ -929,11 +948,23 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
         </div>
         {m.activity_task_id && <AgentActivity key={m.activity_task_id} taskId={m.activity_task_id} steps={activitySteps || []} graph={m.graph} />}
         {m.text && <Markdown className="answer" text={m.text} />}
+        {expired && (
+          <div className="rows-expired" role="note">
+            <span><b>Result rows expired.</b> Studio keeps an answer's data for a limited time;
+              the question, SQL and chart settings are kept.</span>
+            {m.sql && (
+              <button className="chip" onClick={rerunExpired}
+                      title="Run this answer's SQL again for current data">
+                ⟳ re-run for current data
+              </button>
+            )}
+          </div>
+        )}
         {/* The D3 & artifacts window draws every chart right in the thread,
             with D3 alone, under the answer it illustrates. */}
-        {visualMode && (m.panels?.length > 0 || (m.chart && rows?.length > 0)) && (
+        {visualMode && !expired && (m.panels?.length > 0 || (m.chart && rows?.length > 0)) && (
           <div className="msg-visuals">
-            {(m.panels?.length ? m.panels : [{ columns, rows, chart: m.chart }]).map((p, i) => (
+            {(m.panels?.length && !m.rows_purged ? m.panels : [{ columns, rows, chart: m.chart }]).map((p, i) => (
               <div key={i} className="msg-visual">
                 <ChartView columns={p.columns} rows={p.rows} chart={p.chart} visual={p.visual}
                            engine="d3" d3Only tall />
@@ -1040,8 +1071,9 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
             <button className="chip" onClick={emailReport} title="Email this report to yourself">
               ✉ email report
             </button>{" "}
-            {m.chart && !visualMode && (
-              <button className="chip" onClick={onOpenCanvas} title="Open on the main screen">
+            {m.chart && !visualMode && !expired && (
+              <button className="chip" onClick={() => onOpenCanvas(m.rows_purged ? freshView() : undefined)}
+                      title="Open on the main screen">
                 ⤢ canvas
               </button>
             )}
@@ -1074,8 +1106,9 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
         )}
         {/* Charts always live in the canvas (center stage), never inline in the
             chat column — chat keeps a button to bring this message's view back. */}
-        {!visualMode && (m.panels?.length > 0 || (m.chart && rows?.length > 0)) && (
-          <button className="chip chart-open" onClick={onOpenCanvas}>
+        {!visualMode && !expired && (m.panels?.length > 0 || (m.chart && rows?.length > 0)) && (
+          <button className="chip chart-open"
+                  onClick={() => onOpenCanvas(m.rows_purged ? freshView() : undefined)}>
             ⤢ {m.panels?.length > 1 ? `${m.panels.length} charts` : "chart"} in canvas
           </button>
         )}

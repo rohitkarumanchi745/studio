@@ -2108,9 +2108,15 @@ production bug the day Databricks was connected.
 store rows (that is what makes a chat replayable), which is exactly why sharing
 is an RBAC boundary enforced at read time. Stored rows need not live forever:
 `STUDIO_MESSAGE_ROWS_RETENTION_DAYS` (default `0` = keep) strips `rows` and
-`panels[*].rows` from assistant messages older than N days at startup
-(`chat.purge_message_rows`), keeping text, SQL, chart and columns and setting
-`content.rows_purged = true` so the UI can offer a rerun.
+`panels[*].rows` from assistant messages older than N days, keeping text, SQL,
+chart and columns and setting `content.rows_purged = true`; the answer then
+says "Result rows expired" and offers a re-run for current data. The purge is
+a scheduled, lease-guarded pass (`retention.py`), never a boot step, and every
+pass is recorded in `retention_runs`. The first purge that would remove
+existing history — and any later one after the retention is lowered — waits
+out `STUDIO_RETENTION_NOTICE_DAYS` (default 7): Governance → Data retention
+shows what will go and when, downloads exactly those rows as a backup, and can
+postpone it or start it once a backup is confirmed.
 
 ### Tile cache
 
@@ -2603,9 +2609,11 @@ you in: the account is created unverified and the emailed 6-digit code
 | `STUDIO_DASH_TILE_ROWS` | Row cap per dashboard tile (default 5000); the effective cap is `min(STUDIO_DASH_TILE_ROWS, STUDIO_MAX_ROWS)` |
 | `STUDIO_GOVERNANCE_REFRESH_S` | Seconds a process may apply its cached governance document before re-checking the store (default 5). Every accessor that gates a decision probes `governance_docs` at most this often, so a policy applied on any replica takes effect fleet-wide within one interval; `0` checks on every decision. Costs one single-row indexed read per process per interval |
 | `STUDIO_MAX_ROWS` | Server ceiling on rows in any result (default 50000; read by `limits.py`, applied by the gateway) |
-| `STUDIO_MESSAGE_ROWS_RETENTION_DAYS` | `0` (default) keeps chat result rows forever; `> 0` strips rows from assistant messages older than N days at startup, leaving text / SQL / chart / columns and setting `rows_purged` |
+| `STUDIO_MESSAGE_ROWS_RETENTION_DAYS` | `0` (default) keeps chat result rows forever; `> 0` strips rows from assistant messages older than N days on a scheduled pass, leaving text / SQL / chart / columns and setting `rows_purged`. The first purge of existing history waits out a notice (below) |
 | `STUDIO_QUERY_CONCURRENCY` | Reads in flight per source per process (default 8). A slot is held until the warehouse call really returns — abandoned queries still count — and a read that finds no slot within `STUDIO_QUERY_QUEUE_S` (default 60) fails with `QueryBusy` |
 | `STUDIO_QUERY_TIMEOUT_S` | Wall-clock limit for one warehouse read through the gateway, in seconds. Unset: 300 for interactive reads, none for reads inside approved supervised jobs. Set, it applies to every read (`0` = no limit). On expiry the caller gets a clear `QueryTimeout` and the query is cancelled on the warehouse where the connector supports it (Databricks: `cursor.cancel()`); elsewhere it is abandoned and runs until the driver returns |
+| `STUDIO_RETENTION_NOTICE_DAYS` | Notice before the first purge of existing history, or after the retention is lowered (default 7). Administrators can download the affected rows, postpone, or start early under Governance → Data retention |
+| `STUDIO_RETENTION_TICK_SECONDS` | Cadence of the retention pass (default 3600); `STUDIO_RETENTION_TICKER=0` turns the pass off |
 | `STUDIO_SEMANTIC_REFRESH_S` | The same, for the semantic layer's active model document (`semantic_models`, default 5) — without it two replicas can compile the same metric from two different definitions |
 
 **Background jobs & schedulers**
