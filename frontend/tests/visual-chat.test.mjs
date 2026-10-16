@@ -83,20 +83,29 @@ test("a D3-only chart has no engine picker and offers D3 without the line chart"
   for (const type of ["treemap", "sankey", "table", "kpi", "line"]) assert.ok(offered(ordinary).includes(type));
 });
 
-test("a line chart opens as a D3 area; a type D3 lacks as a D3 bar", () => {
+test("a line chart opens as a D3 area; every other type opens as itself in D3", () => {
   const line = html(ChartView, { columns: COLUMNS, rows: ROWS, d3Only: true,
                                  chart: { ...BAR, type: "line" } });
   assert.match(line, /<option value="area" selected=""/);
   assert.doesNotMatch(line, /<option value="line"/);
   assert.match(line, /d3-chart/);
 
-  for (const type of ["table", "treemap", "kpi", "sankey"]) {
+  // The whole catalog draws with D3 here — the KPI and the table included
+  // (elsewhere those are the KPI card and the data table).
+  for (const type of ["table", "treemap", "kpi", "funnel", "gauge", "waterfall", "histogram"]) {
     const markup = html(ChartView, { columns: COLUMNS, rows: ROWS, d3Only: true,
                                      chart: { ...BAR, type } });
-    assert.match(markup, /<option value="bar" selected=""/, type);
+    assert.match(markup, new RegExp(`<option value="${type}" selected=""`), type);
     assert.match(markup, /d3-chart/, type);
-    assert.doesNotMatch(markup, /<table/, type);
+    assert.doesNotMatch(markup, /<table|kpi-card/, type);   // not the HTML table or card
   }
+  // An unknown type opens as a D3 bar.
+  assert.match(html(ChartView, { columns: COLUMNS, rows: ROWS, d3Only: true,
+                                 chart: { ...BAR, type: "mystery" } }),
+               /<option value="bar" selected=""/);
+  // Outside the window the KPI is still the card.
+  assert.match(html(ChartView, { columns: COLUMNS, rows: ROWS, chart: { ...BAR, type: "kpi" } }),
+               /kpi-card/);
 });
 
 test("data no D3 chart fits gets a note, not a table", () => {

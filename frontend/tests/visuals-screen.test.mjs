@@ -67,8 +67,12 @@ test("a chart without x/y still gets columns to draw", () => {
 
 test("the D3 options are exactly the D3 types this data fits", () => {
   const opts = d3Options(COLUMNS, ROWS, CHART.chart);
-  for (const t of ["bar", "hbar", "pie", "donut", "beeswarm", "circle_pack"]) assert.ok(opts.includes(t), t);
-  for (const t of ["network", "calendar", "table", "kpi", "treemap"]) assert.ok(!opts.includes(t), t);
+  for (const t of ["bar", "hbar", "pie", "donut", "beeswarm", "circle_pack",
+                   "table", "kpi", "treemap", "funnel", "gauge", "histogram", "waterfall"]) {
+    assert.ok(opts.includes(t), t);
+  }
+  // What this data does not fit (and the line chart, never offered here).
+  for (const t of ["network", "calendar", "boxplot", "sankey", "combo", "line"]) assert.ok(!opts.includes(t), t);
   const days = d3Options(["day", "sessions"], [["2024-01-01", 3], ["2024-01-02", 5]], null);
   assert.ok(days.includes("calendar") && days.includes("area"));
   // No line charts on this screen, whatever the data.

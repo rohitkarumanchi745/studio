@@ -126,7 +126,6 @@ def test_choosing_a_chart_for_a_visual_panel_drops_the_visual():
     ({"chart_type": "bar", "engine": "flash"}, 400),
     ({"chart_type": "bar", "engine": "echarts"}, 400),      # D3 alone here
     ({"chart_type": "line", "engine": "d3"}, 400),          # and no line charts
-    ({"chart_type": "treemap"}, 400),                        # nor what D3 lacks
     ({}, 400),
     ({"chart_type": "bar", "visual": VISUAL}, 400),
 ])

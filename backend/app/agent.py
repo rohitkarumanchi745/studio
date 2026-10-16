@@ -43,27 +43,24 @@ CHART_TYPES = [
 ]
 
 # What the D3 engine draws (frontend renderers/D3View.jsx D3_TYPES — keep the
-# two in step).
+# two in step): the whole catalog.
 D3_CHART_TYPES = (
-    "bar", "hbar", "stacked_bar", "line", "area", "stacked_area", "pie", "donut",
-    "scatter", "bubble", "heatmap", "network", "beeswarm", "calendar", "circle_pack",
+    "bar", "hbar", "stacked_bar", "combo", "line", "area", "stacked_area", "pie", "donut",
+    "scatter", "bubble", "heatmap", "treemap", "funnel", "radar", "gauge", "kpi",
+    "histogram", "boxplot", "waterfall", "sankey", "table",
+    "network", "beeswarm", "calendar", "circle_pack",
 )
 # What the D3 & artifacts window draws: D3 without the line chart (frontend
 # VISUAL_TYPES). It renders ONLY these, plus custom visuals; d3_only() maps any
 # other type to its nearest stand-in.
 VISUAL_CHART_TYPES = tuple(t for t in D3_CHART_TYPES if t != "line")
-_D3_STAND_IN = {
-    "line": "area", "combo": "bar", "treemap": "circle_pack", "funnel": "hbar",
-    "radar": "bar", "gauge": "bar", "kpi": "bar", "histogram": "beeswarm",
-    "boxplot": "beeswarm", "waterfall": "bar", "sankey": "network", "table": "bar",
-}
+_D3_STAND_IN = {"line": "area"}
 
 
 def d3_only(result):
-    """Make every chart in a result one the D3 & artifacts window draws: any
-    other type becomes its stand-in (a line → an area, a sankey's flows → a
-    network, a boxplot's spread → a beeswarm, a treemap → circle packing), and
-    every panel draws with the D3 engine. Custom visuals are D3 code already. Covers answers that did not
+    """Make every chart in a result one the D3 & artifacts window draws: a
+    line becomes an area (that window uses no line charts) and anything
+    unknown a bar, and every panel draws with the D3 engine. Custom visuals are D3 code already. Covers answers that did not
     come from a visual-mode agent — a cached plan, the keyless fallback, the
     multi-source orchestrator."""
     def fix(chart):

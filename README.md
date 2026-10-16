@@ -1875,8 +1875,10 @@ measurable.
 26 chart types across four engines (ECharts default, Plotly, Vega-Lite, D3), with a
 data-shape fit check that hides types the current result can't support. Pick the
 engine per browser from the chart toolbar; a type an engine lacks falls back to
-ECharts. **D3** draws the core types as hand-built SVG and adds four that only it
-draws — whichever engine is picked:
+ECharts. **D3** draws the whole catalog as hand-built SVG — combo, treemap,
+funnel, radar, gauge, KPI, histogram, box plot, waterfall, sankey (a layered
+layout; a flow that loops back is refused) and the table included — and adds
+four types that only it draws, whichever engine is picked:
 
 | Type | Data it takes | Good for |
 |---|---|---|
@@ -1914,9 +1916,9 @@ turn (`visual: true` on `/api/chat/background`), so queries, permissions,
 governance, history and sharing work exactly as they do there. What changes: the
 agent always visualizes; `render_chart` takes only the types the window draws,
 which are D3's without the line chart (`agent.VISUAL_CHART_TYPES`, kept in step
-with the frontend's `VISUAL_TYPES`); and `agent.d3_only` gives any other chart
-its stand-in (a line becomes an area, a sankey a network, a treemap circle
-packing, a boxplot a beeswarm) and puts every panel on the D3 engine, including
+with the frontend's `VISUAL_TYPES` — every other type of the catalog, the KPI and
+the table drawn by D3 too); and `agent.d3_only` turns a line into an area (and
+anything unknown into a bar) and puts every panel on the D3 engine, including
 answers from the keyless fallback and the multi-agent orchestrator. Custom
 visuals written there are told to draw no line charts either. Custom visuals need one source; the multi-agent workers draw D3
 charts. The turn skips the semantic layer, the plan cache and BitNet routing,

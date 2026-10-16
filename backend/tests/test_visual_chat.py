@@ -55,7 +55,7 @@ def _builtin_rbac():
 
 # ── d3_only ─────────────────────────────────────────────────────────────
 
-def test_d3_only_gives_every_type_a_d3_stand_in_and_every_panel_the_d3_engine():
+def test_d3_only_keeps_every_d3_type_turns_a_line_to_an_area_and_sets_the_engine():
     visual = {"title": "Rings", "code": "d3.select(el)"}
     result = {
         "chart": {"type": "sankey", "x": "from", "y": ["to", "n"], "title": "Flows"},
@@ -69,15 +69,18 @@ def test_d3_only_gives_every_type_a_d3_stand_in_and_every_panel_the_d3_engine():
     }
     out = agent.d3_only(result)
     assert out is result and out["visual_mode"] is True
-    assert out["chart"] == {"type": "network", "x": "from", "y": ["to", "n"], "title": "Flows"}
+    # D3 draws the whole catalog now: a sankey stays a sankey, a table a table.
+    assert out["chart"] == {"type": "sankey", "x": "from", "y": ["to", "n"], "title": "Flows"}
     assert [(p["chart"] or {}).get("type") for p in out["panels"]] == \
-        ["circle_pack", "area", "bar", "bar", None]
+        ["treemap", "area", "table", "bar", None]
     assert [p["engine"] for p in out["panels"]] == ["d3"] * 5
     assert out["panels"][0]["rows"] == [["EU", 1]]
     assert out["panels"][2]["visual"] is visual
     # Every type the agent can name lands on one the window draws.
     for t in agent.CHART_TYPES:
-        assert agent.d3_only({"chart": {"type": t}})["chart"]["type"] in agent.VISUAL_CHART_TYPES
+        drawn = agent.d3_only({"chart": {"type": t}})["chart"]["type"]
+        assert drawn == ("area" if t == "line" else t)
+    assert set(agent.D3_CHART_TYPES) == set(agent.CHART_TYPES)
     assert set(agent.D3_CHART_TYPES) - set(agent.VISUAL_CHART_TYPES) == {"line"}
 
 
@@ -173,14 +176,14 @@ def _run_agent(monkeypatch, chart_types, visual_mode=True, visual_request=None):
 
 
 def test_in_visual_mode_render_chart_refuses_what_the_window_does_not_draw(monkeypatch):
-    out, seen = _run_agent(monkeypatch, ["sankey", "line", "circle_pack"],
+    out, seen = _run_agent(monkeypatch, ["line", "sankey", "boxplot"],
                            visual_request="a radial view")
-    sankey, line, drawn = seen["replies"]
-    for refused in (sankey, line):
-        assert refused.startswith("In this window every chart is drawn with D3")
-        assert "render_visual" in refused and "line," not in refused
-    assert drawn.startswith("Chart panel 1 recorded")
-    assert [(p["chart"]["type"], p["engine"]) for p in out["panels"][:1]] == [("circle_pack", "d3")]
+    line, sankey, boxplot = seen["replies"]
+    assert line.startswith("In this window every chart is drawn with D3")
+    assert "render_visual" in line and "line," not in line
+    assert sankey.startswith("Chart panel 1 recorded") and boxplot.startswith("Chart panel 2")
+    assert [(p["chart"]["type"], p["engine"]) for p in out["panels"][:2]] == \
+        [("sankey", "d3"), ("boxplot", "d3")]
     note = _window_note(seen["system"])
     assert "render_visual" in note and "render_visual" in seen["tools"]
     assert "Never draw a line chart" in note and "line," not in note
@@ -197,7 +200,7 @@ def test_outside_visual_mode_nothing_changes(monkeypatch):
     assert seen["generate"] == [{"no_line_charts": False}]
 
 
-@pytest.mark.parametrize("proposed,drawn", [("sankey", "network"), ("line", "area")])
+@pytest.mark.parametrize("proposed,drawn", [("sankey", "sankey"), ("line", "area")])
 def test_a_self_hosted_model_is_never_told_of_render_visual(monkeypatch, proposed, drawn):
     """BitNet answers in one JSON action, with no retry: a chart type the
     window does not draw becomes its stand-in instead of a refusal."""
@@ -286,8 +289,8 @@ def test_a_visual_turn_goes_straight_to_the_agent_and_is_stored_d3_only(turns):
     msg = out["message"]
     assert msg["served_by"] == "frontier" and msg["visual_mode"] is True
     stored = _stored(out["conversation_id"])
-    assert stored["chart"]["type"] == "circle_pack"
-    assert [(p["chart"]["type"], p["engine"]) for p in stored["panels"]] == [("circle_pack", "d3")]
+    assert stored["chart"]["type"] == "treemap"                  # D3 draws treemaps too
+    assert [(p["chart"]["type"], p["engine"]) for p in stored["panels"]] == [("treemap", "d3")]
     assert stored["visual_mode"] is True
     assert _title(out["conversation_id"]) == "🎨 revenue share by region"
 
@@ -334,7 +337,7 @@ def test_the_multi_agent_answer_is_coerced_to_d3_too(monkeypatch, turns):
     out = chat.ask(chat.Ask(prompt="revenue across everything", source="*", table="*",
                             visual=True), user=ANA)
     stored = _stored(out["conversation_id"])
-    assert [(p["chart"]["type"], p["engine"]) for p in stored["panels"]] == [("hbar", "d3")]
+    assert [(p["chart"]["type"], p["engine"]) for p in stored["panels"]] == [("funnel", "d3")]
     assert stored["visual_mode"] is True
 
 

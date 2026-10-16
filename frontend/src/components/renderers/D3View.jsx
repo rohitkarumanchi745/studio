@@ -1,23 +1,27 @@
-// D3 renderer — hand-built SVG for the core chart types, plus the chart types
-// only D3 draws here: a force-directed network, a beeswarm, a calendar heatmap
-// and circle packing (D3_ONLY). Same validated palette as every other engine.
+// D3 renderer — hand-built SVG for the whole chart catalog, so a screen can
+// draw every type with D3 alone (the D3 & artifacts window does), plus the
+// chart types only D3 draws here: a force-directed network, a beeswarm, a
+// calendar heatmap and circle packing (D3_ONLY). Same validated palette as
+// every other engine.
 //
 // d3 is loaded on demand (dynamic import) so the main bundle stays light. The
-// data builders (networkData, beeswarmData, calendarData, packData) are pure —
-// rows in, plain objects out — so the shapes the charts draw are tested
-// without a DOM. Values come straight from a warehouse: they are written with
+// data builders (networkData, beeswarmData, …, sankeyData) are pure — rows in,
+// plain objects out — so the shapes the charts draw are tested without a DOM.
+// Values come straight from a warehouse: they are written with
 // .text()/textContent only, never as HTML.
 import { useEffect, useRef, useState } from "react";
 import {
-  AXIS_LINE, GRID_LINE, INK, SEQ, SERIES, SURFACE,
+  AXIS_LINE, BAD, GOOD, GRID_LINE, INK, SEQ, SERIES, SURFACE, TOTAL,
   firstNumericIndex, isNumericCol, resolveSpec,
 } from "./common";
 
 /** Chart types no other engine draws: these always render with D3. */
 export const D3_ONLY = new Set(["network", "beeswarm", "calendar", "circle_pack"]);
 export const D3_TYPES = new Set([
-  "bar", "hbar", "stacked_bar", "line", "area", "stacked_area",
+  "bar", "hbar", "stacked_bar", "combo", "line", "area", "stacked_area",
   "pie", "donut", "scatter", "bubble", "heatmap",
+  "treemap", "funnel", "radar", "gauge", "kpi",
+  "histogram", "boxplot", "waterfall", "sankey", "table",
   ...D3_ONLY,
 ]);
 // What the D3 & artifacts screens draw: D3 without the line chart (backend
@@ -28,7 +32,9 @@ export const visualType = (t) => (VISUAL_TYPES.has(t) ? t : t === "line" ? "area
 // Size limits, shared with ChartView's fit rules so a chart is only offered
 // when it will stay readable (and a force layout stays fast).
 export const LIMITS = { networkNodes: 300, networkLinks: 2000, beeswarm: 2000,
-                        calendarDays: 1100, packLeaves: 400 };
+                        calendarDays: 1100, packLeaves: 400, sankeyNodes: 30,
+                        boxGroups: 20, waterfallSteps: 20, funnelStages: 10,
+                        radarAxes: 12, tableRows: 200 };
 
 let _d3 = null;
 function getD3() {
@@ -198,6 +204,144 @@ export function packData(columns, rows, spec) {
   return { name: "root", children: [...groups].map(([name, children]) => ({ name, children })) };
 }
 
+/** Equal-width bins over y[0] (or x when it is the numeric one), like the
+ *  ECharts histogram: between 6 and 20 bins, about √n of them. */
+export function histogramData(columns, rows, spec) {
+  const { xi, yis } = resolveSpec(columns, rows, spec);
+  const vi = yis[0] ?? (xi >= 0 && isNumericCol(rows, xi) ? xi : firstNumericIndex(columns, rows));
+  if (vi < 0) return null;
+  const vals = rows.map((r) => r[vi]).filter(isNum).map(num);
+  if (!vals.length) return null;
+  const lo = Math.min(...vals), hi = Math.max(...vals);
+  const n = Math.min(20, Math.max(6, Math.round(Math.sqrt(vals.length))));
+  const width = (hi - lo) / n || 1;
+  const bins = Array.from({ length: n }, (_, i) => ({ x0: lo + i * width, x1: lo + (i + 1) * width, count: 0 }));
+  for (const v of vals) bins[Math.min(n - 1, Math.floor((v - lo) / width))].count++;
+  return { bins, value: columns[vi] };
+}
+
+function quantile(sorted, q) {
+  const at = (sorted.length - 1) * q;
+  const lo = Math.floor(at), hi = Math.ceil(at);
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (at - lo);
+}
+
+/** One box per x group over y[0]: quartiles, whiskers at 1.5×IQR (kept within
+ *  the data), and the points beyond them as outliers. */
+export function boxplotData(columns, rows, spec) {
+  const { xi, yis } = resolveSpec(columns, rows, spec);
+  const vi = yis[0] ?? -1;
+  if (xi < 0 || vi < 0) return null;
+  const groups = new Map();
+  for (const r of rows) {
+    if (!isNum(r[vi])) continue;
+    const k = String(r[xi]);
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(num(r[vi]));
+  }
+  if (!groups.size || groups.size > LIMITS.boxGroups) return null;
+  const boxes = [...groups].map(([name, vs]) => {
+    const s = vs.slice().sort((a, b) => a - b);
+    const q1 = quantile(s, 0.25), median = quantile(s, 0.5), q3 = quantile(s, 0.75);
+    const iqr = q3 - q1;
+    const inside = s.filter((v) => v >= q1 - 1.5 * iqr && v <= q3 + 1.5 * iqr);
+    return { name, q1, median, q3, lo: inside[0], hi: inside[inside.length - 1], n: s.length,
+             outliers: s.filter((v) => v < inside[0] || v > inside[inside.length - 1]) };
+  });
+  return { boxes, value: columns[vi] };
+}
+
+/** A bridge: each row is a delta (y[0]) from the running total, then the total. */
+export function waterfallData(columns, rows, spec) {
+  const { xi, yis } = resolveSpec(columns, rows, spec);
+  const vi = yis[0] ?? -1;
+  if (xi < 0 || vi < 0 || !rows.length || rows.length > LIMITS.waterfallSteps) return null;
+  let run = 0;
+  const steps = rows.map((r) => {
+    const delta = num(r[vi]) || 0;
+    const step = { name: String(r[xi]), start: run, end: run + delta, delta,
+                   kind: delta >= 0 ? "up" : "down" };
+    run += delta;
+    return step;
+  });
+  steps.push({ name: "total", start: 0, end: run, delta: run, kind: "total" });
+  return { steps, value: columns[vi] };
+}
+
+/** Stages largest first, each with its share of the first stage. */
+export function funnelData(columns, rows, spec) {
+  const { xi, yis } = resolveSpec(columns, rows, spec);
+  const vi = yis[0] ?? firstNumericIndex(columns, rows, xi);
+  if (xi < 0 || vi < 0) return null;
+  const stages = rows.map((r) => ({ name: String(r[xi]), value: Math.max(0, num(r[vi]) || 0) }))
+    .sort((a, b) => b.value - a.value);
+  if (!stages.length || stages.length > LIMITS.funnelStages || !stages[0].value) return null;
+  return { stages: stages.map((st) => ({ ...st, share: st.value / stages[0].value })),
+           value: columns[vi] };
+}
+
+/** One axis per row (x), one polygon per numeric series (y), on a shared scale. */
+export function radarData(columns, rows, spec) {
+  const { xi, yCols, yis } = resolveSpec(columns, rows, spec);
+  if (xi < 0 || !yis.length || rows.length < 3 || rows.length > LIMITS.radarAxes) return null;
+  const series = yis.map((i, k) => ({ name: yCols[k], values: rows.map((r) => Math.max(0, num(r[i]) || 0)) }));
+  const max = Math.max(...series.flatMap((s) => s.values)) || 1;
+  return { axes: rows.map((r) => String(r[xi])), series, max };
+}
+
+/** The one number a KPI or a gauge shows: the single row's value, else the sum
+ *  of the column (as the KPI card does). */
+export function singleValue(columns, rows, spec) {
+  const vi = columns.indexOf(spec?.y?.[0]) >= 0 ? columns.indexOf(spec.y[0]) : firstNumericIndex(columns, rows);
+  if (vi < 0 || !rows.length) return null;
+  const value = rows.length === 1 ? num(rows[0][vi]) : rows.reduce((a, r) => a + (num(r[vi]) || 0), 0);
+  if (!Number.isFinite(value)) return null;
+  return { value, label: columns[vi], rows: rows.length };
+}
+
+/** A flow diagram's graph: x = source, y[0] = target, y[1] (or the first other
+ *  numeric column) = the flow. Repeated pairs add up, self-flows are dropped.
+ *  Columns come from the longest path to each node, so a flow that loops back
+ *  (a cycle) has no left-to-right layout and is refused. */
+export function sankeyData(columns, rows, spec) {
+  const { xi, yis } = resolveSpec(columns, rows, spec);
+  const ti = yis[0] ?? -1;
+  if (xi < 0 || ti < 0 || ti === xi) return null;
+  const vi = yis.length > 1 ? yis[1] : firstNumericIndex(columns, rows, xi, ti);
+  if (vi < 0) return null;
+  const pairs = new Map();
+  for (const r of rows) {
+    const a = r[xi], b = r[ti], v = num(r[vi]);
+    if (a == null || b == null || String(a) === String(b) || !Number.isFinite(v) || v <= 0) continue;
+    const key = `${a}\u0000${b}`;
+    const hit = pairs.get(key);
+    if (hit) hit.value += v;
+    else pairs.set(key, { source: String(a), target: String(b), value: v });
+  }
+  const links = [...pairs.values()];
+  const ids = [...new Set(links.flatMap((l) => [l.source, l.target]))];
+  if (!links.length || ids.length > LIMITS.sankeyNodes) return null;
+  const indeg = new Map(ids.map((id) => [id, 0]));
+  for (const l of links) indeg.set(l.target, indeg.get(l.target) + 1);
+  const layer = new Map(ids.map((id) => [id, 0]));
+  const queue = ids.filter((id) => indeg.get(id) === 0);
+  let seen = 0;
+  while (queue.length) {
+    const id = queue.shift();
+    seen++;
+    for (const l of links.filter((x) => x.source === id)) {
+      layer.set(l.target, Math.max(layer.get(l.target), layer.get(id) + 1));
+      indeg.set(l.target, indeg.get(l.target) - 1);
+      if (indeg.get(l.target) === 0) queue.push(l.target);
+    }
+  }
+  if (seen < ids.length) return null;                   // a cycle
+  const flow = (id, side) => links.filter((l) => l[side] === id).reduce((a, l) => a + l.value, 0);
+  const nodes = ids.map((id) => ({ id, layer: layer.get(id),
+                                   value: Math.max(flow(id, "source"), flow(id, "target")) }));
+  return { nodes, links, layers: Math.max(...nodes.map((n) => n.layer)) + 1, value: columns[vi] };
+}
+
 // ── Drawing ─────────────────────────────────────────────────────────────
 
 function fmtNum(v) {
@@ -261,6 +405,17 @@ export function draw(d3, el, columns, rows, spec, size) {
     case "beeswarm": return drawBeeswarm(d3, el, columns, rows, spec, size);
     case "calendar": return drawCalendar(d3, el, columns, rows, spec, size);
     case "circle_pack": return drawPack(d3, el, columns, rows, spec, size);
+    case "combo": return drawCombo(d3, el, columns, rows, spec, size);
+    case "treemap": return drawTreemap(d3, el, columns, rows, spec, size);
+    case "funnel": return drawFunnel(d3, el, columns, rows, spec, size);
+    case "radar": return drawRadar(d3, el, columns, rows, spec, size);
+    case "gauge": return drawGauge(d3, el, columns, rows, spec, size);
+    case "kpi": return drawKpi(d3, el, columns, rows, spec, size);
+    case "histogram": return drawHistogram(d3, el, columns, rows, spec, size);
+    case "boxplot": return drawBoxplot(d3, el, columns, rows, spec, size);
+    case "waterfall": return drawWaterfall(d3, el, columns, rows, spec, size);
+    case "sankey": return drawSankey(d3, el, columns, rows, spec, size);
+    case "table": return drawTable(d3, el, columns, rows);
     default: return false;
   }
 }
@@ -652,3 +807,323 @@ function drawPack(d3, el, columns, rows, spec, { w, h }) {
     .text((d) => d.data.name.slice(0, Math.max(3, Math.floor(d.r / 4))));
   return null;
 }
+
+/** Bars for y[0], lines for the rest, on one value axis (as ECharts' combo). */
+function drawCombo(d3, el, columns, rows, spec, { w, h }) {
+  const { xi, yCols, yis } = resolveSpec(columns, rows, spec);
+  if (xi < 0 || yis.length < 2) return false;
+  const m = { top: 26, right: 16, bottom: 48, left: 52 };
+  const iw = w - m.left - m.right, ih = h - m.top - m.bottom;
+  const svg = svgFor(d3, el, { w, h }, spec.title);
+  const g = svg.append("g").attr("transform", `translate(${m.left},${m.top})`);
+  const tip = tooltip(el);
+  const cats = rows.map((r, i) => `${i}\u0000${r[xi]}`);
+  const vals = rows.flatMap((r) => yis.map((i) => num(r[i]) || 0));
+  const x = d3.scaleBand().domain(cats).range([0, iw]).padding(0.25);
+  const y = d3.scaleLinear().domain([Math.min(0, d3.min(vals)), Math.max(0, d3.max(vals))]).nice().range([ih, 0]);
+  gridY(d3, g, y, iw);
+  styleAxis(g.append("g").call(d3.axisLeft(y).ticks(5, "~s")));
+  styleAxis(g.append("g").attr("transform", `translate(0,${ih})`)
+    .call(d3.axisBottom(x).tickFormat((k) => String(k).split("\u0000")[1].slice(0, 13)).tickSizeOuter(0)))
+    .selectAll(".tick text").attr("text-anchor", "end").attr("transform", "rotate(-30)");
+  const bars = g.append("g").selectAll("rect").data(rows).join("rect")
+    .attr("x", (_, i) => x(cats[i])).attr("width", x.bandwidth()).attr("rx", 3)
+    .attr("y", (r) => y(Math.max(0, num(r[yis[0]]) || 0)))
+    .attr("height", (r) => Math.abs(y(num(r[yis[0]]) || 0) - y(0))).attr("fill", SERIES[0]);
+  hover(bars, tip, (r) => [String(r[xi]), `${yCols[0]}: ${fmtNum(num(r[yis[0]]))}`]);
+  yis.slice(1).forEach((vi, k) => {
+    const color = SERIES[(k + 1) % SERIES.length];
+    const at = (r, i) => [x(cats[i]) + x.bandwidth() / 2, y(num(r[vi]) || 0)];
+    g.append("path").datum(rows).attr("fill", "none").attr("stroke", color).attr("stroke-width", 2)
+      .attr("d", d3.line().x((r, i) => at(r, i)[0]).y((r, i) => at(r, i)[1]));
+    const dots = g.append("g").selectAll("circle").data(rows).join("circle")
+      .attr("cx", (r, i) => at(r, i)[0]).attr("cy", (r, i) => at(r, i)[1]).attr("r", 3.5)
+      .attr("fill", color).attr("stroke", SURFACE);
+    hover(dots, tip, (r) => [String(r[xi]), `${yCols[k + 1]}: ${fmtNum(num(r[vi]))}`]);
+  });
+  legend(svg, yCols, m.left, 6);
+  return null;
+}
+
+function drawTreemap(d3, el, columns, rows, spec, { w, h }) {
+  const tree = packData(columns, rows, spec);
+  if (!tree) return false;
+  const svg = svgFor(d3, el, { w, h }, spec.title);
+  const tip = tooltip(el);
+  const root = d3.treemap().size([w, h]).paddingInner(2).paddingOuter(1).round(true)(
+    d3.hierarchy(tree).sum((d) => d.value || 0).sort((a, b) => b.value - a.value));
+  const grouped = root.height > 1;
+  const groupNames = grouped ? root.children.map((c) => c.data.name) : [];
+  const leaves = root.leaves();
+  const color = (d, i) => SERIES[(grouped ? groupNames.indexOf(d.parent.data.name) : i) % SERIES.length];
+  const cell = svg.selectAll("g").data(leaves).join("g").attr("transform", (d) => `translate(${d.x0},${d.y0})`);
+  const tiles = cell.append("rect").attr("width", (d) => Math.max(0, d.x1 - d.x0))
+    .attr("height", (d) => Math.max(0, d.y1 - d.y0)).attr("rx", 3).attr("fill", color);
+  hover(tiles, tip, (d) => [d.data.name, `${grouped ? d.parent.data.name + " · " : ""}${fmtNum(d.value)}`,
+                            `${((d.value / root.value) * 100).toFixed(1)}% of total`]);
+  cell.filter((d) => d.x1 - d.x0 > 46 && d.y1 - d.y0 > 20).append("text")
+    .attr("x", 6).attr("y", 15).attr("fill", SURFACE).attr("pointer-events", "none")
+    .text((d) => d.data.name.slice(0, Math.max(3, Math.floor((d.x1 - d.x0 - 8) / 6.5))));
+  return null;
+}
+
+function drawFunnel(d3, el, columns, rows, spec, { w, h }) {
+  const data = funnelData(columns, rows, spec);
+  if (!data) return false;
+  const svg = svgFor(d3, el, { w, h }, spec.title);
+  const tip = tooltip(el);
+  const labelW = Math.min(220, w * 0.38);
+  const fw = w - labelW - 16, gap = 3;
+  const sh = (h - 8 - gap * (data.stages.length - 1)) / data.stages.length;
+  const cx = fw / 2 + 8;
+  data.stages.forEach((st, i) => {
+    const next = data.stages[i + 1] ? data.stages[i + 1].share : st.share * 0.85;
+    const top = 4 + i * (sh + gap), a = (fw * st.share) / 2, b = (fw * next) / 2;
+    const shape = svg.append("path").datum(st)
+      .attr("d", `M${cx - a},${top}L${cx + a},${top}L${cx + b},${top + sh}L${cx - b},${top + sh}Z`)
+      .attr("fill", SERIES[i % SERIES.length]);
+    hover(shape, tip, (d) => [d.name, `${data.value}: ${fmtNum(d.value)}`,
+                              `${(d.share * 100).toFixed(1)}% of the first stage`]);
+    svg.append("text").attr("x", fw + 24).attr("y", top + sh / 2 + 4).attr("fill", INK.secondary)
+      .text(`${st.name.slice(0, 22)} · ${fmtNum(st.value)} (${(st.share * 100).toFixed(0)}%)`);
+  });
+  return null;
+}
+
+function drawRadar(d3, el, columns, rows, spec, { w, h }) {
+  const data = radarData(columns, rows, spec);
+  if (!data) return false;
+  const svg = svgFor(d3, el, { w, h }, spec.title);
+  const tip = tooltip(el);
+  const top = data.series.length > 1 ? 26 : 8;
+  const r = Math.max(20, Math.min(w, h - top) / 2 - 34);
+  const g = svg.append("g").attr("transform", `translate(${w / 2},${top + (h - top) / 2})`);
+  const n = data.axes.length;
+  const angle = (i) => (i / n) * 2 * Math.PI;
+  const radius = d3.scaleLinear().domain([0, data.max * 1.1]).range([0, r]);
+  const at = (i, v) => [Math.sin(angle(i)) * radius(v), -Math.cos(angle(i)) * radius(v)];
+  for (let level = 1; level <= 4; level++) {
+    const v = (data.max * 1.1 * level) / 4;
+    g.append("path").attr("fill", "none").attr("stroke", GRID_LINE)
+      .attr("d", d3.line()(data.axes.map((_, i) => at(i, v))) + "Z");
+  }
+  data.axes.forEach((name, i) => {
+    const [ex, ey] = at(i, data.max * 1.1);
+    g.append("line").attr("x2", ex).attr("y2", ey).attr("stroke", AXIS_LINE);
+    const [lx, ly] = at(i, data.max * 1.24);
+    g.append("text").attr("x", lx).attr("y", ly + 4).attr("fill", INK.muted)
+      .attr("text-anchor", Math.abs(lx) < 4 ? "middle" : lx > 0 ? "start" : "end").text(name.slice(0, 16));
+  });
+  data.series.forEach((s, k) => {
+    const color = SERIES[k % SERIES.length];
+    g.append("path").attr("d", d3.line()(s.values.map((v, i) => at(i, v))) + "Z")
+      .attr("fill", color).attr("fill-opacity", 0.12).attr("stroke", color).attr("stroke-width", 2);
+    const dots = g.append("g").selectAll("circle").data(s.values.map((v, i) => ({ v, i })))
+      .join("circle").attr("cx", (d) => at(d.i, d.v)[0]).attr("cy", (d) => at(d.i, d.v)[1])
+      .attr("r", 3.5).attr("fill", color).attr("stroke", SURFACE);
+    hover(dots, tip, (d) => [data.axes[d.i], `${s.name}: ${fmtNum(d.v)}`]);
+  });
+  if (data.series.length > 1) legend(svg, data.series.map((s) => s.name), 8, 6);
+  return null;
+}
+
+function drawGauge(d3, el, columns, rows, spec, { w, h }) {
+  const data = singleValue(columns, rows, spec);
+  if (!data) return false;
+  const max = Math.max(100, 10 ** Math.ceil(Math.log10(Math.abs(data.value) || 1)));
+  const svg = svgFor(d3, el, { w, h }, spec.title);
+  // A 270° arc reaches r above its centre and r·cos 45° below it.
+  const r = Math.max(30, Math.min(w / 2 - 16, (h - 16) / (1 + Math.SQRT1_2)));
+  const g = svg.append("g").attr("transform", `translate(${w / 2},${8 + r})`);
+  const start = -0.75 * Math.PI, sweep = 1.5 * Math.PI;
+  const share = Math.max(0, Math.min(1, data.value / max));
+  const arc = d3.arc().innerRadius(r - 14).outerRadius(r).cornerRadius(7);
+  g.append("path").attr("d", arc({ startAngle: start, endAngle: start + sweep })).attr("fill", GRID_LINE);
+  g.append("path").attr("d", arc({ startAngle: start, endAngle: start + sweep * share })).attr("fill", SERIES[0]);
+  g.append("text").attr("text-anchor", "middle").attr("y", -4).attr("fill", INK.primary)
+    .attr("font-size", Math.min(34, r / 2.4)).attr("font-weight", 600).text(fmtNum(data.value));
+  g.append("text").attr("text-anchor", "middle").attr("y", Math.min(34, r / 2.4)).attr("fill", INK.muted)
+    .text(`${spec.title || data.label} · of ${fmtNum(max)}`);
+  return null;
+}
+
+function drawKpi(d3, el, columns, rows, spec, { w, h }) {
+  const data = singleValue(columns, rows, spec);
+  if (!data) return false;
+  const svg = svgFor(d3, el, { w, h }, spec.title);
+  const size = Math.max(18, Math.min(56, w / 7, h / 3));
+  svg.append("text").attr("x", w / 2).attr("y", h / 2).attr("text-anchor", "middle")
+    .attr("fill", INK.primary).attr("font-size", size).attr("font-weight", 600).text(fmtNum(data.value));
+  svg.append("text").attr("x", w / 2).attr("y", h / 2 + size * 0.7).attr("text-anchor", "middle")
+    .attr("fill", INK.muted).text(spec.title || data.label);
+  if (data.rows > 1) {
+    svg.append("text").attr("x", w / 2).attr("y", h / 2 + size * 0.7 + 18).attr("text-anchor", "middle")
+      .attr("fill", INK.muted).attr("font-size", 10).text(`sum of ${data.rows} rows`);
+  }
+  return null;
+}
+
+function drawHistogram(d3, el, columns, rows, spec, { w, h }) {
+  const data = histogramData(columns, rows, spec);
+  if (!data) return false;
+  const m = { top: 12, right: 16, bottom: 36, left: 52 };
+  const iw = w - m.left - m.right, ih = h - m.top - m.bottom;
+  const svg = svgFor(d3, el, { w, h }, spec.title);
+  const g = svg.append("g").attr("transform", `translate(${m.left},${m.top})`);
+  const tip = tooltip(el);
+  const x = d3.scaleLinear().domain([data.bins[0].x0, data.bins[data.bins.length - 1].x1]).range([0, iw]);
+  const y = d3.scaleLinear().domain([0, d3.max(data.bins, (b) => b.count) || 1]).nice().range([ih, 0]);
+  gridY(d3, g, y, iw);
+  styleAxis(g.append("g").call(d3.axisLeft(y).ticks(5, "~s")));
+  styleAxis(g.append("g").attr("transform", `translate(0,${ih})`).call(d3.axisBottom(x).ticks(6, "~s")));
+  g.append("text").attr("x", iw).attr("y", ih + 32).attr("text-anchor", "end").attr("fill", INK.muted)
+    .text(data.value);
+  const bars = g.append("g").selectAll("rect").data(data.bins).join("rect")
+    .attr("x", (b) => x(b.x0) + 1).attr("width", (b) => Math.max(0, x(b.x1) - x(b.x0) - 2))
+    .attr("y", (b) => y(b.count)).attr("height", (b) => ih - y(b.count)).attr("rx", 2).attr("fill", SERIES[0]);
+  hover(bars, tip, (b) => [`${fmtNum(b.x0)} – ${fmtNum(b.x1)}`, `count: ${fmtNum(b.count)}`]);
+  return null;
+}
+
+function drawBoxplot(d3, el, columns, rows, spec, { w, h }) {
+  const data = boxplotData(columns, rows, spec);
+  if (!data) return false;
+  const m = { top: 12, right: 16, bottom: 48, left: 52 };
+  const iw = w - m.left - m.right, ih = h - m.top - m.bottom;
+  const svg = svgFor(d3, el, { w, h }, spec.title);
+  const g = svg.append("g").attr("transform", `translate(${m.left},${m.top})`);
+  const tip = tooltip(el);
+  const x = d3.scaleBand().domain(data.boxes.map((b) => b.name)).range([0, iw]).padding(0.35);
+  const all = data.boxes.flatMap((b) => [b.lo, b.hi, ...b.outliers]);
+  const y = d3.scaleLinear().domain(d3.extent(all)).nice().range([ih, 0]);
+  gridY(d3, g, y, iw);
+  styleAxis(g.append("g").call(d3.axisLeft(y).ticks(5, "~s")));
+  styleAxis(g.append("g").attr("transform", `translate(0,${ih})`).call(d3.axisBottom(x).tickSizeOuter(0)))
+    .selectAll(".tick text").attr("text-anchor", "end").attr("transform", "rotate(-30)");
+  const box = g.append("g").selectAll("g").data(data.boxes).join("g")
+    .attr("transform", (b) => `translate(${x(b.name)},0)`);
+  const bw = x.bandwidth(), mid = bw / 2;
+  box.append("line").attr("x1", mid).attr("x2", mid).attr("y1", (b) => y(b.lo)).attr("y2", (b) => y(b.hi))
+    .attr("stroke", SERIES[0]);
+  for (const end of ["lo", "hi"]) {
+    box.append("line").attr("x1", bw * 0.3).attr("x2", bw * 0.7).attr("y1", (b) => y(b[end]))
+      .attr("y2", (b) => y(b[end])).attr("stroke", SERIES[0]);
+  }
+  const rects = box.append("rect").attr("width", bw).attr("y", (b) => y(b.q3))
+    .attr("height", (b) => Math.max(1, y(b.q1) - y(b.q3))).attr("rx", 3)
+    .attr("fill", SERIES[0]).attr("fill-opacity", 0.25).attr("stroke", SERIES[0]).attr("stroke-width", 2);
+  box.append("line").attr("x2", bw).attr("y1", (b) => y(b.median)).attr("y2", (b) => y(b.median))
+    .attr("stroke", SERIES[0]).attr("stroke-width", 2);
+  box.each(function each(b) {
+    d3.select(this).selectAll("circle").data(b.outliers).join("circle").attr("cx", mid)
+      .attr("cy", (v) => y(v)).attr("r", 3).attr("fill", "none").attr("stroke", SERIES[0]);
+  });
+  hover(rects, tip, (b) => [b.name, `median ${fmtNum(b.median)} · n ${b.n}`,
+                            `quartiles ${fmtNum(b.q1)} – ${fmtNum(b.q3)}`,
+                            `whiskers ${fmtNum(b.lo)} – ${fmtNum(b.hi)}`]);
+  return null;
+}
+
+function drawWaterfall(d3, el, columns, rows, spec, { w, h }) {
+  const data = waterfallData(columns, rows, spec);
+  if (!data) return false;
+  const m = { top: 12, right: 16, bottom: 48, left: 52 };
+  const iw = w - m.left - m.right, ih = h - m.top - m.bottom;
+  const svg = svgFor(d3, el, { w, h }, spec.title);
+  const g = svg.append("g").attr("transform", `translate(${m.left},${m.top})`);
+  const tip = tooltip(el);
+  const keys = data.steps.map((st, i) => `${i}\u0000${st.name}`);
+  const x = d3.scaleBand().domain(keys).range([0, iw]).padding(0.25);
+  const ends = data.steps.flatMap((st) => [st.start, st.end]);
+  const y = d3.scaleLinear().domain([Math.min(0, d3.min(ends)), Math.max(0, d3.max(ends))]).nice().range([ih, 0]);
+  gridY(d3, g, y, iw);
+  styleAxis(g.append("g").call(d3.axisLeft(y).ticks(5, "~s")));
+  styleAxis(g.append("g").attr("transform", `translate(0,${ih})`)
+    .call(d3.axisBottom(x).tickFormat((k) => String(k).split("\u0000")[1].slice(0, 13)).tickSizeOuter(0)))
+    .selectAll(".tick text").attr("text-anchor", "end").attr("transform", "rotate(-30)");
+  const color = { up: GOOD, down: BAD, total: TOTAL };
+  const bars = g.append("g").selectAll("rect").data(data.steps).join("rect")
+    .attr("x", (_, i) => x(keys[i])).attr("width", x.bandwidth()).attr("rx", 3)
+    .attr("y", (st) => y(Math.max(st.start, st.end)))
+    .attr("height", (st) => Math.max(1, Math.abs(y(st.start) - y(st.end))))
+    .attr("fill", (st) => color[st.kind]);
+  data.steps.slice(0, -1).forEach((st, i) => {
+    g.append("line").attr("x1", x(keys[i]) + x.bandwidth()).attr("x2", x(keys[i + 1]))
+      .attr("y1", y(st.end)).attr("y2", y(st.end)).attr("stroke", AXIS_LINE).attr("stroke-dasharray", "3,3");
+  });
+  hover(bars, tip, (st) => [st.name, st.kind === "total" ? `total: ${fmtNum(st.end)}`
+    : `${st.delta >= 0 ? "+" : ""}${fmtNum(st.delta)} → ${fmtNum(st.end)}`]);
+  return null;
+}
+
+/** A layered flow diagram: node columns by longest path, node heights by
+ *  flow, links as ribbons whose width is the flow. */
+function drawSankey(d3, el, columns, rows, spec, { w, h }) {
+  const data = sankeyData(columns, rows, spec);
+  if (!data) return false;
+  const svg = svgFor(d3, el, { w, h }, spec.title);
+  const tip = tooltip(el);
+  const nodeW = 12, labelW = Math.min(110, w * 0.18);
+  const usable = w - 2 * labelW - nodeW;
+  const colX = (layer) => labelW + (data.layers > 1 ? (layer / (data.layers - 1)) * usable : usable / 2);
+  const byLayer = d3.groups(data.nodes, (n) => n.layer);
+  // Gaps take at most a third of the height, so flows always keep room.
+  const most = d3.max(byLayer, ([, ns]) => ns.length);
+  const pad = Math.max(1, Math.min(10, (h * 0.33) / Math.max(1, most - 1)));
+  const scale = d3.min(byLayer, ([, ns]) => (h - 8 - pad * (ns.length - 1)) / d3.sum(ns, (n) => n.value));
+  const pos = new Map();
+  for (const [layer, ns] of byLayer) {
+    const total = d3.sum(ns, (n) => n.value) * scale + pad * (ns.length - 1);
+    let at = (h - total) / 2;
+    ns.sort((a, b) => b.value - a.value).forEach((n) => {
+      pos.set(n.id, { x: colX(layer), y: at, h: Math.max(1, n.value * scale), out: 0, in: 0 });
+      at += n.value * scale + pad;
+    });
+  }
+  const color = new Map(data.nodes.map((n, i) => [n.id, SERIES[i % SERIES.length]]));
+  // Each flow is a filled band between two curves — a thick stroke bulges
+  // past its ends where a flow drops steeply.
+  const ribbons = svg.append("g").selectAll("path").data(data.links).join("path")
+    .attr("d", (l) => {
+      const s = pos.get(l.source), t = pos.get(l.target), thick = Math.max(1, l.value * scale);
+      const a0 = s.y + s.out, b0 = t.y + t.in;
+      s.out += thick;
+      t.in += thick;
+      const x0 = s.x + nodeW, x1 = t.x, xm = (x0 + x1) / 2;
+      return `M${x0},${a0}C${xm},${a0} ${xm},${b0} ${x1},${b0}`
+        + `L${x1},${b0 + thick}C${xm},${b0 + thick} ${xm},${a0 + thick} ${x0},${a0 + thick}Z`;
+    })
+    .attr("fill", (l) => color.get(l.source)).attr("fill-opacity", 0.35);
+  hover(ribbons, tip, (l) => [`${l.source} → ${l.target}`, `${data.value}: ${fmtNum(l.value)}`]);
+  const nodes = svg.append("g").selectAll("rect").data(data.nodes).join("rect")
+    .attr("x", (n) => pos.get(n.id).x).attr("y", (n) => pos.get(n.id).y)
+    .attr("width", nodeW).attr("height", (n) => pos.get(n.id).h).attr("rx", 2)
+    .attr("fill", (n) => color.get(n.id));
+  hover(nodes, tip, (n) => [n.id, `${data.value}: ${fmtNum(n.value)}`]);
+  svg.append("g").selectAll("text").data(data.nodes).join("text")
+    .attr("x", (n) => (n.layer === 0 ? pos.get(n.id).x - 6 : pos.get(n.id).x + nodeW + 6))
+    .attr("y", (n) => pos.get(n.id).y + pos.get(n.id).h / 2 + 4)
+    .attr("text-anchor", (n) => (n.layer === 0 ? "end" : "start")).attr("fill", INK.secondary)
+    .attr("paint-order", "stroke").attr("stroke", SURFACE).attr("stroke-width", 3)
+    .attr("pointer-events", "none").text((n) => n.id.slice(0, 18));
+  return null;
+}
+
+/** The rows as a table, built with D3 like every other view — cells as text. */
+function drawTable(d3, el, columns, rows) {
+  if (!columns?.length) return false;
+  const wrap = d3.select(el).append("div").attr("class", "table-wrap d3-table")
+    .style("height", "100%").style("overflow", "auto");
+  const table = wrap.append("table");
+  table.append("thead").append("tr").selectAll("th").data(columns).join("th").text((c) => c);
+  const shown = rows.slice(0, LIMITS.tableRows);
+  table.append("tbody").selectAll("tr").data(shown).join("tr")
+    .selectAll("td").data((r) => r).join("td")
+    .style("text-align", (v) => (typeof v === "number" ? "right" : null))
+    .text((v) => (v == null ? "" : typeof v === "number" ? fmtNum(v) : String(v)));
+  if (rows.length > shown.length) {
+    wrap.append("div").attr("class", "table-more").text(`… ${rows.length - shown.length} more rows`);
+  }
+  return null;
+}
+

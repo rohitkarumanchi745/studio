@@ -221,7 +221,9 @@ export default function ChartView({
     : engine === "vega" && VEGA_TYPES.has(type) ? "vega"
     : engine === "d3" && D3_TYPES.has(type) ? "d3"
     : "echarts";
-  const plottable = typeOk && spec && type !== "table" && type !== "kpi";
+  // In the D3 window D3 draws the KPI and the table too; elsewhere they are the
+  // KPI card and the data table.
+  const plottable = typeOk && spec && (d3Only || (type !== "table" && type !== "kpi"));
   let option = plottable && drawEngine === "echarts" ? buildOption(columns, rows, spec) : null;
   if (option) {
     // spec.format is declarative (number formats, labels, axis titles,
@@ -290,7 +292,7 @@ export default function ChartView({
           with ECharts instead.
         </div>
       )}
-      {typeOk && type === "kpi" && spec ? (
+      {typeOk && type === "kpi" && spec && !d3Only ? (
         <KpiCard columns={columns} rows={rows} spec={spec} />
       ) : plottable && drawEngine === "plotly" ? (
         <PlotlyView columns={columns} rows={rows} spec={spec} tall={tall} />
