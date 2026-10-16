@@ -6,11 +6,11 @@ Locked in here:
 - loading a chart and writing a visual for it read the governed SERVER copy,
   under the reader's current access — a client never supplies the data;
 - choosing a D3 chart saves a new canvas version: that panel's type and engine
-  change (D3 only, never a line chart or another engine), its old visual goes,
+  change (D3 only, never another engine), its old visual goes,
   every sibling (and its visual/engine) stays, and the version is a valid
   parent for the next canvas edit, which keeps the engine;
 - choosing a custom visual accepts only code this server wrote (signature) and
-  still lints it; a visual written here is told no line charts; view-only
+  still lints it; view-only
   access cannot choose; bad choices are refused.
 """
 import json
@@ -125,7 +125,6 @@ def test_choosing_a_chart_for_a_visual_panel_drops_the_visual():
     ({"chart_type": "rocket"}, 400),
     ({"chart_type": "bar", "engine": "flash"}, 400),
     ({"chart_type": "bar", "engine": "echarts"}, 400),      # D3 alone here
-    ({"chart_type": "line", "engine": "d3"}, 400),          # and no line charts
     ({}, 400),
     ({"chart_type": "bar", "visual": VISUAL}, 400),
 ])
@@ -170,7 +169,6 @@ def test_a_visual_is_written_from_the_server_copy_and_saved_signed(monkeypatch):
         conversation_id=cid, message_id=mid, panel_index=0, request="rings"), user=ANA)
     sent = json.loads(llm.calls[0][1][1])
     assert sent["sample_rows"] == [["EU", 125], ["US", 90]]       # the stored rows
-    assert "Do not draw a line chart" in llm.calls[0][0][1]       # none on this screen
     assert gen["code"] == CODE and gen["signature"]
 
     out = chat.visual_apply(chat.VisualChoice(

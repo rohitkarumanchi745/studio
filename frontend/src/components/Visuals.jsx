@@ -7,7 +7,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
 import { LABELS, computeFit } from "./ChartView";
-import D3View, { D3_ONLY, VISUAL_TYPES } from "./renderers/D3View";
+import D3View, { D3_ONLY, D3_TYPES } from "./renderers/D3View";
 import ArtifactView, { downloadArtifact } from "./renderers/ArtifactView";
 
 const keyOf = (c) => `${c.message_id}:${c.panel_index}`;
@@ -23,11 +23,10 @@ export function baseSpec(columns, rows, chart) {
   return { ...(chart || {}), title: chart?.title || "", x, y };
 }
 
-/** Every D3 chart type this data fits, in catalog order (no line charts:
- * this screen, like the D3 & artifacts window, uses none). */
+/** Every D3 chart type this data fits, in catalog order. */
 export function d3Options(columns, rows, chart) {
   const fit = computeFit(columns, rows, baseSpec(columns, rows, chart));
-  return Object.keys(LABELS).filter((t) => VISUAL_TYPES.has(t) && fit[t]?.ok);
+  return Object.keys(LABELS).filter((t) => D3_TYPES.has(t) && fit[t]?.ok);
 }
 
 const isD3 = (type, engine) => engine === "d3" || D3_ONLY.has(type);

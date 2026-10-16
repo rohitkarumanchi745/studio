@@ -1,14 +1,13 @@
 """The D3 & artifacts window — the chat, where every answer is drawn with D3.
 
 Locked in here:
-- the window draws D3 without line charts: d3_only gives every other type its
-  stand-in (a line becomes an area), puts every panel on the D3 engine and
-  leaves custom visuals alone; the backend's lists are the frontend's
+- the window draws every chart type with D3: d3_only keeps every type (an
+  unknown one becomes a bar), puts every panel on the D3 engine and leaves
+  custom visuals alone; the backend's list is the frontend's
   (renderers/D3View.jsx);
-- in visual mode render_chart refuses what the window does not draw (a line
-  chart included) and records D3 panels, the agent is told the window is
-  D3-only with no line charts — naming render_visual only when that tool is
-  offered — and the custom visuals it writes there are told no line charts;
+- in visual mode render_chart records D3 panels of any type, and the agent is
+  told the window is D3-only — naming render_visual only when that tool is
+  offered;
 - a visual turn goes straight to the agent in visual mode (no semantic layer,
   plan cache or BitNet routing, and nothing stored in the plan cache), its
   answer is stored D3-only, and its conversation's title carries the 🎨;
@@ -55,7 +54,7 @@ def _builtin_rbac():
 
 # ── d3_only ─────────────────────────────────────────────────────────────
 
-def test_d3_only_keeps_every_d3_type_turns_a_line_to_an_area_and_sets_the_engine():
+def test_d3_only_keeps_every_type_and_sets_the_d3_engine():
     visual = {"title": "Rings", "code": "d3.select(el)"}
     result = {
         "chart": {"type": "sankey", "x": "from", "y": ["to", "n"], "title": "Flows"},
@@ -69,19 +68,17 @@ def test_d3_only_keeps_every_d3_type_turns_a_line_to_an_area_and_sets_the_engine
     }
     out = agent.d3_only(result)
     assert out is result and out["visual_mode"] is True
-    # D3 draws the whole catalog now: a sankey stays a sankey, a table a table.
+    # D3 draws the whole catalog: a sankey stays a sankey, a line a line.
     assert out["chart"] == {"type": "sankey", "x": "from", "y": ["to", "n"], "title": "Flows"}
     assert [(p["chart"] or {}).get("type") for p in out["panels"]] == \
-        ["treemap", "area", "table", "bar", None]
+        ["treemap", "line", "table", "bar", None]
     assert [p["engine"] for p in out["panels"]] == ["d3"] * 5
     assert out["panels"][0]["rows"] == [["EU", 1]]
     assert out["panels"][2]["visual"] is visual
     # Every type the agent can name lands on one the window draws.
     for t in agent.CHART_TYPES:
-        drawn = agent.d3_only({"chart": {"type": t}})["chart"]["type"]
-        assert drawn == ("area" if t == "line" else t)
+        assert agent.d3_only({"chart": {"type": t}})["chart"]["type"] == t
     assert set(agent.D3_CHART_TYPES) == set(agent.CHART_TYPES)
-    assert set(agent.D3_CHART_TYPES) - set(agent.VISUAL_CHART_TYPES) == {"line"}
 
 
 def test_the_d3_types_are_the_frontends():
@@ -94,9 +91,6 @@ def test_the_d3_types_are_the_frontends():
     assert len(sets) == 2
     assert set(re.findall(r'"([a-z_]+)"', "".join(sets))) == set(agent.D3_CHART_TYPES)
     assert set(agent.D3_CHART_TYPES) <= set(agent.CHART_TYPES)
-    # The window's list is D3 without the line chart, on both sides.
-    assert re.search(r'VISUAL_TYPES = new Set\(\[\.\.\.D3_TYPES\]\.filter\(\(t\) => t !== "line"\)\)',
-                     source)
 
 
 # ── run_agent in visual mode ────────────────────────────────────────────
@@ -175,20 +169,17 @@ def _run_agent(monkeypatch, chart_types, visual_mode=True, visual_request=None):
     return out, seen
 
 
-def test_in_visual_mode_render_chart_refuses_what_the_window_does_not_draw(monkeypatch):
+def test_in_visual_mode_every_type_is_recorded_as_a_d3_panel(monkeypatch):
     out, seen = _run_agent(monkeypatch, ["line", "sankey", "boxplot"],
                            visual_request="a radial view")
-    line, sankey, boxplot = seen["replies"]
-    assert line.startswith("In this window every chart is drawn with D3")
-    assert "render_visual" in line and "line," not in line
-    assert sankey.startswith("Chart panel 1 recorded") and boxplot.startswith("Chart panel 2")
-    assert [(p["chart"]["type"], p["engine"]) for p in out["panels"][:2]] == \
-        [("sankey", "d3"), ("boxplot", "d3")]
+    assert [r.split(" recorded")[0] for r in seen["replies"]] == \
+        ["Chart panel 1", "Chart panel 2", "Chart panel 3"]
+    assert [(p["chart"]["type"], p["engine"]) for p in out["panels"][:3]] == \
+        [("line", "d3"), ("sankey", "d3"), ("boxplot", "d3")]
     note = _window_note(seen["system"])
     assert "render_visual" in note and "render_visual" in seen["tools"]
-    assert "Never draw a line chart" in note and "line," not in note
-    # The custom visual it writes there is told: no line charts.
-    assert seen["generate"] == [{"no_line_charts": True}]
+    assert "draws them all" in note and "line chart" not in note
+    assert seen["generate"] == [{}]                           # no extra rules for visuals
 
 
 def test_outside_visual_mode_nothing_changes(monkeypatch):
@@ -197,13 +188,13 @@ def test_outside_visual_mode_nothing_changes(monkeypatch):
     assert [r.split(" recorded")[0] for r in seen["replies"]] == ["Chart panel 1", "Chart panel 2"]
     assert "engine" not in out["panels"][0]
     assert "D3 & ARTIFACTS WINDOW" not in seen["system"]
-    assert seen["generate"] == [{"no_line_charts": False}]
+    assert seen["generate"] == [{}]
 
 
-@pytest.mark.parametrize("proposed,drawn", [("sankey", "sankey"), ("line", "area")])
+@pytest.mark.parametrize("proposed,drawn", [("sankey", "sankey"), ("line", "line")])
 def test_a_self_hosted_model_is_never_told_of_render_visual(monkeypatch, proposed, drawn):
-    """BitNet answers in one JSON action, with no retry: a chart type the
-    window does not draw becomes its stand-in instead of a refusal."""
+    """BitNet answers in one JSON action, with no retry: whatever chart it
+    proposes is drawn with D3."""
     _stub_langchain_tools(monkeypatch)
     prompts = []
 
@@ -223,22 +214,6 @@ def test_a_self_hosted_model_is_never_told_of_render_visual(monkeypatch, propose
                           {"sales": []}, [], ANA, visual_mode=True)
     assert "render_visual" not in _window_note(prompts[0])
     assert [(p["chart"]["type"], p["engine"]) for p in out["panels"]] == [(drawn, "d3")]
-
-
-def test_the_visual_writer_is_told_no_line_charts_only_when_asked():
-    class _Writer:
-        def __init__(self):
-            self.systems = []
-
-        def invoke(self, messages):
-            self.systems.append(messages[0][1])
-            return _Msg('{"title": "T", "code": "d3.select(el)", "explanation": ""}')
-
-    writer = _Writer()
-    visuals.generate(writer, ["region", "revenue"], [["EU", 1]], "rings", no_line_charts=True)
-    visuals.generate(writer, ["region", "revenue"], [["EU", 1]], "rings")
-    assert "Do not draw a line chart" in writer.systems[0]
-    assert "line chart" not in writer.systems[1]
 
 
 # ── a visual turn, through the chat endpoint ────────────────────────────
