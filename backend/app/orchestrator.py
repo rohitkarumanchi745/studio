@@ -27,11 +27,23 @@ from .connectors import all_sources, get_connector
 MAX_PARALLEL = 6
 
 
+class Roster(list):
+    """The roster of database agents (a plain list of entries), plus
+    `unreachable`: the names of sources this user may query that could not be
+    listed just now. They are off the roster — nobody can query them — but an
+    answer across sources must say so, or it reads as complete when a whole
+    database is missing from it."""
+
+    def __init__(self, entries=(), unreachable=()):
+        super().__init__(entries)
+        self.unreachable = sorted(unreachable)
+
+
 def accessible_sources(user, max_schema_tables=10):
-    """[{connector, allowed, schemas, skill}] for every configured source the
-    user's role may query — the roster of database agents. Sources are probed
-    concurrently (list_tables + schema fetch are independent per source), so the
-    roster's latency is the slowest single source, not their sum."""
+    """Roster of [{connector, allowed, schemas, skill}] for every configured
+    source the user's role may query. Sources are probed concurrently
+    (list_tables + schema fetch are independent per source), so the roster's
+    latency is the slowest single source, not their sum."""
     role = user["role"]
 
     def build(meta):
@@ -42,7 +54,7 @@ def accessible_sources(user, max_schema_tables=10):
         try:
             all_tables = conn.list_tables()
         except Exception:
-            return None  # unreachable source — leave it off the roster
+            return {"unreachable": name}   # off the roster, but named in the answer
         allowed = rbac.allowed_tables(role, name, all_tables)
         if not allowed:
             return None
@@ -52,7 +64,9 @@ def accessible_sources(user, max_schema_tables=10):
         return {"connector": conn, "allowed": allowed, "schemas": schemas,
                 "skill": skills.get_skill(conn, role, allowed, schemas)}
 
-    return [e for e in util.pmap(build, all_sources(), workers=MAX_PARALLEL) if e]
+    built = [e for e in util.pmap(build, all_sources(), workers=MAX_PARALLEL) if e]
+    return Roster([e for e in built if "unreachable" not in e],
+                  [e["unreachable"] for e in built if "unreachable" in e])
 
 
 def _norm(name):
@@ -92,8 +106,27 @@ def run_orchestrated(prompt, user, history, model=None, conversation_id=None,
     agents_used; mode is "orchestrated". Each worker and the aggregator is
     scored as its own rollout (per-agent reward shaping), so their policies
     improve independently. `sources`: an already-built roster (the caller
-    probed it for the ambiguity check) — else built here."""
+    probed it for the ambiguity check) — else built here. Sources the user may
+    query but that could not be reached are named in the answer
+    (unreachable_sources, and a note after the text)."""
     sources = sources if sources is not None else accessible_sources(user)
+    unreachable = list(getattr(sources, "unreachable", []) or [])
+    result = _run_orchestrated(prompt, user, history, model, conversation_id, sources)
+    if unreachable:
+        result["unreachable_sources"] = unreachable
+        names = ", ".join(unreachable)
+        if not sources:
+            result["text"] = (f"Couldn't reach {names} just now, and there is no other data "
+                              "source to answer from. Try again in a moment.")
+        else:
+            gap = "it" if len(unreachable) == 1 else "them"
+            result["text"] = (f"{result.get('text') or ''}\n\n"
+                              f"Note: couldn't reach {names} just now, so this answer "
+                              f"leaves {gap} out.").strip()
+    return result
+
+
+def _run_orchestrated(prompt, user, history, model, conversation_id, sources):
     if not sources:
         return {"text": "No accessible data sources.", "sql": None, "columns": [],
                 "rows": [], "chart": None, "panels": [], "email": None,
