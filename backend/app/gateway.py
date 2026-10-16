@@ -32,18 +32,25 @@ Three entry points, all applying the same steps in the same order:
   scope(user, source, ...)                  steps (a)-(d): connector + allowed tables
 """
 import concurrent.futures
+import contextvars
+import threading
 import os
 import time
 
 from . import cypherguard, db, governance, limits, queryguard, rbac, sources
-from .connectors.base import gateway_scope
+from .connectors.base import CancelToken, cancel_scope, gateway_scope
 from .queryguard import QueryRejected
 
 
 class QueryTimeout(Exception):
-    """Execution exceeded STUDIO_QUERY_TIMEOUT_S. The connector call keeps
-    running on its worker thread (Python cannot kill it); the caller gets a
-    clear error instead of a hung request."""
+    """Execution exceeded its wall-clock limit (see _timeout_s). The query is
+    cancelled when its connector supports it; otherwise the driver call keeps
+    running on its worker thread (Python cannot kill it). Either way the
+    caller gets a clear error instead of a hung request."""
+
+
+class QueryBusy(Exception):
+    """The source already has its maximum of queries in flight (see _slots)."""
 
 
 class QueryResult:
@@ -142,33 +149,92 @@ def check(user, source, sql, *, table_label="*", max_rows=None, allow_explain=Fa
 
 # ── Execution ───────────────────────────────────────────────────────────
 
-def _timeout_s():
+# A person is waiting on an interactive read: give it a limit by default.
+INTERACTIVE_TIMEOUT_S = 300.0
+# Reads inside an approved supervised job are not interactive and may be long.
+_UNBOUNDED_BY_DEFAULT = frozenset({"supervised_read"})
+
+
+def _timeout_s(purpose=None):
+    """Seconds a read may run. STUDIO_QUERY_TIMEOUT_S, when set, is the
+    operator's choice for every read (0 = none); unset, interactive reads get
+    INTERACTIVE_TIMEOUT_S and supervised-job reads none."""
+    raw = os.getenv("STUDIO_QUERY_TIMEOUT_S", "").strip()
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            pass
+    return 0.0 if purpose in _UNBOUNDED_BY_DEFAULT else INTERACTIVE_TIMEOUT_S
+
+
+def _int_env(name, default):
     try:
-        return float(os.getenv("STUDIO_QUERY_TIMEOUT_S", "0") or 0)
+        return max(1, int(os.getenv(name, "") or default))
     except ValueError:
-        return 0.0
+        return default
+
+
+# Per-source concurrency: at most STUDIO_QUERY_CONCURRENCY reads in flight on
+# one source in this process. A slot is held until the warehouse call really
+# returns — not when its caller gives up — so queries abandoned on a source
+# that cannot cancel still count, and cannot pile up behind a runaway one.
+_slots = {}
+_slots_lock = threading.Lock()
+
+
+def _slot(source):
+    with _slots_lock:
+        size = _int_env("STUDIO_QUERY_CONCURRENCY", 8)
+        sem = _slots.get(source)
+        if sem is None or sem[0] != size:
+            sem = _slots[source] = (size, threading.BoundedSemaphore(size))
+        return sem[1]
 
 
 def _run(connector, sql, purpose):
-    """Call run_query inside the gateway scope, on a single-use worker thread
-    when a wall-clock timeout is configured. The scope ContextVar is set INSIDE
-    the worker: ContextVars do not cross thread boundaries, so setting it here
-    and calling on another thread would trip the connector's guard."""
-    def go():
-        with gateway_scope(purpose):
-            return connector.run_query(sql)
+    """Call run_query inside the gateway scope: in a free concurrency slot, on
+    a single-use worker thread when the read has a time limit, and cancelled
+    — not just abandoned — when the limit passes and the connector supports
+    it. The worker runs in a copy of the caller's context; the scope and the
+    cancel token are set inside it, since ContextVars do not cross threads."""
+    timeout = _timeout_s(purpose)
+    slot = _slot(connector.name)
+    try:
+        wait = max(0.0, float(os.getenv("STUDIO_QUERY_QUEUE_S", "") or 60))
+    except ValueError:
+        wait = 60.0
+    if not slot.acquire(timeout=min(wait, timeout) if timeout > 0 else wait):
+        raise QueryBusy(f"{connector.name} is busy: {_int_env('STUDIO_QUERY_CONCURRENCY', 8)} "
+                        "queries are already running there. Try again in a moment.")
+    token = CancelToken()
 
-    timeout = _timeout_s()
+    def go():
+        try:
+            with gateway_scope(purpose), cancel_scope(token):
+                if token.cancelled:
+                    raise QueryTimeout(f"Query on {connector.name} was cancelled before it started")
+                return connector.run_query(sql)
+        finally:
+            slot.release()             # when the warehouse call really ends
+
     if timeout <= 0:
         return go()
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
-        fut = pool.submit(go)
+        try:
+            fut = pool.submit(contextvars.copy_context().run, go)
+        except BaseException:
+            slot.release()
+            raise
         try:
             return fut.result(timeout=timeout)
         except concurrent.futures.TimeoutError:
-            raise QueryTimeout(
-                f"Query on {connector.name} exceeded {timeout:g}s and was abandoned")
+            if token.cancel():
+                raise QueryTimeout(f"Query on {connector.name} exceeded {timeout:g}s and was "
+                                   "cancelled")
+            raise QueryTimeout(f"Query on {connector.name} exceeded {timeout:g}s and was "
+                               "abandoned (this source cannot cancel a running query)")
     finally:
         pool.shutdown(wait=False)      # never join a runaway query
 
