@@ -226,7 +226,13 @@ def _llm_review(kind, target, script, user):
 # ── Execution + retry + escalation ──────────────────────────────────────
 
 def _requester(job):
-    return {"id": job["user_id"], "role": job["requester_role"],
+    """The requester as they are NOW, not as they were at submission: a job's
+    reads run under this role, so a demotion — or a removed or unverified
+    account — after submitting narrows what an approved job may read, never
+    the reverse. requester_role stays on the row as the submission record."""
+    current = db.get_user(job["user_id"]) or {}
+    role = current.get("role") if current and current.get("verified", 1) else None
+    return {"id": job["user_id"], "role": role,
             "email": job["requester_email"], "name": job["requester_email"]}
 
 
@@ -884,11 +890,17 @@ def _need_approver(jid, user):
 @router.post("/{jid}/approve")
 def approve(jid: str, user=Depends(current_user)):
     row = _need_approver(jid, user)
+    requester = db.get_user(row["user_id"])
     if row["kind"] in (PLATFORM_KIND, DAG_KIND):
-        requester = db.get_user(row["user_id"])
         if (requester is None or requester.get("role") not in ("admin", "analyst")
                 or not requester.get("verified", 1)):
             raise HTTPException(403, "Requester can no longer run pipelines")
+    elif (requester is None or not requester.get("verified", 1)
+          or not rbac.can_access(requester.get("role"), row["target"], "*")):
+        # The submission-time gate (supervise), applied to the requester's
+        # role TODAY: approving a write or a Spark job must not act on access
+        # the requester has since lost.
+        raise HTTPException(403, f"The requester's current role can no longer use {row['target']}")
     _decide(row, "approved" if row["kind"] == DAG_KIND else "running", user)
     db.log_activity(user, "job_approve", prompt=row["kind"], source=row["target"])
     if row["kind"] == DAG_KIND:

@@ -526,12 +526,80 @@ def _email_failure(user, pipeline, step_idx, error, results):
 
 # ── Persistence + API ───────────────────────────────────────────────────
 
+def stored_step_allowed(role, step, source=None):
+    """May `role` see a stored pipeline step (its SQL), under TODAY's policy?
+    Read-time policy/namespace checks without contacting warehouse catalogs.
+    Shared by chat (pipelines inside shared conversations) and this module's
+    org-shared pipelines.
+
+    Execution still derives its allowlist from the live catalog through the
+    gateway. History only needs today's policy and the connector's declared
+    namespace; a temporarily offline warehouse must not erase a conversation.
+    """
+    if not isinstance(step, dict) or not step.get("sql"):
+        return False
+    source = step.get("source") or source
+    if not source or source == "*":
+        return False
+    policy = rbac._role_policy(role, source)
+    if not policy:
+        return False
+    try:
+        from .connectors import get_connector
+        connector = get_connector(source)
+        dialect = getattr(connector, "dialect", None)
+        if dialect == "cypher":
+            # Stored graph results need the same dialect guard as live gateway
+            # execution.  Treating Cypher as SQL would safely hide every graph
+            # message, but would also make legitimate history unusable.
+            from . import cypherguard
+            tokens, _ = cypherguard._tokens(step["sql"].strip().rstrip(";"))
+            references = [name for name, is_rel in cypherguard._label_refs(tokens)
+                          if not is_rel]
+            allowed = [name for name in references
+                       if rbac.can_access(role, source, name)]
+            cypherguard.validate(step["sql"], allowed,
+                                 qualifiers=connector.qualifiers())
+            return True
+        # RBAC matches table policies case-insensitively; SQL resolution is
+        # dialect-specific. Derive catalog spellings from each reference and
+        # keep only names the policy grants, just as the live catalog filter
+        # does. Passing ['sales'] as a Snowflake catalog would wrongly hide
+        # an allowed bare `sales`, whose stored name is SALES.
+        tokens, _ = queryguard._tokens(step["sql"].strip().rstrip(";"))
+        references = [queryguard._canon(parts[-1], dialect)
+                      for parts, _ in queryguard._table_refs(tokens)]
+        allowed = [name for name in references if rbac.can_access(role, source, name)]
+        queryguard.validate(step["sql"], allowed, qualifiers=connector.qualifiers(), dialect=dialect)
+        return True
+    except Exception:
+        return False
+
+
+
 def _row(r):
     d = dict(r)
     for k in ("steps", "steps_result"):
         if k in d and d.get(k):
             d[k] = json.loads(d[k])
     return d
+
+
+def _readable(d, user):
+    """May this user see the pipeline — its prompt, step SQL and runs? The
+    owner always. An org-shared pipeline only when the user's CURRENT role may
+    read every step (stored_step_allowed, the rule for pipelines shared in
+    chat): sharing with the org shares the recipe with those who could have
+    written it, not with everyone signed in. Running re-verifies each step
+    against the runner's role on top of this."""
+    if d["user_id"] == user["id"]:
+        return True
+    if d["visibility"] != "org":
+        return False
+    steps = d.get("steps") or []
+    if not steps:
+        return bool(d.get("source")) and bool(rbac._role_policy(user["role"], d["source"]))
+    return all(stored_step_allowed(user["role"], s, d.get("source")) for s in steps)
 
 
 def _own_or_404(pid, user, *, edit=False):
@@ -541,7 +609,7 @@ def _own_or_404(pid, user, *, edit=False):
         raise HTTPException(404, "Pipeline not found")
     d = _row(row)
     owner = d["user_id"] == user["id"]
-    if not owner and d["visibility"] != "org":
+    if not _readable(d, user):
         raise HTTPException(404, "Pipeline not found")  # 404, not 403 — no oracle
     if edit and not owner:
         raise HTTPException(403, "Only the owner can change this pipeline")
@@ -657,6 +725,8 @@ def listing(user=Depends(current_user)):
     out = []
     for r in rows:
         d = _row(r)
+        if not _readable(d, user):
+            continue                        # org-shared, but not readable by this role
         d["mine"] = d["user_id"] == user["id"]
         d["step_count"] = len(d.get("steps") or [])
         out.append(d)

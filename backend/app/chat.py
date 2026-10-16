@@ -16,6 +16,7 @@ from . import (agent, chat_pipelines, chat_platforms, chat_workflows, db, email_
                pipeline_sources)
 from .auth import current_user
 from .matching import focus_tables, match_tables
+from .pipelines import stored_step_allowed as _stored_pipeline_step_allowed
 from .sources import connector_or_400
 
 log = logging.getLogger("studio.chat")
@@ -2280,53 +2281,6 @@ def _blend_identity_current(content):
         return False
     try:
         return governance.identity() == stored
-    except Exception:
-        return False
-
-
-def _stored_pipeline_step_allowed(role, step, source=None):
-    """Read-time policy/namespace checks without contacting warehouse catalogs.
-
-    Execution still derives its allowlist from the live catalog through the
-    gateway. History only needs today's policy and the connector's declared
-    namespace; a temporarily offline warehouse must not erase a conversation.
-    """
-    if not isinstance(step, dict) or not step.get("sql"):
-        return False
-    source = step.get("source") or source
-    if not source or source == "*":
-        return False
-    policy = rbac._role_policy(role, source)
-    if not policy:
-        return False
-    try:
-        from .connectors import get_connector
-        connector = get_connector(source)
-        dialect = getattr(connector, "dialect", None)
-        if dialect == "cypher":
-            # Stored graph results need the same dialect guard as live gateway
-            # execution.  Treating Cypher as SQL would safely hide every graph
-            # message, but would also make legitimate history unusable.
-            from . import cypherguard
-            tokens, _ = cypherguard._tokens(step["sql"].strip().rstrip(";"))
-            references = [name for name, is_rel in cypherguard._label_refs(tokens)
-                          if not is_rel]
-            allowed = [name for name in references
-                       if rbac.can_access(role, source, name)]
-            cypherguard.validate(step["sql"], allowed,
-                                 qualifiers=connector.qualifiers())
-            return True
-        # RBAC matches table policies case-insensitively; SQL resolution is
-        # dialect-specific. Derive catalog spellings from each reference and
-        # keep only names the policy grants, just as the live catalog filter
-        # does. Passing ['sales'] as a Snowflake catalog would wrongly hide
-        # an allowed bare `sales`, whose stored name is SALES.
-        tokens, _ = queryguard._tokens(step["sql"].strip().rstrip(";"))
-        references = [queryguard._canon(parts[-1], dialect)
-                      for parts, _ in queryguard._table_refs(tokens)]
-        allowed = [name for name in references if rbac.can_access(role, source, name)]
-        queryguard.validate(step["sql"], allowed, qualifiers=connector.qualifiers(), dialect=dialect)
-        return True
     except Exception:
         return False
 
