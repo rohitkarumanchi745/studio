@@ -70,6 +70,10 @@ def _build(connector, role, allowed_tables, schemas, fp):
             table_lines.append(f"### {t}\n  (schema not loaded — inspect before use)")
     tables_md = "\n\n".join(table_lines) or "(no accessible tables)"
     dialect_note = _DIALECT_NOTES.get(connector.dialect, "- Standard ANSI SQL.")
+    if getattr(connector, "full_names", False):
+        dialect_note += ("\n- This source spans catalogs and schemas: write EVERY table "
+                         "exactly as listed, in full — catalog.schema.table. A shorter "
+                         "name is rejected.")
     summary = ", ".join(allowed_tables[:8]) + ("…" if len(allowed_tables) > 8 else "")
     return f"""---
 name: {connector.name}-{role}

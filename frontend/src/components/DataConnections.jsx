@@ -347,6 +347,9 @@ export function planConnections({ cfg, ns, name, chosen = [], takenNames = new S
           ...cfg,
           [ns.schema]: n.schema,
           ...(ns.database && n.database ? { [ns.database]: n.database } : {}),
+          // "Everything the credential can see" spans catalogs: no catalog pin,
+          // whatever was typed in that field.
+          ...(ns.database && n.schema === ALL && !n.database ? { [ns.database]: "" } : {}),
         },
       }))
     : [{ ns: null, config: cfg }];
@@ -367,9 +370,20 @@ export function planConnections({ cfg, ns, name, chosen = [], takenNames = new S
   });
 }
 
+/** A schema value meaning every schema (Databricks: as one source, tables
+ * named catalog.schema.table). */
+export const ALL = "*";
+
 /** "catalog.schema" (or just "schema") for messages. */
 export function namespaceLabel(n) {
+  if (n?.schema === ALL) return n.database ? `${n.database} (all schemas)` : "all catalogs";
   return n?.database ? `${n.database}.${n.schema}` : String(n?.schema || "");
+}
+
+/** What the picker shows for a namespace. */
+export function schemaLabel(n) {
+  if (n?.schema !== ALL) return n?.schema;
+  return n.database ? "✳ all schemas — one source" : "✳ everything this credential can see — one source";
 }
 
 export function namespaceKey(n) {
@@ -774,7 +788,7 @@ export function Namespaces({ browse, picked, setPicked, keyOf }) {
                        className={`conn-ns-item${picked.includes(k) ? " conn-ns-on" : ""}${empty ? " conn-ns-empty" : ""}`}>
                   <input type="checkbox" checked={picked.includes(k)} disabled={empty && !picked.includes(k)}
                          onChange={() => toggle(k)} />
-                  <span>{n.schema}</span>
+                  <span>{schemaLabel(n)}</span>
                   {typeof n.tables === "number" && (
                     <span className="meta">{empty ? "empty" : `${n.tables} table${n.tables === 1 ? "" : "s"}`}</span>
                   )}

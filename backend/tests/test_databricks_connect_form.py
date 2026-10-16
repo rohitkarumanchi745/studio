@@ -388,6 +388,8 @@ def test_the_listing_counts_tables_per_schema_where_it_can(monkeypatch):
     browse = connections._DynDatabricks("__browse__", GOOD)
     monkeypatch.setattr(browse, "_conn", lambda: _Conn())
     assert browse.list_namespaces() == [
+        {"database": "", "schema": "*"},     # everything — no total: hive's count is unknown
+        {"database": "main", "schema": "*", "tables": 3},      # all of main, as one source
         {"database": "main", "schema": "default", "tables": 0},
         {"database": "main", "schema": "sales", "tables": 3},
         {"database": "hive_metastore", "schema": "default"},
@@ -396,5 +398,5 @@ def test_the_listing_counts_tables_per_schema_where_it_can(monkeypatch):
     monkeypatch.setitem(connections.TYPES["databricks"], "build", lambda name, cfg: browse)
     monkeypatch.setattr(connections, "_resolves", lambda host, wait=5.0: True)
     out = connections._browse("databricks", GOOD)
-    assert out["ok"] and out["namespaces"][1] == {"database": "main", "schema": "sales", "tables": 3}
-    assert "tables" not in out["namespaces"][2]
+    assert out["ok"] and out["namespaces"][3] == {"database": "main", "schema": "sales", "tables": 3}
+    assert "tables" not in out["namespaces"][4]

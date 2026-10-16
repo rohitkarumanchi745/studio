@@ -1242,6 +1242,17 @@ skill files all apply to it unchanged.
   default one was used): saved, every question would fail. A source that is
   empty anyway says so — "has no tables to read" — instead of "no access",
   which is kept for a role that is filtered down to nothing.
+- **Everything as one source (Databricks).** The schema picker also offers
+  **✳ all schemas** of a catalog and **✳ everything this credential can see**
+  (schema `*`, no catalog). Such a source lists every table by its full name —
+  `catalog.schema.table`, from one `information_schema` query (a `SHOW` walk
+  where that is unreadable), capped by `STUDIO_DATABRICKS_MAX_TABLES` (1000) and
+  never including the `system` catalog of audit and billing logs. With no single
+  namespace to pin, the query guard runs in an explicit full-name mode
+  (`queryguard.FULL_NAMES`): a reference must be written in full and is matched
+  whole against the allowlist, so a short name, another catalog or a quoted part
+  hiding a dot is refused, and the agent's skill file tells it to write names in
+  full. Admin-only like every connection until governance grants it.
 - **Checked before any sign-in (Databricks).** The form's usual mix-ups are
   refused at once, each marked on its own field with where the right value is: a
   token or secret pasted as the Server hostname, a browser address as the HTTP

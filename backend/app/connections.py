@@ -656,6 +656,8 @@ def _namespace(ctype, cfg):
     for f in t.get("fields", []):
         if f["key"] in ("schema", "dataset") and not schema:
             schema = (f.get("default") or "").strip()
+    if schema == "*":                       # a Databricks source spanning schemas
+        return f"{database} · all schemas" if database else "all catalogs"
     return f"{database}.{schema}" if database and schema else (schema or database)
 
 
