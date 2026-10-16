@@ -15,7 +15,7 @@ from . import (agent, chat_pipelines, chat_platforms, chat_workflows, db, email_
                roster, router as model_router, semantic, sessions, skills,
                pipeline_sources)
 from .auth import current_user
-from .matching import match_tables
+from .matching import focus_tables, match_tables
 from .sources import connector_or_400
 
 log = logging.getLogger("studio.chat")
@@ -426,9 +426,10 @@ def _scope(body, user, before_message_id=None):
             cols = util.pmap(connector.get_schema, tabs)   # independent → parallel
             if any(c is None for c in cols):
                 raise RuntimeError("schema fetch failed")
-            schemas = dict(zip(tabs, cols))
+            schemas = {t: governance.governed_schema(body.source, t, c) for t, c in zip(tabs, cols)}
         else:
-            schemas = {table_param: connector.get_schema(table_param)}
+            schemas = {table_param: governance.governed_schema(
+                body.source, table_param, connector.get_schema(table_param))}
     except Exception as e:
         raise HTTPException(502, f"Source error: {e}")
 
@@ -516,6 +517,50 @@ def _resolved_tables(cid):
     except Exception:
         pass
     return out
+
+
+# How many more tables' columns a question may bring into the prompt, beyond
+# the first ten the skill file lists (see _focus_schemas).
+FOCUS_TABLES = int(os.getenv("STUDIO_FOCUS_TABLES", "8"))
+
+
+def _earlier_sql(cid, turns=6):
+    """The SQL of this conversation's recent answers, so a follow-up keeps
+    the tables it was already using."""
+    if not cid:
+        return ""
+    try:
+        answers = [m["content"] for m in db.list_messages(cid) if m["role"] == "assistant"]
+    except Exception:
+        return ""
+    sql = []
+    for content in answers[-turns:]:
+        sql.append(content.get("sql") or "")
+        sql.extend((p or {}).get("sql") or "" for p in content.get("panels") or [])
+    return "\n".join(s for s in sql if s)
+
+
+def _focus_schemas(ctx, user, prompt):
+    """Columns of the tables this question most likely needs that the prompt
+    does not list yet — up to FOCUS_TABLES, picked by name
+    (matching.focus_tables: named in the question or in this conversation's
+    earlier SQL, or sharing the question's terms). The skill file lists the
+    first ten tables' columns; on a wide source the one a question is about is
+    often not among them. Governed like the catalog's schema endpoint, and
+    only from ctx["allowed"] — the tables this turn may query. Never raises:
+    the agent can still call describe_table."""
+    loaded = set(ctx["schemas"])
+    candidates = [t for t in ctx["allowed"] if t not in loaded]
+    if not candidates or FOCUS_TABLES <= 0:
+        return {}
+    picks = focus_tables(prompt, candidates, _earlier_sql(ctx.get("cid")), FOCUS_TABLES)
+    if not picks:
+        return {}
+    from . import util
+    connector = ctx["connector"]
+    cols = util.pmap(connector.get_schema, picks, default=None)
+    return {t: governance.governed_schema(ctx["source"], t, c)
+            for t, c in zip(picks, cols) if c and rbac.can_access(user["role"], ctx["source"], t)}
 
 
 def _answer(ctx, result):
@@ -895,13 +940,21 @@ def _run_turn(ctx, user):
 
     connector = ctx["connector"]
     skill_md = skills.get_skill(connector, user["role"], ctx["allowed"], ctx["schemas"])
+    focus = {}
 
     def _run(spec, kag_first=False, visual=False):
+        # Read only when the agent actually runs (not on a cache or semantic
+        # hit), and once per turn however many models are tried.
+        if "schemas" not in focus:
+            try:
+                focus["schemas"] = _focus_schemas(ctx, user, prompt)
+            except Exception:
+                focus["schemas"] = {}
         return agent.run_agent(
             prompt=prompt, connector=connector, table=ctx["table_param"],
             allowed_tables=ctx["allowed"], schemas=ctx["schemas"], history=ctx["history"],
             user=user, model=spec, skill_md=skill_md, kag_first=kag_first,
-            visual_mode=visual, conversation_id=cid)
+            visual_mode=visual, conversation_id=cid, focus_schemas=focus["schemas"])
 
     if ctx.get("visual"):
         # The D3 & artifacts window goes straight to the frontier agent: the
@@ -990,7 +1043,7 @@ def _run_turn(ctx, user):
     result["source"] = ctx["source"]
     result["table"] = ctx["table_label"]
     try:
-        match_schemas = dict(ctx["schemas"])
+        match_schemas = {**ctx["schemas"], **(focus.get("schemas") or {})}   # no second read
         for t in rbac.allowed_tables(user["role"], ctx["source"], ctx["all_tables"])[:20]:
             if t not in match_schemas:
                 match_schemas[t] = connector.get_schema(t)

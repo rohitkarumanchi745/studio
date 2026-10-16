@@ -42,12 +42,8 @@ def _table_name_or_400(table):
 
 
 def _governed_schema(source, table, cols):
-    """Schema metadata minus governance's denied columns. Masked columns stay:
-    their values are masked at result time, and the column is not a secret."""
-    deny = governance.column_rules(source, table)["deny"]
-    if not deny:
-        return cols
-    return [c for c in cols if str(c.get("name", "")).lower() not in deny]
+    """Schema metadata minus governance's denied columns (governance.governed_schema)."""
+    return governance.governed_schema(source, table, cols)
 
 
 def _read_rows(user, source, sql, purpose, table, max_rows):

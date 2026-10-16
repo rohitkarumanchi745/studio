@@ -50,3 +50,44 @@ def match_tables(prompt, table_schemas):
             })
     out.sort(key=lambda m: (-m["score"], m["table"]))
     return out[:5]
+
+
+# Warehouse naming prefixes: two tables sharing "fact" or "dim" says nothing
+# about either one's subject.
+_NAME_STOP = {"fact", "dim", "stg", "raw", "tbl", "vw", "src", "int", "tmp", "agg"}
+
+
+def _named(name, text):
+    """True when `text` names the table outright (`fact_payments` and
+    `studio_qa.fact_payments` both name studio_dev.studio_qa.fact_payments)."""
+    return re.search(r"(?<![\w$])" + re.escape(name) + r"(?![\w$])", text) is not None
+
+
+def focus_tables(prompt, tables, context="", limit=8):
+    """The tables a request most likely needs, best first — from their names
+    alone, since a source can hold hundreds and reading each one's columns is
+    a warehouse query. Evidence, strongest first:
+      - the request names the table outright;
+      - `context` (this conversation's earlier SQL) names it, so a follow-up
+        keeps its tables;
+      - the request shares terms with the table's own name (its last part:
+        "payments" → studio_qa.fact_payments).
+    Only the request's terms count, never the SQL's: ORDER BY must not pull
+    in an orders table. Tables with no evidence are left out; ties keep the
+    order given."""
+    text, earlier = prompt.lower(), (context or "").lower()
+    words = _tokens(prompt)
+    scored = []
+    for i, table in enumerate(tables):
+        name = table.lower()
+        parts = name.split(".")
+        tails = {".".join(parts[k:]) for k in range(len(parts))}   # full … last part
+        score = 0
+        if any(_named(t, text) for t in tails):
+            score += 10
+        if earlier and any(_named(t, earlier) for t in tails):
+            score += 6
+        score += 2 * len(words & (_tokens(parts[-1].replace("_", " ")) - _NAME_STOP))
+        if score:
+            scored.append((-score, i, table))
+    return [t for _, _, t in sorted(scored)[:limit]]
