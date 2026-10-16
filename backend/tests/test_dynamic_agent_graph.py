@@ -661,8 +661,10 @@ def test_frontier_agent_exposes_optional_spawn_tool_but_descendant_profile_is_cl
         "seed", _Conn("postgres"), "*", ["postgres_orders"], {}, [], USER,
         model="openai:gpt-test", delegation=inbox, tool_profile="graph_worker")
 
+    # describe_table is read-only metadata (RBAC-checked, governed), so the
+    # closed descendant profile keeps it.
     assert captured["names"] == {
-        "run_sql", "render_chart", "data_freshness", "spawn_data_agent"}
+        "run_sql", "describe_table", "render_chart", "data_freshness", "spawn_data_agent"}
     assert "remember" not in captured["names"] and "email_report" not in captured["names"]
     assert "RUNTIME DELEGATION" in captured["volatile"]
     assert '"postgres"' in captured["volatile"]

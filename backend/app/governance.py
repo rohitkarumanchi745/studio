@@ -458,6 +458,16 @@ def column_rules(source, table):
     return {"deny": set(r["deny_columns"]), "mask": set(r["mask_columns"])}
 
 
+def governed_schema(source, table, cols):
+    """A table's schema metadata minus its denied columns (see column_rules) —
+    what the catalog shows and what the agent may be told. Masked columns
+    stay: their values are masked at result time, the column is not a secret."""
+    deny = column_rules(source, table)["deny"]
+    if not deny:
+        return cols
+    return [c for c in cols if str(c.get("name", "")).lower() not in deny]
+
+
 _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _SET_OPS = {"with", "union", "intersect", "except"}
 

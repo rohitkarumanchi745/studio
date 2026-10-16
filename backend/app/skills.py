@@ -26,9 +26,14 @@ _DIALECT_NOTES = {
 }
 
 
+# Bumped whenever the skill text changes, so cached files are rebuilt.
+TEMPLATE_VERSION = 2
+
+
 def fingerprint(dialect, allowed_tables, schemas):
     payload = json.dumps(
         {
+            "template": TEMPLATE_VERSION,
             "dialect": dialect,
             "tables": sorted(allowed_tables),
             "schemas": {t: schemas.get(t, []) for t in sorted(schemas)},
@@ -67,7 +72,7 @@ def _build(connector, role, allowed_tables, schemas, fp):
             col_text = "\n".join(f"  - {c['name']} ({c['type']})" for c in cols)
             table_lines.append(f"### {t}\n{col_text}")
         else:
-            table_lines.append(f"### {t}\n  (schema not loaded — inspect before use)")
+            table_lines.append(f"### {t}\n  (columns not listed — call describe_table before using it)")
     tables_md = "\n\n".join(table_lines) or "(no accessible tables)"
     dialect_note = _DIALECT_NOTES.get(connector.dialect, "- Standard ANSI SQL.")
     if getattr(connector, "full_names", False):
@@ -95,6 +100,8 @@ is invisible and queries touching it are rejected by the query guard.
 
 ## Query guidance
 {dialect_note}
+- Never guess a column name: for a table whose columns are not listed here,
+  call describe_table first (it takes several tables at once).
 - Aggregate in SQL (GROUP BY, filters); the warehouse may hold terabytes.
 - Single SELECT statements only; every query gets an enforced LIMIT.
 - Join only within this source. Cross-database questions are the

@@ -28,7 +28,7 @@ import re
 from typing import List
 from urllib.parse import urlsplit
 
-from . import db, email_service, gateway, grains, progress, visuals
+from . import db, email_service, gateway, governance, grains, progress, rbac, visuals
 from .queryguard import QueryRejected
 
 # Full Power BI / Tableau-style catalog (rendered with ECharts client-side),
@@ -594,9 +594,42 @@ def _single_reply_usage(reply):
     }
 
 
+# describe_table: how many tables one call may read, and how many columns of
+# one table it returns (a very wide table would otherwise flood the context).
+DESCRIBE_MAX_TABLES = 10
+DESCRIBE_MAX_COLUMNS = 300
+
+
+def describe_for(user, connector, allowed_tables, table):
+    """One table's columns for the agent's describe_table tool — exactly what
+    the catalog's schema endpoint would show this user, or an error.
+
+    Only a table this source lists for the user (`allowed_tables`, already
+    RBAC-filtered) can be read, matched case-insensitively and read under the
+    listed spelling: a guessed name — another schema, another catalog — never
+    reaches the warehouse, so this is no way around the source's pinned
+    namespace. RBAC is checked again as defence in depth, and governance's
+    denied columns are removed, as the catalog removes them."""
+    listed = {str(t).lower(): t for t in allowed_tables or []}
+    name = listed.get(str(table).strip().lower())
+    if name is None:
+        return {"error": "not one of the tables you can query on this source"}
+    if not rbac.can_access((user or {}).get("role"), connector.name, name):
+        return {"error": "no access"}
+    try:
+        cols = governance.governed_schema(connector.name, name, connector.get_schema(name))
+    except Exception as e:
+        return {"error": f"could not read its columns: {str(e)[:160]}"}
+    out = {"table": name, "columns": [{"name": c.get("name"), "type": c.get("type")}
+                                      for c in cols[:DESCRIBE_MAX_COLUMNS]]}
+    if len(cols) > DESCRIBE_MAX_COLUMNS:
+        out["note"] = f"first {DESCRIBE_MAX_COLUMNS} of {len(cols)} columns"
+    return out
+
+
 def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, model=None,
               skill_md=None, kag_first=False, delegation=None, tool_profile="full",
-              visual_mode=False, conversation_id=None):
+              visual_mode=False, conversation_id=None, focus_schemas=None):
     """One analytics turn.
 
     schemas: {table_name: [{"name","type"}, ...]} — one entry for single-table
@@ -613,6 +646,11 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
     memory/email and unclassified MCP side effects.
     conversation_id: the chat this turn belongs to; recall_past_work skips it,
     since its turns are already in `history`.
+    focus_schemas: {table: columns} of tables this question looks likely to
+    need beyond `schemas` (chat picks them by name, matching.focus_tables).
+    They go in the volatile half of the prompt, so the cached prefix — the
+    skill file — stays the same from one question to the next. Any other
+    table's columns are one describe_table call away.
     Returns {text, sql, columns, rows, chart, mode, model, email}.
     """
     if tool_profile not in ("full", "graph_worker"):
@@ -749,6 +787,40 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
                        "explanation": out["explanation"], "request": request},
         })
         return f"Custom visual panel {len(ctx['panels'])} recorded: {out['title']}."
+
+    # Columns already in the prompt answer describe_table without a warehouse
+    # read; so does a table described earlier in this turn.
+    described = {t: {"table": t, "columns": cols}
+                 for t, cols in {**(schemas or {}), **(focus_schemas or {})}.items()}
+
+    @tool
+    def describe_table(tables: List[str]) -> str:
+        """Columns (name and type) of tables whose columns are not listed in
+        your briefing. Call it before you query or join such a table — never
+        guess a column name.
+
+        Args:
+            tables: Up to 10 table names, written exactly as listed.
+        """
+        names = [str(t).strip() for t in (tables or []) if str(t).strip()]
+        asked, names = len(names), names[:DESCRIBE_MAX_TABLES]
+        progress.emit_for(_tid, f"{_me}: reading the columns of {', '.join(names) or 'no table'}")
+        out = []
+        for t in names:
+            hit = described.get(t) or next(
+                (v for k, v in described.items() if k.lower() == t.lower()), None)
+            if hit is None:
+                hit = describe_for(user, connector, allowed_tables, t)
+                if "error" not in hit:
+                    described[hit["table"]] = hit
+                else:
+                    hit = {"table": t, **hit}
+            out.append(hit)
+        reply = {"tables": out}
+        if asked > DESCRIBE_MAX_TABLES:
+            reply["note"] = (f"Only the first {DESCRIBE_MAX_TABLES} tables were read; "
+                             "call again for the rest.")
+        return json.dumps(reply, default=str)
 
     @tool
     def data_freshness(table: str) -> str:
@@ -900,7 +972,7 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
     memory_notes = memory.notes_for_prompt(user["id"], prompt)
     # Stable half (cached prefix) + volatile half (below the breakpoint).
     system, volatile = _system_blocks(connector, table, allowed_tables, schemas,
-                                      memory_notes, skill_md)
+                                      memory_notes, skill_md, focus_schemas)
     if delegation is not None:
         available = json.dumps(delegation.source_catalog, ensure_ascii=False)
         delegation_note = (
@@ -933,7 +1005,7 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
 
     try:
         llm = make_llm(spec, user)
-        base_tools = [run_sql, render_chart, data_freshness]
+        base_tools = [run_sql, describe_table, render_chart, data_freshness]
         if tool_profile == "full":
             # Memory is a full chat turn's: graph workers get none of it.
             base_tools += [remember, forget, recall_past_work, email_report]
@@ -1077,15 +1149,18 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
     }
 
 
-def _system_blocks(connector, table, allowed_tables, schemas, memory_notes, skill_md=None):
+def _system_blocks(connector, table, allowed_tables, schemas, memory_notes, skill_md=None,
+                   focus_schemas=None):
     """(stable, volatile) halves of the system prompt.
 
     stable: role, scope, the skill file, learned rules, platform notes, rules —
     identical across turns (and across users of a source), so it is the
-    prompt-cache prefix. volatile: this user's memory notes and the source's
-    recent failures — they change between turns (a `remember` call, any
-    failed query on the source) and must sit BELOW the cache breakpoint, or
-    each change would invalidate the whole cached skill file."""
+    prompt-cache prefix. volatile: this user's memory notes, the source's
+    recent failures and the columns of the tables this question looks likely
+    to need (focus_schemas) — they change between turns (a `remember` call,
+    any failed query on the source, a new question) and must sit BELOW the
+    cache breakpoint, or each change would invalidate the whole cached skill
+    file."""
     scope = f"Selected table: {table}" if table != "*" else "Scope: the whole source (all tables listed below)"
     memory = "\n".join(f"  - {n}" for n in memory_notes) or "  (none)"
     if skill_md:
@@ -1098,10 +1173,14 @@ def _system_blocks(connector, table, allowed_tables, schemas, memory_notes, skil
             lines = "\n".join(f"    - {c['name']} ({c['type']})" for c in cols)
             schema_blocks.append(f"  {t}:\n{lines}")
         schema_text = "\n".join(schema_blocks)
+        listed = len(schema_blocks)
+        unlisted = (f"\nColumns are listed for {listed} of {len(allowed_tables)} tables: "
+                    "call describe_table for any other before you query it."
+                    if listed < len(allowed_tables) else "")
         source_block = f"""Data source: {connector.name} (SQL dialect: {connector.dialect})
 Accessible tables and schemas:
 {schema_text}
-All tables you may reference: {', '.join(allowed_tables)}"""
+All tables you may reference: {', '.join(allowed_tables)}{unlisted}"""
     stable = f"""You are Studio, a senior data analyst agent. Answer the user's question about their data by writing SQL, running it, and (when a visualization helps) proposing a chart.
 
 {scope}
@@ -1146,6 +1225,8 @@ Rules:
   date_trunc) and let the warehouse do the work. Never select raw rows when an
   aggregate answers the question; always LIMIT raw listings.
 - Only SELECT statements; only the tables listed above.
+- Never guess a column name. When a table you need has no columns listed —
+  a join partner, say — call describe_table for it first (several at once).
 - After a successful query, call render_chart when a visualization would help.
   If the user asks for a custom, interactive or D3 visualization — or nothing
   in render_chart's catalog fits — and a render_visual tool is available, call
@@ -1180,13 +1261,21 @@ Rules:
 
 Recent failures on this source (avoid repeating them):
 {failures}"""
+    focus = [(t, cols) for t, cols in (focus_schemas or {}).items() if cols]
+    if focus:
+        lines = "\n".join(f"  {t}: " + ", ".join(f"{c['name']} ({c['type']})" for c in cols)
+                          for t, cols in focus)
+        volatile += ("\n\nColumns of more tables that look relevant to this question "
+                     "(your briefing lists them without columns; these need no "
+                     f"describe_table call):\n{lines}")
     return stable, volatile
 
 
-def _system_prompt(connector, table, allowed_tables, schemas, memory_notes, skill_md=None):
+def _system_prompt(connector, table, allowed_tables, schemas, memory_notes, skill_md=None,
+                   focus_schemas=None):
     """The whole prompt as ONE string (stable + volatile) for non-caching callers."""
     stable, volatile = _system_blocks(connector, table, allowed_tables, schemas,
-                                      memory_notes, skill_md)
+                                      memory_notes, skill_md, focus_schemas)
     return f"{stable}\n\n{volatile}"
 
 
