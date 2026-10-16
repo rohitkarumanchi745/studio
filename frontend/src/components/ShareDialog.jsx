@@ -3,6 +3,7 @@
 // underlying tables — that rejection is surfaced here verbatim.
 import { useEffect, useState } from "react";
 import { api } from "../api";
+import { backdropClose } from "../backdrop";
 
 export default function ShareDialog({ conversationId, title, onClose }) {
   const [shares, setShares] = useState([]);
@@ -60,7 +61,7 @@ export default function ShareDialog({ conversationId, title, onClose }) {
   }
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
+    <div className="modal-backdrop" {...backdropClose(onClose)}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <div className="modal-head">
           <div>

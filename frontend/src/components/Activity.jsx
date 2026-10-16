@@ -2,6 +2,7 @@
 // Regular users see their own history; admins can switch to all users.
 import { useEffect, useState } from "react";
 import { api, getUser } from "../api";
+import { backdropClose } from "../backdrop";
 
 export default function Activity({ onClose }) {
   const user = getUser();
@@ -28,7 +29,7 @@ export default function Activity({ onClose }) {
   );
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
+    <div className="modal-backdrop" {...backdropClose(onClose)}>
       <div className="modal activity" onClick={(e) => e.stopPropagation()}>
         <div className="modal-head">
           <div>

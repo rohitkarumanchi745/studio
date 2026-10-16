@@ -3,6 +3,7 @@
 // four characters, so nothing here can read a key back out.
 import { useEffect, useState } from "react";
 import { api } from "../api";
+import { backdropClose } from "../backdrop";
 
 const LABEL = { anthropic: "Anthropic (Claude)", openai: "OpenAI (GPT)" };
 const PLACEHOLDER = { anthropic: "sk-ant-…", openai: "sk-…" };
@@ -72,7 +73,7 @@ export default function KeySettings({ onClose, onChanged }) {
   const serverHas = state?.server_keys || [];
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
+    <div className="modal-backdrop" {...backdropClose(onClose)}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <div className="modal-head">
           <div>
