@@ -395,6 +395,22 @@ def _cte_legal(bindings, canon, at, dialect=None):
 
 # ── Public API ──────────────────────────────────────────────────────────
 
+class _FullNames:
+    """Connector.qualifiers() for a source whose tables are FULLY QUALIFIED —
+    a Databricks source spanning every catalog/schema its token can see lists
+    `catalog.schema.table`. There is no single namespace to pin, so instead
+    every reference must be written in full and is matched WHOLE against the
+    allowlist. Explicit (never inferred from dots in allowlist names: other
+    sources have dotted file-style names, where `sales.csv` written bare would
+    then read as schema `sales`, table `csv`)."""
+
+    def __repr__(self):
+        return "FULL_NAMES"
+
+
+FULL_NAMES = _FullNames()
+
+
 def _declared_qualifiers(qualifiers, dialect=None):
     """Connector.qualifiers() grouped BY ARITY: {n_parts: {canonical prefix}}.
 
@@ -466,7 +482,8 @@ def validate(sql, allowed_tables, qualifiers=None, dialect=None):
     of the engine, not of the guard. None keeps the historical
     case-insensitive-everything reading, so blend and dashboards are unaffected.
     """
-    quals = _declared_qualifiers(qualifiers, dialect)
+    full_names = qualifiers is FULL_NAMES
+    quals = None if full_names else _declared_qualifiers(qualifiers, dialect)
     raw = (sql or "").strip().rstrip(";").strip()
     toks, cleaned = _tokens(raw)
     if not toks:
@@ -510,6 +527,22 @@ def validate(sql, allowed_tables, qualifiers=None, dialect=None):
         name = _canon(parts[-1], dialect)
         qual_parts = [_canon(p, dialect) for p in parts[:-1]]
         written = ".".join(p.text for p in parts)
+        if full_names:
+            # A shorter name would resolve against whatever catalog/schema the
+            # session happens to be in, so only the whole name is matched.
+            if len(parts) > 1:
+                if any("." in p.text for p in parts):
+                    # `main`.`sales.orders` is schema main, table "sales.orders"
+                    # — joined it would collide with main.sales.orders.
+                    raise QueryRejected(f"Table '{written}' is not a name this source lists")
+                if ".".join(_canon(p, dialect) for p in parts) in allowed:
+                    continue
+                raise QueryRejected(
+                    f"Access to table '{written}' is not permitted for your role")
+            if _cte_legal(ctes, name, at, dialect):
+                continue
+            raise QueryRejected(
+                f"Name the table in full (catalog.schema.table), not '{written}'")
         if quals is not None and qual_parts:
             if not _qualifier_ok(qual_parts, quals):
                 raise QueryRejected(

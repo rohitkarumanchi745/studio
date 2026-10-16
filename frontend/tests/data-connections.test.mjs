@@ -17,7 +17,7 @@ const require = createRequire(import.meta.url);
 let hooks = null;
 const bundle = await build({
   stdin: {
-    contents: `export {default as DataConnections, buildTiles, suggestName, planConnections, connectionReadiness, Namespaces, namespaceKey, remainingPickedNamespaces, GithubPanel, githubRegistrationReady, ConnectForm, instanceBadge, envActions}
+    contents: `export {default as DataConnections, buildTiles, suggestName, planConnections, connectionReadiness, Namespaces, namespaceKey, namespaceLabel, remainingPickedNamespaces, GithubPanel, githubRegistrationReady, ConnectForm, instanceBadge, envActions}
       from "./src/components/DataConnections.jsx";
       export {metaFor} from "./src/components/sourceCatalog.jsx";`,
     resolveDir: frontend, loader: "jsx",
@@ -36,7 +36,7 @@ compiled.require = (id) => id === "react" ? {
 } : require(id);
 compiled._compile(bundle.outputFiles[0].text, compiled.filename);
 const { DataConnections, buildTiles, suggestName, planConnections, connectionReadiness,
-        Namespaces, namespaceKey, remainingPickedNamespaces, GithubPanel,
+        Namespaces, namespaceKey, namespaceLabel, remainingPickedNamespaces, GithubPanel,
         githubRegistrationReady, metaFor, ConnectForm, instanceBadge, envActions } = compiled.exports;
 
 // What the four endpoints answer on a deployment with Postgres configured from
@@ -915,4 +915,33 @@ test("when every picked schema is empty, it says which and what to grant", async
   assert.equal(done.length, 0);
   assert.match(errors.at(-1), /None of the picked schemas has tables this token can see \(main\.sales, main\.ops\)/);
   assert.match(errors.at(-1), /USE CATALOG, USE SCHEMA and SELECT/);
+});
+
+// ── Everything as one source (Databricks: schema "*") ───────────────────
+
+test("the picker offers all schemas of a catalog, and everything, as one source", () => {
+  const browse = { ok: true, truncated: false, namespaces: [
+    { database: "", schema: "*", tables: 6 },
+    { database: "main", schema: "*", tables: 4 },
+    { database: "main", schema: "sales", tables: 3 },
+  ] };
+  const html = harness(Namespaces, { browse, picked: [], setPicked() {}, keyOf: namespaceKey }).render();
+  assert.match(html, /✳ everything this credential can see — one source<\/span><span class="meta">6 tables/);
+  assert.match(html, /✳ all schemas — one source<\/span><span class="meta">4 tables/);
+  assert.equal(namespaceLabel({ database: "", schema: "*" }), "all catalogs");
+  assert.equal(namespaceLabel({ database: "main", schema: "*" }), "main (all schemas)");
+});
+
+test("everything clears a typed catalog; a whole catalog pins it", () => {
+  const cfg = { server_hostname: "h", http_path: "/sql/x", access_token: "t", catalog: "typed", schema: "default" };
+  const ns = { schema: "schema", database: "catalog" };
+  const [everything, wholeMain] = planConnections({ cfg, ns, name: "dbx", chosen: [
+    { database: "", schema: "*" }, { database: "main", schema: "*" }] });
+  assert.equal(everything.config.catalog, "");
+  assert.equal(everything.config.schema, "*");
+  assert.equal(wholeMain.config.catalog, "main");
+  assert.equal(wholeMain.config.schema, "*");
+  // An ordinary schema without a catalog keeps what was typed (unchanged).
+  const [plain] = planConnections({ cfg, ns, name: "dbx", chosen: [{ database: "", schema: "sales" }] });
+  assert.equal(plain.config.catalog, "typed");
 });

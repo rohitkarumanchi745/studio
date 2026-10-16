@@ -13,6 +13,28 @@ import re
 import threading
 
 from .base import Connector, jsonify_rows
+from ..queryguard import FULL_NAMES
+
+#: Schema value meaning "every schema" — of the configured catalog, or of every
+#: catalog the token can see when no catalog is set. Such a source lists its
+#: tables by full name (catalog.schema.table) and the query guard matches them
+#: whole (queryguard.FULL_NAMES).
+ALL_SCHEMAS = "*"
+#: Catalogs never listed in an all-schemas source: `system` holds the
+#: workspace's audit, billing and access logs, not business data.
+_SKIPPED_CATALOGS = {"system"}
+#: Only plain identifiers make a listable name: the catalog endpoints and the
+#: query guard both read a name as dot-separated plain parts.
+_PLAIN = re.compile(r"^[A-Za-z_][\w$]*$")
+
+
+def max_tables():
+    """Cap on the tables an all-schemas source lists (and the agent is told
+    about): a metastore can hold tens of thousands."""
+    try:
+        return max(1, int(os.getenv("STUDIO_DATABRICKS_MAX_TABLES", "1000")))
+    except ValueError:
+        return 1000
 
 #: Env var naming the SQL warehouse that a submitted job's sql_tasks run on.
 #: There is no default: a Jobs run-submit with a sql_task and no warehouse is
@@ -331,12 +353,24 @@ class DatabricksConnector(Connector):
         the declared prefixes must match that reading.
         """
         cfg = self._cfg()
+        if self.all_schemas:
+            return FULL_NAMES            # every reference written, and matched, in full
         schema = (cfg["schema"] or "default").strip().lower()
         catalog = (cfg["catalog"] or "").strip().lower()
         out = {schema}
         if catalog:
             out.add(f"{catalog}.{schema}")
         return frozenset(out)
+
+    @property
+    def all_schemas(self):
+        """Spans every schema (of its catalog, or of every catalog)."""
+        return (self._cfg()["schema"] or "").strip() == ALL_SCHEMAS
+
+    @property
+    def full_names(self):
+        """Its tables are named catalog.schema.table (skills tell the agent)."""
+        return self.all_schemas
 
     def configured(self):
         cfg = self._cfg()
@@ -358,7 +392,7 @@ class DatabricksConnector(Connector):
         }
         if cfg["catalog"]:
             kwargs["catalog"] = cfg["catalog"]
-        if cfg["schema"]:
+        if cfg["schema"] and cfg["schema"].strip() != ALL_SCHEMAS:
             kwargs["schema"] = cfg["schema"]
         kwargs.update(self.connect_limits)
         return sql.connect(**kwargs)
@@ -398,12 +432,77 @@ class DatabricksConnector(Connector):
                 self._pool_conn = None
 
     def list_tables(self):
+        if self.all_schemas:
+            return self._execute(self._all_tables)
+
         def go(con):
             cur = con.cursor()
             cur.execute("SHOW TABLES")
             # SHOW TABLES → (database, tableName, isTemporary)
             return [r[1] for r in cur.fetchall()]
         return self._execute(go)
+
+    #: Set by an all-schemas listing that hit max_tables().
+    tables_truncated = False
+
+    def _all_tables(self, con):
+        """catalog.schema.table for every table this token can see, in its
+        catalog (or every catalog but `system`). One information_schema query
+        where Unity Catalog has it — it lists only what the caller has
+        privileges on, as SHOW TABLES does — else a SHOW walk."""
+        catalog = (self._cfg()["catalog"] or "").strip()
+        cap = max_tables()
+        cur = con.cursor()
+        if catalog and "`" in catalog:
+            return []
+        src = f"`{catalog}`.information_schema.tables" if catalog \
+            else "system.information_schema.tables"
+        skipped = ", ".join(f"'{c}'" for c in sorted(_SKIPPED_CATALOGS))
+        try:
+            cur.execute(
+                f"SELECT table_catalog, table_schema, table_name FROM {src} "
+                f"WHERE table_schema <> 'information_schema' AND table_catalog NOT IN ({skipped}) "
+                f"ORDER BY table_catalog, table_schema, table_name LIMIT {cap + 1}")
+            rows = [tuple(r[:3]) for r in cur.fetchall()]
+        except Exception:
+            rows = self._walk_tables(cur, catalog, cap)
+        names = [".".join(p for p in r if p) for r in rows
+                 if all(_PLAIN.match(str(p)) for p in r if p) and r[-1]]
+        self.tables_truncated = len(names) > cap
+        return names[:cap]
+
+    def _walk_tables(self, cur, catalog, cap):
+        """(catalog, schema, table) by SHOW statements — a workspace without
+        Unity Catalog, or a token that cannot read information_schema."""
+        if catalog:
+            catalogs = [catalog]
+        else:
+            try:
+                cur.execute("SHOW CATALOGS")
+                catalogs = [r[0] for r in cur.fetchall()
+                            if r[0] and r[0].lower() not in _SKIPPED_CATALOGS]
+            except Exception:
+                catalogs = [""]             # no catalogs at all: the Hive metastore
+        out = []
+        for c in catalogs[:self.BROWSE_CATALOG_LIMIT]:
+            if "`" in c:
+                continue
+            try:
+                cur.execute(f"SHOW SCHEMAS IN `{c}`" if c else "SHOW SCHEMAS")
+                schemas = [r[0] for r in cur.fetchall()
+                           if r[0] and r[0].lower() != "information_schema" and "`" not in r[0]]
+            except Exception:
+                continue
+            for sch in schemas:
+                where = f"`{c}`.`{sch}`" if c else f"`{sch}`"
+                try:
+                    cur.execute(f"SHOW TABLES IN {where}")
+                except Exception:
+                    continue
+                out += [(c, sch, r[1]) for r in cur.fetchall()]
+                if len(out) > cap:
+                    return out
+        return out
 
     #: Cap on catalogs walked by list_namespaces — one round trip each, and a
     #: metastore with hundreds of catalogs must not hang the connect screen.
@@ -442,11 +541,28 @@ class DatabricksConnector(Connector):
                 schemas = [r[0] for r in cur.fetchall()
                            if r[0] and r[0].lower() != "information_schema"]
                 counts = self._table_counts(cur, catalog)
+                listed = []
                 for schema in schemas:
                     item = {"database": catalog, "schema": schema}
                     if counts is not None:
                         item["tables"] = counts.get(schema.lower(), 0)
-                    out.append(item)
+                    listed.append(item)
+                if catalog and catalog.lower() not in _SKIPPED_CATALOGS and len(listed) > 1:
+                    # The whole catalog, as one source (with one schema, that
+                    # schema already is the whole catalog).
+                    every = {"database": catalog, "schema": ALL_SCHEMAS}
+                    if counts is not None:
+                        every["tables"] = sum(i["tables"] for i in listed)
+                    out.append(every)
+                out += listed
+            if len([c for c in catalogs if c and c.lower() not in _SKIPPED_CATALOGS]) > 1:
+                # Everything the token can see, as one source.
+                schemas_seen = [i for i in out if i["schema"] != ALL_SCHEMAS
+                                and (i["database"] or "").lower() not in _SKIPPED_CATALOGS]
+                every = {"database": "", "schema": ALL_SCHEMAS}
+                if schemas_seen and all("tables" in i for i in schemas_seen):
+                    every["tables"] = sum(i["tables"] for i in schemas_seen)
+                out.insert(0, every)
             return out
 
         return self._execute(go)
@@ -469,6 +585,12 @@ class DatabricksConnector(Connector):
             return None
 
     def get_schema(self, table):
+        if self.all_schemas:
+            parts = str(table).split(".")
+            if not all(_PLAIN.match(p) for p in parts):
+                raise ValueError("Invalid table name")
+            table = ".".join(f"`{p}`" for p in parts)
+
         def go(con):
             cur = con.cursor()
             cur.execute(f"DESCRIBE TABLE {table}")
