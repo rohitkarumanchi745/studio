@@ -45,6 +45,24 @@ ADMIN = {"id": "u-admin", "email": "admin@studio.test", "role": "admin", "name":
 ANALYST = {"id": "u-analyst", "email": "ana@studio.test", "role": "analyst", "name": "Ana"}
 
 
+def _persist_user(user):
+    """Approval re-checks the requester's CURRENT account, so the people these
+    tests submit as must exist, as every real requester does."""
+    with db.connect() as c:
+        # Test modules share one database and some reuse an email under
+        # another id; approval looks the requester up by id, so any free email
+        # will do.
+        taken = c.execute("SELECT id FROM users WHERE email=?", (user["email"],)).fetchone()
+        email = user["email"] if taken is None or taken[0] == user["id"] \
+            else f"{user['id']}@studio.test"
+        c.execute(
+            "INSERT INTO users (id,email,password_hash,name,role,verified,created_at) "
+            "VALUES (?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING",
+            (user["id"], email, db.UNUSABLE_PASSWORD_HASH, user["name"],
+             user["role"], 1, time.time()))
+        c.commit()
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _tables():
     db.init_db()
@@ -52,6 +70,8 @@ def _tables():
     mcp.init_tables()
     toolbuilder.init_tables()
     seed()
+    for user in (ADMIN, ANALYST):
+        _persist_user(user)
     yield
 
 
