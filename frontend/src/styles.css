@@ -68,6 +68,8 @@ input:focus, select:focus { border-color: var(--accent); }
   color: var(--ink-3); font-size: 11px; border-top: 1px solid var(--line); padding-top: 10px;
 }
 .error { color: var(--bad); font-size: 13px; }
+.chat-notice { background: var(--accent-soft); border: 1px solid var(--line); border-radius: var(--radius);
+               padding: 10px 14px; color: var(--ink-2); font-size: 13px; line-height: 1.5; }
 
 /* ── Layout ── */
 .layout { display: flex; height: 100%; }

@@ -58,13 +58,14 @@ import Sidebar from "./components/Sidebar";
 // element in an unkeyed RenderedRoute, so moving between the two keeps the
 // same Chat instance mounted — which matters because onConversationCreated
 // fires mid-stream on the first answer; a remount would drop it.
-function ChatPage({ modelsEpoch, onConversationCreated }) {
+function ChatPage({ modelsEpoch, onConversationCreated, onConversationMissing }) {
   const { conversationId = null } = useParams();
   const navigate = useNavigate();
   return (
     <Chat
       conversationId={conversationId}
       onConversationCreated={onConversationCreated}
+      onConversationMissing={onConversationMissing}
       onOpenDashboard={(id) => navigate(id ? `/dashboards/${id}` : "/dashboards")}
       modelsEpoch={modelsEpoch}
     />
@@ -74,13 +75,14 @@ function ChatPage({ modelsEpoch, onConversationCreated }) {
 // "/visuals" and "/visuals/c/:conversationId": the D3 & artifacts window — the
 // same Chat, in visual mode. One element for both routes, for the same reason
 // as ChatPage: the first answer creates the conversation mid-stream.
-function VisualChatPage({ modelsEpoch, onConversationCreated }) {
+function VisualChatPage({ modelsEpoch, onConversationCreated, onConversationMissing }) {
   const { conversationId = null } = useParams();
   const navigate = useNavigate();
   return (
     <Chat
       conversationId={conversationId}
       onConversationCreated={onConversationCreated}
+      onConversationMissing={onConversationMissing}
       onOpenDashboard={(id) => navigate(id ? `/dashboards/${id}` : "/dashboards")}
       modelsEpoch={modelsEpoch}
       visualMode
@@ -192,12 +194,16 @@ export default function App() {
     <ChatPage
       modelsEpoch={modelsEpoch}
       onConversationCreated={(id) => { navigate(`/c/${id}`); refresh(); }}
+      // A link to a conversation that is gone is replaced, so Back does not
+      // return to it; the sidebar drops it now rather than at the next poll.
+      onConversationMissing={() => { navigate("/", { replace: true }); refresh(); }}
     />
   );
   const visualChat = (
     <VisualChatPage
       modelsEpoch={modelsEpoch}
       onConversationCreated={(id) => { navigate(`/visuals/c/${id}`); refresh(); }}
+      onConversationMissing={() => { navigate("/visuals", { replace: true }); refresh(); }}
     />
   );
 
