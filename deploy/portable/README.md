@@ -432,6 +432,30 @@ Do not deploy a second Lightning server/controller replica as an availability
 shortcut: Agent Lightning 1.0.1 uses a process-local store, and Studio's wrapper
 deliberately rejects a second writer to prevent split-brain history.
 
+## Deployment acceptance gates
+
+Studio's prompt-to-new-DAG path (plan → approve → publish → run) is accepted
+per deployment, not claimed by the code. The repository proves the planner,
+compiler and approval chain against fakes; it cannot prove a given cluster's
+storage and Airflow. Until a deployment passes both gates below, treat it as
+able to trigger already-deployed DAGs only, and say so to its users. Record the
+date, environment and outcome of each pass, and repeat both after changing the
+DAG storage, the Airflow version, or either warehouse identity.
+
+1. **One shared DAG filesystem.** On the real storage — the `ReadWriteMany`
+   volume in a multi-node cluster, not a single-host bind mount — the Studio
+   worker can write `/opt/airflow/dags` and the scheduler and DAG processor read
+   the same files. The `test -w` / `test -r .studio-airflow-shared-v1` checks
+   below must pass in every replica that mounts it.
+2. **A real prompt reaches a terminal run.** From Studio chat, ask for an
+   Airflow pipeline over the deployment's own warehouse (not the disposable
+   `warehouse` service), approve it as an administrator, and confirm all of:
+   the DAG registers in Airflow import-clean and unpaused within the 900-second
+   publication window; its run reaches a terminal state that Studio's Jobs
+   screen reports (a failure must surface there with its task, not hang); and a
+   successful run's output lands in `STUDIO_AIRFLOW_OUTPUT_SCHEMA` under the
+   writer identity, not the reader.
+
 ## Readiness and smoke tests
 
 Container readiness is necessary but not sufficient. Run these checks after
