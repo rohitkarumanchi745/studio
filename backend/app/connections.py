@@ -841,7 +841,10 @@ def _browse(ctype, cfg):
         if len(out) >= 500:
             truncated = True
             continue
-        out.append({"database": pair[0], "schema": pair[1]})
+        item = {"database": pair[0], "schema": pair[1]}
+        if isinstance(n.get("tables"), int):
+            item["tables"] = n["tables"]          # how many tables it holds, when known
+        out.append(item)
     return {"ok": True, "namespaces": out, "truncated": truncated}
 
 

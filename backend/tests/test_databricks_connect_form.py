@@ -347,3 +347,54 @@ def test_the_tidy_config_is_what_gets_saved(client, monkeypatch):
     assert t.status_code == 200 and list(t.json()["fields"]) == ["http_path"]
     assert t.json()["stage"] == "check"
     assert detail["stage"] == "check"
+
+
+# ── The picker shows which schemas hold tables ──────────────────────────
+
+def test_the_listing_counts_tables_per_schema_where_it_can(monkeypatch):
+    """Unity Catalog: one information_schema query per catalog. Hive metastore
+    (no information_schema): counts unknown, the listing itself unharmed."""
+    executed = []
+
+    class _Cur:
+        def __init__(self):
+            self.rows = []
+
+        def execute(self, sql, params=None):
+            executed.append(sql)
+            if sql == "SHOW CATALOGS":
+                self.rows = [("main",), ("hive_metastore",)]
+            elif sql == "SHOW SCHEMAS IN `main`":
+                self.rows = [("default",), ("sales",), ("information_schema",)]
+            elif sql == "SHOW SCHEMAS IN `hive_metastore`":
+                self.rows = [("default",)]
+            elif "`main`.information_schema.tables" in sql:
+                self.rows = [("sales", 3)]
+            elif "`hive_metastore`.information_schema" in sql:
+                raise RuntimeError("no information_schema in the Hive metastore")
+            else:
+                raise AssertionError(sql)
+
+        def fetchall(self):
+            return self.rows
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+        def close(self):
+            pass
+
+    browse = connections._DynDatabricks("__browse__", GOOD)
+    monkeypatch.setattr(browse, "_conn", lambda: _Conn())
+    assert browse.list_namespaces() == [
+        {"database": "main", "schema": "default", "tables": 0},
+        {"database": "main", "schema": "sales", "tables": 3},
+        {"database": "hive_metastore", "schema": "default"},
+    ]
+    # And the browse endpoint passes the counts through.
+    monkeypatch.setitem(connections.TYPES["databricks"], "build", lambda name, cfg: browse)
+    monkeypatch.setattr(connections, "_resolves", lambda host, wait=5.0: True)
+    out = connections._browse("databricks", GOOD)
+    assert out["ok"] and out["namespaces"][1] == {"database": "main", "schema": "sales", "tables": 3}
+    assert "tables" not in out["namespaces"][2]

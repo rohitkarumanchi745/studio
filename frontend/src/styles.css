@@ -1187,6 +1187,8 @@ input:focus, select:focus, .composer-pill:focus-within { box-shadow: 0 0 0 1px v
 .conn-label { font-size: 12px; color: var(--ink-2); }
 .conn-input-bad { border-color: var(--bad) !important; }
 .conn-field-error { font-size: 12px; line-height: 1.4; color: var(--bad); }
+.conn-ns-empty { opacity: 0.55; }
+.conn-ns-item .meta { margin-left: 4px; }
 
 /* The schema picker: what this credential can see, grouped by database. */
 .conn-ns {
