@@ -439,13 +439,34 @@ class DatabricksConnector(Connector):
                 except Exception:
                     continue
                 # SHOW SCHEMAS → (databaseName,) on Spark, (namespace,) on UC.
-                for r in cur.fetchall():
-                    schema = r[0]
-                    if schema and schema.lower() != "information_schema":
-                        out.append({"database": catalog, "schema": schema})
+                schemas = [r[0] for r in cur.fetchall()
+                           if r[0] and r[0].lower() != "information_schema"]
+                counts = self._table_counts(cur, catalog)
+                for schema in schemas:
+                    item = {"database": catalog, "schema": schema}
+                    if counts is not None:
+                        item["tables"] = counts.get(schema.lower(), 0)
+                    out.append(item)
             return out
 
         return self._execute(go)
+
+    @staticmethod
+    def _table_counts(cur, catalog):
+        """{schema: tables this token can see} for one Unity Catalog catalog —
+        one query, so the picker can tell an empty schema from a full one before
+        anything is saved. information_schema lists only what the caller has
+        privileges on, as SHOW TABLES does. None when unknown: the Hive
+        metastore has no information_schema, and a failure here must not cost
+        the listing itself."""
+        if not catalog:
+            return None
+        try:
+            cur.execute(f"SELECT table_schema, COUNT(*) FROM `{catalog}`.information_schema.tables "
+                        "WHERE table_schema <> 'information_schema' GROUP BY table_schema")
+            return {str(r[0]).lower(): int(r[1]) for r in cur.fetchall() if r[0] is not None}
+        except Exception:
+            return None
 
     def get_schema(self, table):
         def go(con):

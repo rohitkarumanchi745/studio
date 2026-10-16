@@ -367,6 +367,11 @@ export function planConnections({ cfg, ns, name, chosen = [], takenNames = new S
   });
 }
 
+/** "catalog.schema" (or just "schema") for messages. */
+export function namespaceLabel(n) {
+  return n?.database ? `${n.database}.${n.schema}` : String(n?.schema || "");
+}
+
 export function namespaceKey(n) {
   return `${n?.database || ""}\u0000${n?.schema || ""}`;
 }
@@ -488,8 +493,9 @@ export function ConnectForm({ tile, defaultName, takenNames, onDone, onError, on
     // partial failure has to name the source that failed and keep the ones
     // that already landed rather than leaving an indeterminate set.
     const done = [];
-    for (const p of named) {
-      setProgress(`connecting ${p.name} (${done.length + 1} of ${named.length})…`);
+    const skipped = [];   // picked schemas that signed in but hold nothing readable
+    for (const [i, p] of named.entries()) {
+      setProgress(`connecting ${p.name} (${i + 1} of ${named.length})…`);
       try {
         await api("/connections", {
           method: "POST",
@@ -497,6 +503,11 @@ export function ConnectForm({ tile, defaultName, takenNames, onDone, onError, on
         });
         done.push(p.name);
       } catch (e) {
+        if (named.length > 1 && p.ns && e.detail?.stage === "signed_in"
+            && e.detail?.fields?.[ns.schema]) {
+          skipped.push(namespaceLabel(p.ns));   // keep going with the others
+          continue;
+        }
         setBusy("");
         setProgress("");
         if (!done.length && refusedSave(e)) return;
@@ -516,9 +527,18 @@ export function ConnectForm({ tile, defaultName, takenNames, onDone, onError, on
     }
     setBusy("");
     setProgress("");
-    onDone(done.length === 1
+    const skippedNote = skipped.length
+      ? ` Skipped ${skipped.join(", ")} — no tables this token can see.` : "";
+    if (!done.length) {
+      onError(`None of the picked schemas has tables this token can see (${skipped.join(", ")}). `
+        + "Pick schemas that show a table count, or grant the token USE CATALOG, USE SCHEMA "
+        + "and SELECT.");
+      return;
+    }
+    onDone((done.length === 1
       ? `Connected — “${done[0]}” is now a source in the chat picker (open a new chat or refresh to see it).`
-      : `Connected ${done.length} sources — ${done.join(", ")} — each scoped to its own schema.`);
+      : `Connected ${done.length} sources — ${done.join(", ")} — each scoped to its own schema.`)
+      + skippedNote);
   }
 
   // Re-point a built-in source. ONE namespace: it stays one source with one
@@ -716,6 +736,12 @@ export function Namespaces({ browse, picked, setPicked, keyOf }) {
   if (!browse.namespaces.length) {
     return <div className="meta">No schemas visible to this account — type one above.</div>;
   }
+  // Table counts come with the listing where the warehouse can say (Databricks
+  // with Unity Catalog). Every counted schema empty almost always means the
+  // credential lacks read access, not that the workspace has no data.
+  const counted = browse.namespaces.filter((n) => typeof n.tables === "number");
+  const allEmpty = counted.length > 0 && counted.length === browse.namespaces.length
+    && counted.every((n) => n.tables === 0);
 
   const groups = [];
   for (const n of browse.namespaces) {
@@ -742,16 +768,29 @@ export function Namespaces({ browse, picked, setPicked, keyOf }) {
           <div className="conn-ns-list">
             {g.items.map((n) => {
               const k = keyOf(n);
+              const empty = n.tables === 0;
               return (
-                <label key={k} className={`conn-ns-item${picked.includes(k) ? " conn-ns-on" : ""}`}>
-                  <input type="checkbox" checked={picked.includes(k)} onChange={() => toggle(k)} />
+                <label key={k} title={empty ? "No tables this credential can see" : undefined}
+                       className={`conn-ns-item${picked.includes(k) ? " conn-ns-on" : ""}${empty ? " conn-ns-empty" : ""}`}>
+                  <input type="checkbox" checked={picked.includes(k)} disabled={empty && !picked.includes(k)}
+                         onChange={() => toggle(k)} />
                   <span>{n.schema}</span>
+                  {typeof n.tables === "number" && (
+                    <span className="meta">{empty ? "empty" : `${n.tables} table${n.tables === 1 ? "" : "s"}`}</span>
+                  )}
                 </label>
               );
             })}
           </div>
         </div>
       ))}
+      {allEmpty && (
+        <div className="meta conn-warn">
+          This credential can see these schemas but no tables in any of them. It most likely
+          needs USE CATALOG, USE SCHEMA and SELECT on the tables (in Unity Catalog, for the
+          user or service principal that owns the token).
+        </div>
+      )}
       {browse.truncated && (
         <div className="meta">Showing the first {browse.namespaces.length} — type a name above to bind one not listed.</div>
       )}

@@ -842,3 +842,77 @@ test("a sign-in the workspace refused marks the field and says it was refused", 
     assert.doesNotMatch(html, /nothing\s+was sent|Signed in, but not saved/);
   });
 });
+
+// ── The picker shows which schemas hold tables; saving skips empty ones ─
+
+const LISTED = { ok: true, truncated: false, namespaces: [
+  { database: "main", schema: "default", tables: 0 },
+  { database: "main", schema: "sales", tables: 3 },
+  { database: "main", schema: "ops", tables: 1 },
+] };
+
+test("the picker shows table counts and will not pick an empty schema", () => {
+  const html = harness(Namespaces, { browse: LISTED, picked: [], setPicked() {}, keyOf: namespaceKey }).render();
+  assert.match(html, /<span>sales<\/span><span class="meta">3 tables<\/span>/);
+  assert.match(html, /<span>ops<\/span><span class="meta">1 table<\/span>/);
+  assert.match(html, /conn-ns-empty[^>]*>.*?disabled="".*?<span>default<\/span><span class="meta">empty<\/span>/s);
+  assert.doesNotMatch(html, /no tables in any of them/);
+  const allEmpty = { ...LISTED, namespaces: LISTED.namespaces.map((n) => ({ ...n, tables: 0 })) };
+  assert.match(harness(Namespaces, { browse: allEmpty, picked: [], setPicked() {}, keyOf: namespaceKey }).render(),
+               /no tables in any of them\. It most likely\s+needs USE CATALOG, USE SCHEMA and SELECT/);
+  // Counts unknown (a Hive metastore): nothing is greyed out.
+  const unknown = { ...LISTED, namespaces: LISTED.namespaces.map(({ tables, ...n }) => n) };
+  assert.doesNotMatch(harness(Namespaces, { browse: unknown, picked: [], setPicked() {}, keyOf: namespaceKey }).render(),
+                      /conn-ns-empty|disabled=""/);
+});
+
+async function saveTwo(emptyNames) {
+  const posts = [], done = [], errors = [];
+  await withApi({ __user: ADMIN, "/connections/browse": LISTED }, async () => {
+    const original = globalThis.fetch;
+    globalThis.fetch = async (url, options = {}) => {
+      if (url === "/api/connections" && options.method === "POST") {
+        const body = JSON.parse(options.body);
+        posts.push(body.config.schema);
+        if (emptyNames.includes(body.config.schema)) {
+          const said = "Signed in, but this schema has no tables the credential can see.";
+          return { status: 400, ok: false, json: async () => ({ detail: {
+            error: `connection test failed: ${said}`, fields: { schema: said }, stage: "signed_in" } }) };
+        }
+        return { status: 201, ok: true, json: async () => ({ name: body.name }) };
+      }
+      return original(url, options);
+    };
+    const tile = byId(buildTiles({ types: [DBX], sources: [], envs: [] })).databricks;
+    const panel = harness(ConnectForm, { tile, defaultName: "databricks-2", takenNames: new Set(),
+      onDone: (m) => done.push(m), onError: (m) => errors.push(m), onRemoved() {} });
+    const type = (key, value) => findNode(panel.tree(),
+      (n) => n.type === "input" && n.props.name === `conn-databricks-${key}`).props.onChange({ target: { value } });
+    type("server_hostname", "dbc-1.cloud.databricks.com");
+    type("http_path", "/sql/1.0/warehouses/abc");
+    type("access_token", "dapi-token");
+    await findNode(panel.tree(), (n) => n.type === "button"
+      && String(n.props.children).includes("Sign in and list schemas")).props.onClick();
+    // Tick sales and ops (the picker would not let "default" be ticked).
+    const ns = findNode(panel.tree(), (n) => n.type?.name === "Namespaces");
+    ns.props.setPicked([namespaceKey(LISTED.namespaces[1]), namespaceKey(LISTED.namespaces[2])]);
+    await findNode(panel.tree(), (n) => n.type === "button" && n.props.className === "primary").props.onClick();
+  });
+  return { posts, done, errors };
+}
+
+test("saving several schemas skips an empty one and connects the rest", async () => {
+  const { posts, done, errors } = await saveTwo(["ops"]);
+  assert.deepEqual(posts, ["sales", "ops"]);
+  assert.equal(done.length, 1);
+  assert.match(done[0], /“databricks-2-1” is now a source/);
+  assert.match(done[0], /Skipped main\.ops — no tables this token can see\./);
+  assert.ok(errors.every((e) => e === ""), errors.join(" | "));
+});
+
+test("when every picked schema is empty, it says which and what to grant", async () => {
+  const { done, errors } = await saveTwo(["sales", "ops"]);
+  assert.equal(done.length, 0);
+  assert.match(errors.at(-1), /None of the picked schemas has tables this token can see \(main\.sales, main\.ops\)/);
+  assert.match(errors.at(-1), /USE CATALOG, USE SCHEMA and SELECT/);
+});
