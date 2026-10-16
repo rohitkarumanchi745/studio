@@ -402,7 +402,7 @@ def _scope(body, user, before_message_id=None):
         raise HTTPException(502, f"Source error: {e}")
     allowed = rbac.allowed_tables(user["role"], body.source, all_tables)
     if not allowed:
-        raise HTTPException(403, "Your role has no access to this source")
+        raise HTTPException(403, rbac.nothing_to_read(body.source, all_tables))
 
     # Scope: an explicit multi-selection, one table, or the whole source ("*").
     selection = [t for t in (body.tables or []) if t]

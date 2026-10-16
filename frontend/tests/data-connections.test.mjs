@@ -801,3 +801,30 @@ test("a save refused for its fields marks them instead of a banner", async () =>
     assert.ok(errors.every((e) => e === ""), errors.join(" | "));
   });
 });
+
+test("a save refused after signing in says so, and marks the schema", async () => {
+  await withApi({ __user: ADMIN }, async () => {
+    const said = "Signed in, but this schema has no tables the credential can see.";
+    globalThis.fetch = async (url, options = {}) => {
+      if (url === "/api/connections/env/databricks" && options.method === "PUT") {
+        return { status: 400, ok: false, json: async () => ({ detail: {
+          error: `connection test failed: ${said}`, fields: { schema: said }, signed_in: true } }) };
+      }
+      return { status: 200, ok: true, json: async () => [] };
+    };
+    const errors = [];
+    const { panel, type } = dbxForm(errors);
+    findNode(panel.tree(), (n) => n.type?.name === "Instances").props.onManage(
+      { name: "databricks", kind: "env", mode: "environment", configured: true }, "change");
+    type("server_hostname", "dbc-1.cloud.databricks.com");
+    type("http_path", "/sql/1.0/warehouses/abc");
+    type("access_token", "dapi-token");
+    await findNode(panel.tree(), (n) => n.type === "button" && n.props.className === "primary")
+      .props.onClick();
+    const html = panel.render();
+    assert.match(html, /name="conn-databricks-schema" class="conn-input-bad"/);
+    assert.ok(html.includes(said));
+    assert.match(html, /Signed in, but not saved — fix the marked field\./);
+    assert.doesNotMatch(html, /nothing\s+was sent/);
+  });
+});

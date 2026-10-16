@@ -108,6 +108,17 @@ def kag_scopes_for(role, user_id=None):
     return scopes
 
 
+def nothing_to_read(source, all_tables):
+    """Why a role that may use `source` still has no tables on it, in words. An
+    EMPTY source is not a permission problem: answering "no access" sent an
+    admin hunting through roles for what was a schema with nothing in it."""
+    if not all_tables:
+        return (f"{source} has no tables to read — the catalog and schema it is connected "
+                "to are empty, or its credential cannot see their tables. An admin can "
+                "choose the schema on Data connections.")
+    return "Your role has no access to this source"
+
+
 def can_access(role, source, table):
     policy = _role_policy(role, source)
     if policy is None:

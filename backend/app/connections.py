@@ -299,6 +299,7 @@ def _refused(problems):
 #: Connectable types: how to build one, its dialect, and the form the UI renders.
 TYPES = {
     "postgres": {
+        "needs_tables": True,
         "label": "PostgreSQL", "dialect": "postgres", "build": _DynPostgres,
         "hint_key": "dsn",
         "ns": {"schema": "schema", "database": ""},
@@ -309,6 +310,7 @@ TYPES = {
         ],
     },
     "snowflake": {
+        "needs_tables": True,
         "label": "Snowflake", "dialect": "snowflake", "build": _DynSnowflake,
         "hint_key": "account",
         "ns": {"schema": "schema", "database": "database"},
@@ -322,6 +324,7 @@ TYPES = {
         ],
     },
     "databricks": {
+        "needs_tables": True,
         "label": "Databricks SQL", "dialect": "databricks", "build": _DynDatabricks,
         "check": _check_databricks, "explain": describe_databricks_error,
         "resolve": "server_hostname",
@@ -340,6 +343,7 @@ TYPES = {
         ],
     },
     "bigquery": {
+        "needs_tables": True,
         "label": "BigQuery", "dialect": "bigquery", "build": _DynBigQuery,
         "hint_key": "project",
         "ns": {"schema": "dataset", "database": "project"},
@@ -686,7 +690,28 @@ def _probe(ctype, cfg):
         return {"ok": False, "error": _safe_connection_error(e, t, cfg)}
     finally:
         _close_connector(conn)
+    if not tables and t.get("needs_tables"):
+        # Signed in, but nothing to read: saved, every question would fail.
+        said = _empty_scope(ctype, cfg)
+        field = (t.get("ns") or {}).get("schema")
+        return {"ok": False, "error": said, "signed_in": True,
+                **({"fields": {field: said}} if field else {})}
     return {"ok": True, "tables": len(tables), "sample": list(tables)[:8]}
+
+
+def _empty_scope(ctype, cfg):
+    """What to say when a warehouse signs in but its schema shows no tables."""
+    t = TYPES[ctype]
+    ns = t.get("ns") or {}
+    label = next((f["label"].lower() for f in t["fields"] if f["key"] == ns.get("schema")),
+                 "schema")
+    said = f"Signed in, but this {label} has no tables the credential can see"
+    database = ns.get("database")
+    if database and not str(cfg.get(database) or "").strip():
+        db_label = next(f["label"].lower() for f in t["fields"] if f["key"] == database)
+        said += f" (no {db_label} is set, so the default one was used)"
+    return (said + ". Use “Sign in and list schemas” to pick the one that holds your data, "
+            "or grant the credential read access to its tables.")
 
 
 def _safe_connection_error(exc, connection_type, cfg):
@@ -873,7 +898,8 @@ def _refuse_save(probe):
     fields, so the screen can mark them; a failed sign-in stays one sentence."""
     said = f"connection test failed: {probe['error']}"
     if probe.get("fields"):
-        raise HTTPException(400, {"error": said, "fields": probe["fields"]})
+        raise HTTPException(400, {"error": said, "fields": probe["fields"],
+                                  "signed_in": bool(probe.get("signed_in"))})
     raise HTTPException(400, said)
 
 

@@ -465,7 +465,8 @@ export function ConnectForm({ tile, defaultName, takenNames, onDone, onError, on
   // A save refused for the form's fields marks them, like a sign-in would.
   function refusedSave(e) {
     if (e.detail?.fields) {
-      setTest({ ok: false, error: e.detail.error, fields: e.detail.fields });
+      setTest({ ok: false, error: e.detail.error, fields: e.detail.fields,
+                signed_in: !!e.detail.signed_in });
       onError("");
       return true;
     }
@@ -653,8 +654,10 @@ export function ConnectForm({ tile, defaultName, takenNames, onDone, onError, on
 
       {formRefused ? (
         <div className="error">
-          Fix the marked {Object.keys(fieldProblems).length > 1 ? "fields" : "field"} — nothing
-          was sent to {tile.meta?.label || "the server"} yet.
+          {test?.signed_in
+            ? "Signed in, but not saved — fix the marked field."
+            : <>Fix the marked {Object.keys(fieldProblems).length > 1 ? "fields" : "field"} — nothing
+              was sent to {tile.meta?.label || "the server"} yet.</>}
         </div>
       ) : test && (test.ok
         ? <div className="meta share-notice">
