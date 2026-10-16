@@ -158,7 +158,7 @@ export function isVisualConversation(c) {
 // tasks as the chat — but every answer is visualized, drawn with D3 alone (or
 // as a custom visual the AI writes), and shown right in the thread.
 export default function Chat({ conversationId, onConversationCreated, onOpenDashboard, modelsEpoch,
-                               visualMode = false, onOpenCharts }) {
+                               visualMode = false, onOpenCharts, onConversationMissing }) {
   const [canvas, setCanvas] = useState(null);
   const [chatOpen, setChatOpen] = useState(true);
   const [models, setModels] = useState([]);
@@ -199,6 +199,8 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
   const [showPlatform, setShowPlatform] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  // Why this is a new chat, when the one that was open turned out to be gone.
+  const [notice, setNotice] = useState("");
   const [failedActivity, setFailedActivity] = useState(null);
   // Live activity: the steps the agent has emitted so far this turn, refreshed
   // by the task poll — so the "thinking" bubble shows what is actually happening.
@@ -280,6 +282,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
       setMessages([]);
       return;
     }
+    setNotice("");
     api(`/conversations/${conversationId}/messages`)
       .then((ms) => {
         if (taskViewEpochRef.current !== epoch || activeConvRef.current !== conversationId) return;
@@ -309,16 +312,50 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
           })
           .catch(() => {});
       })
-      .catch(() => {
+      .catch((err) => {
         if (taskViewEpochRef.current !== epoch || activeConvRef.current !== conversationId) return;
         setMessages([]);
         setCanvas(null);
+        if (err?.status === 404) leaveMissingConversation(conversationId);
       });
   }, [conversationId]);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, busy]);
+
+  // A conversation can disappear under an open link: deleted in another tab,
+  // no longer shared, or never in this database at all (Studio once ran on its
+  // fallback store for an hour). Its id used to trap the user — the chat opened
+  // empty and every question failed with "Conversation not found". Now they
+  // land in a new chat, told why, with whatever they had asked or typed.
+  function leaveMissingConversation(id, question) {
+    if (!onConversationMissing) return false;
+    const draft = question || localStorage.getItem("studio_draft:" + id) || "";
+    localStorage.removeItem("studio_draft:" + id);
+    if (draft) localStorage.setItem("studio_draft:new", draft);
+    setNotice("That conversation isn't available any more — it may have been deleted or is no "
+              + "longer shared with you — so this is a new chat."
+              + (draft ? " What you asked is in the box below; send it to ask here." : ""));
+    onConversationMissing(id);
+    return true;
+  }
+
+  // A send that failed. A 404 may mean the conversation itself is gone, which
+  // is checked with the server (not guessed from the message) before leaving.
+  async function sendFailed(err, question) {
+    const id = conversationId;
+    if (err?.status === 404 && id && onConversationMissing) {
+      const gone = await api(`/conversations/${id}/messages`)
+        .then(() => false, (e) => e?.status === 404);
+      if (gone && activeConvRef.current === id && leaveMissingConversation(id, question)) {
+        setBusy(false);
+        return;
+      }
+    }
+    setError(err.message);
+    setBusy(false);
+  }
 
   async function send(e) {
     e?.preventDefault();
@@ -356,8 +393,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
       if (!conversationId) onConversationCreated(data.conversation_id);
       pollFor(data.task_id, data.conversation_id);
     } catch (err) {
-      setError(err.message);
-      setBusy(false);
+      await sendFailed(err, q);
     }
   }
 
@@ -395,8 +431,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
       });
       pollFor(data.task_id, data.conversation_id);
     } catch (err) {
-      setError(err.message);
-      setBusy(false);
+      await sendFailed(err);
     }
   }
 
@@ -417,7 +452,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
       setShowPlatform(false);
       if (!conversationId) onConversationCreated(data.conversation_id);
       pollFor(data.task_id, data.conversation_id);
-    } catch (e) { setError(e.message); setBusy(false); }
+    } catch (e) { await sendFailed(e); }
   }
 
   // A clarification chip re-asks the same question scoped the way the user
@@ -454,8 +489,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
       if (!conversationId) onConversationCreated(data.conversation_id);
       pollFor(data.task_id, data.conversation_id);
     } catch (err) {
-      setError(err.message);
-      setBusy(false);
+      await sendFailed(err, q);
     }
   }
 
@@ -651,6 +685,11 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
       </div>
 
       <div className="messages">
+        {notice && (
+          <div className="msg">
+            <div className="chat-notice" role="status">{notice}</div>
+          </div>
+        )}
         {messages.length === 0 && !busy && (
           <div className="empty">
             <div className="empty-title">
