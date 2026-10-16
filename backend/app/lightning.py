@@ -8,9 +8,10 @@ Every agent run becomes a *rollout* (prompt -> actions -> outcome) with a
 - User 👍/👎 feedback overwrites the heuristic — explicit reward beats guessed.
 - Recent failures are injected into the system prompt ("known pitfalls"), so
   the agent learns from bugs immediately, with no training run at all.
-- scripts/train_apo.py distills low-reward traces into prompts/system_learned.txt
-  (Agent Lightning's APO idea: optimize the prompt, not the weights) — the
-  right lever for API models like Claude/GPT, whose weights we can't touch.
+- learned_rules.py distills low-reward traces into draft rules on a schedule;
+  an admin approves them into every agent's prompt (Agent Lightning's APO
+  idea: optimize the prompt, not the weights) — the right lever for API
+  models like Claude/GPT, whose weights we can't touch.
 
 The second half of this module makes Studio a real Agent Lightning CLIENT
 (the `agentlightning` package, github.com/microsoft/agent-lightning), so the

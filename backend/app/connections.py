@@ -22,8 +22,21 @@ Security model:
   keeping their names (see "Built-in sources, managed from this screen").
   Same encryption, same admin gate; a disconnected or unreadable one fails
   closed and never falls back to the environment's credential.
+- Adding schemas to a live source never widens it: each picked schema becomes
+  a NEW source, pinned like any other. From an env-configured source the new
+  row stores only a reference ({"from_env": "<source>", "schema": …}), so the
+  deployment's secret never lands in this table, and a derived source follows
+  its parent: a rotated, replaced or disconnected built-in source takes it
+  along at once (resolve() keys its cache on the resolved config).
+- Disconnect is reversible, delete is not. A disconnected row (enabled=0) is
+  invisible to every read path — resolve(), source_entries() and RBAC all go
+  through _rows()/_row_by_name(), which only see enabled rows — so it fails
+  closed exactly like a deleted one. It keeps its ciphertext, so reconnecting
+  needs no re-typed secret, and keeps its NAME, so no other connection can take
+  that name and inherit the governance grants written against it.
 """
 import base64
+import hashlib
 import json
 import re
 import socket
@@ -37,7 +50,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from . import db
 from .auth import current_user
@@ -437,6 +450,47 @@ def _decrypt(token):
         return None
 
 
+#: Env-configured connector classes that can seed sources pinned to another
+#: schema, and the connection type each one corresponds to.
+_ENV_TYPES = ((PostgresConnector, "postgres"), (SnowflakeConnector, "snowflake"),
+              (DatabricksConnector, "databricks"), (BigQueryConnector, "bigquery"))
+
+
+def _env_parent(name):
+    """(ctype, live config) for a configured env source whose type has
+    namespaces, else None. Read from the connector itself, so it is exactly
+    the credential the deployment runs with right now."""
+    from . import connectors
+    conn = connectors._REGISTRY.get(name)
+    if conn is None:
+        return None
+    # As the source is set NOW: a replacement made on this screen wins, and one
+    # switched off here (an _Offline, none of these classes) takes its derived
+    # sources offline with it.
+    conn = managed_sources([name]).get(name, conn)
+    for cls, ctype in _ENV_TYPES:
+        if isinstance(conn, cls):
+            if not conn.configured():
+                return None
+            cfg = ({"dsn": conn._dsn(), "schema": conn._schema()} if ctype == "postgres"
+                   else conn._cfg())
+            return ctype, {k: str(v) for k, v in cfg.items() if v}
+    return None
+
+
+def _config(row):
+    """The config a row runs with: its decrypted dict, with a from_env
+    reference resolved against the deployment's current credential. None
+    when either half is unavailable — callers treat that as unconfigured."""
+    cfg = _decrypt(row["config"])
+    if cfg is None or "from_env" not in cfg:
+        return cfg
+    parent = _env_parent(cfg["from_env"])
+    if parent is None or parent[0] != row["ctype"]:
+        return None
+    return {**parent[1], **{k: v for k, v in cfg.items() if k != "from_env"}}
+
+
 def _rows():
     with db.connect() as c:
         rows = c.execute("SELECT * FROM data_connections WHERE enabled=1 ORDER BY created_at").fetchall()
@@ -466,6 +520,13 @@ def _evict_cached(name):
         _close_connector(hit[1])
 
 
+def _row_by_id(cid):
+    """Any row, enabled or not — for the admin routes that act on one."""
+    with db.connect() as c:
+        r = c.execute("SELECT * FROM data_connections WHERE id=?", (cid,)).fetchone()
+    return dict(r) if r else None
+
+
 def resolve(name):
     """The live connector for a user-connected source, or None. Cached per row;
     a row that no longer decrypts resolves to None (fail closed)."""
@@ -473,16 +534,20 @@ def resolve(name):
     if row is None or row["ctype"] not in TYPES:
         _evict_cached(name)
         return None
-    key = (row["id"], row["created_at"])
     # Validate the encrypted row against the CURRENT Studio secret before a
     # cache hit. Runtime secret rotation must fail closed immediately; an
     # already-open vendor session is not authority to keep using credentials
     # that this process can no longer decrypt. PBKDF derivation is cached, so
-    # this per-resolve Fernet authentication is cheap.
-    cfg = _decrypt(row["config"])
+    # this per-resolve Fernet authentication is cheap. A from_env row resolves
+    # against its parent's CURRENT credential, so the key carries the resolved
+    # config (hashed): a rotated, replaced or disconnected parent never leaves
+    # a derived source on the old connection.
+    cfg = _config(row)
     if cfg is None:
         _evict_cached(name)
         return None
+    key = (row["id"], row["created_at"],
+           hashlib.sha256(json.dumps(cfg, sort_keys=True).encode()).hexdigest())
     with _LOCK:
         hit = _CACHE.get(name)
         if hit and hit[0] == key:
@@ -513,7 +578,7 @@ def source_entries():
         t = TYPES.get(row["ctype"])
         if not t:
             continue
-        cfg = _decrypt(row["config"])
+        cfg = _config(row)
         out.append({"name": row["name"], "dialect": t["dialect"],
                     "configured": cfg is not None,
                     "type_label": t["label"], "ctype": row["ctype"],
@@ -674,13 +739,14 @@ def _hint(ctype, cfg):
 
 
 def _public(row):
-    cfg = _decrypt(row["config"])
+    cfg = _config(row)
     t = TYPES.get(row["ctype"], {})
     return {"id": row["id"], "name": row["name"], "ctype": row["ctype"],
             "type_label": t.get("label", row["ctype"]), "label": row.get("label") or "",
             "hint": _hint(row["ctype"], cfg) if cfg else "",
             "namespace": _namespace(row["ctype"], cfg) if cfg else "",
-            "configured": cfg is not None, "created_at": row.get("created_at")}
+            "configured": cfg is not None, "enabled": bool(row.get("enabled", 1)),
+            "created_at": row.get("created_at")}
 
 
 # ── Probe ────────────────────────────────────────────────────────────────
@@ -883,8 +949,13 @@ def types(user=Depends(current_user)):
 
 @router.get("")
 def list_connections(user=Depends(current_user)):
+    """Every connection, disconnected ones included (enabled=False) — this is
+    the only place a disconnected row is visible, so the admin can reconnect or
+    remove it."""
     _admin(user)
-    return [_public(r) for r in _rows()]
+    with db.connect() as c:
+        rows = c.execute("SELECT * FROM data_connections ORDER BY created_at").fetchall()
+    return [_public(dict(r)) for r in rows]
 
 
 @router.post("/test")
@@ -923,25 +994,35 @@ def _refuse_save(probe):
     raise HTTPException(400, said)
 
 
-@router.post("", status_code=201)
-def create_connection(body: ConnIn, user=Depends(current_user)):
-    _admin(user)
-    name = (body.name or "").strip().lower()
+def _create(user, name, ctype, stored, effective, label=""):
+    """Validate, probe with the `effective` config, then store `stored` —
+    the same dict for a typed credential, a from_env reference for a source
+    derived from the deployment's own."""
+    name = (name or "").strip().lower()
     if not _NAME_RE.match(name):
         raise HTTPException(400, "name must be 2-31 chars: lowercase letters, digits, - or _")
     from . import connectors
     if name in connectors._REGISTRY or _row_by_name(name):
         raise HTTPException(400, f"a source named '{name}' already exists")
-    if body.ctype not in TYPES:
-        raise HTTPException(400, f"unknown connection type '{body.ctype}'")
-    cfg = _normalized(body.ctype, {k: str(v) for k, v in (body.config or {}).items()})
-    _require_pin(body.ctype, cfg, "— each one becomes its own source")
-    probe = _probe(body.ctype, cfg)
+    with db.connect() as c:
+        parked = c.execute("SELECT 1 FROM data_connections WHERE name=?", (name,)).fetchone()
+    if parked:
+        # A disconnected row still owns the name (and any grants written
+        # against it) — the UNIQUE constraint would say so as a 500.
+        raise HTTPException(400, f"a disconnected source named '{name}' exists — "
+                                 "reconnect it or remove it first")
+    if ctype not in TYPES:
+        raise HTTPException(400, f"unknown connection type '{ctype}'")
+    effective = _normalized(ctype, effective)
+    if "from_env" not in stored:
+        stored = _normalized(ctype, stored)
+    _require_pin(ctype, effective, "— each one becomes its own source")
+    probe = _probe(ctype, effective)
     if not probe["ok"]:
         _refuse_save(probe)
-    row = {"id": str(uuid.uuid4()), "name": name, "ctype": body.ctype,
-           "label": (body.label or "").strip()[:80],
-           "config": _fernet().encrypt(json.dumps(cfg).encode()).decode(),
+    row = {"id": str(uuid.uuid4()), "name": name, "ctype": ctype,
+           "label": (label or "").strip()[:80],
+           "config": _fernet().encrypt(json.dumps(stored).encode()).decode(),
            "created_by": user["id"], "created_at": time.time(), "enabled": 1}
     with db.connect() as c:
         c.execute("INSERT INTO data_connections (id, name, ctype, label, config, "
@@ -950,7 +1031,139 @@ def create_connection(body: ConnIn, user=Depends(current_user)):
                    row["created_by"], row["created_at"]))
         c.commit()
     _evict_cached(name)
-    db.log_activity(user, "connection_create", prompt=name, source=body.ctype)
+    db.log_activity(user, "connection_create", prompt=name, source=ctype)
+    return _public(row)
+
+
+@router.post("", status_code=201)
+def create_connection(body: ConnIn, user=Depends(current_user)):
+    _admin(user)
+    # from_env is how a derived source points at the deployment's credential;
+    # it is minted only by add_schema below, never accepted from a client.
+    cfg = {k: str(v) for k, v in (body.config or {}).items() if k != "from_env"}
+    return _create(user, body.name, body.ctype, cfg, cfg, body.label)
+
+
+# ── Add schemas to a live source ─────────────────────────────────────────
+#
+# The connect form lists schemas only while the admin holds the credential
+# they just typed. A live source — above all an env-configured one, whose
+# secret the admin never sees — gets the same step without re-entering it.
+
+def _parent(name):
+    """(ctype, effective config, template, ns) for a live source that can have
+    schemas added. `template` is what a derived row stores before its schema
+    is set: a from_env reference when the credential is the deployment's, or
+    a copy of a typed credential (independent of its parent afterwards, like
+    picking several schemas at connect time)."""
+    env = _env_parent(name)
+    if env is not None:
+        ctype, cfg = env
+        template = {"from_env": name}
+    else:
+        row = _row_by_name(name)
+        cfg = _config(row) if row else None
+        if cfg is None:
+            raise HTTPException(404, f"no live source named '{name}' can list schemas")
+        ctype = row["ctype"]
+        raw = _decrypt(row["config"]) or {}
+        template = {"from_env": raw["from_env"]} if "from_env" in raw else dict(raw)
+    ns = (TYPES.get(ctype) or {}).get("ns") or {}
+    if not ns.get("schema"):
+        raise HTTPException(400, f"{TYPES[ctype]['label']} has no schemas to add")
+    return ctype, cfg, template, ns
+
+
+def _pinned(ns, schema, database=""):
+    return {ns["schema"]: schema,
+            **({ns["database"]: database} if ns.get("database") and database else {})}
+
+
+def _current(ctype, cfg, ns):
+    """The namespace a source is pinned to, with the type's default schema
+    filled in — a Postgres row saved without one runs on `public`."""
+    field = next((f for f in TYPES[ctype]["fields"] if f["key"] == ns["schema"]), {})
+    return {"schema": cfg.get(ns["schema"]) or field.get("default", ""),
+            "database": cfg.get(ns["database"], "") if ns.get("database") else ""}
+
+
+@router.get("/sources/{name}/namespaces")
+def browse_source(name: str, user=Depends(current_user)):
+    """Schemas a live source's own credential can see, plus the one it is
+    already pinned to (the picker shows that one as taken)."""
+    _admin(user)
+    ctype, cfg, _template, ns = _parent(name)
+    return {**_browse(ctype, cfg), "current": _current(ctype, cfg, ns)}
+
+
+class SchemaIn(BaseModel):
+    name: str
+    schema_: str = Field(alias="schema")
+    database: str | None = None
+
+
+@router.post("/sources/{name}/schemas", status_code=201)
+def add_schema(name: str, body: SchemaIn, user=Depends(current_user)):
+    """Bind ONE more schema of a live source as a new source. One per call so
+    the screen can report exactly which of several picks failed."""
+    _admin(user)
+    ctype, cfg, template, ns = _parent(name)
+    schema = body.schema_.strip()
+    database = (body.database or "").strip()
+    if not schema:
+        raise HTTPException(400, "pick a schema")
+    pin = _pinned(ns, schema, database)
+    current = _current(ctype, cfg, ns)
+    if schema == current["schema"] and (not ns.get("database") or database == current["database"]):
+        raise HTTPException(400, f"'{name}' is already pinned to {schema}")
+    return _create(user, body.name, ctype, {**template, **pin}, {**cfg, **pin},
+                   label=f"{name} · {schema}")
+
+
+def _set_enabled(cid, enabled):
+    with db.connect() as c:
+        c.execute("UPDATE data_connections SET enabled=? WHERE id=?", (1 if enabled else 0, cid))
+        c.commit()
+
+
+@router.post("/{cid}/disconnect")
+def disconnect_connection(cid: str, user=Depends(current_user)):
+    """Take the source offline without forgetting it: it leaves the picker and
+    every query path, but the encrypted credential and the name stay, so a
+    reconnect is one click and governance grants still mean the same source."""
+    _admin(user)
+    row = _row_by_id(cid)
+    if row is None:
+        raise HTTPException(404, "Not found")
+    if row["enabled"]:
+        _set_enabled(cid, False)
+        _evict_cached(row["name"])
+        db.log_activity(user, "connection_disconnect", prompt=row["name"], source=row["ctype"])
+    row["enabled"] = 0
+    return _public(row)
+
+
+@router.post("/{cid}/reconnect")
+def reconnect_connection(cid: str, user=Depends(current_user)):
+    """Bring a disconnected source back on its stored credential. Re-probed
+    first, like create: the password may have rotated while it was parked, and
+    a source that comes back dead is worse than one that says why it can't."""
+    _admin(user)
+    row = _row_by_id(cid)
+    if row is None:
+        raise HTTPException(404, "Not found")
+    if not row["enabled"]:
+        cfg = _config(row)
+        if cfg is None:
+            raise HTTPException(400, "the stored credential can no longer be read "
+                                     "(STUDIO_SECRET changed) — remove it and connect again")
+        probe = _probe(row["ctype"], cfg)
+        if not probe["ok"]:
+            raise HTTPException(400, f"connection test failed: {probe['error']}")
+        _set_enabled(cid, True)
+        _evict_cached(row["name"])
+        db.log_activity(user, "connection_reconnect", prompt=row["name"], source=row["ctype"])
+    row["enabled"] = 1
     return _public(row)
 
 

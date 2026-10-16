@@ -17,7 +17,7 @@ const require = createRequire(import.meta.url);
 let hooks = null;
 const bundle = await build({
   stdin: {
-    contents: `export {default as DataConnections, buildTiles, suggestName, planConnections, connectionReadiness, Namespaces, namespaceKey, namespaceLabel, remainingPickedNamespaces, GithubPanel, githubRegistrationReady, ConnectForm, instanceBadge, envActions}
+    contents: `export {default as DataConnections, buildTiles, suggestName, planConnections, connectionReadiness, Namespaces, namespaceKey, namespaceLabel, remainingPickedNamespaces, GithubPanel, githubRegistrationReady, ConnectForm, instanceBadge, envActions, userActions, Instances, planSchemaAdds}
       from "./src/components/DataConnections.jsx";
       export {metaFor} from "./src/components/sourceCatalog.jsx";`,
     resolveDir: frontend, loader: "jsx",
@@ -37,7 +37,8 @@ compiled.require = (id) => id === "react" ? {
 compiled._compile(bundle.outputFiles[0].text, compiled.filename);
 const { DataConnections, buildTiles, suggestName, planConnections, connectionReadiness,
         Namespaces, namespaceKey, namespaceLabel, remainingPickedNamespaces, GithubPanel,
-        githubRegistrationReady, metaFor, ConnectForm, instanceBadge, envActions } = compiled.exports;
+        githubRegistrationReady, metaFor, ConnectForm, instanceBadge, envActions,
+        userActions, Instances, planSchemaAdds } = compiled.exports;
 
 // What the four endpoints answer on a deployment with Postgres configured from
 // the environment, one user-added Snowflake, and S3 keys that were never set.
@@ -944,4 +945,143 @@ test("everything clears a typed catalog; a whole catalog pins it", () => {
   // An ordinary schema without a catalog keeps what was typed (unchanged).
   const [plain] = planConnections({ cfg, ns, name: "dbx", chosen: [{ database: "", schema: "sales" }] });
   assert.equal(plain.config.catalog, "typed");
+});
+
+// ── Disconnect / reconnect / remove ─────────────────────────────────────
+// A disconnected connection is gone from /catalog/sources — that is the point
+// — so only /connections still lists it. It must stay on its tile (so it can
+// be reconnected) without counting as live.
+
+const PARKED = { id: "c2", name: "old-sf", ctype: "snowflake", type_label: "Snowflake",
+                 hint: "acme-dev", configured: true, enabled: false };
+
+test("a disconnected connection stays on its tile but is not counted live", () => {
+  const tiles = byId(buildTiles({ types: TYPES, conns: [...CONNS, PARKED], sources: SOURCES }));
+  const parked = tiles.snowflake.instances.find((i) => i.name === "old-sf");
+  assert.deepEqual([parked.kind, parked.connId, parked.configured, parked.disconnected],
+                   ["user", "c2", false, true]);
+  assert.equal(tiles.snowflake.instances.filter((i) => i.configured).length, 1);
+  // A live connection is never mistaken for a parked one.
+  assert.equal(tiles.snowflake.instances.find((i) => i.name === "sales-sf").disconnected, false);
+});
+
+test("each row offers the action that fits its state, env sources none", () => {
+  const tile = byId(buildTiles({ types: TYPES, conns: [...CONNS, PARKED], sources: SOURCES })).snowflake;
+  const html = renderToStaticMarkup(React.createElement(Instances, { tile, onAct() {} }));
+  const rows = html.split('class="dbconn-row').slice(1);
+  const row = (name) => rows.find((r) => r.includes(`<b>${name}</b>`));
+
+  assert.match(row("sales-sf"), /Disconnect/);
+  assert.match(row("sales-sf"), /Remove/);
+  assert.doesNotMatch(row("sales-sf"), /Reconnect/);
+
+  assert.match(row("old-sf"), /^ dbconn-row-off"/);          // styled as parked
+  assert.match(row("old-sf"), />disconnected</);
+  assert.match(row("old-sf"), /Reconnect/);
+  assert.match(row("old-sf"), /Remove/);
+  assert.doesNotMatch(row("old-sf"), /Disconnect/);
+
+  // The env-configured Snowflake is switched off in the environment, not here.
+  assert.doesNotMatch(row("snowflake"), /<button/);
+});
+
+test("a connection whose credential no longer decrypts can only be removed", () => {
+  const broken = { ...CONNS[0], configured: false };
+  const sources = SOURCES.map((s) => s.name === "sales-sf" ? { ...s, configured: false } : s);
+  const tile = byId(buildTiles({ types: TYPES, conns: [broken], sources })).snowflake;
+  const html = renderToStaticMarkup(React.createElement(Instances, { tile, onAct() {} }));
+  assert.match(html, /credential unreadable/);
+  assert.match(html, /Remove/);
+  assert.doesNotMatch(html, /Disconnect|↻ Reconnect/);
+});
+
+test("a disconnected connection still holds its name against new ones", async () => {
+  await withApi({ __user: ADMIN, "/catalog/sources": SOURCES, "/connections/types": TYPES,
+                  "/connections": [...CONNS, { ...PARKED, name: "postgres-2", ctype: "postgres" }],
+                  "/m365/status": { configured: true, connected: false } },
+    async ({ flush }) => {
+      const panel = harness(DataConnections, { onClose() {} });
+      panel.render();
+      panel.start();
+      await flush();
+      panel.set(S.picked, "postgres");
+      // postgres-2 is parked, so the suggestion skips past it.
+      assert.match(panel.render(), /value="postgres-3"/);
+    });
+});
+
+test("connections made here and built-in sources each get their own actions", () => {
+  const tiles = byId(buildTiles({ types: TYPES, conns: [...CONNS, PARKED], sources: SOURCES, envs: ENVS }));
+  const sf = tiles.snowflake.instances;
+  assert.deepEqual(userActions(sf.find((i) => i.name === "sales-sf")), ["disconnect", "remove"]);
+  assert.deepEqual(userActions(sf.find((i) => i.name === "old-sf")), ["reconnect", "remove"]);
+  assert.deepEqual(userActions(sf.find((i) => i.name === "snowflake")), []);
+  assert.deepEqual(envActions(sf.find((i) => i.name === "old-sf")), []);
+  // One row component carries both: built-in actions via onManage, the rest via onAct.
+  const html = renderToStaticMarkup(React.createElement(Instances,
+    { tile: tiles.snowflake, onAct() {}, onManage() {} }));
+  const row = (name) => html.split('class="dbconn-row').slice(1).find((r) => r.includes(`<b>${name}</b>`));
+  assert.match(row("snowflake"), /Set up/);
+  assert.match(row("sales-sf"), /Disconnect/);
+  assert.match(row("old-sf"), /Reconnect/);
+});
+
+// ── Add schemas to a live source ────────────────────────────────────────
+// The connect form can list schemas only right after typing a credential; a
+// live source (the env-configured warehouse above all) adds them from its row.
+
+test("a live source can add schemas from its row — an env one gets nothing else", () => {
+  const tiles = byId(buildTiles({ types: TYPES, conns: [...CONNS, PARKED], sources: SOURCES }));
+  const rowsOf = (tile) => {
+    const html = renderToStaticMarkup(React.createElement(Instances, { tile, onAct() {} }));
+    const rows = html.split('class="dbconn-row').slice(1);
+    return (name) => rows.find((r) => r.includes(`<b>${name}</b>`));
+  };
+  const pg = rowsOf(tiles.postgres)("postgres");           // configured by environment
+  assert.match(pg, /Add schemas/);
+  assert.doesNotMatch(pg, /Disconnect|Remove/);
+
+  const sf = rowsOf(tiles.snowflake);
+  assert.match(sf("sales-sf"), /Add schemas/);             // a live user connection
+  assert.doesNotMatch(sf("old-sf"), /Add schemas/);        // parked: reconnect first
+  assert.doesNotMatch(sf("snowflake"), /<button/);          // env, not configured
+
+  // A type with no schemas (Neo4j) never offers the step.
+  const graph = { id: "neo4j", ns: {}, instances: [
+    { name: "neo4j", configured: true, kind: "env", disconnected: false }] };
+  assert.doesNotMatch(renderToStaticMarkup(React.createElement(Instances, { tile: graph, onAct() {} })),
+                      /Add schemas/);
+});
+
+test("added schemas are named after the source and dodge taken names", () => {
+  const plan = planSchemaAdds({
+    source: "postgres",
+    chosen: [{ database: "railway", schema: "messy_retail" }, { database: "railway", schema: "staging" }],
+    takenNames: new Set(["postgres", "postgres-staging"]),
+  });
+  assert.deepEqual(plan, [
+    { name: "postgres-messy-retail", schema: "messy_retail", database: "railway" },
+    { name: "postgres-staging-2", schema: "staging", database: "railway" },
+  ]);
+  assert.deepEqual(planSchemaAdds({ source: "postgres", chosen: [] }), []);
+  // Every schema of a catalog, and a long name keeps its suffix.
+  assert.equal(planSchemaAdds({ source: "databricks",
+    chosen: [{ database: "main", schema: "*" }] })[0].name, "databricks-all");
+  const long = "a".repeat(29);
+  const [first, second] = planSchemaAdds({ source: long,
+    chosen: [{ schema: "x1" }, { schema: "x1" }] });
+  assert.equal(first.name.length <= 31 && second.name.length <= 31, true);
+  assert.notEqual(first.name, second.name);
+  assert.match(second.name, /-2$/);
+});
+
+test("the source's own schema is listed but cannot be picked", () => {
+  const found = [{ database: "railway", schema: "messy_retail" }, { database: "railway", schema: "public" }];
+  const html = renderNs({ browse: { ok: true, namespaces: found },
+                          current: { schema: "public", database: "" } });
+  const items = html.split('class="conn-ns-item').slice(1);
+  const own = items.find((i) => i.includes("<span>public</span>"));
+  assert.match(own, /disabled=""/);
+  assert.match(own, /this source/);
+  assert.doesNotMatch(items.find((i) => i.includes("messy_retail")), /disabled|this source/);
 });

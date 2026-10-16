@@ -9,7 +9,9 @@ Locked in here:
   /catalog/sources; non-admin roles get the standard fail-closed treatment
   (allowed=False, 403 on tables) until governance grants the source;
 - a failing probe blocks the save; name rules reject builtins/duplicates/bad
-  slugs; a row that no longer decrypts fails CLOSED (unconfigured, no resolve).
+  slugs; a row that no longer decrypts fails CLOSED (unconfigured, no resolve);
+- disconnect is reversible: the source is offline on every read path but keeps
+  its credential and its name; reconnect re-probes before bringing it back.
 """
 import importlib
 
@@ -265,14 +267,81 @@ def test_delete_unregisters(client, monkeypatch):
     assert client.get("/api/catalog/sources/crm/tables").status_code == 403
 
 
+def test_disconnect_takes_the_source_offline_and_reconnect_restores_it(client, monkeypatch):
+    _stub_type(monkeypatch)
+    _login(client)
+    cid = _create(client).json()["id"]
+    from app import connections, rbac
+    from app.connectors import get_connector
+
+    r = client.post(f"/api/connections/{cid}/disconnect")
+    assert r.status_code == 200 and r.json()["enabled"] is False
+    # Offline on every read path, exactly like a deleted source…
+    assert connections.resolve("crm") is None
+    with pytest.raises(KeyError):
+        get_connector("crm")
+    assert "crm" not in {s["name"] for s in client.get("/api/catalog/sources").json()}
+    assert "crm" not in rbac.allowed_sources("admin")
+    assert client.get("/api/catalog/sources/crm/tables").status_code == 403
+    # …but still listed for the admin, and still owning its name.
+    row = next(c for c in client.get("/api/connections").json() if c["id"] == cid)
+    assert row["enabled"] is False and row["hint"] == "crm.internal"
+    taken = _create(client)
+    assert taken.status_code == 400 and "disconnected" in taken.json()["detail"]
+    # Idempotent: a second disconnect is not an error.
+    assert client.post(f"/api/connections/{cid}/disconnect").status_code == 200
+
+    r = client.post(f"/api/connections/{cid}/reconnect")
+    assert r.status_code == 200 and r.json()["enabled"] is True
+    assert get_connector("crm").list_tables() == ["orders", "users"]
+    assert "crm" in {s["name"] for s in client.get("/api/catalog/sources").json()}
+
+
+def test_reconnect_reprobes_the_stored_credential(client, monkeypatch):
+    _stub_type(monkeypatch)
+    _login(client)
+    cid = _create(client).json()["id"]
+    client.post(f"/api/connections/{cid}/disconnect")
+
+    # The warehouse starts refusing the credential while the source is parked.
+    monkeypatch.setattr(_Stub, "list_tables",
+                        lambda self: (_ for _ in ()).throw(RuntimeError("password expired")))
+    r = client.post(f"/api/connections/{cid}/reconnect")
+    # Refused, and — as for any probe where a secret was submitted — without
+    # the driver's text, which can carry the credential.
+    assert r.status_code == 400 and r.json()["detail"].startswith("connection test failed")
+    assert SECRET not in r.text
+    from app import connections
+    assert connections.resolve("crm") is None                    # stays offline
+
+    # A row that no longer decrypts cannot come back in place.
+    from app import db
+    c = db._conn()
+    c.execute("UPDATE data_connections SET config=?", ("not-a-fernet-token",))
+    c.commit()
+    c.close()
+    r = client.post(f"/api/connections/{cid}/reconnect")
+    assert r.status_code == 400 and "remove it and connect again" in r.json()["detail"]
+
+    # A disconnected source can still be removed outright, freeing the name.
+    assert client.delete(f"/api/connections/{cid}").status_code == 200
+    monkeypatch.setattr(_Stub, "list_tables", lambda self: ["orders", "users"])
+    assert _create(client).status_code == 201
+
+
 def test_non_admin_cannot_manage(client, monkeypatch):
     _stub_type(monkeypatch)
+    _login(client)
+    cid = _create(client).json()["id"]
     _login(client, "analyst@studio.local", "analyst123")
     assert client.get("/api/connections").status_code == 403
-    assert _create(client).status_code == 403
+    assert _create(client, name="crm2").status_code == 403
     assert client.post("/api/connections/test",
                        json={"ctype": "stub", "config": {}}).status_code == 403
     assert client.get("/api/connections/types").status_code == 403
+    assert client.post(f"/api/connections/{cid}/disconnect").status_code == 403
+    assert client.post(f"/api/connections/{cid}/reconnect").status_code == 403
+    assert client.delete(f"/api/connections/{cid}").status_code == 403
 
 
 # ── Fail closed when the row no longer decrypts ──────────────────────────
@@ -628,3 +697,183 @@ def test_throwaway_and_cached_connectors_are_closed(client, monkeypatch):
     monkeypatch.setattr(bootstrap, "jwt_secret", lambda: "a-new-runtime-secret")
     assert connections.resolve("rotating-source") is None
     assert cached_after_create.closed is True
+
+
+# ── Adding schemas to a live source ──────────────────────────────────────
+
+def _ns_stub_type(monkeypatch):
+    """The stub type, with a schema + database the picker can write into."""
+    from app import connections
+    monkeypatch.setitem(connections.TYPES, "stub", {
+        "label": "Stub DB", "dialect": "ansi", "build": _Stub, "hint_key": "host",
+        "ns": {"schema": "schema", "database": "database"},
+        "fields": [connections._field("host", "Host", required=True),
+                   connections._field("token", "Token", required=True, secret=True),
+                   connections._field("database", "Database"),
+                   connections._field("schema", "Schema", default="public")],
+    })
+
+
+class _EnvStub(_Stub):
+    """An env-configured source: its credential lives in the deployment."""
+    def __init__(self, token=SECRET):
+        super().__init__("stubenv", {"host": "wh.internal", "token": token,
+                                     "database": "acme", "schema": "public"})
+
+    def _cfg(self):
+        return dict(self.cfg)
+
+
+def _env_source(monkeypatch, token=SECRET):
+    from app import connections, connectors
+    env = _EnvStub(token)
+    monkeypatch.setitem(connectors._REGISTRY, "stubenv", env)
+    monkeypatch.setattr(connections, "_ENV_TYPES", ((_EnvStub, "stub"),))
+    return env
+
+
+def _stored(name):
+    from app import connections, db
+    c = db._conn()
+    raw = c.execute("SELECT config FROM data_connections WHERE name=?", (name,)).fetchone()[0]
+    c.close()
+    return connections._decrypt(raw)
+
+
+def test_a_connection_lists_its_schemas_without_the_credential(client, monkeypatch):
+    _ns_stub_type(monkeypatch)
+    _login(client)
+    assert client.post("/api/connections", json={
+        "name": "crm", "ctype": "stub",
+        "config": {"host": "crm.internal", "token": SECRET, "database": "acme"}}).status_code == 201
+    r = client.get("/api/connections/sources/crm/namespaces")
+    assert r.status_code == 200 and SECRET not in r.text
+    body = r.json()
+    assert {n["schema"] for n in body["namespaces"]} == {"public", "analytics"}
+    assert body["current"] == {"schema": "public", "database": "acme"}
+
+
+def test_adding_a_schema_creates_an_independent_pinned_source(client, monkeypatch):
+    _ns_stub_type(monkeypatch)
+    _login(client)
+    client.post("/api/connections", json={
+        "name": "crm", "ctype": "stub",
+        "config": {"host": "crm.internal", "token": SECRET, "database": "acme"}})
+    r = client.post("/api/connections/sources/crm/schemas",
+                    json={"name": "crm-analytics", "schema": "analytics", "database": "acme"})
+    assert r.status_code == 201, r.text
+    assert r.json()["namespace"] == "acme.analytics" and SECRET not in r.text
+    assert r.json()["label"] == "crm · analytics"
+    # A copy, like picking two schemas at connect time: removing the parent
+    # leaves the new source working.
+    parent = next(c for c in client.get("/api/connections").json() if c["name"] == "crm")
+    client.delete(f"/api/connections/{parent['id']}")
+    from app import connectors
+    assert connectors.get_connector("crm-analytics").cfg["schema"] == "analytics"
+
+
+def test_the_parents_own_schema_cannot_be_added_again(client, monkeypatch):
+    _ns_stub_type(monkeypatch)
+    _login(client)
+    client.post("/api/connections", json={
+        "name": "crm", "ctype": "stub",
+        "config": {"host": "crm.internal", "token": SECRET, "database": "acme"}})
+    r = client.post("/api/connections/sources/crm/schemas",
+                    json={"name": "crm-public", "schema": "public", "database": "acme"})
+    assert r.status_code == 400 and "already pinned" in r.json()["detail"]
+
+
+def test_an_env_source_binds_schemas_by_reference_never_by_copy(client, monkeypatch):
+    _ns_stub_type(monkeypatch)
+    env = _env_source(monkeypatch)
+    _login(client)
+    assert client.get("/api/connections/sources/stubenv/namespaces").json()["current"] == {
+        "schema": "public", "database": "acme"}
+    r = client.post("/api/connections/sources/stubenv/schemas",
+                    json={"name": "wh-analytics", "schema": "analytics", "database": "acme"})
+    assert r.status_code == 201, r.text
+    # The deployment's secret is not in the table — only where to find it.
+    assert _stored("wh-analytics") == {"from_env": "stubenv", "schema": "analytics",
+                                       "database": "acme"}
+    from app import connections, connectors
+    assert connectors.get_connector("wh-analytics").cfg["token"] == SECRET
+
+    # Rotating the env credential reaches the derived source (on the restart
+    # that rotation implies — here, a cleared cache).
+    env.cfg["token"] = "rotated-tok"
+    connections._CACHE.clear()
+    assert connectors.get_connector("wh-analytics").cfg["token"] == "rotated-tok"
+
+    # An env source that is switched off takes its derived sources with it.
+    env.cfg["token"] = ""
+    connections._CACHE.clear()
+    assert connections.resolve("wh-analytics") is None
+    srcs = {s["name"]: s for s in client.get("/api/catalog/sources").json()}
+    assert srcs["wh-analytics"]["configured"] is False
+
+
+def test_a_derived_source_follows_its_parent_as_set_now(client, monkeypatch):
+    """A built-in source can be replaced or switched off on this screen
+    (managed_sources), and its derived sources follow at once — no restart,
+    no stale cached connection on the old credential."""
+    _ns_stub_type(monkeypatch)
+    env = _env_source(monkeypatch)
+    _login(client)
+    r = client.post("/api/connections/sources/stubenv/schemas",
+                    json={"name": "wh-sales", "schema": "sales", "database": "acme"})
+    assert r.status_code == 201, r.text
+    from app import connections, connectors
+    first = connections.resolve("wh-sales")
+    assert first.cfg["token"] == SECRET
+
+    # The env credential rotates: the very next resolve uses it (cache keyed on it).
+    env.cfg["token"] = "rotated-tok"
+    assert connections.resolve("wh-sales").cfg["token"] == "rotated-tok"
+
+    # Replaced on the Data connections screen: the derived source follows.
+    managed = {}
+    monkeypatch.setattr(connections, "managed_sources", lambda names: {
+        n: managed[n] for n in names if n in managed})
+    managed["stubenv"] = _EnvStub(token="replaced-tok")
+    assert connections.resolve("wh-sales").cfg["token"] == "replaced-tok"
+
+    # Switched off there: the derived source goes offline with it (fails closed).
+    managed["stubenv"] = connections._Offline("stubenv", "ansi", "switched off")
+    assert connections.resolve("wh-sales") is None
+    srcs = {s["name"]: s for s in client.get("/api/catalog/sources").json()}
+    assert srcs["wh-sales"]["configured"] is False
+
+
+def test_a_source_derived_from_env_passes_on_the_reference(client, monkeypatch):
+    _ns_stub_type(monkeypatch)
+    _env_source(monkeypatch)
+    _login(client)
+    client.post("/api/connections/sources/stubenv/schemas",
+                json={"name": "wh-analytics", "schema": "analytics", "database": "acme"})
+    r = client.post("/api/connections/sources/wh-analytics/schemas",
+                    json={"name": "wh-staging", "schema": "staging", "database": "acme"})
+    assert r.status_code == 201, r.text
+    assert _stored("wh-staging") == {"from_env": "stubenv", "schema": "staging", "database": "acme"}
+
+
+def test_clients_cannot_mint_an_env_reference(client, monkeypatch):
+    _ns_stub_type(monkeypatch)
+    _env_source(monkeypatch)
+    _login(client)
+    r = client.post("/api/connections", json={
+        "name": "sneaky", "ctype": "stub",
+        "config": {"host": "x.internal", "token": "own-tok", "from_env": "stubenv"}})
+    assert r.status_code == 201
+    assert "from_env" not in _stored("sneaky")
+
+
+def test_adding_schemas_is_admin_only_and_needs_a_namespaced_live_source(client, monkeypatch):
+    _stub_type(monkeypatch)          # no `ns`: this type has no schemas
+    _login(client)
+    _create(client)
+    assert client.get("/api/connections/sources/crm/namespaces").status_code == 400
+    assert client.get("/api/connections/sources/nope/namespaces").status_code == 404
+    _login(client, "viewer@studio.local", "viewer123")
+    assert client.get("/api/connections/sources/crm/namespaces").status_code == 403
+    assert client.post("/api/connections/sources/crm/schemas",
+                       json={"name": "crm-x", "schema": "x"}).status_code == 403

@@ -299,7 +299,9 @@ def init_db():
             id TEXT PRIMARY KEY,
             user_id TEXT NOT NULL,
             note TEXT NOT NULL,
-            created_at REAL NOT NULL
+            embedding TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL
         );
         CREATE TABLE IF NOT EXISTS email_codes (
             email TEXT PRIMARY KEY,
@@ -650,25 +652,20 @@ def recent_failures(source, limit=5):
     return [r["error"] for r in rows]
 
 
-# ── Memory + email verification ─────────────────────────────────────────
+def active_learned_rules():
+    """The admin-approved learned rules (learned_rules.py owns the table and
+    its lifecycle), or None. Read on every agent turn — one indexed row — so
+    an approval or retirement reaches every replica on the next question."""
+    try:
+        with connect() as c:
+            row = c.execute("SELECT rules FROM learned_rules WHERE status='active'").fetchone()
+    except Exception:
+        return None   # table not created yet (an agent call before init_state)
+    return row["rules"] if row else None
 
-def add_memory(user_id, note):
-    with connect() as c:
-        c.execute(
-            "INSERT INTO user_memory (id, user_id, note, created_at) VALUES (?,?,?,?)",
-            (str(uuid.uuid4()), user_id, note[:500], time.time()),
-        )
-        c.commit()
 
-
-def list_memory(user_id, limit=20):
-    with connect() as c:
-        rows = c.execute(
-            "SELECT note FROM user_memory WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
-            (user_id, limit),
-        ).fetchall()
-    return [r["note"] for r in rows]
-
+# ── Email verification ──────────────────────────────────────────────────
+# (user_memory rows are owned by memory.py, which dedups and ranks them.)
 
 def set_email_code(email, code):
     with connect() as c:

@@ -621,7 +621,8 @@ def test_frontier_agent_exposes_optional_spawn_tool_but_descendant_profile_is_cl
     monkeypatch.setattr(agent, "concrete_model_spec", lambda spec: "openai:gpt-test")
     monkeypatch.setattr(agent, "self_hosted", lambda spec: False)
     monkeypatch.setattr(agent, "make_llm", lambda *a, **k: object())
-    monkeypatch.setattr(agent.db, "list_memory", lambda *a, **k: [])
+    from app import memory
+    monkeypatch.setattr(memory, "notes_for_prompt", lambda *a, **k: [])
     monkeypatch.setattr(agent, "_recent_failure_notes", lambda *a, **k: [])
     # graph_worker must not even ask for arbitrary MCP tools.
     monkeypatch.setattr(agent, "mcp_servers", lambda *a, **k: pytest.fail(

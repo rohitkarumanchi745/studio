@@ -1214,6 +1214,12 @@ input:focus, select:focus, .composer-pill:focus-within { box-shadow: 0 0 0 1px v
 .conn-ns-item:hover { border-color: var(--axis); }
 .conn-ns-item input { margin: 0; accent-color: var(--accent); }
 .conn-ns-on { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+.conn-ns-item:has(input:disabled) { cursor: default; opacity: .65; }
+/* Add schemas to a live source: the same picker, opened from a source row. */
+.conn-add-schemas {
+  display: flex; flex-direction: column; gap: 8px;
+  border-left: 3px solid var(--accent); padding-left: 10px;
+}
 .conn-req { color: var(--bad); }
 .conn-warn { color: var(--warn); }
 
@@ -1227,6 +1233,11 @@ input:focus, select:focus, .composer-pill:focus-within { box-shadow: 0 0 0 1px v
 .dbconn-row .chip { margin-left: auto; }
 .dbconn-row .m365-badge { margin-left: auto; }
 .dbconn-row .chip + .m365-badge, .dbconn-row .m365-badge + .chip { margin-left: 0; }
+.dbconn-row { flex-wrap: wrap; }
+.dbconn-actions { display: flex; gap: 6px; }
+.dbconn-actions .chip { margin-left: 0; }
+.dbconn-row-off { border-style: dashed; }
+.dbconn-row-off b, .dbconn-row-off .srcicon { opacity: 0.6; }
 
 @media (max-width: 620px) {
   .conn-form { grid-template-columns: 1fr; }

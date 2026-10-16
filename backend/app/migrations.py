@@ -343,6 +343,14 @@ def _m14_scrub_private_graph_trace_context(c, is_pg):
                   (json.dumps(meta, separators=(",", ":")), row["id"]))
 
 
+def _m15_user_memory_rank_columns(c, is_pg):
+    # memory.py dedups a re-remembered note by refreshing it (updated_at) and
+    # ranks notes against the prompt (embedding). NULL updated_at reads as
+    # created_at, so old notes keep their order.
+    _add_column(c, "user_memory", "embedding", "TEXT", is_pg)
+    _add_column(c, "user_memory", "updated_at", "REAL", is_pg)
+
+
 MIGRATIONS = [
     (1, "users.verified", _m1_users_verified),
     (2, "conversations.folder_id", _m2_conversations_folder_id),
@@ -358,6 +366,7 @@ MIGRATIONS = [
     (12, "agent_sessions.conversation_message_ids", _m12_agent_sessions_message_ids),
     (13, "agent_sessions.is_fork", _m13_agent_sessions_forks),
     (14, "agent_traces.scrub_private_graph_context", _m14_scrub_private_graph_trace_context),
+    (15, "user_memory.embedding+updated_at", _m15_user_memory_rank_columns),
 ]
 
 
