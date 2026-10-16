@@ -19,17 +19,19 @@ for the very table a question (or a join) needed. Locked in here:
 import json
 import os
 import tempfile
+import types
 
 _TMP = tempfile.mkdtemp(prefix="studio-schema-beyond-ten-test-")
 os.environ["STUDIO_DB_PATH"] = os.path.join(_TMP, "studio.db")
 
 import pytest
 
-from app import agent, chat, db, governance, matching, qcache, semantic, skills
+from app import agent, chat, connections, db, governance, matching, qcache, semantic, skills
 from app import router as model_router
 from app.connectors.demo import DemoConnector, seed
 
 ANA = {"id": "u-sb-ana", "email": "sb-ana@studio.test", "role": "analyst", "name": "Ana"}
+ADMIN = {"id": "u-sb-admin", "email": "sb-admin@studio.test", "role": "admin", "name": "Ad"}
 VIEWER = {"id": "u-sb-view", "email": "sb-view@studio.test", "role": "viewer", "name": "Vi"}
 SALES_SQL = "SELECT region, SUM(revenue) AS revenue FROM sales GROUP BY 1"
 GOV_YAML = """
@@ -44,6 +46,9 @@ compliance:
       deny_columns: [name]
     qualtrics_nps:
       deny_columns: [difficulty_driver]
+  dbx_all:
+    studio_dev.studio_qa.dim_customers:
+      deny_columns: [email]
 """
 
 
@@ -157,7 +162,8 @@ class _Msg:
         self.content = text
 
 
-def _turn_with_tool(monkeypatch, calls, schemas, focus=None):
+def _turn_with_tool(monkeypatch, calls, schemas, focus=None, connector=None, tables=TABLES,
+                    user=ANA):
     """run_agent with a scripted graph that only calls describe_table."""
     monkeypatch.setattr(agent, "llm_available", lambda *a, **k: True)
     monkeypatch.setattr(agent, "make_llm", lambda spec, user=None, **kw: object())
@@ -176,8 +182,8 @@ def _turn_with_tool(monkeypatch, calls, schemas, focus=None):
         return G()
 
     monkeypatch.setattr(agent, "_graph", fake_graph)
-    agent.run_agent("revenue by region", DemoConnector(), "*", TABLES, schemas, [], ANA,
-                    focus_schemas=focus)
+    agent.run_agent("revenue by region", connector or DemoConnector(), "*", tables, schemas, [],
+                    user, focus_schemas=focus)
     return seen
 
 
@@ -305,3 +311,83 @@ def test_focus_can_be_switched_off(turns, monkeypatch):
     monkeypatch.setattr(chat, "FOCUS_TABLES", 0)
     chat.ask(chat.Ask(prompt="revenue from sales", source="demo", table="*"), user=ANA)
     assert turns[0]["focus_schemas"] == {}
+
+
+# ── Databricks, every schema: full names, as on a real workspace ─────────
+# The real connector code against a scripted warehouse: twelve tables in one
+# schema sort ahead of the ones the questions are about.
+
+DBX_TABLES = ([("studio_dev", "analytics", f"kpi_{i:02d}") for i in range(1, 13)]
+              + [("studio_dev", "retail_qa", "retail_orders"),
+                 ("studio_dev", "studio_qa", "dim_customers"),
+                 ("studio_dev", "studio_qa", "fact_payments")])
+DBX_COLUMNS = {
+    "`studio_dev`.`studio_qa`.`fact_payments`": [("payment_id", "bigint"), ("customer_id", "bigint"),
+                                                 ("method", "string"), ("amount", "double")],
+    "`studio_dev`.`studio_qa`.`dim_customers`": [("customer_id", "bigint"), ("segment", "string"),
+                                                 ("email", "string")],
+}
+
+
+class _Cur:
+    def __init__(self):
+        self.rows, self.sql = [], []
+
+    def execute(self, sql, params=None):
+        self.sql.append(sql)
+        if "information_schema.tables" in sql:
+            self.rows = list(DBX_TABLES)
+        elif sql.startswith("DESCRIBE TABLE "):
+            self.rows = DBX_COLUMNS.get(sql[len("DESCRIBE TABLE "):], [("id", "bigint")])
+        else:
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+    def fetchall(self):
+        return self.rows
+
+    def described(self):
+        return [s[len("DESCRIBE TABLE "):] for s in self.sql if s.startswith("DESCRIBE TABLE ")]
+
+
+def _databricks():
+    conn = connections._DynDatabricks("dbx_all", {
+        "server_hostname": "dbc-1.cloud.databricks.com", "http_path": "/sql/1.0/warehouses/a",
+        "access_token": "dapi-x", "catalog": "studio_dev", "schema": "*"})
+    cur = _Cur()
+    conn._conn = lambda: types.SimpleNamespace(cursor=lambda: cur, close=lambda: None)
+    return conn, cur
+
+
+def test_databricks_tables_past_the_first_ten_are_read_by_full_name(monkeypatch):
+    conn, cur = _databricks()
+    tables = conn.list_tables()
+    assert len(tables) == 15 and "studio_dev.studio_qa.fact_payments" not in tables[:10]
+    schemas = {t: [] for t in tables[:10]}
+    seen = _turn_with_tool(monkeypatch, [["studio_dev.studio_qa.fact_payments"],
+                                         ["fact_payments"], ["studio_dev.other.fact_payments"],
+                                         ["studio_dev.studio_qa.dim_customers"]],
+                           schemas, connector=conn, tables=tables, user=ADMIN)
+    full, short, other, customers = seen["replies"]
+    assert [c["name"] for c in full["tables"][0]["columns"]] == \
+        ["payment_id", "customer_id", "method", "amount"]
+    # A short name, or a schema the source does not list, is never sent.
+    assert "error" in short["tables"][0] and "error" in other["tables"][0]
+    assert cur.described() == ["`studio_dev`.`studio_qa`.`fact_payments`",
+                               "`studio_dev`.`studio_qa`.`dim_customers`"]
+    # Governance applies to full names too.
+    assert [c["name"] for c in customers["tables"][0]["columns"]] == ["customer_id", "segment"]
+
+
+def test_a_databricks_question_brings_in_its_tables_through_a_whole_turn(turns, monkeypatch):
+    conn, cur = _databricks()
+    monkeypatch.setattr(chat, "connector_or_400", lambda source: conn)
+    chat.ask(chat.Ask(prompt="payments by method and customer segment", source="dbx_all",
+                      table="*"), user=ADMIN)
+    kw = turns[0]
+    assert set(kw["focus_schemas"]) == {"studio_dev.studio_qa.dim_customers",
+                                        "studio_dev.studio_qa.fact_payments"}
+    assert [c["name"] for c in kw["focus_schemas"]["studio_dev.studio_qa.dim_customers"]] == \
+        ["customer_id", "segment"]                                     # email denied
+    assert "write EVERY table" in kw["skill_md"]
+    assert ("### studio_dev.studio_qa.fact_payments\n  (columns not listed — call describe_table"
+            in kw["skill_md"])
