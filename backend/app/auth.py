@@ -22,6 +22,8 @@ production deploy booted without a secret (bootstrap.enforce() should have
 refused, but if it was bypassed) — signing and verifying then fail closed
 with a 500 rather than using any fallback string.
 """
+import hashlib
+import hmac
 import json
 import os
 import random
@@ -32,7 +34,7 @@ from typing import Optional
 
 import jwt
 import requests
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
@@ -198,10 +200,19 @@ def me(user=Depends(current_user)):
 #      AZURE_GROUP_ROLE_MAP, e.g. {"Studio-Admins": "admin", "Analysts": "analyst"}
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
-_SSO_STATES = {}  # state -> expiry (in-memory; fine for a single backend)
+# state -> (expiry, binding) (in-memory; fine for a single backend). The
+# binding is the hash of a nonce kept in an HttpOnly cookie of the browser
+# that started the login: the callback and the handoff below finish only in
+# that browser. Without it, a sign-in could be completed — or its handoff code
+# spent — in someone else's browser, logging them in as whoever started it
+# (login CSRF), and anything they then did (connect Microsoft 365, upload
+# documents) would land in that account.
+_SSO_STATES = {}
+_SSO_COOKIE = "studio_sso_bind"
+_SSO_STATE_TTL = 600
 _ROLE_RANK = {"admin": 3, "analyst": 2, "viewer": 1}
 
-# code -> (expiry, access_token, user dict). The token the SPA will use, parked
+# code -> (expiry, access_token, user dict, binding). The token the SPA will use, parked
 # for at most SSO_HANDOFF_TTL seconds and handed over exactly once, so the
 # redirect URL carries only an opaque code that is worthless the moment it is
 # spent. PER PROCESS, like _SSO_STATES: behind several replicas the exchange
@@ -210,6 +221,22 @@ _ROLE_RANK = {"admin": 3, "analyst": 2, "viewer": 1}
 # short-lived either way.
 _SSO_HANDOFF = {}
 SSO_HANDOFF_TTL = 60
+
+
+def _binding(nonce):
+    return hashlib.sha256(nonce.encode()).hexdigest()
+
+
+def _same_browser(request, binding):
+    """True when this request carries the login cookie whose hash is `binding`."""
+    nonce = request.cookies.get(_SSO_COOKIE) if request is not None else None
+    return bool(nonce and binding and hmac.compare_digest(_binding(nonce), binding))
+
+
+def _https(request, redirect):
+    return (request.url.scheme == "https"
+            or request.headers.get("x-forwarded-proto", "").split(",")[0].strip() == "https"
+            or str(redirect).startswith("https://"))
 
 
 def _azure_cfg():
@@ -256,16 +283,16 @@ def sso_status():
 
 
 @router.get("/azure/login")
-def azure_login():
+def azure_login(request: Request):
     cfg = _azure_cfg()
     if not cfg:
         msg = ("Azure SSO is not configured. Set AZURE_TENANT_ID / AZURE_CLIENT_ID / "
                "AZURE_CLIENT_SECRET in backend/.env (see auth.py for the app-registration steps).")
         return RedirectResponse(f"{FRONTEND_URL}/?sso_error={urllib.parse.quote(msg)}")
-    state = secrets.token_urlsafe(24)
+    state, nonce = secrets.token_urlsafe(24), secrets.token_urlsafe(32)
     now = time.time()
-    _SSO_STATES[state] = now + 600
-    for k in [k for k, exp in _SSO_STATES.items() if exp < now]:
+    _SSO_STATES[state] = (now + _SSO_STATE_TTL, _binding(nonce))
+    for k in [k for k, (exp, _b) in _SSO_STATES.items() if exp < now]:
         _SSO_STATES.pop(k, None)
     params = urllib.parse.urlencode({
         "client_id": cfg["client_id"],
@@ -275,23 +302,36 @@ def azure_login():
         "scope": "openid profile email User.Read",
         "state": state,
     })
-    return RedirectResponse(
+    out = RedirectResponse(
         f"https://login.microsoftonline.com/{cfg['tenant']}/oauth2/v2.0/authorize?{params}")
+    # SameSite=Lax: sent on Microsoft's top-level redirect back and on the
+    # SPA's same-origin exchange, never on a cross-site subrequest.
+    out.set_cookie(_SSO_COOKIE, nonce, max_age=_SSO_STATE_TTL, httponly=True,
+                   secure=_https(request, cfg["redirect"]), samesite="lax", path="/")
+    return out
 
 
 @router.get("/azure/callback")
-def azure_callback(code: str = None, state: str = None, error: str = None,
+def azure_callback(request: Request, code: str = None, state: str = None, error: str = None,
                    error_description: str = None):
     def fail(msg):
-        return RedirectResponse(f"{FRONTEND_URL}/?sso_error={urllib.parse.quote(msg[:300])}")
+        out = RedirectResponse(f"{FRONTEND_URL}/?sso_error={urllib.parse.quote(msg[:300])}")
+        out.delete_cookie(_SSO_COOKIE, path="/")
+        return out
 
     if error:
         return fail(error_description or error)
     cfg = _azure_cfg()
     if not cfg:
         return fail("Azure SSO is not configured.")
-    if not code or not state or _SSO_STATES.pop(state, 0) < time.time():
+    exp, binding = _SSO_STATES.pop(state, (0, None)) if state else (0, None)
+    if not code or exp < time.time():
         return fail("SSO state expired or invalid — try signing in again.")
+    if not _same_browser(request, binding):
+        # A genuine state finishing in a browser that did not start it: a
+        # forwarded sign-in link. Refused before the code is exchanged.
+        return fail("This sign-in was not started in this browser — sign in from Studio's "
+                    "login page.")
 
     token_res = requests.post(
         f"https://login.microsoftonline.com/{cfg['tenant']}/oauth2/v2.0/token",
@@ -332,20 +372,21 @@ def azure_callback(code: str = None, state: str = None, error: str = None,
     user = db.upsert_sso_user(email, name, role)
     # Neither the token nor the user payload goes in the URL — only a code that
     # POST /auth/sso/exchange trades for the session once.
-    return RedirectResponse(f"{FRONTEND_URL}/?sso_code={_park_sso_session(user)}")
+    # The cookie stays: the SPA's exchange below must come from this browser too.
+    return RedirectResponse(f"{FRONTEND_URL}/?sso_code={_park_sso_session(user, binding)}")
 
 
-def _park_sso_session(user):
+def _park_sso_session(user, binding):
     """Mint the user's JWT, park it under a fresh random handoff code, return
     the code. Expired entries are dropped on the way through so a process that
     only ever mints codes cannot grow a map of live tokens."""
     now = time.time()
-    for stale in [k for k, (exp, _t, _u) in _SSO_HANDOFF.items() if exp < now]:
+    for stale in [k for k, (exp, *_rest) in _SSO_HANDOFF.items() if exp < now]:
         _SSO_HANDOFF.pop(stale, None)
     code = secrets.token_urlsafe(32)
     _SSO_HANDOFF[code] = (now + SSO_HANDOFF_TTL, make_token(user),
                           {"id": user["id"], "email": user["email"],
-                           "name": user["name"], "role": user["role"]})
+                           "name": user["name"], "role": user["role"]}, binding)
     return code
 
 
@@ -354,16 +395,21 @@ class SsoCode(BaseModel):
 
 
 @router.post("/sso/exchange")
-def sso_exchange(body: SsoCode):
-    """Trade a handoff code for {access_token, user} — exactly once.
+def sso_exchange(body: SsoCode, request: Request, response: Response):
+    """Trade a handoff code for {access_token, user} — exactly once, and only
+    in the browser that started the login (its cookie matches the code's
+    binding). A forwarded `/?sso_code=` link is worthless elsewhere: binding
+    only the callback would still let a spent-elsewhere code log a stranger in.
 
     The entry is popped BEFORE anything is checked, so a replayed code (or one
-    scraped from a history entry, which never held the token) gets the same 400
-    as a forged or expired one. 400 rather than 401: nothing is authenticated
-    here yet, and the SPA's 401 handler must not reload the page under it.
+    scraped from a history entry, which never held the token), or one tried in
+    the wrong browser, gets the same 400 as a forged or expired one — and is
+    spent. 400 rather than 401: nothing is authenticated here yet, and the
+    SPA's 401 handler must not reload the page under it.
     """
     entry = _SSO_HANDOFF.pop((body.code or "").strip(), None)
-    if not entry or entry[0] < time.time():
+    if not entry or entry[0] < time.time() or not _same_browser(request, entry[3]):
         raise HTTPException(400, "SSO code is invalid or expired — sign in again")
-    _exp, token, user = entry
+    _exp, token, user, _binding_hash = entry
+    response.delete_cookie(_SSO_COOKIE, path="/")      # one login per cookie
     return {"access_token": token, "user": user}
