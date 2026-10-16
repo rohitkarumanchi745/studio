@@ -487,7 +487,18 @@ def _extract_usage(result):
 
 
 def _final_text(result):
-    for message in reversed(result.get("messages", [])):
+    """The answer THIS turn wrote: the last AI text after the user's prompt.
+
+    The message list also holds the conversation so far — prior answers go in
+    as AI messages — so walking all of it returned the PREVIOUS answer when
+    this turn ended on a tool call without writing anything: ask about one
+    table, switch to another, and the reply was the first table's summary."""
+    messages = result.get("messages", [])
+    start = 0
+    for i, message in enumerate(messages):
+        if getattr(message, "type", "") == "human":
+            start = i + 1                   # the current prompt is the last human turn
+    for message in reversed(messages[start:]):
         if getattr(message, "type", "") == "ai":
             content = message.content
             if isinstance(content, str) and content.strip():
@@ -498,6 +509,41 @@ def _final_text(result):
                 if text:
                     return text
     return ""
+
+
+_SUMMARY_SYSTEM = ("You are a data analyst. In 2-4 sentences, say what this query result shows "
+                   "in answer to the question, with concrete numbers from it. No SQL, no "
+                   "preamble, no markdown table.")
+
+
+def _summarize_result(llm, prompt, ctx):
+    """(text, usage) for a turn that ran a query but wrote no answer: one short
+    call over a sample of the result. Never raises — a failed summary falls
+    back to saying what came back, which is still this turn's answer."""
+    rows = ctx.get("rows") or []
+    try:
+        reply = llm.invoke([
+            ("system", _SUMMARY_SYSTEM),
+            ("user", json.dumps({"question": prompt, "columns": ctx.get("columns") or [],
+                                 "row_count": len(rows), "rows": rows[:PREVIEW_ROWS]},
+                                default=str)),
+        ])
+        text = _reply_content(reply).strip()
+        if text:
+            return text, _single_reply_usage(reply)
+    except Exception:
+        pass
+    shown = len(rows)
+    return (f"The query returned {shown} row{'' if shown == 1 else 's'} — "
+            "see the chart and the data below."), {}
+
+
+def _add_usage(a, b):
+    out = dict(a or {})
+    for k, v in (b or {}).items():
+        if isinstance(v, (int, float)):
+            out[k] = out.get(k, 0) + v
+    return out
 
 
 def _reply_content(reply):
@@ -938,8 +984,14 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
             graph = _graph(llm, base_tools, system, spec, volatile)
             result = graph.invoke({"messages": messages}, config={"recursion_limit": 16})
         if not self_hosted(spec):
-            text = _final_text(result) or "Done."
+            text = _final_text(result)
             usage = _extract_usage(result)
+            if not text and ctx["sql"] is not None and not ctx["errors"]:
+                # It queried and charted but wrote nothing: summarize what came
+                # back rather than show nothing (or an older answer).
+                text, extra = _summarize_result(llm, prompt, ctx)
+                usage = _add_usage(usage, extra)
+            text = text or "Done."
     except Exception as e:
         # Provider/graph failure — fall back so the product keeps working.
         msg = str(e)
