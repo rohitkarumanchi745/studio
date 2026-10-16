@@ -461,12 +461,16 @@ export function ConnectForm({ tile, defaultName, takenNames, onDone, onError, on
   // in anywhere. Editing a field clears them (setField resets test/browse).
   const fieldProblems = browse?.fields || test?.fields || {};
   const formRefused = Object.keys(fieldProblems).length > 0;
+  // How far it got: "check" (refused before any sign-in), "sign_in" (the
+  // workspace refused the credential or path), "signed_in" (signed in, but the
+  // catalog/schema is wrong or empty).
+  const refusedAt = browse?.stage || test?.stage || "check";
 
   // A save refused for the form's fields marks them, like a sign-in would.
   function refusedSave(e) {
     if (e.detail?.fields) {
       setTest({ ok: false, error: e.detail.error, fields: e.detail.fields,
-                signed_in: !!e.detail.signed_in });
+                stage: e.detail.stage });
       onError("");
       return true;
     }
@@ -654,8 +658,10 @@ export function ConnectForm({ tile, defaultName, takenNames, onDone, onError, on
 
       {formRefused ? (
         <div className="error">
-          {test?.signed_in
+          {refusedAt === "signed_in"
             ? "Signed in, but not saved — fix the marked field."
+            : refusedAt === "sign_in"
+            ? `${tile.meta?.label || "The server"} refused the sign-in — fix the marked field.`
             : <>Fix the marked {Object.keys(fieldProblems).length > 1 ? "fields" : "field"} — nothing
               was sent to {tile.meta?.label || "the server"} yet.</>}
         </div>

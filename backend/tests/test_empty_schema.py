@@ -71,7 +71,7 @@ def test_an_empty_warehouse_schema_cannot_be_saved(monkeypatch, cfg, mentions_ca
     out = connections._probe("databricks", {
         "server_hostname": "dbc-1.cloud.databricks.com", "http_path": "/sql/1.0/warehouses/a",
         "access_token": "dapi-x", **cfg})
-    assert out["ok"] is False and list(out["fields"]) == ["schema"] and out["signed_in"] is True
+    assert out["ok"] is False and list(out["fields"]) == ["schema"] and out["stage"] == "signed_in"
     assert out["error"].startswith("Signed in, but this schema has no tables")
     assert "Sign in and list schemas" in out["error"]
     assert ("no catalog is set" in out["error"]) is mentions_catalog

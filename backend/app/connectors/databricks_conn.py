@@ -202,19 +202,51 @@ _SAY_GAVE_UP = ("The workspace did not accept the sign-in in time. If the SQL wa
                 "Server hostname and HTTP path.")
 _SAY_CONNECT = "Could not open a connection to that host on port 443."
 # The driver's own fixed phrases, for when it hands over only text (its retry
-# policy reports a refused status as a sentence, not a code).
+# policy reports a refused status as a sentence, not a code). Whole phrases
+# only: a bare "NOT_FOUND" also matched Databricks' SCHEMA_NOT_FOUND, and a
+# schema that is not there was reported as a missing warehouse.
 _DRIVER_SAYS = (
-    ("Received 400", 400), ("Received 401", 401), ("UNAUTHORIZED", 401),
-    ("403 codes are not retried", 403), ("FORBIDDEN", 403),
-    ("Received 404", 404), ("NOT_FOUND", 404),
+    ("Received 400 - BAD_REQUEST", 400), ("Received 401 - UNAUTHORIZED", 401),
+    ("403 codes are not retried", 403), ("Received 404 - NOT_FOUND", 404),
 )
+# Server errors that name the problem once signed in: a catalog or schema that
+# is not there (or not visible to this token), or a permission it lacks. Checked
+# before any status code — they arrive inside otherwise ordinary errors.
+_NAMESPACE = (
+    ("catalog", re.compile(r"NO_SUCH_CATALOG|CATALOG_NOT_FOUND|"
+                           r"catalog\s+'[^']*'\s+(?:was\s+)?not\s+found", re.I)),
+    ("schema", re.compile(r"SCHEMA_NOT_FOUND|NO_SUCH_SCHEMA|NO_SUCH_DATABASE|"
+                          r"database\s+'[^']*'\s+not\s+found", re.I)),
+    ("permission", re.compile(r"INSUFFICIENT_PERMISSIONS|PERMISSION_DENIED|"
+                              r"does\s+not\s+have\s+(?:USE|USAGE|SELECT)", re.I)),
+)
+_SAY_NAMESPACE = {
+    "catalog": ("Signed in, but that catalog does not exist or this token cannot see it — use "
+                "“Sign in and list schemas” to pick one, or leave Catalog blank for the "
+                "workspace default."),
+    "schema": ("Signed in, but that schema does not exist in the catalog, or this token cannot "
+               "see it — use “Sign in and list schemas” to pick one."),
+    "permission": ("Signed in, but this token lacks permission on that catalog or schema — it "
+                   "needs USE CATALOG, USE SCHEMA and SELECT on the tables."),
+}
+# Which form field a failure points at, and how far the sign-in got.
+_FIELD_FOR_STATUS = {400: "http_path", 401: "access_token", 404: "http_path"}
 _SAY_TLS = "The secure (TLS) handshake with that host failed — is it a Databricks workspace?"
 
 
 def describe_error(exc):
-    """A plain sentence for why a Databricks sign-in failed, or None. Walks the
+    """A plain sentence for why a Databricks sign-in failed, or None."""
+    found = classify_error(exc)
+    return found["said"] if found else None
+
+
+def classify_error(exc):
+    """{said, field, stage} for a failed Databricks sign-in, or None. Walks the
     exception chain (the driver wraps urllib3's errors, which wrap the socket's)
-    and decides from the HTTP status and the exception TYPES only."""
+    and decides from the HTTP status, the exception TYPES and the server's
+    named error classes. `said` is a fixed sentence, never built from the
+    exception text; `field` is the form field to fix (or None); `stage` is
+    "signed_in" when the workspace accepted the credential, else "sign_in"."""
     seen, stack, codes, kinds, texts = set(), [exc], set(), set(), []
     while stack:
         e = stack.pop()
@@ -234,20 +266,28 @@ def describe_error(exc):
             stack += [ctx.get("original-exception"), ctx.get("no-retry-reason")]
         stack += [e.__cause__, e.__context__, getattr(e, "reason", None)]
     text = " ".join(t for t in texts if t)
+
+    def said(sentence, field=None, stage="sign_in"):
+        return {"said": sentence, "field": field, "stage": stage}
+
+    for what, pattern in _NAMESPACE:
+        if pattern.search(text):
+            return said(_SAY_NAMESPACE[what], None if what == "permission" else what,
+                        "signed_in")
     codes.update(code for phrase, code in _DRIVER_SAYS if phrase in text)
     for code in (401, 403, 404, 400, 429, 503):
         if code in codes:
-            return _SAY_STATUS[code]
+            return said(_SAY_STATUS[code], _FIELD_FOR_STATUS.get(code))
     if kinds & {"NameResolutionError", "gaierror"}:
-        return _SAY_RESOLVE
+        return said(_SAY_RESOLVE, "server_hostname")
     if "MaxRetryDurationError" in kinds or "max retry duration" in text:
-        return _SAY_GAVE_UP
+        return said(_SAY_GAVE_UP)
     if kinds & {"ConnectTimeoutError", "ReadTimeoutError", "TimeoutError", "timeout"}:
-        return _SAY_TIMEOUT
+        return said(_SAY_TIMEOUT)
     if kinds & {"SSLError", "SSLCertVerificationError"}:
-        return _SAY_TLS
+        return said(_SAY_TLS)
     if kinds & {"NewConnectionError", "ConnectionRefusedError"}:
-        return _SAY_CONNECT
+        return said(_SAY_CONNECT)
     return None
 
 

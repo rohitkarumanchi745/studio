@@ -45,6 +45,7 @@ from .connectors.base import Connector
 from .connectors.bigquery_conn import BigQueryConnector
 from .connectors.databricks_conn import PROBE_LIMITS as DATABRICKS_PROBE_LIMITS
 from .connectors.databricks_conn import DatabricksConnector
+from .connectors.databricks_conn import classify_error as classify_databricks_error
 from .connectors.databricks_conn import describe_error as describe_databricks_error
 from .connectors.graph_conn import GraphConnector
 from .connectors.postgres_conn import PostgresConnector
@@ -292,8 +293,21 @@ def _normalized(ctype, cfg):
 
 
 def _refused(problems):
-    """A probe/browse result for a form that failed its checks."""
-    return {"ok": False, "error": " ".join(problems.values()), "fields": problems}
+    """A probe/browse result for a form that failed its checks — before any
+    sign-in (stage "check")."""
+    return {"ok": False, "error": " ".join(problems.values()), "fields": problems,
+            "stage": "check"}
+
+
+def _failed(t, exc, cfg):
+    """A probe/browse result for a failed sign-in. A type that can tell which
+    field the failure points at (and whether the credential was accepted) marks
+    that field, so the form shows it where it was typed."""
+    out = {"ok": False, "error": _safe_connection_error(exc, t, cfg)}
+    found = t["classify"](exc) if t.get("classify") else None
+    if found and found.get("field"):
+        out.update(fields={found["field"]: out["error"]}, stage=found["stage"])
+    return out
 
 
 #: Connectable types: how to build one, its dialect, and the form the UI renders.
@@ -327,6 +341,7 @@ TYPES = {
         "needs_tables": True,
         "label": "Databricks SQL", "dialect": "databricks", "build": _DynDatabricks,
         "check": _check_databricks, "explain": describe_databricks_error,
+        "classify": classify_databricks_error,
         "resolve": "server_hostname",
         "resolve_says": ("That Server hostname does not resolve — copy it from "
                          f"{_DBX_WHERE} (it looks like dbc-1234abcd-5678.cloud.databricks.com)."),
@@ -687,14 +702,14 @@ def _probe(ctype, cfg):
             return {"ok": False, "error": "the connector reports itself unconfigured — check the fields"}
         tables = conn.list_tables()
     except Exception as e:
-        return {"ok": False, "error": _safe_connection_error(e, t, cfg)}
+        return _failed(t, e, cfg)
     finally:
         _close_connector(conn)
     if not tables and t.get("needs_tables"):
         # Signed in, but nothing to read: saved, every question would fail.
         said = _empty_scope(ctype, cfg)
         field = (t.get("ns") or {}).get("schema")
-        return {"ok": False, "error": said, "signed_in": True,
+        return {"ok": False, "error": said, "stage": "signed_in",
                 **({"fields": {field: said}} if field else {})}
     return {"ok": True, "tables": len(tables), "sample": list(tables)[:8]}
 
@@ -811,7 +826,7 @@ def _browse(ctype, cfg):
         found = conn.list_namespaces()
         connector_truncated = bool(getattr(conn, "namespaces_truncated", False))
     except Exception as e:
-        return {"ok": False, "error": _safe_connection_error(e, t, cfg), "namespaces": []}
+        return {**_failed(t, e, cfg), "namespaces": []}
     finally:
         _close_connector(conn)
     # Cap the list: a metastore can hold thousands, and the picker is a picker,
@@ -899,7 +914,7 @@ def _refuse_save(probe):
     said = f"connection test failed: {probe['error']}"
     if probe.get("fields"):
         raise HTTPException(400, {"error": said, "fields": probe["fields"],
-                                  "signed_in": bool(probe.get("signed_in"))})
+                                  "stage": probe.get("stage", "check")})
     raise HTTPException(400, said)
 
 
