@@ -16,6 +16,7 @@ import { api as sharedApi } from "../api";
 import ChartView from "./ChartView";
 import FilterBar, { EMPTY_CONTEXT } from "./FilterBar";
 import { captureKeyOrder } from "./renderers/format";
+import { backdropClose } from "../backdrop";
 
 const DEFAULT_LAYOUT = { cols: 12, row_h: 80, gap: 12 };
 const CROSS_DEBOUNCE = 0;    // chart clicks fire immediately
@@ -340,7 +341,7 @@ export function DashboardPicker({ onPick, onClose }) {
   }, []);
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
+    <div className="modal-backdrop" {...backdropClose(onClose)}>
       <div className="modal dash-picker" onClick={(e) => e.stopPropagation()}>
         <div className="modal-head">
           <div>

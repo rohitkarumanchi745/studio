@@ -22,6 +22,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { api, getUser } from "../api";
 import { CATEGORIES, SourceIcon, metaFor } from "./sourceCatalog";
+import { backdropClose } from "../backdrop";
 
 const STATUS_LABEL = {
   onboarding: "Onboarding — first sync running",
@@ -181,7 +182,7 @@ export default function DataConnections({ onClose }) {
   }
 
   return (
-    <div className="modal-backdrop" onClick={onClose}>
+    <div className="modal-backdrop" {...backdropClose(onClose)}>
       <div className="modal connect-modal" onClick={(e) => e.stopPropagation()}>
         <div className="modal-head">
           <div>
