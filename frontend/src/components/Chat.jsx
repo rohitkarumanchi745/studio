@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api";
 import Canvas from "./Canvas";
 import ChartView from "./ChartView";
+import Markdown from "./Markdown";
 import SqlLab from "./SqlLab";
 import ChatPipeline from "./ChatPipeline";
 import ChatWorkflow from "./ChatWorkflow";
@@ -804,17 +805,22 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
     }
   }
 
+  // Clicking your vote again takes it back (score 0); clicking the other one
+  // switches it. The server keeps one vote per answer either way.
   async function vote(score) {
-    if (!m.trace_id || voted) return;
-    setVoted(score);
+    if (!m.trace_id) return;
+    const previous = voted;
+    const next = voted === score ? 0 : score;
+    setVoted(next);
     try {
       await api("/feedback", {
         method: "POST",
-        body: JSON.stringify({ trace_id: m.trace_id, score }),
+        body: JSON.stringify({ trace_id: m.trace_id, score: next }),
       });
-      setStatus(score > 0 ? "thanks — the agent learns from this" : "flagged for agent learning");
+      setStatus(next === 0 ? "feedback removed"
+        : next > 0 ? "thanks — the agent learns from this" : "flagged for agent learning");
     } catch (e) {
-      setVoted(0);
+      setVoted(previous);
       setStatus(`feedback failed: ${e.message}`);
     }
   }
@@ -883,7 +889,7 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
           </span>
         </div>
         {m.activity_task_id && <AgentActivity key={m.activity_task_id} taskId={m.activity_task_id} steps={activitySteps || []} graph={m.graph} />}
-        {m.text && <p className="answer">{m.text}</p>}
+        {m.text && <Markdown className="answer" text={m.text} />}
         {/* The D3 & artifacts window draws every chart right in the thread,
             with D3 alone, under the answer it illustrates. */}
         {visualMode && (m.panels?.length > 0 || (m.chart && rows?.length > 0)) && (
@@ -1011,16 +1017,16 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
             <button
               className={"chip" + (voted === 1 ? " chip-on" : "")}
               onClick={() => vote(1)}
-              disabled={!!voted}
-              title="Good answer — reinforces this behavior"
+              aria-pressed={voted === 1}
+              title={voted === 1 ? "Take this back" : "Good answer — reinforces this behavior"}
             >
               👍
             </button>{" "}
             <button
               className={"chip" + (voted === -1 ? " chip-on" : "")}
               onClick={() => vote(-1)}
-              disabled={!!voted}
-              title="Wrong or unhelpful — the agent learns from flagged runs"
+              aria-pressed={voted === -1}
+              title={voted === -1 ? "Take this back" : "Wrong or unhelpful — the agent learns from flagged runs"}
             >
               👎
             </button>

@@ -131,29 +131,43 @@ def agl_available():
     return out
 
 
+def _score(mode, failed, has_sql, has_rows, chart_type, panels, errors):
+    if mode != "agent":
+        return None
+    if failed:
+        return 0.0
+    r = 0.35  # answered at all
+    if has_sql:
+        r += 0.25  # grounded in a real query
+    if has_rows:
+        r += 0.15  # the query produced data
+    if chart_type and chart_type != "table":
+        r += 0.15  # visualized the answer
+    if panels > 1:
+        r += 0.10  # multi-view answer
+    r -= 0.10 * min(errors, 2)  # stumbles along the way
+    return round(max(0.0, min(1.0, r)), 2)
+
+
 def heuristic_reward(result):
     """Score a run 0..1 from observable outcomes. User feedback replaces this.
 
     Fallback-mode runs return None — deterministic previews aren't agent
     behavior, and training on them would teach nothing.
     """
-    if result.get("mode") != "agent":
-        return None
-    text = result.get("text") or ""
-    if text.startswith("(Agent error"):
-        return 0.0
-    r = 0.35  # answered at all
-    if result.get("sql"):
-        r += 0.25  # grounded in a real query
-    if result.get("rows"):
-        r += 0.15  # the query produced data
     chart = result.get("chart") or {}
-    if chart.get("type") and chart.get("type") != "table":
-        r += 0.15  # visualized the answer
-    if len(result.get("panels") or []) > 1:
-        r += 0.10  # multi-view answer
-    r -= 0.10 * min(len(result.get("errors") or []), 2)  # stumbles along the way
-    return round(max(0.0, min(1.0, r)), 2)
+    return _score(result.get("mode"), (result.get("text") or "").startswith("(Agent error"),
+                  bool(result.get("sql")), bool(result.get("rows")), chart.get("type"),
+                  len(result.get("panels") or []), len(result.get("errors") or []))
+
+
+def heuristic_reward_of_trace(trace, meta):
+    """The same score, rebuilt from a stored chat trace — what a run goes back
+    to when its user takes their feedback back. Every input is on the row
+    (record_chat_trace stores them), so this equals the score it was given."""
+    return _score(trace.get("mode"), not trace.get("ok"), bool(trace.get("sql")),
+                  (trace.get("row_count") or 0) > 0, trace.get("chart_type"),
+                  trace.get("panel_count") or 0, len((meta or {}).get("errors") or []))
 
 
 def agent_reward(role, sub):
