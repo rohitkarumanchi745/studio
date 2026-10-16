@@ -27,7 +27,9 @@ const urlStub = {
 const bundle = await build({
   stdin: {
     contents: `export {default as ChartView, computeFit, LABELS} from "./src/components/ChartView.jsx";
-      export {D3_ONLY, D3_TYPES, networkData, beeswarmData, calendarData, packData, dayKey}
+      export {D3_ONLY, D3_TYPES, networkData, beeswarmData, calendarData, packData, dayKey,
+              histogramData, boxplotData, waterfallData, funnelData, radarData, singleValue,
+              sankeyData}
         from "./src/components/renderers/D3View.jsx";`,
     resolveDir: frontend, loader: "jsx",
   },
@@ -44,7 +46,8 @@ compiled.paths = Module._nodeModulePaths(frontend);
 compiled.require = (id) => (id === "echarts" ? { init() { return {}; } } : require(id));
 compiled._compile(bundle.outputFiles[0].text, compiled.filename);
 const { ChartView, computeFit, LABELS, D3_ONLY, D3_TYPES, networkData, beeswarmData,
-        calendarData, packData, dayKey } = compiled.exports;
+        calendarData, packData, dayKey, histogramData, boxplotData, waterfallData, funnelData,
+        radarData, singleValue, sankeyData } = compiled.exports;
 
 globalThis.localStorage = { getItem: () => null, setItem() {} };
 
@@ -141,4 +144,57 @@ test("picking the D3 engine draws a core type with D3", () => {
   } finally {
     globalThis.localStorage = { getItem: () => null, setItem() {} };
   }
+});
+
+// ── The rest of the catalog: the numbers each D3 chart is drawn from ────
+
+test("D3 covers the whole catalog: every chart type has a D3 renderer", () => {
+  for (const t of Object.keys(LABELS)) assert.ok(D3_TYPES.has(t), t);
+});
+
+test("a histogram bins like the ECharts one: equal widths, every value counted", () => {
+  const h = histogramData(["v"], Array.from({ length: 36 }, (_, i) => [i]), { x: "v", y: ["v"] });
+  assert.equal(h.bins.length, 6);                                  // √36
+  assert.equal(h.bins.reduce((a, b) => a + b.count, 0), 36);
+  assert.equal(h.bins[0].x0, 0);
+  assert.equal(h.bins.at(-1).x1, 35);
+});
+
+test("a box plot: quartiles, whiskers within 1.5×IQR, the rest outliers", () => {
+  const rows = [1, 2, 3, 4, 5, 6, 7, 8, 9, 40].map((v) => ["A", v]);
+  const [box] = boxplotData(["g", "v"], rows, { x: "g", y: ["v"] }).boxes;
+  assert.deepEqual([box.q1, box.median, box.q3], [3.25, 5.5, 7.75]);
+  assert.deepEqual([box.lo, box.hi, box.outliers, box.n], [1, 9, [40], 10]);
+});
+
+test("a waterfall runs a total and ends on it", () => {
+  const w = waterfallData(["s", "d"], [["a", 100], ["b", -30], ["c", 5]], { x: "s", y: ["d"] });
+  assert.deepEqual(w.steps.map((s) => [s.name, s.start, s.end, s.kind]), [
+    ["a", 0, 100, "up"], ["b", 100, 70, "down"], ["c", 70, 75, "up"], ["total", 0, 75, "total"]]);
+});
+
+test("a funnel sorts largest first with each stage's share of the first", () => {
+  const f = funnelData(["s", "n"], [["Paid", 10], ["Visit", 100], ["Signup", 40]], { x: "s", y: ["n"] });
+  assert.deepEqual(f.stages.map((s) => [s.name, s.share]), [["Visit", 1], ["Signup", 0.4], ["Paid", 0.1]]);
+});
+
+test("a radar needs 3–12 axes; a KPI is the one value, or the sum", () => {
+  const cols = ["k", "a", "b"];
+  const rows = [["x", 1, 5], ["y", 2, 4], ["z", 3, 9]];
+  const r = radarData(cols, rows, { x: "k", y: ["a", "b"] });
+  assert.deepEqual([r.axes, r.series.map((s) => s.name), r.max], [["x", "y", "z"], ["a", "b"], 9]);
+  assert.equal(radarData(cols, rows.slice(0, 2), { x: "k", y: ["a"] }), null);
+  assert.deepEqual(singleValue(["v"], [[7]], { y: ["v"] }), { value: 7, label: "v", rows: 1 });
+  assert.equal(singleValue(cols, rows, { y: ["b"] }).value, 18);
+});
+
+test("a sankey lays nodes out in columns by longest path and refuses a cycle", () => {
+  const cols = ["s", "t", "v"];
+  const s = sankeyData(cols, [["Ads", "Landing", 60], ["Landing", "Signup", 30],
+                              ["Ads", "Signup", 5], ["Ads", "Landing", 10]], { x: "s", y: ["t", "v"] });
+  const layer = Object.fromEntries(s.nodes.map((n) => [n.id, n.layer]));
+  assert.deepEqual(layer, { Ads: 0, Landing: 1, Signup: 2 });     // Signup after Landing
+  assert.equal(s.links.find((l) => l.source === "Ads" && l.target === "Landing").value, 70);
+  assert.equal(s.nodes.find((n) => n.id === "Landing").value, 70);  // max(in, out)
+  assert.equal(sankeyData(cols, [["a", "b", 1], ["b", "a", 1]], { x: "s", y: ["t", "v"] }), null);
 });

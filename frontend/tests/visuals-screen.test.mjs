@@ -67,12 +67,16 @@ test("a chart without x/y still gets columns to draw", () => {
 
 test("the D3 options are exactly the D3 types this data fits", () => {
   const opts = d3Options(COLUMNS, ROWS, CHART.chart);
-  for (const t of ["bar", "hbar", "pie", "donut", "beeswarm", "circle_pack"]) assert.ok(opts.includes(t), t);
-  for (const t of ["network", "calendar", "table", "kpi", "treemap"]) assert.ok(!opts.includes(t), t);
+  for (const t of ["bar", "hbar", "pie", "donut", "beeswarm", "circle_pack",
+                   "table", "kpi", "treemap", "funnel", "gauge", "histogram", "waterfall"]) {
+    assert.ok(opts.includes(t), t);
+  }
+  assert.ok(opts.includes("line"));
+  // What this data does not fit.
+  for (const t of ["network", "calendar", "boxplot", "sankey", "combo"]) assert.ok(!opts.includes(t), t);
   const days = d3Options(["day", "sessions"], [["2024-01-01", 3], ["2024-01-02", 5]], null);
   assert.ok(days.includes("calendar") && days.includes("area"));
-  // No line charts on this screen, whatever the data.
-  assert.ok(!opts.includes("line") && !days.includes("line"));
+  assert.ok(days.includes("line"));
 });
 
 test("the list groups by conversation and searches title, source and type", () => {

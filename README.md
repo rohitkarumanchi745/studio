@@ -1875,8 +1875,10 @@ measurable.
 26 chart types across four engines (ECharts default, Plotly, Vega-Lite, D3), with a
 data-shape fit check that hides types the current result can't support. Pick the
 engine per browser from the chart toolbar; a type an engine lacks falls back to
-ECharts. **D3** draws the core types as hand-built SVG and adds four that only it
-draws — whichever engine is picked:
+ECharts. **D3** draws the whole catalog as hand-built SVG — combo, treemap,
+funnel, radar, gauge, KPI, histogram, box plot, waterfall, sankey (a layered
+layout; a flow that loops back is refused) and the table included — and adds
+four types that only it draws, whichever engine is picked:
 
 | Type | Data it takes | Good for |
 |---|---|---|
@@ -1912,22 +1914,20 @@ the multi-agent path), and the answer comes back in the thread drawn by **D3
 alone**, as a D3 chart or a custom visual the AI writes. It is the chat's own
 turn (`visual: true` on `/api/chat/background`), so queries, permissions,
 governance, history and sharing work exactly as they do there. What changes: the
-agent always visualizes; `render_chart` takes only the types the window draws,
-which are D3's without the line chart (`agent.VISUAL_CHART_TYPES`, kept in step
-with the frontend's `VISUAL_TYPES`); and `agent.d3_only` gives any other chart
-its stand-in (a line becomes an area, a sankey a network, a treemap circle
-packing, a boxplot a beeswarm) and puts every panel on the D3 engine, including
-answers from the keyless fallback and the multi-agent orchestrator. Custom
-visuals written there are told to draw no line charts either. Custom visuals need one source; the multi-agent workers draw D3
-charts. The turn skips the semantic layer, the plan cache and BitNet routing,
+agent always visualizes, with any chart type — D3 draws the whole catalog
+(`agent.D3_CHART_TYPES`, kept in step with the frontend's `D3_TYPES`), the KPI
+and the table included; and `agent.d3_only` puts every panel on the D3 engine
+(turning an unknown type into a bar), including answers from the keyless
+fallback and the multi-agent orchestrator. Custom visuals need one source; the
+multi-agent workers draw D3 charts. The turn skips the semantic layer, the plan cache and BitNet routing,
 which return stock charts and cannot write a visual. Commands are read as
 questions there, so the window never builds a pipeline or submits a platform
 job, and its conversations carry a 🎨 in the title so they reopen in it.
 
 **Your charts** (⊞ in that window's toolbar) puts the two side by side for
 every chart in your conversations, in D3 terms only: a chart is "D3" or "not
-D3 yet", and **Use this** saves a D3 chart (never another engine, never a line
-chart). Pick a chart and it shows every
+D3 yet", and **Use this** saves a D3 chart (never another engine). Pick a chart
+and it shows every
 D3 chart type its data fits, drawn live, plus any custom visuals — describe one
 and the AI writes it there. **Use this** saves the choice as a new canvas version
 of that answer (`chat.visual_apply`): the same server-side rules as a canvas edit

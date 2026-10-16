@@ -15,8 +15,8 @@ import PlotlyView, { PLOTLY_TYPES } from "./renderers/PlotlyView";
 import VegaView, { VEGA_TYPES } from "./renderers/VegaView";
 import ArtifactView, { downloadArtifact } from "./renderers/ArtifactView";
 import D3View, {
-  D3_ONLY, D3_TYPES, LIMITS as D3_LIMITS, VISUAL_TYPES, beeswarmData, calendarData, networkData,
-  packData, visualType,
+  D3_ONLY, D3_TYPES, LIMITS as D3_LIMITS, beeswarmData, calendarData, d3Type, networkData,
+  packData,
 } from "./renderers/D3View";
 
 const ENGINES = [
@@ -36,10 +36,9 @@ const TYPE_GROUPS = [
   ["KPI", ["kpi", "gauge"]],
   ["Data", ["table"]],
 ];
-// The picker in d3Only mode: the same groups, holding only what the D3 &
-// artifacts window draws (D3, no line chart).
+// The picker in d3Only mode: the same groups, holding what D3 draws (all of it).
 const D3_GROUPS = TYPE_GROUPS
-  .map(([g, ts]) => [g, ts.filter((t) => VISUAL_TYPES.has(t))])
+  .map(([g, ts]) => [g, ts.filter((t) => D3_TYPES.has(t))])
   .filter(([, ts]) => ts.length);
 export const LABELS = {
   bar: "Bar", hbar: "Horizontal bar", stacked_bar: "Stacked bar", combo: "Combo (bar+line)",
@@ -153,14 +152,14 @@ export default function ChartView({
   // The engine chosen for THIS chart on the Visuals screen; it overrides the
   // browser-wide default (the toolbar can still switch for this session).
   engine: chosenEngine,
-  // The D3 & artifacts window: draw with D3 alone — no engine picker, only
-  // the types that window draws (no line chart), and no table standing in.
+  // The D3 & artifacts window: draw with D3 alone — no engine picker, the
+  // types D3 draws, and the KPI and table drawn by D3 as well.
   d3Only = false,
   // Dashboard tile props: identify the tile, apply a cross-filter highlight,
   // report clicks upward, and surface format warnings. All optional.
   tileId, highlight, onSelect, onWarnings,
 }) {
-  const pickType = (t) => (d3Only ? visualType(t) : t || "table");
+  const pickType = (t) => (d3Only ? d3Type(t) : t || "table");
   const [type, setType] = useState(pickType(chart?.type));
   useEffect(() => setType(pickType(chart?.type)), [chart]);
 
@@ -221,7 +220,9 @@ export default function ChartView({
     : engine === "vega" && VEGA_TYPES.has(type) ? "vega"
     : engine === "d3" && D3_TYPES.has(type) ? "d3"
     : "echarts";
-  const plottable = typeOk && spec && type !== "table" && type !== "kpi";
+  // In the D3 window D3 draws the KPI and the table too; elsewhere they are the
+  // KPI card and the data table.
+  const plottable = typeOk && spec && (d3Only || (type !== "table" && type !== "kpi"));
   let option = plottable && drawEngine === "echarts" ? buildOption(columns, rows, spec) : null;
   if (option) {
     // spec.format is declarative (number formats, labels, axis titles,
@@ -290,7 +291,7 @@ export default function ChartView({
           with ECharts instead.
         </div>
       )}
-      {typeOk && type === "kpi" && spec ? (
+      {typeOk && type === "kpi" && spec && !d3Only ? (
         <KpiCard columns={columns} rows={rows} spec={spec} />
       ) : plottable && drawEngine === "plotly" ? (
         <PlotlyView columns={columns} rows={rows} spec={spec} tall={tall} />

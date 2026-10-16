@@ -128,14 +128,74 @@ test("every type D3 claims draws without throwing", () => {
     beeswarm: [["g", "v"], [["a", 1], ["b", 2]], { x: "g", y: ["v"] }],
     circle_pack: [["g", "v"], [["a", 1], ["b", 2]], { x: "g", y: ["v"] }],
     heatmap: [["a", "b", "v"], [["x", "y", 1]], { x: "a", y: ["b", "v"] }],
+    ...MORE,
   };
   for (const type of D3_TYPES) {
     const [columns, rows, spec] = fixtures[type] || [REGIONS.columns, REGIONS.rows,
                                                      { x: "region", y: ["revenue", "cost"] }];
     const { out, count } = render(type, columns, rows, spec);
     assert.notEqual(out, false, type);
-    assert.equal(count("svg"), 1, type);
+    assert.equal(count(type === "table" ? "table" : "svg"), 1, type);
   }
+});
+
+// The rest of the catalog, drawn with D3 for the D3 & artifacts window.
+const FLOWS = [["source", "target", "visits"],
+               [["Ads", "Landing", 60], ["Search", "Landing", 40], ["Landing", "Signup", 30],
+                ["Landing", "Bounce", 70], ["Signup", "Paid", 12]],
+               { x: "source", y: ["target", "visits"] }];
+const SPREAD = [["team", "hours"],
+                [...Array.from({ length: 9 }, (_, i) => ["A", 10 + i]), ["A", 60],
+                 ...Array.from({ length: 6 }, (_, i) => ["B", 20 + i * 2])],
+                { x: "team", y: ["hours"] }];
+const BRIDGE = [["step", "delta"], [["Start", 100], ["Price", 20], ["Churn", -35], ["Upsell", 15]],
+                { x: "step", y: ["delta"] }];
+const MORE = {
+  sankey: FLOWS, boxplot: SPREAD, waterfall: BRIDGE,
+  kpi: [["revenue"], [[1234.5]], { x: "revenue", y: ["revenue"] }],
+  gauge: [["score"], [[72]], { x: "score", y: ["score"] }],
+  histogram: [["amount"], Array.from({ length: 50 }, (_, i) => [i * 3]), { x: "amount", y: ["amount"] }],
+};
+
+test("the rest of the catalog draws every datum it is given", () => {
+  const tree = render("treemap", REGIONS.columns, REGIONS.rows, { x: "region", y: ["revenue"] });
+  assert.equal(tree.count("rect"), 4);
+  assert.equal(render("funnel", REGIONS.columns, REGIONS.rows, { x: "region", y: ["revenue"] })
+    .count("path"), 4);
+  const radar = render("radar", REGIONS.columns, REGIONS.rows, { x: "region", y: ["revenue", "cost"] });
+  assert.equal(radar.count("circle"), 8);                // 2 series × 4 axes
+  const combo = render("combo", REGIONS.columns, REGIONS.rows, { x: "region", y: ["revenue", "cost"] });
+  assert.equal(combo.count("rect[rx='3']"), 4);          // bars for revenue
+  assert.equal(combo.count("circle"), 4);                // a line (with points) for cost
+  const hist = render("histogram", ...MORE.histogram);
+  assert.equal(hist.count("rect[rx='2']"), 7);           // ≈√50 bins
+  const box = render("boxplot", ...SPREAD);
+  assert.equal(box.count("rect[rx='3']"), 2);            // one box per team
+  assert.equal(box.count("circle"), 1);                  // the 60-hour outlier
+  const fall = render("waterfall", ...BRIDGE);
+  const fills = [...fall.el.querySelectorAll("rect[rx='3']")].map((r) => r.getAttribute("fill"));
+  assert.deepEqual(fills, ["#008300", "#008300", "#e66767", "#008300", "#3987e5"]); // + total
+  const flow = render("sankey", ...FLOWS);
+  assert.equal(flow.count("rect"), 6);                   // six nodes
+  assert.equal(flow.count("path"), 5);                   // five flows
+  assert.match(render("kpi", ...MORE.kpi).el.textContent, /1,234\.5/);
+  assert.equal(render("gauge", ...MORE.gauge).count("path"), 2);
+  const table = render("table", REGIONS.columns, REGIONS.rows);
+  assert.equal(table.count("tbody tr"), 4);
+  assert.equal(table.count("th"), 3);
+});
+
+test("a flow that loops back, or a box with no groups, is refused", () => {
+  assert.equal(render("sankey", ["a", "b", "v"], [["x", "y", 1], ["y", "x", 1]],
+                      { x: "a", y: ["b", "v"] }).out, false);
+  assert.equal(render("boxplot", ["v"], [[1]], { x: "nope", y: ["v"] }).out, false);
+  assert.equal(render("radar", ["a", "v"], [["x", 1], ["y", 2]], { x: "a", y: ["v"] }).out, false);
+});
+
+test("table cells are text, never markup", () => {
+  const { el } = render("table", ["name"], [["<img src=x onerror=alert(1)>"]]);
+  assert.equal(el.querySelectorAll("img").length, 0);
+  assert.match(el.querySelector("td").textContent, /<img/);
 });
 
 test("a tooltip shows data as text, never as markup", () => {

@@ -128,15 +128,9 @@ def parse(text):
             "explanation": str(obj.get("explanation") or "").strip()[:600]}
 
 
-# The D3 & artifacts window and its chart screen use no line charts.
-NO_LINE_CHARTS = ("\n- Do not draw a line chart (a series traced as a line). Show change "
-                  "over time as an area, bars or a calendar instead.")
-
-
-def generate(llm, columns, rows, request, title="", no_line_charts=False):
+def generate(llm, columns, rows, request, title=""):
     """Ask `llm` for a visual of this result. One retry, with the reason, when
-    the reply is unusable or the lint finds a problem; then VisualError.
-    no_line_charts: for the D3 & artifacts surfaces, which use none."""
+    the reply is unusable or the lint finds a problem; then VisualError."""
     payload = json.dumps({
         "request": request,
         "title_hint": title,
@@ -148,8 +142,7 @@ def generate(llm, columns, rows, request, title="", no_line_charts=False):
     feedback = ""
     last = "no reply"
     for _ in range(2):
-        reply = llm.invoke([("system", PROMPT + (NO_LINE_CHARTS if no_line_charts else "")),
-                            ("user", payload + feedback)])
+        reply = llm.invoke([("system", PROMPT), ("user", payload + feedback)])
         try:
             out = parse(_text(reply))
         except VisualError as e:
