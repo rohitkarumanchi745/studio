@@ -82,9 +82,10 @@ def scope(user, source, *, table_label="*"):
     if not rbac.can_access(_role(user), source, table_label or "*"):
         raise QueryRejected(f"Your role has no access to {source}")
     connector = sources.connector_or_400(source)
-    allowed = rbac.allowed_tables(_role(user), source, connector.list_tables())
+    tables = connector.list_tables()
+    allowed = rbac.allowed_tables(_role(user), source, tables)
     if not allowed:
-        raise QueryRejected("Your role has no access to this source")
+        raise QueryRejected(rbac.nothing_to_read(source, tables))
     return connector, allowed
 
 

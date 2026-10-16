@@ -1236,7 +1236,12 @@ skill files all apply to it unchanged.
 - **Saved only after a live probe.** Namespace discovery validates the submitted
   credentials but does not save them. Each selected or typed namespace is then
   persisted only after its own `list_tables()` probe succeeds, so one credential
-  can create several separately scoped sources without saving a broken scope.
+  can create several separately scoped sources without saving a broken scope. A
+  SQL warehouse schema that signs in but shows **no tables** is refused too, with
+  the schema field marked (and a note when no catalog/database was set, so the
+  default one was used): saved, every question would fail. A source that is
+  empty anyway says so — "has no tables to read" — instead of "no access",
+  which is kept for a role that is filtered down to nothing.
 - **Checked before any sign-in (Databricks).** The form's usual mix-ups are
   refused at once, each marked on its own field with where the right value is: a
   token or secret pasted as the Server hostname, a browser address as the HTTP
