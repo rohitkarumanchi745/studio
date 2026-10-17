@@ -566,11 +566,26 @@ def stored_step_allowed(role, step, source=None):
         # keep only names the policy grants, just as the live catalog filter
         # does. Passing ['sales'] as a Snowflake catalog would wrongly hide
         # an allowed bare `sales`, whose stored name is SALES.
+        #
+        # A source that spans catalogs and schemas (queryguard.FULL_NAMES, e.g.
+        # Databricks "all schemas") lists and grants tables by their FULL name
+        # and the guard matches references whole, so the candidates must be
+        # full names too: reduced to `retail_products`, every stored answer on
+        # such a source was refused and showed as "Hidden" — even to its owner.
+        qualifiers = connector.qualifiers()
         tokens, _ = queryguard._tokens(step["sql"].strip().rstrip(";"))
-        references = [queryguard._canon(parts[-1], dialect)
-                      for parts, _ in queryguard._table_refs(tokens)]
+        if qualifiers is queryguard.FULL_NAMES:
+            # Only names inside the source's own scope stand in for its listing.
+            in_scope = getattr(connector, "full_name_in_scope", None) or (lambda _name: True)
+            references = [name for name in
+                          (".".join(queryguard._canon(part, dialect) for part in parts)
+                           for parts, _ in queryguard._table_refs(tokens))
+                          if in_scope(name)]
+        else:
+            references = [queryguard._canon(parts[-1], dialect)
+                          for parts, _ in queryguard._table_refs(tokens)]
         allowed = [name for name in references if rbac.can_access(role, source, name)]
-        queryguard.validate(step["sql"], allowed, qualifiers=connector.qualifiers(), dialect=dialect)
+        queryguard.validate(step["sql"], allowed, qualifiers=qualifiers, dialect=dialect)
         return True
     except Exception:
         return False

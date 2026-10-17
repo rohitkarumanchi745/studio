@@ -372,6 +372,22 @@ class DatabricksConnector(Connector):
         """Its tables are named catalog.schema.table (skills tell the agent)."""
         return self.all_schemas
 
+    def full_name_in_scope(self, name):
+        """Whether a catalog.schema.table name lies where list_tables() looks:
+        the pinned catalog when there is one, else any catalog but `system`,
+        and never information_schema. Read-time checks of stored SQL use it
+        in place of a live listing, so a policy of "*" still cannot release
+        an answer that names a table this source would never have listed."""
+        parts = str(name).lower().split(".")
+        if len(parts) != 3 or not all(parts):
+            return False
+        catalog = (self._cfg()["catalog"] or "").strip().lower()
+        if catalog and parts[0] != catalog:
+            return False
+        if parts[0] in {c.lower() for c in _SKIPPED_CATALOGS}:
+            return False
+        return parts[1] != "information_schema"
+
     def configured(self):
         cfg = self._cfg()
         if not (cfg["server_hostname"] and cfg["http_path"] and cfg["access_token"]):
