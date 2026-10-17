@@ -171,14 +171,19 @@ function runner(code) {
   }
   var data = rowsOf(JSON.parse(document.getElementById("studio-data").textContent));
   var el = document.getElementById("root");
-  function draw(d3, data, el, size, ui) {
+  // The code is the BODY of draw(d3, data, el, size, ui). Models sometimes
+  // write the whole function instead; wrapped, that only declares a nested
+  // draw nobody calls — a blank frame, no error. So the wrapper has its own
+  // name, and when the code left a draw of its own and drew nothing, call it.
+  function __studioDraw(d3, data, el, size, ui) {
 ${code}
+    ;if (typeof draw === "function" && !el.hasChildNodes()) return draw(d3, data, el, size, ui);
   }
   function render() {
     el.replaceChildren();
     try {
-      draw(window.d3, data, el, { width: el.clientWidth || innerWidth, height: el.clientHeight || innerHeight },
-           window.__studioUi);
+      __studioDraw(window.d3, data, el, { width: el.clientWidth || innerWidth, height: el.clientHeight || innerHeight },
+                   window.__studioUi);
       say("ok", "");
     } catch (e) {
       say("error", (e && e.message) || e);
