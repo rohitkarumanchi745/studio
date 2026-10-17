@@ -13,6 +13,13 @@
 // The parent listens to its own frame only, matched by a per-render nonce, and
 // treats what the frame says (an error message) as text.
 //
+// Like a Claude artifact, a visual is interactive: draw() gets a `ui` helper
+// for its own controls (a metric switcher, a slider, a toggle — Studio's
+// filter bar above it already covers dates and categories), and when those
+// filters change the parent posts the new rows into the SAME frame, which
+// re-draws them — no reload, no white flash, so the visual can move between
+// states instead of blinking.
+//
 // A srcdoc frame INHERITS the embedding page's CSP. Studio's page sends none
 // today; if one is ever added, it must still let this frame run its inline
 // scripts — or artifacts must move to a separate origin.
@@ -66,24 +73,112 @@ const GUARD = `
   window.addEventListener("error", function (e) { window.__studioSay("error", e.message || "error"); });
 })();`;
 
+// The controls a visual builds for itself. Each keeps its value in ui.state
+// across redraws (a resize, Studio's filters), returns it, and calls onChange.
+// Labels and options are set with textContent: data never becomes markup.
+const UI = `
+(function () {
+  var state = {};
+  function field(parent, label) {
+    var wrap = document.createElement("label");
+    wrap.className = "sv-field";
+    if (label) {
+      var t = document.createElement("span");
+      t.className = "sv-label";
+      t.textContent = String(label);
+      wrap.appendChild(t);
+    }
+    parent.appendChild(wrap);
+    return wrap;
+  }
+  function kept(key, fallback) { return key != null && key in state ? state[key] : fallback; }
+  var reduced = false;
+  try { reduced = matchMedia("(prefers-reduced-motion: reduce)").matches; } catch (e) {}
+  window.__studioUi = {
+    state: state,
+    reducedMotion: reduced,
+    bar: function (el) {
+      var b = document.createElement("div");
+      b.className = "sv-bar";
+      el.appendChild(b);
+      return b;
+    },
+    select: function (parent, o) {
+      var s = document.createElement("select");
+      (o.options || []).forEach(function (v) {
+        var op = document.createElement("option");
+        op.value = String(v);
+        op.textContent = String(v);
+        s.appendChild(op);
+      });
+      var v = kept(o.key, o.value);
+      if (v != null) s.value = String(v);
+      s.addEventListener("change", function () {
+        state[o.key] = s.value;
+        if (o.onChange) o.onChange(s.value);
+      });
+      field(parent, o.label).appendChild(s);
+      return s.value;
+    },
+    slider: function (parent, o) {
+      var s = document.createElement("input");
+      s.type = "range";
+      s.min = String(o.min);
+      s.max = String(o.max);
+      s.step = String(o.step || 1);
+      s.value = String(kept(o.key, o.value != null ? o.value : o.max));
+      var out = document.createElement("span");
+      out.className = "sv-value";
+      out.textContent = s.value;
+      s.addEventListener("input", function () {
+        state[o.key] = Number(s.value);
+        out.textContent = s.value;
+        if (o.onChange) o.onChange(Number(s.value));
+      });
+      var f = field(parent, o.label);
+      f.appendChild(s);
+      f.appendChild(out);
+      return Number(s.value);
+    },
+    toggle: function (parent, o) {
+      var c = document.createElement("input");
+      c.type = "checkbox";
+      c.checked = Boolean(kept(o.key, o.value));
+      c.addEventListener("change", function () {
+        state[o.key] = c.checked;
+        if (o.onChange) o.onChange(c.checked);
+      });
+      var f = field(parent, "");
+      f.appendChild(c);
+      var t = document.createElement("span");
+      t.textContent = String(o.label || "");
+      f.appendChild(t);
+      return c.checked;
+    }
+  };
+})();`;
+
 function runner(code) {
   return `
 (function () {
   var say = window.__studioSay;
-  var payload = JSON.parse(document.getElementById("studio-data").textContent);
-  var data = payload.rows.map(function (r) {
-    var o = {};
-    payload.columns.forEach(function (c, i) { o[c] = r[i]; });
-    return o;
-  });
+  function rowsOf(payload) {
+    return payload.rows.map(function (r) {
+      var o = {};
+      payload.columns.forEach(function (c, i) { o[c] = r[i]; });
+      return o;
+    });
+  }
+  var data = rowsOf(JSON.parse(document.getElementById("studio-data").textContent));
   var el = document.getElementById("root");
-  function draw(d3, data, el, size) {
+  function draw(d3, data, el, size, ui) {
 ${code}
   }
   function render() {
     el.replaceChildren();
     try {
-      draw(window.d3, data, el, { width: el.clientWidth || innerWidth, height: el.clientHeight || innerHeight });
+      draw(window.d3, data, el, { width: el.clientWidth || innerWidth, height: el.clientHeight || innerHeight },
+           window.__studioUi);
       say("ok", "");
     } catch (e) {
       say("error", (e && e.message) || e);
@@ -91,6 +186,14 @@ ${code}
   }
   var t;
   window.addEventListener("resize", function () { clearTimeout(t); t = setTimeout(render, 150); });
+  // Studio's filters changed: new rows for the same visual, from the page
+  // that embeds this frame and from nowhere else.
+  window.addEventListener("message", function (e) {
+    var m = e.data;
+    if (e.source !== window.parent || !m || typeof m !== "object" || !m.studioRows) return;
+    data = rowsOf(m.studioRows);
+    render();
+  });
   render();
 })();`;
 }
@@ -113,9 +216,17 @@ export function buildArtifactDoc({ code, columns, rows, nonce, title = "", d3Src
   html, body { margin: 0; height: 100%; background: #fff; color: #4a4844;
     font: 12px system-ui, -apple-system, "Segoe UI", sans-serif; overflow: hidden; }
   #root { width: 100%; height: 100%; position: relative; }
+  .sv-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 4px 2px 8px; }
+  .sv-field { display: inline-flex; align-items: center; gap: 6px; color: #4a4844; }
+  .sv-label { color: #79766f; }
+  .sv-value { min-width: 2.5em; color: #1b1a19; font-variant-numeric: tabular-nums; }
+  .sv-field select, .sv-field input { font: inherit; color: inherit; }
+  .sv-field select { padding: 3px 6px; border: 1px solid #e3e1de; border-radius: 6px; background: #fff; }
+  .sv-field input[type=range] { accent-color: #0f6cbd; }
 </style>
 <script data-nonce="${String(nonce).replace(/[^A-Za-z0-9]/g, "")}">${GUARD}</script>
 ${d3Tag}
+<script>${UI}</script>
 </head><body><div id="root"></div>
 <script type="application/json" id="studio-data">${dataJson(columns, rows)}</script>
 <script>${scriptSafe(runner(code))}</script>
@@ -133,12 +244,31 @@ function absolute(url) {
 export default function ArtifactView({ visual, columns, rows, tall }) {
   const ref = useRef(null);
   const [failure, setFailure] = useState("");
+  // One document per visual: it embeds the rows it starts with, and later
+  // rows (Studio's filters) are posted into the same frame instead of
+  // rebuilding it — a reload would blank the visual and reset its controls.
   const nonce = useMemo(() => Math.random().toString(36).slice(2) + Date.now().toString(36),
-                        [visual?.code, columns, rows]);
-  const srcDoc = useMemo(() => buildArtifactDoc({
-    code: visual?.code || "", columns, rows, nonce, title: visual?.title,
-    d3Src: absolute(d3Url),
-  }), [visual?.code, visual?.title, columns, rows, nonce]);
+                        [visual?.code, columns]);
+  const embedded = useRef(rows);
+  const latest = useRef(rows);
+  latest.current = rows;
+  const loaded = useRef(false);
+  const srcDoc = useMemo(() => {
+    embedded.current = latest.current;
+    loaded.current = false;
+    return buildArtifactDoc({
+      code: visual?.code || "", columns, rows: latest.current, nonce, title: visual?.title,
+      d3Src: absolute(d3Url),
+    });
+  }, [visual?.code, visual?.title, columns, nonce]);
+
+  const sendRows = () => {
+    const frame = ref.current;
+    if (!frame?.contentWindow || !loaded.current || embedded.current === latest.current) return;
+    embedded.current = latest.current;
+    frame.contentWindow.postMessage({ studioRows: { columns, rows: latest.current } }, "*");
+  };
+  useEffect(sendRows, [rows]);
 
   useEffect(() => {
     setFailure("");
@@ -167,6 +297,7 @@ export default function ArtifactView({ visual, columns, rows, tall }) {
         sandbox="allow-scripts"
         referrerPolicy="no-referrer"
         srcDoc={srcDoc}
+        onLoad={() => { loaded.current = true; sendRows(); }}
       />
     </>
   );

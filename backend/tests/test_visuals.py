@@ -218,3 +218,16 @@ def test_a_visual_counts_as_data_for_read_time_authorization():
     # A visual with no attributable SQL is not released, like rows would not be.
     content = {"panels": [{"visual": {"code": "/* EU: 125 */"}}]}
     assert chat._sql_tables_allowed("analyst", "demo", content) is False
+
+
+def test_the_prompt_asks_for_an_interactive_artifact_with_motion():
+    """Custom visuals are built like Claude artifacts: their own controls (via
+    the sandbox's ui helper) on top of Studio's date/category filters, and
+    marks that animate in and move between states — unless the reader asked
+    for reduced motion."""
+    p = visuals.PROMPT
+    assert "function draw(d3, data, el, size, ui)" in p
+    for helper in ("ui.bar(el)", "ui.select(", "ui.slider(", "ui.toggle("):
+        assert helper in p, helper
+    assert "Studio already puts a date range, category" in p      # don't rebuild those
+    assert "keyed joins" in p and "ui.reducedMotion" in p

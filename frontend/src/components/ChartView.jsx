@@ -14,6 +14,8 @@ import { applyFormat } from "./renderers/format";
 import PlotlyView, { PLOTLY_TYPES } from "./renderers/PlotlyView";
 import VegaView, { VEGA_TYPES } from "./renderers/VegaView";
 import ArtifactView, { downloadArtifact } from "./renderers/ArtifactView";
+import VisualControls from "./VisualControls";
+import { EMPTY_STATE, applyControls, detectControls } from "./visualFilters";
 import D3View, {
   D3_ONLY, D3_TYPES, LIMITS as D3_LIMITS, beeswarmData, calendarData, d3Type, networkData,
   packData,
@@ -174,7 +176,30 @@ export default function ChartView({
   const [saveError, setSaveError] = useState("");
   useEffect(() => { setShowVisual(true); setShowCode(false); setSaveError(""); }, [visual?.code]);
 
+  // The D3 & artifacts window puts a filter bar over every visual — a date
+  // range, category pickers, top N — read off the rows it already has, and
+  // draws what is left with motion. A custom visual gets the same bar and
+  // the filtered rows of its own (original) columns.
+  const artifact = Boolean(visual?.code && showVisual);
+  const baseColumns = artifact ? visual.columns || columns : columns;
+  const baseRows = artifact ? visual.rows || rows : rows;
+  const controls = useMemo(() => (d3Only ? detectControls(baseColumns, baseRows, spec) : null),
+                           [d3Only, baseColumns, baseRows, spec]);
+  const [filters, setFilters] = useState(EMPTY_STATE);
+  useEffect(() => setFilters(EMPTY_STATE), [baseColumns, baseRows]);
+  const shownRows = useMemo(
+    () => (controls ? applyControls(baseColumns, baseRows || [], controls, filters) : baseRows),
+    [controls, baseColumns, baseRows, filters]);
+
   if (!columns?.length || !rows?.length) return null;
+
+  const filterBar = controls && (
+    <VisualControls controls={controls} state={filters} shown={shownRows.length}
+                    total={(baseRows || []).length} onChange={(s) => setFilters(s || EMPTY_STATE)} />
+  );
+  const nothingLeft = d3Only && !shownRows.length && (
+    <div className="chart-note">Nothing in this range — widen the dates or reset the filters.</div>
+  );
 
   if (visual?.code && showVisual) {
     return (
@@ -203,8 +228,10 @@ export default function ChartView({
         )}
         {visual.explanation && <div className="meta artifact-note">{visual.explanation}</div>}
         {saveError && <div className="chart-note">Could not save the file: {saveError}</div>}
-        <ArtifactView visual={visual} columns={visual.columns || columns}
-                      rows={visual.rows || rows} tall={tall} />
+        {filterBar}
+        {nothingLeft || (
+          <ArtifactView visual={visual} columns={baseColumns} rows={shownRows} tall={tall} />
+        )}
         {showCode && <pre className="artifact-code">{visual.code}</pre>}
       </div>
     );
@@ -278,6 +305,7 @@ export default function ChartView({
         </span>
       </div>
       )}
+      {filterBar}
       {!typeOk && (
         <div className="chart-note">
           {LABELS[type]} doesn’t fit this data — {fit[type]?.reason}.
@@ -297,8 +325,9 @@ export default function ChartView({
         <PlotlyView columns={columns} rows={rows} spec={spec} tall={tall} />
       ) : plottable && drawEngine === "vega" ? (
         <VegaView columns={columns} rows={rows} spec={spec} tall={tall} />
-      ) : plottable && drawEngine === "d3" ? (
-        <D3View columns={columns} rows={rows} spec={spec} tall={tall} />
+      ) : nothingLeft ? nothingLeft : plottable && drawEngine === "d3" ? (
+        <D3View columns={columns} rows={d3Only ? shownRows : rows} spec={spec} tall={tall}
+                motion={d3Only} />
       ) : d3Only ? null : option ? (
         <Echart option={option} tall={tall} spec={spec} onSelect={onSelect} tileId={tileId} />
       ) : (

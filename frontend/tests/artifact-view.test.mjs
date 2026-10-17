@@ -67,19 +67,19 @@ test("the frame's policy allows no network, no frames and only Studio's d3", () 
     assert.ok(policy.includes(rule), rule);
   }
   assert.doesNotMatch(policy, /unsafe-eval/);
-  assert.equal(scripts(doc), 4);                       // guard, d3, data, runner
+  assert.equal(scripts(doc), 5);                       // guard, d3, ui helpers, data, runner
 });
 
 test("no data value or code can close the script element early", () => {
   const evil = "</script><script>alert(document.domain)</script>";
   const doc = buildArtifactDoc({ code: `/* ${evil} */ ${DRAW}`, columns: COLUMNS,
                                  rows: [[evil, 1]], nonce: "n2", d3Src: D3 });
-  assert.equal(scripts(doc), 4);                       // still exactly our four
-  // Parsed as a browser would: four script elements, and the hostile value is
+  assert.equal(scripts(doc), 5);                       // still exactly our five
+  // Parsed as a browser would: five script elements, and the hostile value is
   // back intact as data. (Its "<script>" survives only as inert text inside a
   // neutralised comment — inside a script element only "</script" ends one.)
   const parsed = new JSDOM(doc).window.document;
-  assert.equal(parsed.querySelectorAll("script").length, 4);
+  assert.equal(parsed.querySelectorAll("script").length, 5);
   const data = JSON.parse(parsed.getElementById("studio-data").textContent);
   assert.equal(data.rows[0][0], evil);
   assert.equal(scriptSafe("a</SCRIPT>b<!--c"), "a<\\/SCRIPT>b<\\!--c");
