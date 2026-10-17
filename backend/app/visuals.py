@@ -2,7 +2,7 @@
 
 When no chart type fits what the user asked for — a radial timeline, an
 annotated story, small multiples, "an interactive D3 view of …" — the agent can
-write one: the body of a JavaScript function ``draw(d3, data, el, size)``. The
+write one: the body of a JavaScript function ``draw(d3, data, el, size, ui)``. The
 browser runs it in a sandboxed iframe (frontend renderers/ArtifactView.jsx):
 scripts only, an opaque origin with no access to Studio's page, cookies, storage
 or login token, no navigation, and a Content-Security-Policy with no network.
@@ -34,23 +34,38 @@ PROMPT = f"""You write ONE custom data visualization with D3 v7, as code.
 Reply with ONLY a JSON object:
 {{"title": "<short title>", "code": "<JavaScript>", "explanation": "<one or two sentences: what it shows and how to read it>"}}
 
-"code" is the BODY of:   function draw(d3, data, el, size) {{ <code> }}
+"code" is the BODY of:   function draw(d3, data, el, size, ui) {{ <code> }}
 - d3 is the whole D3 v7 library. data is an array of row objects keyed by column
   name (numbers may arrive as strings; values may be null). el is an empty <div>
   filling the frame. size is {{width, height}} in pixels.
-- Draw into el only, sized to size.width x size.height. draw may be called again
-  on resize: build everything from scratch each time.
+- Draw into el only, sized to size.width x size.height. draw is called again on
+  resize and whenever the user changes Studio's filters (new data): build
+  everything from scratch each time.
+- Make it an interactive artifact. Studio already puts a date range, category
+  filters and top-N above every visual and hands draw the filtered rows — do not
+  build those. Add the controls THIS view needs beyond them, with ui:
+    var bar = ui.bar(el);   // a controls row at the top of el; draw the chart below it
+    ui.select(bar, {{key, label, options, value, onChange}})        // e.g. a metric switcher
+    ui.slider(bar, {{key, label, min, max, step, value, onChange}}) // e.g. a threshold or N
+    ui.toggle(bar, {{key, label, value, onChange}})                 // e.g. "show labels", "as %"
+  Each returns its current value and keeps it across redraws (ui.state[key]).
+  Use a select when the data has several measures; skip controls that add nothing.
+- Motion, like a polished artifact: marks ease in on first draw (d3 transitions,
+  ~600ms, d3.easeCubicOut, a small stagger). When one of YOUR controls changes,
+  update the marks in place with keyed joins — entering marks grow in, leaving
+  ones fade out, the rest glide to their new positions; do not rebuild for it.
+  When ui.reducedMotion is true, skip transitions.
 - Write every data value with .text() — never .html(), innerHTML or
   insertAdjacentHTML.
 - There is no network and no other code: no fetch, XMLHttpRequest, WebSocket,
   import(), eval or new Function; no window.parent, top or opener; no cookies or
   storage. The sandbox blocks all of them and the visual would fail.
-- Interaction is welcome: tooltips (an absolutely positioned <div> filled with
-  .text()), hover, zoom, brush, drag, transitions.
+- Also welcome: tooltips (an absolutely positioned <div> filled with .text()),
+  hover, zoom, brush, drag.
 - Colors: categories {", ".join(_SERIES)}; magnitude ramp {", ".join(_SEQ)}.
   Text #4a4844, muted text #79766f, gridlines #eceae7, background white,
   font 11-12px.
-- Under 250 lines. No external data, images or fonts.
+- Under 300 lines. No external data, images or fonts.
 """
 
 # Mistakes worth a retry, as (pattern, what to say). Bare `parent.` / `top.` /

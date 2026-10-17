@@ -14,6 +14,7 @@ import {
   AXIS_LINE, BAD, GOOD, GRID_LINE, INK, SEQ, SERIES, SURFACE, TOTAL,
   firstNumericIndex, isNumericCol, resolveSpec,
 } from "./common";
+import { animate, captureBars } from "./motion";
 
 /** Chart types no other engine draws: these always render with D3. */
 export const D3_ONLY = new Set(["network", "beeswarm", "calendar", "circle_pack"]);
@@ -41,8 +42,12 @@ function getD3() {
   return _d3;
 }
 
-export default function D3View({ columns, rows, spec, tall }) {
+// motion: the D3 & artifacts window animates its charts (renderers/motion.js)
+// — in on first draw, and between states when a filter changes the rows. A
+// resize alone redraws in place.
+export default function D3View({ columns, rows, spec, tall, motion = false }) {
   const ref = useRef(null);
+  const drawn = useRef(null);
   const [err, setErr] = useState("");
   const [size, setSize] = useState(null);
 
@@ -68,10 +73,16 @@ export default function D3View({ columns, rows, spec, tall }) {
     getD3()
       .then((d3) => {
         if (dead) return;
+        const last = drawn.current;
+        const changed = !last || last.rows !== rows || last.columns !== columns
+          || last.spec?.type !== spec?.type;
+        const before = motion && changed ? captureBars(el) : null;
         el.replaceChildren();
         try {
           stop = draw(d3, el, columns, rows, spec, size);
           if (stop === false) setErr("This data cannot be drawn as this chart type in D3.");
+          else if (before) animate(d3, el, spec, last?.spec?.type === spec?.type ? before : new Map());
+          drawn.current = { columns, rows, spec };
         } catch (e) {
           setErr("D3 failed to render: " + String(e?.message || e).slice(0, 120));
         }
@@ -424,7 +435,7 @@ function legend(svg, names, x, y) {
   let at = 0;
   names.forEach((n, i) => {
     const item = g.append("g").attr("transform", `translate(${at},0)`);
-    item.append("rect").attr("width", 10).attr("height", 10).attr("rx", 2)
+    item.append("rect").attr("class", "legend-swatch").attr("width", 10).attr("height", 10).attr("rx", 2)
       .attr("fill", SERIES[i % SERIES.length]);
     const t = item.append("text").attr("x", 14).attr("y", 9).attr("fill", INK.secondary)
       .text(String(n).slice(0, 24));

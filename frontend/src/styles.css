@@ -76,6 +76,34 @@ input:focus, select:focus { border-color: var(--accent); }
 .retention-runs { margin-top: 8px; font-size: 12px; border-collapse: collapse; }
 .retention-runs th, .retention-runs td { padding: 3px 10px 3px 0; text-align: left; }
 .retention-runs tr.bad td { color: var(--bad); }
+/* D3 & artifacts window: the filter bar above every visual (VisualControls). */
+.vc-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 2px 0 8px;
+          font-size: 12px; color: var(--ink-2); }
+.vc-dates { display: inline-flex; align-items: center; gap: 6px; }
+.vc-label { color: var(--ink-3); }
+.vc-dash { color: var(--ink-3); }
+.vc-bar select, .vc-bar input[type=date], .vc-bar input[type=month] {
+  font: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--line);
+  border-radius: 6px; padding: 3px 6px; transition: border-color .15s ease, box-shadow .15s ease; }
+.vc-bar select:hover, .vc-bar input:hover { border-color: var(--axis); }
+.vc-bar select:focus-visible, .vc-bar input:focus-visible {
+  outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+.vc-pick { position: relative; }
+.vc-pick > summary { list-style: none; cursor: pointer; padding: 3px 8px; border: 1px solid var(--line);
+  border-radius: 6px; background: var(--surface); transition: border-color .15s ease; }
+.vc-pick > summary::-webkit-details-marker { display: none; }
+.vc-pick[open] > summary, .vc-pick > summary:hover { border-color: var(--axis); }
+.vc-menu { position: absolute; z-index: 20; top: calc(100% + 4px); left: 0; min-width: 180px;
+  max-height: 260px; overflow: auto; padding: 6px; background: var(--surface);
+  border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow-pop);
+  animation: vc-pop .16s cubic-bezier(.2,.8,.2,1); transform-origin: top left; }
+.vc-menu-actions { display: flex; gap: 4px; margin-bottom: 4px; }
+.vc-option { display: flex; align-items: center; gap: 6px; padding: 3px 4px; border-radius: 4px;
+  cursor: pointer; white-space: nowrap; }
+.vc-option:hover { background: var(--surface-2); }
+.vc-count { margin-left: 4px; }
+@keyframes vc-pop { from { opacity: 0; transform: scale(.96) translateY(-2px); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .vc-menu { animation: none; } }
 .chat-notice { background: var(--accent-soft); border: 1px solid var(--line); border-radius: var(--radius);
                padding: 10px 14px; color: var(--ink-2); font-size: 13px; line-height: 1.5; }
 
