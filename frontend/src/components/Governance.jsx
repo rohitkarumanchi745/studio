@@ -4,7 +4,7 @@
 // Studio's built-in RBAC.
 import { Fragment, useEffect, useState } from "react";
 import { api, getToken } from "../api";
-import { PlanningContextPicker, usePlanningCatalog } from "./Pipelines";
+import { PlanningContextPicker, usePlanningCatalog } from "./planningContext";
 
 // Chat result-row retention (retention.py): what the scheduled pass removes,
 // and — before the first purge of existing history — the notice, a download of

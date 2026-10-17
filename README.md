@@ -3,13 +3,10 @@
 An agentic analytics platform. Ask your data anything in plain English — a crew
 of named agents writes the SQL, runs it (read-only, RBAC-enforced), and renders
 Power BI / Tableau-class visualizations you can pin, cross-filter, and share.
-Chat and the Pipelines view turn requests into **governed, read-only query
-bundles that run on demand** — **verified SQL** and **prompt-driven pipelines**
-with data lineage — and routes anything that writes (a script, a Spark job)
-through a **safe-production flow** (generate → validate → approve → deploy →
-run) with a human in the loop. What that flow deploys is the verified SQL steps,
-or a Spark payload built from them; the Python it generates is a syntax-checked
-**deliverable Studio never executes**. A separate chat workflow path builds
+Every answer is **verified SQL** run through one governed gate, and anything
+that writes (a script, a Spark job) goes through **supervised Jobs** with a
+human in the loop. Python that Studio drafts (**Build Python**) is a
+**deliverable Studio never executes**. A chat workflow path builds
 dependency-aware, single-source SQL DAGs for Airflow from declarative plans,
 using a trusted compiler and administrator-approved publication and execution.
 Around these paths sit **governance-as-code** and two deliberately separate
@@ -23,20 +20,12 @@ result must be configured before learned-scope routing can take over.
 
 **Live demo:** https://studio-production-ac35.up.railway.app
 
-Chat can build and run pipelines using the conversation. Ask a data question,
-then use the pipeline card's **Run pipeline** button or say **"run this
-pipeline"**. Use **Build pipeline** in the composer (or ask **"build a pipeline
-for monthly revenue by region"**) for a pipeline draft, then describe changes
-in follow-up messages. Each version stays attached to its chat message; a run
-uses that version and checks current permissions again. A data answer's SQL
-and multi-source panels become steps without requiring BitNet or model training.
-You can also say **"build and run a pipeline for monthly revenue by region"**
-to build, verify, save privately, and execute in one turn. Interrupted read-only
-queries may repeat during a worker retry; saved pipeline and run records are
-deduplicated per chat turn.
-These steps are independent, read-only queries; they do not pass intermediate
-outputs to one another or execute generated Python. Requests with failed
-verification remain blocked and show the reasons.
+Chat builds Airflow DAGs from the conversation: tick **Build an approval-gated
+Airflow DAG from this prompt** in the composer, or ask for one (see below).
+Chat's earlier read-only SQL pipelines, and the **Pipelines** and **Pipeline
+flow** screens, were removed. A pipeline drafted that way in an old
+conversation stays visible as a record of its SQL, still checked against the
+reader's current permissions, but it no longer runs.
 
 Chat also submits runs to **Airflow, Databricks Jobs, dbt Cloud, and Spark on
 Kubernetes**. For example, say **"trigger Airflow DAG daily_sales"**, **"run
@@ -46,7 +35,7 @@ and enter its payload. Every external run requires an administrator's approval
 in Jobs. **"Check job status"** follows the selected run; the chat card
 also refreshes its status, logs, and quality checks. These commands address
 existing DAGs/jobs or an explicit job definition with deployed code; they do
-not publish a chat SQL bundle as an Airflow DAG or execute generated Python.
+not publish a chat answer as an Airflow DAG or execute generated Python.
 
 For a **new dependency-aware pipeline**, ask **"build an Airflow pipeline"**
 and describe the input, transformations, duplicate key/winner rule, and explicit
@@ -76,7 +65,7 @@ tests remain operator acceptance gates.
 flowchart TB
     subgraph client["Browser — React + Vite · light Fluent / Data-Formulator UI"]
         chat["Chat + Canvas + encoding shelf<br/>ask · fields→channels · pin · cross-filter"]
-        views["Semantic layer · Autopilot · Pipelines · Flow<br/>Jobs · Governance · Agents · Dashboards"]
+        views["Semantic layer · Autopilot · Jobs<br/>Governance · Agents · Dashboards"]
     end
 
     subgraph api["FastAPI — one origin, API at /api/*"]
@@ -88,7 +77,6 @@ flowchart TB
         subgraph agents["Agent layer"]
             orch["orchestrator.py · planned DAG / fan-out"]
             agent["agent.py · LangGraph ReAct"]
-            flowm["flow.py · staged typed pipeline"]
             auto["autopilot.py · proactive agents"]
             sup["supervisor.py · risk + human-in-loop"]
         end
@@ -157,8 +145,8 @@ flowchart TB
 **One gate for data.** Every path that returns rows — the agent's `run_sql`
 tool, the keyless fallback preview, canvas panels, a chat rerun, dashboard
 tiles, catalog samples and suggestions, freshness probes, a semantic-cache
-hit, a supervised read, and `queries.verify_sql` (the verified-SQL library, a
-pipeline step, the flow's Validator, the semantic layer) — calls
+hit, a supervised read, and `queries.verify_sql` (the verified-SQL library and
+the semantic layer) — calls
 `gateway.execute(user, source, sql, purpose)` (`gateway.py`), which applies
 RBAC check → query guard → row limit → execution → governance compliance
 filter → audit, in that fixed order and nowhere else. The `purpose` becomes
@@ -477,10 +465,8 @@ independent planning council. BitNet may execute independent seed nodes because
 they receive the exact root prompt; dependency-context nodes and the terminal
 reasoner escalate to the frontier, and a failed independent BitNet worker is
 retried once on the frontier. BitNet itself needs a separate, versioned
-spawn-action training stream before it can delegate safely. A staged
-pipeline separately adds a **Pipeline planner**, **Code generator**,
-**Validator**, **Approval agent**, and a **Deployment executor**;
-the verified-SQL path is served by a **SQL verifier**. `roster.py` gives each a
+spawn-action training stream before it can delegate safely. The verified-SQL
+path is served by a **SQL verifier**. `roster.py` gives each a
 stable name, so every answer reports which agent(s) ran and each executed node's
 rollout is attributed to it.
 
@@ -535,23 +521,20 @@ panel, and `GET /freshness/{source}`. Honest limit: it reports what's *in* the
 tables — a silently failed pipeline shows up as a freshness value that stops
 advancing, not as a schedule alert.
 
-### Prompt-built pipelines + data lineage
+### Planning context for DAG drafts
 
-For the read-only Pipelines view and chat SQL bundles, describe a job; the
-**Pipeline planner** routes it to the source whose tables best match and drafts
-an ordered set of steps. An admin can register GitHub repositories from the
-**GitHub tile in Data Connections** (also available in Governance). Builders
-can then select a repository and up to three Confluence pages in Chat or
-Pipelines when building a draft.
-The selected repository's allowlisted pipeline files and the selected pages'
-text become **bounded, untrusted reference context** for the model, with
+An admin can register GitHub repositories from the **GitHub tile in Data
+Connections** (also available in Governance). Builders can then select a
+repository and up to three Confluence pages in Chat when drafting an Airflow
+DAG. The selected repository's allowlisted pipeline files and the selected
+pages' text become **bounded, untrusted reference context** for the model, with
 repository commit/page-version provenance in the draft. A URL in the prompt
 cannot register a repository, choose a different site, or grant access. A
 failed fetch or missing planning model blocks a source-backed draft instead of
 claiming to have used material it did not read. Source selection is a planning
 input, not a command to clone, import, deploy, or run code from GitHub or
-Confluence. Execution uses newly verified read-only SQL through Studio's data
-gateway, or the separately approved, trusted-compiled Airflow DAG path below.
+Confluence; execution uses the separately approved, trusted-compiled Airflow
+DAG path below.
 Selected file excerpts and page text are sent to the configured planning
 model provider, which may be external; choose only material approved for that
 provider and the intended Studio users.
@@ -562,49 +545,14 @@ redacts lines matching common credential markers, but this cannot guarantee
 arbitrary secrets are absent. Likewise, analysts can select pages readable by
 the Confluence service account within the configured spaces; scope that
 account and allowlist accordingly.
-Every drafted read-only step is run
-through `verify_sql` (RBAC + guard + real execution) before you see it, and the
-response separates the two outcomes honestly: **`steps` holds only the steps
-that verified** — possibly an empty list, still a `200` — and **`dropped` holds
-every failure with its `error`**, which the UI renders as a "✗ failed: …" list
-rather than badging a broken step "verified". Saving re-verifies server-side
-under *your* role and rejects the whole pipeline on the first failure (a
-client's `verified: true` is never trusted), so "saved" means "runnable"; more
-than `MAX_STEPS` (6) steps is a `400`, never a silent truncation.
 
-A step also carries **`intent_warnings`**. `grains.py` maps a prompt word to a
-time grain (`monthly` → `month`) and to that dialect's bucket expression
-(SQLite `strftime`, `DATE_TRUNC` elsewhere), so the deterministic drafter
-buckets by the grain the prompt asked for and — in that bucketed shape —
-aggregates the measure and groups by the dimension the prompt named; it also
-skips a top-ranked table that holds no column the prompt mentioned. A prompt
-with no grain in it keeps exactly the previous shape. When a drafted step
-ignores a named grain — a "monthly" request answered by a daily aggregate — the
-step is **kept and flagged** (`["does not bucket by month"]`, a ⚠ badge) rather
-than dropped: it verified, it just may not be the question you asked, and only
-you can judge that.
-
-A pipeline renders a **source → table → step lineage diagram** (drawn from the
-verified steps only) so a multi-source request shows exactly where each table
-comes from; a failed step emails the requester naming the failing source/table,
-and each completed or failed run records its complete attempted recipe in
-`agent_traces` as `mode="pipeline"`. A successful execution earns `1`, a failed
-execution `0`; a corrected follow-up keeps the earlier failure and links its
-new outcome through `repairs_run_id`. Complete pipeline bundles remain local —
-they are not exported through the generic Agent Lightning trace stream or
-mistaken for one-query `run_sql` labels. Recent SQL
-pipeline examples are scoped to their owner and rechecked against current
-source/table permissions and connector namespaces before they inform another
-draft. `pipeline_memory.py` ranks the caller's bounded successful history by
-prompt similarity, requiring both observed success and reward `1`; positive
-feedback cannot turn a failed run into a proven recipe, and negative feedback
-removes a success from reuse. An exact normalized request re-verifies the old
-SQL. A related request passes the matching recipe to the model for adaptation,
-with the latest prompt authoritative; no model or a failed adaptation blocks
-reuse instead of silently preserving old filters. Unchanged SQL after changed
-parameters is flagged and blocked. Drafts show the matched prompt and keep
-trace/run provenance. Every new SQL draft and execution still passes the normal
-gateway checks. This is experience retrieval, not model-weight training.
+Read-only SQL pipelines — the Pipelines screen, Pipeline flow, and the
+pipeline card chat attached to every data answer — were removed: they re-ran
+SQL on demand but kept no results and had no schedule, so asking again did the
+same job. Drafts saved in old conversations are history. Each stored step is
+still checked against the reader's **current** role before it is shown
+(`stored_access.py`, the same rule chat applies to every stored statement), and
+none of them can run.
 
 ### Natural prompts → reusable Airflow SQL DAGs
 
@@ -852,75 +800,16 @@ stores. Do not enable collection where an automated deletion SLA is required;
 removing that data and revoking its registry release is a separate destructive
 operator procedure.
 
-### The staged flow — safe production behavior
+### Spark job submissions
 
-`flow.py` turns one business request into a chain where **each stage is a named
-agent that emits a typed JSON contract**, and each is recorded as a rollout:
-
-```mermaid
-flowchart TB
-    req["Business request"] --> plan["Pipeline planner → PipelineSpec"]
-    plan --> gen["Code generator → GeneratedArtifact"]
-    gen --> val{"Validator → ValidationResult"}
-    val -- fail --> rep["repair ×N"]
-    rep --> val
-    rep -- still failing --> hr["human review · STOP before approval"]
-    val -- ok --> appr["Approval agent / human → DeploymentRequest"]
-    appr -- reject --> pb["policy block (no bypass)"]
-    appr -- ok --> dep{"Deploy the verified SQL steps<br/>(or a Spark payload of them)"}
-    dep -- fail --> de["report error · do NOT bypass policy"]
-    dep -- ok --> run{"Run"}
-    run -- fail --> rt["platform retries"]
-    rt -- still failing --> ro["stop · alert · rollback"]
-    run -- ok --> ex["ExecutionResult · says what ran"]
-    gen -. artifact syntax-checked only, never executed .-> ex
-```
-
-Read-only deployments run through; writes and Spark jobs hit the human-approval
-gate. Deploy and Run are distinct phases — a deploy error is reported and never
-bypasses policy; a run that keeps failing after the platform's retries is
-stopped, the requester is alerted, and the deployment is rolled back
-(best-effort, via an opt-in connector `rollback` hook).
-
-**What actually gets deployed — and what does not.** The Code generator emits
-Python, and it is tempting to read the green Validator tick as "the program
-ran". It did not. The Validator only **parses** the artifact — the check is
-named `python syntax (static only — not executed)` and sets
-`ValidationResult.artifact_status = "syntax_checked_not_executed"` — because
-**Studio never executes model-generated Python**. What the Approval agent hands
-the executor is `DeploymentRequest.script`, built from the **verified SQL
-steps** (or a Spark payload of them), carried on the request as
-`deploys: "sql_steps" | "spark_job"` with `artifact_deployed: false`. So a run
-whose artifact would raise on its first line is filed as
-**`succeeded_sql_only`**, not `succeeded`, and one sentence written in a single
-place (`flow.deployed_note`) says what ran — *"deployed the 3 verified SQL
-steps; the generated Python artifact is a deliverable and was not executed
-(syntax-checked only)"* — surfaced identically on `ExecutionResult.deployed`,
-in the pipeline view, in the per-stage trace and in the digest email, so they
-can never drift. The artifact is yours to take away and run wherever you run
-code; Studio hands it over, it does not launch it. Routing it into a real
-runtime is on the [roadmap](#future-rollouts), behind the same supervisor gate
-as every other write.
-
-**The Spark payload is a real Jobs submission, built by the connector.** The
-flow used to hand-roll `{"tasks": [{"name": …, "sql": …}]}` — a shape the
-Databricks API does not accept, so an approved `spark_job` deployment failed at
-submit time, after the human gate. `databricks_conn.build_submission()` now owns
-the Jobs 2.1 run-submit body: one `sql_task` per verified step, each with a
-unique, API-legal `task_key` slugged from the step name (duplicates get a
-numeric suffix — the API rejects a duplicate key, and silently merging two
-steps would drop a verified statement) and the warehouse from
-**`DATABRICKS_WAREHOUSE_ID`**. The statement rides inline as
-`sql_task.query.query_text`; a workspace restricted to *saved* queries would
-register the query first and substitute `query_id` in the same slot. With no
-warehouse configured the flow **refuses before the supervisor is called** —
-`decision: "reject"`, empty script, the reason naming the variable — rather than
-building a body the API would `400`. `validate_submission()` runs both inside
-the builder and again at the top of `submit_spark_job()`, before any HTTP call:
-unique task keys, exactly one recognized task type per task, compute present
+A supervised `spark_job` (submitted from Jobs or proposed by an autopilot
+agent) posts a Databricks Jobs 2.1 run-submit body. `validate_submission()`
+runs at the top of `submit_spark_job()`, before any HTTP call: unique task
+keys, exactly one recognized task type per task, compute present
 (`warehouse_id` inside a `sql_task`, `existing_cluster_id` / `new_cluster` /
 `job_cluster_key` otherwise). Studio's private `output` key is stripped from
-what is posted (`api_body()`) while the stored script keeps it for the bridge.
+what is posted (`api_body()`) while the stored script keeps it for the
+lakehouse bridge.
 
 ### Supervised execution + human-in-the-loop
 
@@ -1501,8 +1390,8 @@ both self-heal, and neither can touch the trace the answer came from.
 
 **Scope of delivery.** Chat turns (synchronous and background), autopilot
 turns, and the crew's per-agent rollouts go through `lightning.record_*` and are
-eligible for generic external delivery. Complete SQL/Airflow/platform pipeline
-outcomes, flow-stage traces (`flow.py`), and standalone
+eligible for generic external delivery. Complete Airflow/platform pipeline
+outcomes and standalone
 `/verify-sql` traces (`queries.py`) that call `db.add_trace()` directly remain
 local. Delivery to an external Agent Lightning server requires
 `STUDIO_AGL_URL`; local recording works with it unset.
@@ -1983,10 +1872,7 @@ erDiagram
     conversations ||--o{ messages : contains
     conversations ||--o{ conversation_shares : "shared via"
     dashboards ||--o{ dashboard_tiles : contains
-    users ||--o{ pipelines : builds
-    pipelines ||--o{ pipeline_runs : "traced by"
     users ||--o{ saved_queries : verifies
-    users ||--o{ flow_runs : "runs staged flow"
     users ||--o{ supervised_jobs : submits
     users ||--o{ query_cache : "semantic cache"
     users ||--o{ background_jobs : enqueues
@@ -2018,13 +1904,6 @@ erDiagram
         text messages
         text prefix_hash
         int cache_read_tokens
-    }
-    flow_runs {
-        text id PK
-        text spec
-        text validation
-        text deployment
-        text execution
     }
     query_cache {
         text signature
@@ -2200,16 +2079,10 @@ optional and falls back to the in-process cache silently.
   tool-builder kind (`mcp_build`) is an approval *record*: it is handled before
   any connector is resolved, records `executed: false`, and is not submittable
   over HTTP at all.
-- **Generated Python is a deliverable, never a deployable** — the staged flow's
-  Validator only *parses* the artifact (`python syntax (static only — not
-  executed)`, `artifact_status = "syntax_checked_not_executed"`), and what the
-  executor submits is `DeploymentRequest.script` — the **verified SQL steps**,
-  or a Spark payload of them (`deploys`, with `artifact_deployed: false`). A run
-  that produced an artifact is reported as `succeeded_sql_only` and every
-  surface (pipeline view, stage trace, digest email) prints the same sentence
-  naming what ran. Nothing in Studio ever executes model-generated Python;
-  approved tool-builder MCP servers are the one code path that runs at all, and
-  only inside the sandbox.
+- **Generated Python is a deliverable, never a deployable** — **Build Python**
+  drafts a module for you to review and run wherever you run code; nothing in
+  Studio ever executes model-generated Python. Approved tool-builder MCP
+  servers are the one code path that runs at all, and only inside the sandbox.
 - **Built tools run sandboxed** — approved model-generated MCP servers launch
   only through `sandbox_runner` (path-confined, rlimits, watchdog, minimal
   explicit env — secrets reach a tool only via the `STUDIO_TOOL_ENV_ALLOW`
@@ -2322,8 +2195,7 @@ optional and falls back to the in-process cache silently.
 | **Semantic cache re-executes the SQL** (never returns stored rows) | Fresh data + RBAC/guard/governance re-checked on every hit | A hit still pays the warehouse round-trip (but skips the LLM) |
 | **Harrier embeddings when configured, lexical signature otherwise** | Real semantic match (different-word paraphrases) with Harrier; deterministic lexical fallback keeps it working offline with zero deps | Embeddings need a Harrier endpoint stood up; the lexical fallback misses different-word paraphrases |
 | **Read-only by default; writes go through supervisor + a human** | An analytics tool must never silently mutate production | Every write is gated — latency and a human in the loop, by design |
-| **Studio generates Python but never runs it in-process** | Arbitrary code execution is the blast radius to avoid | The staged flow deploys the verified SQL steps (or a Spark payload of them) and hands the artifact over as a deliverable — a run that produced one reads `succeeded_sql_only`, and actually running it takes the supervised Jobs path or an approved, sandboxed tool |
-| **A read-only SQL bundle returns only the steps that verified** | "Verified" here means it ran through the gateway | A prompt can legitimately come back with zero steps and a list of reasons; the separate Airflow DAG path reports static checks, never execution verification |
+| **Studio generates Python but never runs it in-process** | Arbitrary code execution is the blast radius to avoid | Build Python hands the module over as a deliverable; actually running it takes the supervised Jobs path or an approved, sandboxed tool |
 | **New Airflow DAGs use typed SQL and a trusted compiler** | Model text cannot become arbitrary executable Python; dependencies, destinations, and approval are explicit | One source, limited SQL shapes, manual runs, and operator-managed shared storage/connection mapping; static validation does not prove runtime success |
 | **Fail the read when governance lineage is unknowable** | A denied column inside a CTE could surface in any output column — guessing is a leak | A legitimate query must be rewritten (select the column at the top level, or drop it) before it will run |
 | **Process runner by default on a laptop, docker required in production** (built tools) | Zero extra infra on dev; production must not run approved generated code with the app's own credentials by omission | A production boot now *fails* until the operator picks `STUDIO_TOOL_RUNNER=docker`, `STUDIO_TOOLBUILDER=0`, or the explicit `STUDIO_TOOL_RUNNER_ALLOW_PROCESS=1`; the process runner still cannot cut off the network or hide host files, and `RLIMIT_AS` is not enforceable on macOS |
@@ -2519,8 +2391,8 @@ alone; FastAPI serves the built frontend on one origin, with an SPA fallback
 so a refresh on a nested route still works.
 
 Every surface has a URL — `/dashboards`, `/dashboards/<id>`, `/queries`,
-`/pipelines`, `/governance`, `/semantic`, `/jobs`, `/py`, `/sessions`,
-`/agents`, `/flow`, `/skills`, `/autopilot`, `/toolbuilder`, `/kag`, and
+`/governance`, `/semantic`, `/jobs`, `/py`, `/sessions`,
+`/agents`, `/skills`, `/autopilot`, `/toolbuilder`, `/kag`, and
 `/c/<conversation-id>` for a chat (`/` is a new chat; unknown paths redirect to
 `/`) — bookmarkable, shareable, and the browser back button works between
 them (React Router; the Vite dev server handles deep links itself).
@@ -2737,29 +2609,24 @@ boot rather than promoting an account it cannot prove control of),
 migrations** + a pooled Postgres facade, the **durable job queue** with an
 optional worker service and leased schedulers (ticks off the poll loop, leases
 renewed under a long tick, re-entrancy matched by the answered message id),
-**honest artifact reporting** in the staged flow (`succeeded_sql_only`, the
-`static only — not executed` check name, `artifact_deployed: false`) and
-**verified-only pipeline drafts** (`steps` / `dropped` + grain
-`intent_warnings`), the `app/viz/` package split with
+the `app/viz/` package split with
 an enforced import layering (`tests/test_layering.py`), and one `/api` surface
 with **React Router** URLs for every view.
 
 ### What Studio still does not do
 
-Four limits are worth stating plainly, because each is easy to read the other
+These limits are worth stating plainly, because each is easy to read the other
 way round from the feature list above:
 
-- **Analytics SQL bundles remain independent read-only queries, not general
-  ETL.** Their lineage diagram does not imply dependent execution. The separate
-  chat workflow planner now generates dependency-aware, single-source Airflow
-  SQL DAGs, but only SELECT, CTAS, and INSERT SELECT tasks, with explicit
-  destinations, static validation, and administrator approval. It does not
-  support arbitrary Python, UPDATE/DELETE/MERGE, cross-source execution,
-  recurring scheduling, or backfills. Triggering an existing platform job and
-  compiling a new typed DAG are distinct paths; neither automatically converts
-  an arbitrary analytics bundle into ETL.
-- **Model-generated Python is compiled and delivered, never executed.** The staged
-  flow's Validator only parses the artifact (`syntax_checked_not_executed`).
+- **Airflow DAGs are the only pipelines, and they are narrow.** The chat
+  workflow planner generates dependency-aware, single-source Airflow SQL DAGs,
+  but only SELECT, CTAS, and INSERT SELECT tasks, with explicit destinations,
+  static validation, and administrator approval. It does not support arbitrary
+  Python, UPDATE/DELETE/MERGE, cross-source execution, recurring scheduling, or
+  backfills. Triggering an existing platform job and compiling a new typed DAG
+  are distinct paths.
+- **Model-generated Python is delivered, never executed.** Build Python hands
+  over a module for you to review.
   (Model-written JavaScript for a *custom visual* does run — only in the
   viewer's browser, in a sandboxed frame with no network and no access to
   Studio; see *Visualization*.)
@@ -2767,10 +2634,6 @@ way round from the feature list above:
   tool-builder MCP servers run inside their sandbox. The new Airflow path
   executes SQL through a trusted, fixed compiler-generated Python wrapper in
   Airflow; it does not permit model-written operators or Python task bodies.
-- **What Flow deploys is the verified SQL steps, or a Spark payload built from
-  them**, through the supervisor and its human-approval gate — with
-  `artifact_deployed: false` and a run reported as `succeeded_sql_only`. The
-  artifact is yours to take away and run wherever you run code.
 - **A live BitNet base-model endpoint does not prove trained agent execution.**
   The source build and container image have not been exercised on this machine;
   the gateway/supervisor contracts are tested against stub engines. Even a
@@ -2824,15 +2687,8 @@ default; not needed at today's volume, adopt when data/QPS justify a cluster):
 - Prune finished `background_jobs` rows and move `purge_message_rows` onto the
   worker's leased scheduler (both run best-effort at startup today); expose
   `jobs.stats()` on `/api/health`.
-- Connect the staged flow's generated deployment plan to platform-specific
-  deployment adapters. Chat already submits explicit platform payloads through
-  the supervisor and publishes supported typed SQL DAGs through the new Airflow
-  compiler; general deployment of the staged flow's generated SQL/Python to
-  arbitrary external jobs remains separate work.
-- **Actually running the generated Python artifact** — today the staged flow
-  deploys only the verified SQL steps (or a Spark payload of them) and the
-  artifact is a syntax-checked deliverable Studio hands over and never
-  executes. Executing it means submitting it to a real runtime (an Airflow
+- **Actually running generated Python** — today Build Python's module is a
+  deliverable Studio hands over and never executes. Executing it means submitting it to a real runtime (an Airflow
   `PythonOperator` task, a Databricks job, a container) behind the same
   supervisor + human-approval gate, with the sandbox guarantees the tool-builder
   runners already give — a deliberate piece of work, not a flag to flip.

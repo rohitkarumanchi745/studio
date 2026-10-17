@@ -21,7 +21,7 @@ os.environ["STUDIO_DB_PATH"] = os.path.join(_TMP, "studio.db")
 import pytest
 
 import app.connectors as connectors
-from app import chat, connections, db, governance, pipelines, rbac
+from app import chat, connections, db, governance, rbac, stored_access
 
 SOURCE = "databricks-3"
 TABLE = "studio_dev.retail_qa.retail_products"
@@ -93,7 +93,7 @@ def test_a_role_granted_exactly_that_table_sees_it_and_others_do_not():
     "SELECT * FROM studio_dev.information_schema.tables",       # never listed
 ])
 def test_what_the_gateway_would_refuse_stays_hidden_even_under_star(sql):
-    assert not pipelines.stored_step_allowed("admin", {"source": SOURCE, "sql": sql}, SOURCE)
+    assert not stored_access.stored_step_allowed("admin", {"source": SOURCE, "sql": sql}, SOURCE)
     assert _shown(_answer(ADMIN, sql=sql, author="admin"), ADMIN)["redacted"] is True
 
 

@@ -4,11 +4,10 @@ import Canvas from "./Canvas";
 import ChartView from "./ChartView";
 import Markdown from "./Markdown";
 import SqlLab from "./SqlLab";
-import ChatPipeline from "./ChatPipeline";
 import ChatWorkflow from "./ChatWorkflow";
 import ChatPlatformRun, { PlatformComposer } from "./ChatPlatformRun";
 import { chatPipelineFields, PlanningContextPicker, PlanningSources,
-  usePlanningCatalog } from "./Pipelines";
+  usePlanningCatalog } from "./planningContext";
 
 // "Demo agent" for a single worker; "Snowflake agent + Databricks agent →
 // Aggregator" when a question fanned out across sources.
@@ -230,7 +229,6 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
     : sel.length === 0 ? "✳ All tables" : sel.length === 1 ? sel[0] : `${sel.length} tables`;
   const [messages, setMessages] = useState([]);
   const [prompt, setPrompt] = useState("");
-  const [buildPipeline, setBuildPipeline] = useState(false);
   const [buildAirflow, setBuildAirflow] = useState(false);
   const [repositoryId, setRepositoryId] = useState("");
   const [confluencePageIds, setConfluencePageIds] = useState([]);
@@ -421,13 +419,12 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
           tables: !orchestrated && sel.length > 1 ? sel : undefined,
           conversation_id: conversationId,
           model: model || undefined,
-          ...(visualMode ? { visual: true } : chatPipelineFields(buildPipeline, buildAirflow,
+          ...(visualMode ? { visual: true } : chatPipelineFields(buildAirflow,
             repositoryId, confluencePageIds)),
         }),
       });
       // Building is a one-turn action; follow-ups such as "run this pipeline"
       // must be interpreted normally after the draft has been requested.
-      setBuildPipeline(false);
       setBuildAirflow(false);
       if (!conversationId) onConversationCreated(data.conversation_id);
       pollFor(data.task_id, data.conversation_id);
@@ -438,17 +435,18 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
 
   async function runPipeline(message, action = "run") {
     const pipeline = message.pipeline;
-    const workflow = pipeline?.execution_mode === "airflow_dag";
-    if (busy || !conversationId || !message.message_id || (!workflow && pipeline?.status !== "ready")) return;
+    // Only an Airflow DAG drafted in chat can run; read-only SQL pipelines
+    // were removed, and their saved drafts are kept as a record only.
+    if (busy || !conversationId || !message.message_id || pipeline?.execution_mode !== "airflow_dag") return;
     // Workflow cards use freshly polled state. The saved message may still
     // say awaiting_approval after completion; the server checks the live job
     // before deciding whether to reuse its pending request or create a rerun.
     // Bind this action to the saved answer and its source. The current picker
     // may have changed since this pipeline was drafted.
     const pipelineSource = pipeline.source;
-    if (!pipelineSource || (!workflow && (pipeline.dropped?.length || !pipeline.steps?.length || pipeline.steps.some((s) => !s.verified || !s.sql)))) return;
+    if (!pipelineSource) return;
     taskViewEpochRef.current++;
-    const q = action === "status" ? "Check pipeline status" : workflow ? "Submit this pipeline" : "Run this pipeline";
+    const q = action === "status" ? "Check pipeline status" : "Submit this pipeline";
     setError("");
     setFailedActivity(null);
     setMessages((ms) => [...ms, { role: "user", text: q, source: pipelineSource, table: "*" }]);
@@ -827,26 +825,17 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
               </option>
             ))}
           </select>
-          <button className="primary send-btn" aria-label={buildAirflow ? "Build Airflow DAG" : buildPipeline ? "Build pipeline" : "Send message"} disabled={busy || !prompt.trim()}>
+          <button className="primary send-btn" aria-label={buildAirflow ? "Build Airflow DAG" : "Send message"} disabled={busy || !prompt.trim()}>
             ➤
           </button>
         </div>
         {!visualMode && (<>
         <label className="composer-pipeline-option">
-          <input type="checkbox" checked={buildPipeline} disabled={busy} onChange={(e) => {
-            setBuildPipeline(e.target.checked);
-            if (e.target.checked) setBuildAirflow(false);
-          }} />
-          Build a read-only pipeline from this prompt
-        </label>
-        <label className="composer-pipeline-option">
-          <input type="checkbox" checked={buildAirflow} disabled={busy} onChange={(e) => {
-            setBuildAirflow(e.target.checked);
-            if (e.target.checked) setBuildPipeline(false);
-          }} />
+          <input type="checkbox" checked={buildAirflow} disabled={busy}
+            onChange={(e) => setBuildAirflow(e.target.checked)} />
           Build an approval-gated Airflow DAG from this prompt
         </label>
-        {(buildPipeline || buildAirflow) && (
+        {buildAirflow && (
           <PlanningContextPicker {...planningCatalog}
             repositoryId={repositoryId} confluencePageIds={confluencePageIds}
             onRepositoryChange={setRepositoryId} onConfluenceChange={setConfluencePageIds}
@@ -858,6 +847,33 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
       </form>
       </main>
     </div>
+  );
+}
+
+// A read-only SQL pipeline saved in this conversation before that feature was
+// removed. Kept as a record of the SQL it held; it no longer runs.
+export function SavedSqlPipeline({ pipeline }) {
+  const steps = pipeline.steps || [];
+  return (
+    <section className="chat-pipeline" aria-label="Saved SQL pipeline">
+      <div className="chat-pipeline-heading">
+        <strong>{pipeline.name || "Saved SQL pipeline"}</strong>
+        <span className="chat-pipeline-status" role="status">Record only</span>
+      </div>
+      <p className="chat-pipeline-description">
+        Read-only SQL pipelines were removed, so this one no longer runs. Ask the question
+        again for fresh results, or build an Airflow DAG from it and submit that for approval.
+      </p>
+      {steps.map((step, index) => (
+        <details className="chat-pipeline-step" key={`${step.name}-${index}`}>
+          <summary>
+            <span>{index + 1}. {step.name || "Query"}</span>
+            <span className="meta">{step.source || pipeline.source}{step.table && step.table !== "*" ? ` / ${step.table}` : ""}</span>
+          </summary>
+          {step.sql && <pre className="query-sql">{step.sql}</pre>}
+        </details>
+      ))}
+    </section>
   );
 }
 
@@ -1023,7 +1039,7 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
         <PlanningSources sources={m.pipeline?.planning_sources} />
         {m.pipeline?.execution_mode === "airflow_dag"
           ? <ChatWorkflow key={m.pipeline.job_id || m.message_id} pipeline={m.pipeline} messageId={m.message_id} busy={busy} onRun={onRunPipeline} onStatus={onPipelineStatus} />
-          : m.pipeline && <ChatPipeline pipeline={m.pipeline} messageId={m.message_id} busy={busy} onRun={onRunPipeline} />}
+          : m.pipeline?.steps?.length > 0 && <SavedSqlPipeline pipeline={m.pipeline} />}
         {m.platform_run && <ChatPlatformRun key={m.platform_run.job_id || m.message_id} artifact={m.platform_run} messageId={m.message_id} busy={busy} onAction={onPlatformAction} />}
         {m.clarify && onClarify && (
           <div className="clarify-chips">

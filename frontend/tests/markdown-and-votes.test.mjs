@@ -23,7 +23,7 @@ const bundle = await build({
   plugins: [{
     name: "stub-chat-children",
     setup(b) {
-      b.onResolve({ filter: /^\.\/(Canvas|ChartView|SqlLab|ChatPipeline|ChatWorkflow|ChatPlatformRun)$/ },
+      b.onResolve({ filter: /^\.\/(Canvas|ChartView|SqlLab|ChatWorkflow|ChatPlatformRun)$/ },
                   ({ path: p }) => ({ path: p.slice(2), namespace: "chat-child" }));
       b.onLoad({ filter: /.*/, namespace: "chat-child" }, ({ path: name }) => ({
         contents: `export default function ${name}() { return null; }

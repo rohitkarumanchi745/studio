@@ -33,7 +33,7 @@ const bundle = await build({
     {
       name: "stub-children",
       setup(b) {
-        b.onResolve({ filter: /^\.\/(Canvas|SqlLab|ChatPipeline|ChatWorkflow|ChatPlatformRun|ChartView)$/ },
+        b.onResolve({ filter: /^\.\/(Canvas|SqlLab|ChatWorkflow|ChatPlatformRun|ChartView)$/ },
                     ({ path: p }) => ({ path: p.slice(2), namespace: "child" }));
         b.onLoad({ filter: /.*/, namespace: "child" }, ({ path: name }) => ({
           contents: `export default function ${name}() { return null; }

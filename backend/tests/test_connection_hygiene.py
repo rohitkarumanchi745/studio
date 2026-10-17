@@ -26,7 +26,7 @@ import types
 import pytest
 from fastapi import HTTPException
 
-from app import db, flow
+from app import db
 
 APP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app")
 
@@ -285,15 +285,28 @@ def test_connect_returns_the_pooled_connection_whether_or_not_the_body_raises(pg
 
 # ── Regression: the real-world shape ─────────────────────────────────────
 
+def _remove_owned(row_id, user):
+    """The shape of an owner-checked delete (the removed flow.remove() was the
+    original): read the row, raise 404 for another user's row from INSIDE the
+    block, otherwise delete it."""
+    with db.connect() as c:
+        r = c.execute("SELECT user_id FROM owned_rows WHERE id=?", (row_id,)).fetchone()
+        if r is None or dict(r)["user_id"] != user["id"]:
+            raise HTTPException(404, "Not found")  # 404, not 403 — no oracle
+        c.execute("DELETE FROM owned_rows WHERE id=?", (row_id,))
+        c.commit()
+    return {"deleted": True}
+
+
 def test_app_function_raising_mid_block_leaves_the_pool_full(pg, caplog, monkeypatch):
-    """flow.remove() reads the row, finds another user's flow and raises 404
-    from INSIDE the block — the exact shape (read, then HTTPException) that used
-    to strand a pooled connection for the life of the traceback."""
+    """Reading the row, finding another user's and raising 404 from INSIDE the
+    block — the exact shape (read, then HTTPException) that used to strand a
+    pooled connection for the life of the traceback."""
     caplog.set_level(logging.WARNING, logger="studio.db")
     monkeypatch.setattr(FakeRawConn, "SCRIPT", [[{"user_id": "someone-else"}]])
 
     with pytest.raises(HTTPException) as e:
-        flow.remove("f-1", {"id": "u-owner", "email": "o@studio.test", "role": "analyst"})
+        _remove_owned("f-1", {"id": "u-owner", "email": "o@studio.test", "role": "analyst"})
     assert e.value.status_code == 404
 
     p = _pool()

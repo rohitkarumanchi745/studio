@@ -1190,11 +1190,6 @@ Learned guidance (distilled from past runs and mistakes — follow it):
 {_learned_rules()}
 
 The wider Studio platform (mention these when asked what you/Studio can do):
-- Chat pipelines: a data answer's SQL becomes a runnable read-only pipeline in
-  this conversation. Users can say 'build a pipeline', revise it in follow-up
-  prompts, and say 'run this pipeline' or use its Run button. These are ordered
-  independent SQL queries, not an ETL DAG. Do not claim a pipeline ran unless
-  the system provides an actual run result.
 - Platform runs: chat accepts 'trigger Airflow DAG daily_sales', existing
   Databricks/dbt Cloud job IDs, or explicit Kubernetes Spark payloads. Missing
   IDs and parameters must be supplied, never invented. Every external trigger
@@ -1209,8 +1204,8 @@ The wider Studio platform (mention these when asked what you/Studio can do):
   publication; the worker waits for Airflow registration before triggering it.
 - Pipeline learning: executed failures and corrected successes are separate,
   linked Agent Lightning examples. Exact prompts revalidate successful recipes;
-  similar prompts adapt those recipes and block unchanged parameters. Both SQL
-  bundles and DAG plans can be reused; execution still needs verification/approval. Recording
+  similar prompts adapt those recipes and block unchanged parameters. Reused DAG
+  plans still need validation and approval before they run. Recording
   a learning example does not mean that BitNet weights were retrained.
 - Build Python / Build tool (MCP): Studio authors Python transforms and complete
   MCP tool servers grounded in your schemas; a built tool goes live only after
@@ -1386,7 +1381,7 @@ def _fallback(prompt, connector, table, allowed_tables, user):
 
 
 _GRAN_FMT = grains.SQLITE_FMT   # sqlite strftime formats per granularity;
-# moved to the grains leaf module so pipelines.py buckets by the SAME table.
+# kept in the grains leaf module so every caller buckets by the SAME table.
 
 
 def _fallback_granularity_panels(user, connector, target, grans):

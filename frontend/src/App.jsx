@@ -7,14 +7,12 @@ import Autopilot from "./components/Autopilot";
 import Chat, { isVisualConversation } from "./components/Chat";
 import Dashboard from "./components/Dashboard";
 import DashboardList from "./components/DashboardList";
-import Flow from "./components/Flow";
 import Login from "./components/Login";
 import Governance from "./components/Governance";
 import Semantic from "./components/Semantic";
 import Jobs from "./components/Jobs";
 import Kag from "./components/Kag";
 import PyBuild from "./components/PyBuild";
-import Pipelines from "./components/Pipelines";
 import LearnedRules from "./components/LearnedRules";
 import Memory from "./components/Memory";
 import QueryLibrary from "./components/QueryLibrary";
@@ -233,14 +231,12 @@ export default function App() {
         onDashboards={go("/dashboards")}
         onQueries={go("/queries")}
         onVisuals={go("/visuals")}
-        onPipelines={go("/pipelines")}
         onGovernance={go("/governance")}
         onSemantic={go("/semantic")}
         onJobs={go("/jobs")}
         onPyBuild={go("/py")}
         onSessions={go("/sessions")}
         onAgents={go("/agents")}
-        onFlow={go("/flow")}
         onSkills={go("/skills")}
         onMemory={go("/memory")}
         onLearnedRules={go("/learned-rules")}
@@ -266,7 +262,6 @@ export default function App() {
         <Route path="/autopilot" element={<Autopilot user={user} onClose={home} onOpenJobs={go("/jobs")} />} />
         <Route path="/kag" element={<Kag user={user} onClose={home} />} />
         <Route path="/toolbuilder" element={<ToolBuilder onClose={home} onOpenJobs={go("/jobs")} />} />
-        <Route path="/flow" element={<Flow onClose={home} onOpenJobs={go("/jobs")} />} />
         <Route path="/agents" element={<Agents onClose={home} />} />
         <Route path="/redteam" element={<RedTeam user={user} onClose={home} />} />
         <Route
@@ -286,7 +281,6 @@ export default function App() {
         <Route path="/jobs" element={<Jobs onClose={home} />} />
         <Route path="/governance" element={<Governance onClose={home} />} />
         <Route path="/semantic" element={<Semantic user={user} onClose={home} />} />
-        <Route path="/pipelines" element={<Pipelines onClose={home} />} />
         <Route path="/queries" element={<QueryLibrary onClose={home} />} />
         <Route path="/visuals" element={visualChat} />
         <Route path="/visuals/c/:conversationId" element={visualChat} />

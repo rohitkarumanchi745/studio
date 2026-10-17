@@ -168,8 +168,8 @@ def _harden(con):
 
 
 def lineage(parts, combined_label="blended table"):
-    """source -> table -> part -> blend, in the graph shape Lineage.jsx renders
-    (pipelines.lineage builds the same structure for pipeline steps)."""
+    """source -> table -> part -> blend: the provenance graph carried on a
+    blended answer."""
     sources, tables, steps, edges = {}, {}, [], []
     for i, p in enumerate(parts):
         src = p.get("source") or "?"

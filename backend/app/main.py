@@ -11,9 +11,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import (auth, autopilot, catalog, chat, confluence, connections, dashboards, db, flow, freshness,
+from . import (auth, autopilot, catalog, chat, confluence, connections, dashboards, db, freshness,
                governance, jobs, kag, kag_graph, keys, learned_rules, mcp, memory, migrations,
-               pipelines, policy_trajectories, pybuild,
+               policy_trajectories, pybuild,
                qcache, queries, redteam, repos, retention, semantic, sessions, supervisor,
                toolbuilder, trainer)
 from .agent import llm_available, llm_spec
@@ -40,10 +40,10 @@ app.add_middleware(
 # single URL per endpoint in dev, prod and /docs. Anything in front of the app
 # (reverse proxies, auth gateways) only needs to protect the /api prefix.
 _ROUTERS = (auth.router, catalog.router, chat.router, dashboards.router,
-            queries.router, pipelines.router, governance.router,
+            queries.router, governance.router,
             supervisor.router, mcp.router, pybuild.router, toolbuilder.router,
             kag.router, repos.router, repos._settings, confluence.router, sessions.router,
-            flow.router, trainer.router, policy_trajectories.router,
+            trainer.router, policy_trajectories.router,
             freshness.router, objectstore.router,
             semantic.router, autopilot.router, redteam.router, m365.router,
             connections.router, memory.router, learned_rules.router, retention.router)
@@ -71,7 +71,6 @@ def init_state():
     dashboards.init_tables()
     keys.init_tables()
     queries.init_tables()
-    pipelines.init_tables()
     governance.init_tables()
     governance.load()
     semantic.init_tables()
@@ -83,7 +82,6 @@ def init_state():
     kag_graph.init_tables()
     repos.init_tables()
     sessions.init_tables()
-    flow.init_tables()
     qcache.init_tables()
     trainer.init_tables()
     policy_trajectories.init_tables()

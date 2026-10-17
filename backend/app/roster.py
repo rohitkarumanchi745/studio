@@ -34,41 +34,12 @@ GRAPH_PLANNERS = [
      "planner_role": "minimalist", "produces": "candidate graph"},
 ]
 
-# The staged pipeline crew (flow.py): each turns one typed JSON artifact into
-# the next, and each run is recorded as its own Agent Lightning trace.
-STAGE_AGENTS = [
-    {"name": "Pipeline planner", "stage": "plan", "role": "stage",
-     "produces": "PipelineSpec"},
-    {"name": "Code generator", "stage": "codegen", "role": "stage",
-     "produces": "GeneratedArtifact"},
-    {"name": "Validator", "stage": "validate", "role": "stage",
-     "produces": "ValidationResult"},
-    {"name": "Approval agent", "stage": "approve", "role": "stage",
-     "produces": "DeploymentRequest"},
-    {"name": "Deployment executor", "stage": "execute", "role": "stage",
-     "produces": "ExecutionResult"},
-]
-
-
-# Utility agents that aren't source workers or a flow stage but are still named,
+# Utility agents that aren't source workers but are still named,
 # traced agents in their own right.
 SQL_VERIFIER = {"name": "SQL verifier", "role": "verifier", "produces": "verified SQL"}
 # The semantic layer answers from admin-defined metrics, so every phrasing of the
 # same question compiles to the same SQL — no model reinventing "revenue".
 SEMANTIC = {"name": "Semantic layer", "role": "semantic", "produces": "governed metric SQL"}
-
-
-def stage(name):
-    """The named stage agent for a flow stage (plan/codegen/validate/…)."""
-    return next((a for a in STAGE_AGENTS if a["stage"] == name),
-                {"name": name, "stage": name, "role": "stage"})
-
-
-def executor_name(target):
-    """The executor agent is named for where it deploys ("Databricks executor")."""
-    if not target or target == "*":
-        return "Deployment executor"
-    return f"{target[:1].upper()}{target[1:]} executor"
 
 
 def roster(user):
@@ -102,7 +73,6 @@ def summary(user):
         "orchestrator": ORCHESTRATOR,
         "aggregator": AGGREGATOR,
         "graph_planners": GRAPH_PLANNERS,
-        "pipeline_crew": STAGE_AGENTS,
         "utility_agents": [SQL_VERIFIER, SEMANTIC],
         "multi_source": len(accessible) > 1,
         "accessible_count": len(accessible),
