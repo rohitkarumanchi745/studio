@@ -200,7 +200,13 @@ def test_databricks_cancels_a_timed_out_statement_and_never_retries_it(monkeypat
 def test_a_statement_queued_behind_it_when_its_caller_gave_up_never_runs(monkeypatch):
     """Databricks runs one statement at a time per source; a caller that timed
     out while queued behind a runaway statement must not run later anyway."""
-    monkeypatch.setenv("STUDIO_QUERY_TIMEOUT_S", "0.3")
+    # The runaway statement holds the connection for 1s; the queued caller
+    # gives up after 0.2s, well before — so it is unambiguously abandoned
+    # while still queued. (With equal limits the two deadlines raced: the
+    # runaway was sometimes cancelled a few ms before the queued caller gave
+    # up, and the queued statement then — correctly — ran.) Each _run reads
+    # the limit as it starts.
+    monkeypatch.setenv("STUDIO_QUERY_TIMEOUT_S", "1.0")
     conn, wh = _databricks()
     errors = []
 
@@ -213,6 +219,7 @@ def test_a_statement_queued_behind_it_when_its_caller_gave_up_never_runs(monkeyp
     first = threading.Thread(target=ask, args=("SELECT slow FROM t",))
     first.start()
     assert _eventually(lambda: wh.executed == ["SELECT slow FROM t"])
+    monkeypatch.setenv("STUDIO_QUERY_TIMEOUT_S", "0.2")
     ask("SELECT queued FROM t")                    # waits on the connection lock, times out
     first.join(5)
     assert len(errors) == 2 and all("exceeded" in e for e in errors)

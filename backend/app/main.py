@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from . import (auth, autopilot, catalog, chat, confluence, connections, dashboards, db, flow, freshness,
                governance, jobs, kag, kag_graph, keys, learned_rules, mcp, memory, migrations,
                pipelines, policy_trajectories, pybuild,
-               qcache, queries, redteam, repos, semantic, sessions, supervisor,
+               qcache, queries, redteam, repos, retention, semantic, sessions, supervisor,
                toolbuilder, trainer)
 from .agent import llm_available, llm_spec
 from .connectors import objectstore
@@ -46,7 +46,7 @@ _ROUTERS = (auth.router, catalog.router, chat.router, dashboards.router,
             flow.router, trainer.router, policy_trajectories.router,
             freshness.router, objectstore.router,
             semantic.router, autopilot.router, redteam.router, m365.router,
-            connections.router, memory.router, learned_rules.router)
+            connections.router, memory.router, learned_rules.router, retention.router)
 for _router in _ROUTERS:
     app.include_router(_router, prefix="/api")
 
@@ -65,8 +65,9 @@ def init_state():
     from . import bootstrap
     bootstrap.enforce()
     chat.init_tables()
-    # Expire stored result rows past STUDIO_MESSAGE_ROWS_RETENTION_DAYS (0 = never); a scheduler will own this later.
-    chat.purge_message_rows()
+    # Result-row retention runs on the scheduler (retention.tick_once), never at
+    # boot: a boot-time purge removed history the moment a setting changed.
+    retention.init_tables()
     dashboards.init_tables()
     keys.init_tables()
     queries.init_tables()

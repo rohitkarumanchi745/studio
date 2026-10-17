@@ -68,6 +68,14 @@ input:focus, select:focus { border-color: var(--accent); }
   color: var(--ink-3); font-size: 11px; border-top: 1px solid var(--line); padding-top: 10px;
 }
 .error { color: var(--bad); font-size: 13px; }
+.rows-expired { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 6px 0;
+                padding: 8px 12px; border: 1px dashed var(--line); border-radius: var(--radius);
+                color: var(--ink-2); font-size: 13px; background: var(--surface-2); }
+.retention-notice { margin: 8px 0; padding: 10px 12px; border: 1px solid var(--warn);
+                    border-radius: var(--radius); color: var(--ink-2); font-size: 13px; }
+.retention-runs { margin-top: 8px; font-size: 12px; border-collapse: collapse; }
+.retention-runs th, .retention-runs td { padding: 3px 10px 3px 0; text-align: left; }
+.retention-runs tr.bad td { color: var(--bad); }
 .chat-notice { background: var(--accent-soft); border: 1px solid var(--line); border-radius: var(--radius);
                padding: 10px 14px; color: var(--ink-2); font-size: 13px; line-height: 1.5; }
 
