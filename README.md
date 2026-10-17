@@ -1173,6 +1173,22 @@ page / sheet) it stood on.
 - **Selectable as an engine.** When your role can reach a collection with content,
   `📄 KAG — your documents` appears in the composer's model menu; choosing it runs
   a documents-first turn that grounds in your files before touching the warehouse.
+- **A graph of what the documents connect** (`kag_graph.py`). Ingest also extracts
+  entities and relationships from each chunk — deterministically by default,
+  with the configured model when `STUDIO_KAG_GRAPH_LLM=1` — under the chunk's own
+  scope, and `knowledge_search` adds the connected subgraph to the passages it
+  returns. Every entity mention and relationship is recorded **per chunk**
+  (`kag_mentions`, `kag_edge_mentions`); counts are recomputed from that
+  evidence, never incremented blindly.
+- **Deleting a document deletes what it said.** Deleting a document, re-ingesting
+  a new version, deleting a collection, an M365 tombstone and an M365 purge all
+  remove the graph evidence in the same transaction as the chunks — even with
+  the graph turned off. A relationship another document still supports stays,
+  with its weight recomputed; nothing only the deleted document said survives,
+  and retrieval ignores any evidence whose chunk is gone. Graphs written before
+  per-chunk provenance are repaired on upgrade: migration 16 drops evidence for
+  deleted chunks and every unprovable relationship, and queues a
+  `kag_graph_rebuild` job that re-derives the graph from the surviving chunks.
 
 ### Microsoft 365 extraction layer
 

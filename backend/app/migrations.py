@@ -351,6 +351,41 @@ def _m15_user_memory_rank_columns(c, is_pg):
     _add_column(c, "user_memory", "updated_at", "REAL", is_pg)
 
 
+def _m16_kag_graph_provenance(c, is_pg):
+    # Before per-chunk provenance, a relationship summed its weight across
+    # documents under ONE source_name and entity counts only ever went up; no
+    # delete path touched the graph. So an old graph can hold evidence for
+    # chunks that are gone, relationships nothing proves any more, and
+    # inflated counts. The graph is derived data, and the chunks are the source
+    # of truth: drop evidence whose chunk is gone, drop every relationship that
+    # has no per-chunk provenance (that is every legacy one — its source_name
+    # cannot say which documents support it), recount entities, and queue a
+    # rebuild that re-derives relationships and exact counts from the chunks
+    # that survive. Retrieval already ignores anything without live evidence.
+    needed = ("kag_chunks", "kag_entities", "kag_edges", "kag_mentions",
+              "kag_edge_mentions", "background_jobs")
+    if not all(_table_exists(c, t, is_pg) for t in needed):
+        return
+    live = "EXISTS (SELECT 1 FROM kag_chunks k WHERE k.id = {t}.chunk_id)"
+    c.execute(f"DELETE FROM kag_mentions WHERE NOT {live.format(t='kag_mentions')}")
+    c.execute(f"DELETE FROM kag_edge_mentions WHERE NOT {live.format(t='kag_edge_mentions')}")
+    c.execute(
+        "DELETE FROM kag_edges WHERE NOT EXISTS (SELECT 1 FROM kag_edge_mentions m "
+        "WHERE m.collection = kag_edges.collection AND m.src = kag_edges.src "
+        "AND m.dst = kag_edges.dst AND m.relation = kag_edges.relation "
+        "AND m.access_scope = kag_edges.access_scope)")
+    c.execute(
+        "UPDATE kag_entities SET mentions = (SELECT COUNT(*) FROM kag_mentions m "
+        "WHERE m.collection = kag_entities.collection AND m.norm = kag_entities.norm "
+        "AND m.access_scope = kag_entities.access_scope)")
+    c.execute("DELETE FROM kag_entities WHERE mentions = 0")
+    job_id = "kag-graph-rebuild-m16"
+    if (c.execute("SELECT 1 FROM kag_chunks LIMIT 1").fetchone()
+            and not c.execute("SELECT 1 FROM background_jobs WHERE id=?", (job_id,)).fetchone()):
+        from . import jobs
+        jobs.enqueue("kag_graph_rebuild", {}, job_id=job_id, conn=c)
+
+
 MIGRATIONS = [
     (1, "users.verified", _m1_users_verified),
     (2, "conversations.folder_id", _m2_conversations_folder_id),
@@ -367,6 +402,7 @@ MIGRATIONS = [
     (13, "agent_sessions.is_fork", _m13_agent_sessions_forks),
     (14, "agent_traces.scrub_private_graph_context", _m14_scrub_private_graph_trace_context),
     (15, "user_memory.embedding+updated_at", _m15_user_memory_rank_columns),
+    (16, "kag graph per-chunk provenance + rebuild", _m16_kag_graph_provenance),
 ]
 
 

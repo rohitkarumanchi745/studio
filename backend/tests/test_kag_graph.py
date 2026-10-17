@@ -4,7 +4,7 @@ Locked in:
 - deterministic extraction (no LLM, no network) yields entities + co-occurrence
   edges from prose;
 - indexing is scoped by the chunk's access_scope; re-indexing a source clears and
-  rebuilds without duplicating;
+  rebuilds without duplicating (deletion and provenance: test_kag_graph_deletion);
 - graph_search seeds on query terms, walks scoped edges, and returns the
   connected subgraph + source provenance;
 - RBAC fail-closed: a private 'u:' scope is reachable ONLY by its owner — not
@@ -38,6 +38,14 @@ TEXT = ("Acme uses Snowflake for the Warehouse. "
 
 
 def _index(env, scope="analyst", collection="handbook", source="policy.docx", cid="c1"):
+    # A real chunk row first: retrieval only trusts evidence whose chunk exists.
+    import time
+    with env.db.connect() as c:
+        c.execute("INSERT INTO kag_chunks (id, collection, source_type, source_name, chunk_text, "
+                  "embedding, metadata, access_scope, content_hash, created_at) "
+                  "VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING",
+                  (cid, collection, "pdf", source, TEXT, None, "{}", scope, cid, time.time()))
+        c.commit()
     env.kg.index_chunk(collection, chunk_id=cid, source_name=source,
                        text=TEXT, access_scope=scope)
 
