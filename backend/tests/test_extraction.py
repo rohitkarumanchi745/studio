@@ -727,6 +727,21 @@ def test_onboard_delta_idempotency_and_tombstone(env, monkeypatch):
     assert "SECOND version" in txt and "first version" not in txt
     assert env.store.get_delta(uid, "drive") == feed2["@odata.deltaLink"]
 
+    # The graph follows the documents: the tombstoned Beta and the replaced
+    # first version of Alpha leave nothing behind, and no count is inflated.
+    c = env.db._conn()
+    ents = {r["norm"]: r["mentions"] for r in c.execute(
+        "SELECT norm, mentions FROM kag_entities WHERE collection=?", (coll,)).fetchall()}
+    sources = {r["source_name"] for r in c.execute(
+        "SELECT DISTINCT source_name FROM kag_mentions WHERE collection=? UNION "
+        "SELECT DISTINCT source_name FROM kag_edge_mentions WHERE collection=?",
+        (coll, coll)).fetchall()}
+    c.close()
+    assert "beta" not in ents and ents.get("alpha") == 1 and "second" in ents
+    assert sources == {a_src}
+    from app import kag_graph
+    assert kag_graph.graph_search("Beta memo", role="viewer", user_id=uid) == {}
+
 
 def test_enqueue_onboard_when_configured_creates_collection_and_schedules(env, monkeypatch):
     _configure_azure(monkeypatch)

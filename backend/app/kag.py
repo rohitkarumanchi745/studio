@@ -123,16 +123,47 @@ def init_tables():
         _m365_parsers.register()
     except Exception:
         pass
+    # The graph tables are part of this store: ingest and every delete write
+    # them in the same transaction as the chunks, so they must always exist.
+    from . import kag_graph
+    kag_graph.init_tables()
+
+
+def _drop_source(c, collection, source_name):
+    """Delete one document — its chunks AND its graph evidence — on the
+    caller's open transaction. Returns the chunk count. Every path that removes
+    a document (delete, re-ingest, an M365 tombstone) comes through here, so
+    none of them can leave graph rows behind."""
+    from . import kag_graph
+    ids = [r["id"] for r in c.execute(
+        "SELECT id FROM kag_chunks WHERE collection=? AND source_name=?",
+        (collection, source_name)).fetchall()]
+    kag_graph.remove_source(c, collection, source_name, ids)
+    cur = c.execute("DELETE FROM kag_chunks WHERE collection=? AND source_name=?",
+                    (collection, source_name))
+    return getattr(cur, "rowcount", 0) or 0
 
 
 def delete_source(collection, source_name):
-    """Remove every chunk of one source from a collection — the wholesale DELETE
-    keyed on (collection, source_name) that re-ingest already uses, exposed so a
-    tombstoned Graph item's chunks are dropped on delta. Returns the row count."""
+    """Remove one document from a collection — chunks and graph evidence, in one
+    transaction. The delete route and a tombstoned M365 item both use it.
+    Returns the chunk count."""
     with db.connect() as c:
-        cur = c.execute("DELETE FROM kag_chunks WHERE collection=? AND source_name=?",
-                        (collection, source_name))
+        n = _drop_source(c, collection, source_name)
+        c.commit()
+    return n
+
+
+def remove_collection(name):
+    """Remove a collection — its chunks, its whole graph and the collection row
+    — in one transaction. The delete route and an M365 purge both use it.
+    Returns the chunk count."""
+    from . import kag_graph
+    with db.connect() as c:
+        kag_graph.remove_collection(c, name)
+        cur = c.execute("DELETE FROM kag_chunks WHERE collection=?", (name,))
         n = getattr(cur, "rowcount", 0) or 0
+        c.execute("DELETE FROM kag_collections WHERE name=?", (name,))
         c.commit()
     return n
 
@@ -380,8 +411,10 @@ def ingest_bytes(user, collection, name, data, access_scope=None):
     (else 404 — invisible). A missing collection is auto-created ONLY by an admin
     (with access_scope); a non-admin ingesting into a non-existent collection
     gets 404. Re-ingest of the same (collection, source_name) is a wholesale
-    UPDATE — old chunks deleted, new ones inserted — so removed pages/rows
-    disappear. content_hash dedups identical chunks within the document.
+    UPDATE — old chunks and their graph evidence deleted, new ones inserted, in
+    one transaction — so removed pages/rows disappear, and so does a document
+    whose new version has no extractable text. content_hash dedups identical
+    chunks within the document.
     """
     if len(data) > MAX_BYTES:
         raise HTTPException(413, f"file exceeds the {MAX_BYTES} byte KAG limit")
@@ -416,6 +449,9 @@ def ingest_bytes(user, collection, name, data, access_scope=None):
     except ValueError as e:
         raise HTTPException(422, f"could not parse {name}: {e}")
     if not chunks:
+        # A new version with no text still replaces the old one: its chunks and
+        # graph evidence must not outlive it.
+        delete_source(collection, name)
         return {"collection": collection, "source_name": name, "chunks": 0,
                 "embedded": False, "dormant": not embed.available(),
                 "note": "no extractable text (e.g. a scanned image PDF)"}
@@ -439,30 +475,32 @@ def ingest_bytes(user, collection, name, data, access_scope=None):
                      json.dumps(vec) if vec else None, json.dumps(meta, default=str),
                      scope, h, now))
 
+    # Graph layer: extract entities/relations from the new chunks BEFORE the
+    # write transaction (the LLM extractor makes network calls). Best-effort: a
+    # chunk that fails to extract adds nothing and never fails the ingest.
+    from . import kag_graph
+    graph_input = []
+    for r in rows:
+        try:
+            rmeta = json.loads(r[6]) if r[6] else {}
+        except Exception:
+            rmeta = {}
+        graph_input.append({"id": r[0], "source_name": name, "text": r[4],
+                            "access_scope": scope,
+                            "page": rmeta.get("page") or rmeta.get("sheet")})
+    evidence = kag_graph.extract(graph_input, user)
+
+    # One transaction replaces the document: the old version's chunks and graph
+    # evidence go, the new ones arrive, and counts are recomputed from evidence.
     with db.connect() as c:
-        c.execute("DELETE FROM kag_chunks WHERE collection=? AND source_name=?",
-                  (collection, name))
+        _drop_source(c, collection, name)
         for r in rows:
             c.execute(
                 "INSERT INTO kag_chunks (id, collection, source_type, source_name, "
                 "chunk_text, embedding, metadata, access_scope, content_hash, created_at) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?)", r)
+        kag_graph.write(c, collection, evidence)
         c.commit()
-    # Graph layer: extract entities/relations from the new chunks (best-effort;
-    # portable, RBAC-scoped by the same access_scope). Never fails the ingest.
-    try:
-        from . import kag_graph
-        kag_graph.clear_source(collection, name)
-        for r in rows:
-            try:
-                rmeta = json.loads(r[6]) if r[6] else {}
-            except Exception:
-                rmeta = {}
-            kag_graph.index_chunk(collection, chunk_id=r[0], source_name=name,
-                                  text=r[4], access_scope=scope,
-                                  page=rmeta.get("page") or rmeta.get("sheet"), user=user)
-    except Exception:
-        pass
     db.log_activity(user, "kag_ingest", prompt=name, source=collection,
                     row_count=len(rows))
     return {"collection": collection, "source_name": name, "chunks": len(rows),
@@ -746,12 +784,7 @@ def delete_doc(name: str, source_name: str, user=Depends(current_user)):
     # Deleting content requires admin, or a role that can ingest into the scope.
     if user["role"] != "admin" and not _reachable(coll["access_scope"], user["role"]):
         raise HTTPException(403, "not permitted")
-    with db.connect() as c:
-        cur = c.execute("DELETE FROM kag_chunks WHERE collection=? AND source_name=?",
-                        (name, _basename(source_name)))
-        n = cur.rowcount if cur.rowcount is not None else 0
-        c.commit()
-    return {"deleted": n}
+    return {"deleted": delete_source(name, _basename(source_name))}
 
 
 @router.delete("/collections/{name}")
@@ -759,10 +792,6 @@ def delete_collection(name: str, user=Depends(current_user)):
     _admin(user)
     if not _collection(name):
         raise HTTPException(404, "Not found")
-    with db.connect() as c:
-        cur = c.execute("DELETE FROM kag_chunks WHERE collection=?", (name,))
-        n = cur.rowcount if cur.rowcount is not None else 0
-        c.execute("DELETE FROM kag_collections WHERE name=?", (name,))
-        c.commit()
+    n = remove_collection(name)
     db.log_activity(user, "kag_collection_delete", prompt=name)
     return {"deleted": n}
