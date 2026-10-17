@@ -34,14 +34,16 @@ def current():
     return _task.get()
 
 
-def emit(label):
+def emit(label, agent=None):
     """Append one step to the bound task's live feed. No-op when unbound
     (synchronous /chat has no task row and stays silent)."""
-    emit_for(_task.get(), label)
+    emit_for(_task.get(), label, agent=agent)
 
 
-def emit_for(tid, label):
-    """Append one step to a specific task's feed. Never raises."""
+def emit_for(tid, label, agent=None):
+    """Append one step to a specific task's feed. Never raises. `agent` names
+    who acted ("Snowflake agent", "Aggregator", a planner), so the UI can show
+    how many agents a task is using while it runs."""
     if not tid or not label:
         return
     try:
@@ -53,7 +55,10 @@ def emit_for(tid, label):
                 steps = json.loads(dict(r)["steps"] or "[]")
             except (TypeError, ValueError):
                 steps = []
-            steps.append({"t": round(time.time(), 2), "label": str(label)[:200]})
+            step = {"t": round(time.time(), 2), "label": str(label)[:200]}
+            if agent:
+                step["agent"] = str(agent)[:80]
+            steps.append(step)
             c.execute("UPDATE chat_tasks SET steps=? WHERE id=?",
                       (json.dumps(steps[-MAX_STEPS:]), tid))
             c.commit()

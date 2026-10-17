@@ -694,7 +694,7 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         """
         # Activity is retained after the turn. Keep executable SQL out of the
         # progress feed; the governed answer and audit log own the query text.
-        progress.emit_for(_tid, f"{_me}: running SQL on {connector.name}")
+        progress.emit_for(_tid, f"{_me}: running SQL on {connector.name}", agent=_me)
         # The gateway derives the table allowlist from this user's role itself;
         # `allowed_tables` here only shapes the prompt. Each call (rejected or
         # not) leaves its own audit row under the action "agent_sql".
@@ -733,7 +733,7 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
             x: Column for the x axis / category / label / source dimension.
             y: Numeric column(s) to plot; special shapes noted per type above.
         """
-        progress.emit_for(_tid, f"{_me}: rendering a {chart_type} chart")
+        progress.emit_for(_tid, f"{_me}: rendering a {chart_type} chart", agent=_me)
         if chart_type not in CHART_TYPES:
             return f"Unsupported chart_type. Use one of: {', '.join(CHART_TYPES)}"
         if ctx["sql"] is None:
@@ -768,7 +768,7 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
             request: What to draw and how — encodings, interactions, emphasis —
                 in plain words; the code is written from this.
         """
-        progress.emit_for(_tid, f"{_me}: writing a custom visual")
+        progress.emit_for(_tid, f"{_me}: writing a custom visual", agent=_me)
         if ctx["sql"] is None:
             return "No query result yet — call run_sql first."
         try:
@@ -804,7 +804,7 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         """
         names = [str(t).strip() for t in (tables or []) if str(t).strip()]
         asked, names = len(names), names[:DESCRIBE_MAX_TABLES]
-        progress.emit_for(_tid, f"{_me}: reading the columns of {', '.join(names) or 'no table'}")
+        progress.emit_for(_tid, f"{_me}: reading the columns of {', '.join(names) or 'no table'}", agent=_me)
         out = []
         for t in names:
             hit = described.get(t) or next(
@@ -1027,7 +1027,7 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
             pass
         # Cache the system prompt + prior-turn prefix (KV reuse across turns).
         messages = _cache_history(history, spec) + [("user", prompt)]
-        progress.emit_for(_tid, f"{_me}: reading the question and the schema")
+        progress.emit_for(_tid, f"{_me}: reading the question and the schema", agent=_me)
         # Multi-agent graph workers get a closed read-only tool profile. MCP
         # servers may expose arbitrary side effects, so only standalone chat
         # turns retain them.
@@ -1059,7 +1059,7 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
             usage = _single_reply_usage(reply)
         elif mcp_cfg:
             progress.emit_for(_tid, f"{_me}: loading tools from {len(mcp_cfg)} MCP "
-                                   f"server{'s' if len(mcp_cfg) != 1 else ''}")
+                                   f"server{'s' if len(mcp_cfg) != 1 else ''}", agent=_me)
             # MCP tools are async — load them and run the graph on an event loop.
             import asyncio
 

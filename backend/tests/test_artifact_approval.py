@@ -203,6 +203,9 @@ def test_approval_registers_the_server_exactly_once(no_warehouse, monkeypatch):
 
 
 def test_rejection_registers_nothing(no_warehouse):
+    # What THIS rejection registers: other test modules share the database and
+    # may have approved tools for the same analyst id.
+    before = set(mcp.registered(ANALYST))
     a = toolbuilder.build(BuildIn(prompt="never approved", kind="mcp"), user=ANALYST)
     sub = toolbuilder.submit(a["id"], SubmitIn(source="demo"), user=ANALYST)
     supervisor.reject(sub["job"]["id"], user=ADMIN)
@@ -212,7 +215,7 @@ def test_rejection_registers_nothing(no_warehouse):
     assert got["server_name"] is None
     assert not os.path.exists(
         os.path.join(os.environ["STUDIO_TOOLBUILDER_DIR"], f"srv_{a['id']}.py"))
-    assert not [n for n in mcp.registered(ANALYST) if n.startswith("tb_")]
+    assert set(mcp.registered(ANALYST)) == before
 
 
 def test_non_admin_cannot_approve_an_artifact(no_warehouse):
