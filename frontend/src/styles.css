@@ -144,6 +144,12 @@ input:focus, select:focus { border-color: var(--accent); }
 @keyframes viz-zoom { from { opacity: 0; transform: scale(.97); } to { opacity: 1; transform: none; } }
 @media (prefers-reduced-motion: reduce) { .viz-full { animation: none; } .viz-body { transition: none; } }
 @media (max-width: 900px) { .viz-frame.is-wide { width: auto; margin-left: 0; } }
+/* Pipeline screens: a labelled go button (the round send button cut "build"). */
+.go-btn { height: 36px; padding: 0 16px; border-radius: 10px; flex: none; white-space: nowrap; font-weight: 600; }
+.pl-step-remove { float: right; margin-left: 8px; font-size: 11px; }
+.job-summary { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; margin-top: 4px; min-width: 0; }
+.job-what { font-size: 12px; color: var(--ink-2); background: var(--surface-2); padding: 1px 6px; border-radius: 4px;
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chat-notice { background: var(--accent-soft); border: 1px solid var(--line); border-radius: var(--radius);
                padding: 10px 14px; color: var(--ink-2); font-size: 13px; line-height: 1.5; }
 
@@ -557,6 +563,8 @@ td { color: var(--ink-2); }
 .flow-status { display: inline-flex; align-items: center; margin: 12px 0; padding: 4px 12px;
   border-radius: 999px; font-size: 12px; font-weight: 700; text-transform: capitalize;
   border: 1px solid var(--line); }
+/* Pipeline flow writes its status as a sentence (pipelineText.js): keep its case. */
+.flow-status.flow-status-sentence { text-transform: none; }
 .flow-status-ok { color: var(--ok); border-color: #3d5a2e; }
 .flow-status-warn { color: var(--warn); border-color: #6b5a1e; }
 .flow-status-bad { color: var(--bad); border-color: #6b2540; }
