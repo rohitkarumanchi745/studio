@@ -109,6 +109,41 @@ input:focus, select:focus { border-color: var(--accent); }
 .activity-crew-list { display: flex; flex-wrap: wrap; gap: 6px; }
 .activity-crew-agent { cursor: default; }
 .agent-count { white-space: nowrap; }
+/* VizFrame: the reader sizes a visual in the D3 & artifacts window. */
+.echart-fill { height: 100%; margin-top: 0; }
+.viz-frame { position: relative; }
+/* Centred over its column with margins, not a transform: a transform would
+   trap anything position:fixed inside it. */
+.viz-frame.is-wide { --wide: min(1240px, calc(100vw - 320px)); width: var(--wide); max-width: none;
+  margin-left: calc((100% - var(--wide)) / 2); background: var(--surface); position: relative; z-index: 2;
+  padding: 10px 12px 4px; border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow-2);
+  box-sizing: border-box; }
+.viz-controls { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; margin: 0 0 6px; }
+.viz-seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.viz-seg .viz-size { border: 0; border-radius: 0; border-right: 1px solid var(--line); }
+.viz-seg .viz-size:last-child { border-right: 0; }
+.viz-size { font: inherit; font-size: 11px; color: var(--ink-2); background: var(--surface); cursor: pointer;
+  padding: 3px 9px; border: 1px solid var(--line); border-radius: 6px; transition: background .15s ease, color .15s ease; }
+.viz-size:hover { background: var(--surface-2); }
+.viz-size.is-on { background: var(--accent-soft); color: var(--accent); }
+.viz-body { position: relative; min-height: 0; transition: height .18s cubic-bezier(.2,.8,.2,1); }
+.viz-body > .echart-fill { height: 100%; }
+.viz-placeholder { display: grid; place-items: center; color: var(--ink-3); font-size: 12px;
+  border: 1px dashed var(--line); border-radius: var(--radius); }
+.viz-handle { height: 10px; margin-top: 2px; cursor: ns-resize; border-radius: 4px; position: relative; touch-action: none; }
+.viz-handle::after { content: ""; position: absolute; left: 50%; top: 3px; width: 44px; height: 4px; margin-left: -22px;
+  border-radius: 2px; background: var(--line); transition: background .15s ease; }
+.viz-handle:hover::after, .viz-handle:focus-visible::after { background: var(--accent); }
+.viz-handle:focus-visible { outline: none; }
+.viz-full { position: fixed; inset: 20px; z-index: 1000; display: flex; flex-direction: column; gap: 8px; padding: 14px;
+  background: var(--surface); border-radius: 12px; box-shadow: 0 0 0 100vmax rgba(20, 20, 20, .45), var(--shadow-pop);
+  animation: viz-zoom .2s cubic-bezier(.2,.8,.2,1); }
+.viz-full-head { display: flex; align-items: center; justify-content: space-between; }
+.viz-full-body { flex: 1; min-height: 0; }
+.viz-full-body > .echart-fill { height: 100%; }
+@keyframes viz-zoom { from { opacity: 0; transform: scale(.97); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .viz-full { animation: none; } .viz-body { transition: none; } }
+@media (max-width: 900px) { .viz-frame.is-wide { width: auto; margin-left: 0; } }
 .chat-notice { background: var(--accent-soft); border: 1px solid var(--line); border-radius: var(--radius);
                padding: 10px 14px; color: var(--ink-2); font-size: 13px; line-height: 1.5; }
 
