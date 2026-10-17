@@ -45,7 +45,8 @@ function getD3() {
 // motion: the D3 & artifacts window animates its charts (renderers/motion.js)
 // — in on first draw, and between states when a filter changes the rows. A
 // resize alone redraws in place.
-export default function D3View({ columns, rows, spec, tall, motion = false }) {
+// fill: take the size of the frame around it (VizFrame) instead of a fixed height.
+export default function D3View({ columns, rows, spec, tall, motion = false, fill = false }) {
   const ref = useRef(null);
   const drawn = useRef(null);
   const [err, setErr] = useState("");
@@ -97,7 +98,7 @@ export default function D3View({ columns, rows, spec, tall, motion = false }) {
   return (
     <>
       {err && <div className="chart-note">{err}</div>}
-      <div ref={ref} className={"echart d3-chart" + (tall ? " echart-tall" : "")}
+      <div ref={ref} className={"echart d3-chart" + (fill ? " echart-fill" : tall ? " echart-tall" : "")}
            style={err ? { display: "none" } : undefined} />
     </>
   );

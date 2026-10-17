@@ -246,7 +246,7 @@ function absolute(url) {
   }
 }
 
-export default function ArtifactView({ visual, columns, rows, tall }) {
+export default function ArtifactView({ visual, columns, rows, tall, fill = false }) {
   const ref = useRef(null);
   const [failure, setFailure] = useState("");
   // One document per visual: it embeds the rows it starts with, and later
@@ -298,7 +298,7 @@ export default function ArtifactView({ visual, columns, rows, tall }) {
       <iframe
         ref={ref}
         title={visual?.title || "Custom visual"}
-        className={"artifact-frame echart" + (tall ? " echart-tall" : "")}
+        className={"artifact-frame echart" + (fill ? " echart-fill" : tall ? " echart-tall" : "")}
         sandbox="allow-scripts"
         referrerPolicy="no-referrer"
         srcDoc={srcDoc}

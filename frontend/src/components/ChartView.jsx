@@ -15,6 +15,7 @@ import PlotlyView, { PLOTLY_TYPES } from "./renderers/PlotlyView";
 import VegaView, { VEGA_TYPES } from "./renderers/VegaView";
 import ArtifactView, { downloadArtifact } from "./renderers/ArtifactView";
 import VisualControls from "./VisualControls";
+import VizFrame from "./VizFrame";
 import { EMPTY_STATE, applyControls, detectControls } from "./visualFilters";
 import D3View, {
   D3_ONLY, D3_TYPES, LIMITS as D3_LIMITS, beeswarmData, calendarData, d3Type, networkData,
@@ -229,9 +230,13 @@ export default function ChartView({
         {visual.explanation && <div className="meta artifact-note">{visual.explanation}</div>}
         {saveError && <div className="chart-note">Could not save the file: {saveError}</div>}
         {filterBar}
-        {nothingLeft || (
+        {nothingLeft || (d3Only ? (
+          <VizFrame title={visual.title || chart?.title}>
+            <ArtifactView visual={visual} columns={baseColumns} rows={shownRows} fill />
+          </VizFrame>
+        ) : (
           <ArtifactView visual={visual} columns={baseColumns} rows={shownRows} tall={tall} />
-        )}
+        ))}
         {showCode && <pre className="artifact-code">{visual.code}</pre>}
       </div>
     );
@@ -325,7 +330,12 @@ export default function ChartView({
         <PlotlyView columns={columns} rows={rows} spec={spec} tall={tall} />
       ) : plottable && drawEngine === "vega" ? (
         <VegaView columns={columns} rows={rows} spec={spec} tall={tall} />
-      ) : nothingLeft ? nothingLeft : plottable && drawEngine === "d3" ? (
+      ) : nothingLeft ? nothingLeft : plottable && drawEngine === "d3" && d3Only ? (
+        // The D3 & artifacts window: the reader sizes the visual (VizFrame).
+        <VizFrame title={chart?.title}>
+          <D3View columns={columns} rows={shownRows} spec={spec} fill motion />
+        </VizFrame>
+      ) : plottable && drawEngine === "d3" ? (
         <D3View columns={columns} rows={d3Only ? shownRows : rows} spec={spec} tall={tall}
                 motion={d3Only} />
       ) : d3Only ? null : option ? (

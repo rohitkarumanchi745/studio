@@ -71,7 +71,8 @@ const BAR = { type: "bar", x: "region", y: ["revenue"], title: "By region" };
 
 test("a D3-only chart has no engine picker and offers every chart type", () => {
   const markup = html(ChartView, { columns: COLUMNS, rows: ROWS, chart: BAR, d3Only: true });
-  assert.match(markup, /class="echart d3-chart"/);
+  // Drawn inside the frame the reader sizes (VizFrame), filling it.
+  assert.match(markup, /class="viz-frame"[\s\S]*class="echart d3-chart echart-fill"/);
   assert.match(markup, /class="artifact-badge"[^>]*>D3</);
   assert.doesNotMatch(markup, /ECharts|Plotly|Altair/);
   assert.deepEqual(new Set(offered(markup)), D3_TYPES);
@@ -133,7 +134,8 @@ const ANSWER = {
 test("the window draws every panel in the thread, with D3 or a sandboxed visual", () => {
   const markup = html(AssistantMessage, { m: ANSWER, visualMode: true, onOpenCanvas() {} });
   assert.equal(markup.match(/class="msg-visual"/g)?.length, 2);
-  assert.match(markup, /class="echart d3-chart echart-tall"/);
+  assert.match(markup, /class="echart d3-chart echart-fill"/);
+  assert.match(markup, /class="artifact-frame echart echart-fill"/);
   assert.match(markup, /<iframe[^>]*sandbox="allow-scripts"/);
   assert.match(markup, /One ring per region/);
   assert.doesNotMatch(markup, /in canvas|⤢ canvas|ECharts|Plotly|Altair/);
