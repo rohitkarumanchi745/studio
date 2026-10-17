@@ -190,6 +190,31 @@ class PostgresConnector(Connector):
                 return [{"name": r[0], "type": r[1]} for r in cur.fetchall()]
         return self._execute(go)
 
+    def describe_relations(self):
+        """Kind and columns for every relation in the pinned schema, in two
+        information_schema queries."""
+        schema = self._schema()
+
+        def go(con):
+            with con.cursor() as cur:
+                cur.execute("SELECT table_name, table_type FROM information_schema.tables "
+                            "WHERE table_schema = %s", (schema,))
+                out = {name: {"kind": "table" if ttype == "BASE TABLE"
+                              else "view" if ttype == "VIEW" else "other",
+                              "namespace": schema, "columns": []}
+                       for name, ttype in cur.fetchall()}
+                cur.execute("SELECT table_name, column_name, data_type "
+                            "FROM information_schema.columns WHERE table_schema = %s "
+                            "ORDER BY table_name, ordinal_position", (schema,))
+                for name, col, ctype in cur.fetchall():
+                    if name in out:
+                        out[name]["columns"].append({"name": col, "type": ctype})
+                return out
+        try:
+            return self._execute(go)
+        except Exception:
+            return None
+
     def relation_kind(self, namespace, table):
         """Inspect pg_catalog without selecting any output-table data."""
         if not isinstance(namespace, str) or not isinstance(table, str) \

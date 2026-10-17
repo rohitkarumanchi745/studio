@@ -1330,6 +1330,10 @@ input:focus, select:focus, .composer-pill:focus-within { box-shadow: 0 0 0 1px v
 .dbconn-row .chip + .m365-badge, .dbconn-row .m365-badge + .chip { margin-left: 0; }
 .dbconn-row { flex-wrap: wrap; }
 .dbconn-actions { display: flex; gap: 6px; }
+/* What discovery found (MetadataLine.jsx): a full-width line under the row. */
+.metadata-line { flex-basis: 100%; display: flex; flex-wrap: wrap; align-items: center;
+  gap: 8px; font-size: 12px; padding-left: 30px; }
+.dbconn-row .metadata-line .chip { margin-left: 0; }
 .dbconn-actions .chip { margin-left: 0; }
 .dbconn-row-off { border-style: dashed; }
 .dbconn-row-off b, .dbconn-row-off .srcicon { opacity: 0.6; }

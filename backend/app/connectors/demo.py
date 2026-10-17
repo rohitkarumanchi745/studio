@@ -362,6 +362,23 @@ class DemoConnector(Connector):
         c.close()
         return [{"name": r[1], "type": r[2]} for r in rows]
 
+    def describe_relations(self):
+        """Kind and columns for every table and view in the demo warehouse."""
+        c = self._conn()
+        try:
+            rows = c.execute("SELECT name, type FROM sqlite_master "
+                             "WHERE type IN ('table', 'view') ORDER BY name").fetchall()
+            out = {}
+            for name, kind in rows:
+                # PRAGMA can't be parameterized; names come from sqlite_master.
+                quoted = name.replace('"', '""')
+                cols = c.execute(f'PRAGMA table_info("{quoted}")').fetchall()
+                out[name] = {"kind": kind, "namespace": None,
+                             "columns": [{"name": r[1], "type": r[2]} for r in cols]}
+            return out
+        finally:
+            c.close()
+
     def run_query(self, sql):
         c = self._conn()
         cur = c.execute(sql)

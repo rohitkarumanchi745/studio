@@ -994,6 +994,23 @@ def _refuse_save(probe):
     raise HTTPException(400, said)
 
 
+# Listeners told when a source is saved or reconnected — metagraph.py queues
+# its discovery here. Each is called as fn(name, trigger, conn=...): on a save,
+# `conn` is the transaction holding the new row, so whatever a listener writes
+# lands (or rolls back) with it.
+_SOURCE_LISTENERS = []
+
+
+def on_source_saved(fn):
+    _SOURCE_LISTENERS.append(fn)
+    return fn
+
+
+def _announce(name, trigger, *, conn=None):
+    for fn in list(_SOURCE_LISTENERS):
+        fn(name, trigger, conn=conn)
+
+
 def _create(user, name, ctype, stored, effective, label=""):
     """Validate, probe with the `effective` config, then store `stored` —
     the same dict for a typed credential, a from_env reference for a source
@@ -1029,6 +1046,9 @@ def _create(user, name, ctype, stored, effective, label=""):
                   "created_by, created_at, enabled) VALUES (?,?,?,?,?,?,?,1)",
                   (row["id"], row["name"], row["ctype"], row["label"], row["config"],
                    row["created_by"], row["created_at"]))
+        # Listeners (metagraph.py's discovery) write in this transaction, so
+        # the connection and its discovery job land together.
+        _announce(name, "connection_saved", conn=c)
         c.commit()
     _evict_cached(name)
     db.log_activity(user, "connection_create", prompt=name, source=ctype)
@@ -1162,6 +1182,7 @@ def reconnect_connection(cid: str, user=Depends(current_user)):
             raise HTTPException(400, f"connection test failed: {probe['error']}")
         _set_enabled(cid, True)
         _evict_cached(row["name"])
+        _announce(row["name"], "reconnected")
         db.log_activity(user, "connection_reconnect", prompt=row["name"], source=row["ctype"])
     row["enabled"] = 1
     return _public(row)
