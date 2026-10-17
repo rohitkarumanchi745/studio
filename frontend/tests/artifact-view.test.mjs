@@ -146,3 +146,24 @@ test("a thrown error and a syntax error both come back to Studio", async () => {
   assert.equal(broken.messages[0].kind, "error");
   broken.close();
 });
+
+// A model sometimes writes the whole function — `function draw(d3, data, el,
+// size, ui) { … }` — instead of its body. Wrapped by the runner, that only
+// declared a nested draw that nothing called: a blank frame and no error.
+test("a visual written as the whole draw function still draws", async () => {
+  const body = `d3.select(el).append("svg").attr("class", "drawn");`;
+  for (const code of [
+    body,
+    `function draw(d3, data, el, size, ui) {\n  ${body}\n}`,
+    `const draw = (d3, data, el, size, ui) => {\n  ${body}\n};`,
+  ]) {
+    const { messages, document, close } = await run(code);
+    assert.equal(document.querySelectorAll("svg.drawn").length, 1, code.slice(0, 40));
+    assert.equal(messages[0].kind, "ok");
+    close();
+  }
+  // A body with its own helper named draw, already called, is not drawn twice.
+  const { document, close } = await run(`function draw() { ${body} }\ndraw();`);
+  assert.equal(document.querySelectorAll("svg.drawn").length, 1);
+  close();
+});

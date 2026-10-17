@@ -20,6 +20,7 @@ browser.
 """
 import json
 import re
+import textwrap
 
 MAX_CODE_CHARS = 20_000
 SAMPLE_ROWS = 30
@@ -35,6 +36,8 @@ Reply with ONLY a JSON object:
 {{"title": "<short title>", "code": "<JavaScript>", "explanation": "<one or two sentences: what it shows and how to read it>"}}
 
 "code" is the BODY of:   function draw(d3, data, el, size, ui) {{ <code> }}
+  Write only the statements inside — not the "function draw(...) {{" line or its
+  closing brace.
 - d3 is the whole D3 v7 library. data is an array of row objects keyed by column
   name (numbers may arrive as strings; values may be null). el is an empty <div>
   filling the frame. size is {{width, height}} in pixels.
@@ -121,6 +124,58 @@ def _text(reply):
     return "".join(b.get("text", "") for b in content if isinstance(b, dict))
 
 
+# The whole function instead of its body: `function draw(d3, data, el, size,
+# ui) { … }`, or `const draw = (…) => { … }`. The runner would only declare a
+# nested draw — so keep just the body (the runner also copes, for code stored
+# before this existed).
+_WRAPPED = re.compile(
+    r"^\s*(?:function\s+draw\s*\(([^)]*)\)"
+    r"|(?:const|let|var)\s+draw\s*=\s*(?:function\s*)?\(([^)]*)\)\s*(?:=>)?)"
+    r"\s*\{(?P<body>[\s\S]*)\}\s*;?\s*$")
+
+
+def _balanced(body):
+    """True when the braces in `body` close in order (never more closes than
+    opens so far, and as many of each), skipping strings and comments — so
+    the outer braces really were the function's own."""
+    depth, i, n = 0, 0, len(body)
+    while i < n:
+        ch = body[i]
+        if ch in "\"'`":
+            j = i + 1
+            while j < n and body[j] != ch:
+                j += 2 if body[j] == "\\" else 1
+            i = j + 1
+            continue
+        if body.startswith("//", i):
+            j = body.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if body.startswith("/*", i):
+            j = body.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth < 0:
+                return False
+        i += 1
+    return depth == 0
+
+
+def unwrap(code):
+    """The body of a whole `draw` function, or the code unchanged."""
+    m = _WRAPPED.match(code or "")
+    if not m:
+        return code
+    params = [s.strip() for s in (m.group(1) if m.group(1) is not None else m.group(2) or "").split(",")]
+    if params[:4] != ["d3", "data", "el", "size"] or not _balanced(m.group("body")):
+        return code
+    return textwrap.dedent(m.group("body")).strip("\n")
+
+
 def parse(text):
     """{"title", "code", "explanation"} from a model reply, or VisualError."""
     t = re.sub(r"^```(?:json)?\s*|\s*```$", "", (text or "").strip())
@@ -139,7 +194,7 @@ def parse(text):
     if len(code) > MAX_CODE_CHARS:
         raise VisualError(f"the code is over {MAX_CODE_CHARS:,} characters")
     return {"title": str(obj.get("title") or "Custom visual").strip()[:120],
-            "code": code,
+            "code": unwrap(code),
             "explanation": str(obj.get("explanation") or "").strip()[:600]}
 
 

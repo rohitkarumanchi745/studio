@@ -231,3 +231,26 @@ def test_the_prompt_asks_for_an_interactive_artifact_with_motion():
         assert helper in p, helper
     assert "Studio already puts a date range, category" in p      # don't rebuild those
     assert "keyed joins" in p and "ui.reducedMotion" in p
+
+
+@pytest.mark.parametrize("wrapped", [
+    'function draw(d3, data, el, size, ui) {\n  d3.select(el).append("svg");\n  var s = "}{";\n}',
+    'function draw(d3, data, el, size) { d3.select(el).append("svg"); var s = "}{"; }',
+    'const draw = (d3, data, el, size, ui) => {\n  d3.select(el).append("svg");\n  var s = "}{";\n};',
+])
+def test_a_whole_draw_function_is_reduced_to_its_body(wrapped):
+    """Written as the whole function, the runner only declared a nested draw:
+    a blank frame, no error. parse() keeps just the body."""
+    out = visuals.parse(json.dumps({"title": "t", "code": wrapped, "explanation": "e"}))["code"]
+    assert not out.lstrip().startswith(("function draw", "const draw"))
+    assert 'd3.select(el).append("svg");' in out and 'var s = "}{";' in out
+
+
+@pytest.mark.parametrize("code", [
+    'd3.select(el).append("svg");',                                       # already a body
+    "function draw(a, b) { return 1; }",                                  # another function
+    "function draw(d3, data, el, size) { x(); }\ndraw(d3, data, el, size);",  # wrapper, then a call
+    "function draw(d3, data, el, size) { helper(); }\nfunction helper() { x(); }",  # two functions
+])
+def test_anything_else_is_left_as_written(code):
+    assert visuals.unwrap(code) == code
