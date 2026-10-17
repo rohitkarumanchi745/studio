@@ -15,6 +15,7 @@ Run from the backend directory:
 import os
 import sys
 import tempfile
+import time
 
 # Throwaway SQLite + sandbox dir BEFORE app modules compute their paths.
 # setdefault for the sandbox: toolbuilder.SANDBOX is frozen at IMPORT time while
@@ -38,6 +39,20 @@ VIEWER = {"id": "u-viewer", "email": "view@studio.test", "role": "viewer", "name
 STRANGER = {"id": "u-other", "email": "x@studio.test", "role": "analyst", "name": "Other"}
 
 
+def _persist_user(user):
+    """Approving a job re-checks its requester's CURRENT account, so the people
+    these tests submit as must exist, as every real requester does. An
+    id-derived email: test modules share one database, and several use the
+    same email under other ids."""
+    with db.connect() as c:
+        c.execute(
+            "INSERT INTO users (id,email,password_hash,name,role,verified,created_at) "
+            "VALUES (?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING",
+            (user["id"], f"{user['id']}@persisted.test", db.UNUSABLE_PASSWORD_HASH,
+             user["name"], user["role"], 1, time.time()))
+        c.commit()
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _tables():
     db.init_db()
@@ -45,6 +60,8 @@ def _tables():
     mcp.init_tables()
     toolbuilder.init_tables()
     seed()
+    for user in (ADMIN, ANALYST, VIEWER, STRANGER):
+        _persist_user(user)
     yield
 
 

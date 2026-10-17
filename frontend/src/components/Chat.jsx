@@ -19,6 +19,27 @@ function agentLabel(agents) {
   return agents.some((a) => a.role === "aggregator") ? `${names} → Aggregator` : names;
 }
 
+const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+
+/** How many agents a task used, and which: from a finished answer's `agents`
+ *  ({name, role}), or — while it runs — from the agents its progress steps
+ *  name. {total, text, detail, names}; total 0 when nothing names an agent. */
+export function agentSummary(agents = [], steps = []) {
+  const seen = new Map();
+  for (const a of agents || []) if (a?.name) seen.set(a.name, a.role || "worker");
+  for (const s of steps || []) if (s?.agent && !seen.has(s.agent)) seen.set(s.agent, "agent");
+  const names = [...seen.keys()];
+  const roles = [...seen.values()];
+  const count = (r) => roles.filter((x) => x === r).length;
+  const parts = [];
+  if (count("planner")) parts.push(plural(count("planner"), "planner"));
+  if (count("worker")) parts.push(plural(count("worker"), "worker"));
+  if (count("aggregator")) parts.push("Aggregator");
+  if (count("orchestrator")) parts.push("Orchestrator");
+  return { total: names.length, names, text: plural(names.length, "agent"),
+           detail: parts.length > 1 ? parts.join(" · ") : "" };
+}
+
 function buildCanvas(m) {
   const panels =
     m.panels?.length > 0
@@ -48,7 +69,8 @@ function elapsedTime(seconds) {
 
 // Task progress is a record of observable work, not the model's reasoning.
 // Completed steps are loaded from the owner-only task endpoint on expansion.
-export function AgentActivity({ steps = [], graph, running = false, failed = false, taskId, startedAt }) {
+export function AgentActivity({ steps = [], graph, running = false, failed = false, taskId, startedAt,
+                               agents }) {
   const [loadedSteps, setLoadedSteps] = useState(null);
   const [loadError, setLoadError] = useState("");
   const [loading, setLoading] = useState(false);
@@ -68,6 +90,9 @@ export function AgentActivity({ steps = [], graph, running = false, failed = fal
     ? `${events.length} ${events.length === 1 ? "event" : "events"}`
     : loadedSteps !== null ? "No recorded events" : "View recorded steps";
   const summaryStatus = failed ? `Run failed · ${recorded}` : running ? current || "Working…" : recorded;
+  // How many agents this task is using: live from the steps they emit, then
+  // the answer's final roster once it is saved.
+  const crew = agentSummary(agents, events);
 
   useEffect(() => {
     if (!running) return undefined;
@@ -102,6 +127,12 @@ export function AgentActivity({ steps = [], graph, running = false, failed = fal
             {summaryStatus}
           </span>
         </span>
+        {crew.total > 0 && (
+          <span className="activity-agents" title={crew.names.join(", ")}
+                aria-label={`${crew.text}${running ? " working" : ""}`}>
+            👥 {crew.text}{running ? " working" : ""}
+          </span>
+        )}
         {(running || events.length > 0) && <span className="activity-duration" aria-label={`${duration} elapsed`}>{duration}</span>}
         <span className="activity-chevron" aria-hidden="true" />
       </summary>
@@ -125,6 +156,14 @@ export function AgentActivity({ steps = [], graph, running = false, failed = fal
         )}
         {!loading && !loadError && !running && loadedSteps !== null && !events.length && (
           <p className="activity-note">No progress events were recorded for this {failed ? "run" : "answer"}.</p>
+        )}
+        {crew.total > 0 && !loadError && (
+          <section className="activity-crew" aria-label="Agents">
+            <h4>Agents · {crew.text}{crew.detail ? ` (${crew.detail})` : ""}</h4>
+            <div className="activity-crew-list">
+              {crew.names.map((name) => <span key={name} className="chip activity-crew-agent">{name}</span>)}
+            </div>
+          </section>
         )}
         {canShowGraph && nodes.length > 0 && !loadError && (
           <section className="activity-graph" aria-label="Agent graph">
@@ -939,6 +978,15 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
               : m.mode === "orchestrated" && m.agents_used?.length > 0
                 ? ` · agents: ${m.agents_used.join(", ")}`
                 : ""}
+            {(() => {
+              const crew = agentSummary(m.agents?.length ? m.agents
+                : (m.agents_used || []).map((name) => ({ name, role: "worker" })));
+              return crew.total > 0 && (
+                <span className="agent-count" title={crew.names.join(", ")}>
+                  {" "}· 👥 {crew.text}{crew.detail ? ` (${crew.detail})` : ""}
+                </span>
+              );
+            })()}
             {m.cached && (
               <span title={`reused the plan for: "${m.cached.from_prompt}"`}>
                 {" · "}reused plan{m.cached.similarity < 1 ? ` (${Math.round(m.cached.similarity * 100)}% match)` : ""} · fresh data
@@ -946,7 +994,7 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
             )}
           </span>
         </div>
-        {m.activity_task_id && <AgentActivity key={m.activity_task_id} taskId={m.activity_task_id} steps={activitySteps || []} graph={m.graph} />}
+        {m.activity_task_id && <AgentActivity key={m.activity_task_id} taskId={m.activity_task_id} steps={activitySteps || []} graph={m.graph} agents={m.agents} />}
         {m.text && <Markdown className="answer" text={m.text} />}
         {expired && (
           <div className="rows-expired" role="note">

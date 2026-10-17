@@ -257,7 +257,8 @@ def test_a_dependent_node_runs_after_its_upstream_and_sees_its_rows(monkeypatch)
 def test_a_failing_node_skips_its_dependents_instead_of_fabricating_answers(monkeypatch):
     seen = []
     activity = []
-    monkeypatch.setattr(ag.progress, "emit_for", lambda _tid, label: activity.append(label))
+    monkeypatch.setattr(ag.progress, "emit_for",
+                        lambda _tid, label, agent=None: activity.append(label))
     _fake_agent(monkeypatch, seen, fail=("postgres",))
     recorded = []
     monkeypatch.setattr(ag.lightning, "record_agent_rollout",

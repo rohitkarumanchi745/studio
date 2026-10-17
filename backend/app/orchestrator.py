@@ -202,14 +202,7 @@ def _run_orchestrated(prompt, user, history, model, conversation_id, sources):
                           for node in plan["nodes"]],
                 "combine": plan.get("combine", "reason"),
             }
-            formation = plan.get("formation") or {}
-            council = formation.get("planners") or []
-            if council:
-                progress.emit(
-                    f"{len(council)} independent planner(s) formed a "
-                    f"{len(plan['nodes'])}-agent graph")
-            else:
-                progress.emit(f"planned {len(plan['nodes'])} agent(s)")
+            _announce_formation(plan)
         else:
             progress.emit("fanning out to " + ", ".join(
                 roster.name_for(s["connector"].name) for s in sources))
@@ -245,7 +238,7 @@ def _run_orchestrated(prompt, user, history, model, conversation_id, sources):
     blended, blend_error = None, None
     if table_requested:
         jobs.check_claim()
-        progress.emit("Aggregator: blending the agents' results into one table")
+        progress.emit("Aggregator: blending the agents' results into one table", agent="Aggregator")
         try:
             blended = agent_graph.blend_parts(plan, run["results"], user)
             if blended is None:
@@ -259,7 +252,7 @@ def _run_orchestrated(prompt, user, history, model, conversation_id, sources):
 
     jobs.check_claim()
     progress.emit("Aggregator: synthesizing one answer from "
-                  f"{len(subs)} agents' results")
+                  f"{len(subs)} agents' results", agent="Aggregator")
     reasoner_spec = agent_graph.reasoning_model_spec(spec)
     text = _aggregate(prompt, subs, user, reasoner_spec,
                       conversation_id=conversation_id)
@@ -379,6 +372,24 @@ def _run_orchestrated(prompt, user, history, model, conversation_id, sources):
     }
 
 
+def _announce_formation(plan):
+    """Progress for the planning step: one step per planner, named with its
+    agent, so the live view counts the planners among the agents this task
+    is using; then what they formed."""
+    council = (plan.get("formation") or {}).get("planners") or []
+    for planner in council:
+        name = planner.get("agent") or planner.get("role") or "Graph planner"
+        outcome = ("proposed the graph that was chosen" if planner.get("selected")
+                   else "proposed a graph" if planner.get("status") == "valid"
+                   else "could not propose a usable graph")
+        progress.emit(f"{name}: {outcome}", agent=name)
+    if council:
+        progress.emit(f"{len(council)} independent planner(s) formed a "
+                      f"{len(plan['nodes'])}-agent graph")
+    else:
+        progress.emit(f"planned {len(plan['nodes'])} agent(s)")
+
+
 def _fanout(prompt, sources, user, model):
     """Scatter: run every source's agent concurrently and independently. One
     thread per source (each has its own connector), so the agents never touch
@@ -394,9 +405,9 @@ def _fanout(prompt, sources, user, model):
             sub = agent.run_agent(prompt, conn, "*", s["allowed"], s["schemas"],
                                   [], user, model, skill_md=s["skill"])
             progress.emit_for(tid, f"{roster.name_for(conn.name)}: finished "
-                                   f"({len(sub.get('rows') or [])} rows)")
+                                   f"({len(sub.get('rows') or [])} rows)", agent=roster.name_for(conn.name))
         except Exception as e:
-            progress.emit_for(tid, f"{roster.name_for(conn.name)}: failed")
+            progress.emit_for(tid, f"{roster.name_for(conn.name)}: failed", agent=roster.name_for(conn.name))
             sub = {"text": f"(agent error: {e})", "sql": None, "columns": [],
                    "rows": [], "chart": None, "panels": [], "errors": [str(e)]}
         sub["_source"] = conn.name

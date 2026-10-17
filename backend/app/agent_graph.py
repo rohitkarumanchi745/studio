@@ -1136,7 +1136,7 @@ def execute(plan, sources, prompt, user, model=None, conversation_id=None,
                     "or returned no rows: " \
                     + ", ".join(blocked_by)
                 progress.emit_for(tid, f"{roster.name_for(node['source'])}: skipped "
-                                       f"(dependency: {', '.join(blocked_by)})")
+                                       f"(dependency: {', '.join(blocked_by)})", agent=roster.name_for(node['source']))
                 return {"text": f"(agent skipped: {detail})", "sql": None,
                         "columns": [], "rows": [], "chart": None, "panels": [],
                         "errors": [detail], "_source": node["source"],
@@ -1202,9 +1202,9 @@ def execute(plan, sources, prompt, user, model=None, conversation_id=None,
                 if dependent_trajectory is not None:
                     sub["_dependent_trajectory"] = dependent_trajectory
                 progress.emit_for(tid, f"{roster.name_for(node['source'])}: finished "
-                                       f"({len(sub.get('rows') or [])} rows)")
+                                       f"({len(sub.get('rows') or [])} rows)", agent=roster.name_for(node['source']))
             except Exception as e:
-                progress.emit_for(tid, f"{roster.name_for(node['source'])}: failed")
+                progress.emit_for(tid, f"{roster.name_for(node['source'])}: failed", agent=roster.name_for(node['source']))
                 sub = {"text": f"(agent error: {e})", "sql": None, "columns": [], "rows": [],
                        "chart": None, "panels": [], "errors": [str(e)],
                        "_source": node["source"], "_node": node["id"],

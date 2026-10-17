@@ -104,6 +104,11 @@ input:focus, select:focus { border-color: var(--accent); }
 .vc-count { margin-left: 4px; }
 @keyframes vc-pop { from { opacity: 0; transform: scale(.96) translateY(-2px); } to { opacity: 1; transform: none; } }
 @media (prefers-reduced-motion: reduce) { .vc-menu { animation: none; } }
+.activity-agents { flex: none; margin-right: 8px; font-size: 12px; color: var(--ink-2); white-space: nowrap; }
+.activity-crew h4 { margin: 10px 0 6px; font-size: 12px; font-weight: 600; color: var(--ink-2); }
+.activity-crew-list { display: flex; flex-wrap: wrap; gap: 6px; }
+.activity-crew-agent { cursor: default; }
+.agent-count { white-space: nowrap; }
 .chat-notice { background: var(--accent-soft); border: 1px solid var(--line); border-radius: var(--radius);
                padding: 10px 14px; color: var(--ink-2); font-size: 13px; line-height: 1.5; }
 
