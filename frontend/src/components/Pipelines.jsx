@@ -10,6 +10,7 @@
 // with nothing verified Save is off and says why.
 import { useEffect, useState } from "react";
 import { api, getUser } from "../api";
+import { withoutStep } from "./pipelineText";
 import Lineage from "./Lineage";
 
 export function planningContextFields(repositoryId, confluencePageIds) {
@@ -243,11 +244,15 @@ export function PlanningSources({ sources }) {
 // One drafted step. Works for both lists: the badge, the tone and the reason
 // all come off the step itself. `intent_warnings` (e.g. the request said
 // "monthly" and the SQL buckets by day) warn — they never hide the step.
-function Step({ s }) {
+function Step({ s, onRemove }) {
   const warnings = s.intent_warnings || [];
   return (
     <div className="pl-step">
       <div className="pl-step-head">
+        {onRemove && (
+          <button type="button" className="chip pl-step-remove" onClick={onRemove}
+                  title="Leave this step out of the pipeline">✕ remove</button>
+        )}
         <span className="query-badge" style={{ color: s.verified ? "var(--ok)" : "var(--bad)" }}>
           {s.verified ? "✓ verified" : `✗ failed: ${s.error || "did not verify"}`}
         </span>
@@ -322,6 +327,16 @@ export default function Pipelines({ onClose }) {
     } finally {
       setBuilding(false);
     }
+  }
+
+  // Leave a drafted step out before saving. Saving re-verifies every step on
+  // the server, so this only ever narrows what runs.
+  function removeStep(i) {
+    setDraft((d) => d && ({
+      ...d,
+      steps: d.steps.filter((_, k) => k !== i),
+      lineage: withoutStep(d.lineage, i),
+    }));
   }
 
   async function save() {
@@ -413,8 +428,8 @@ export default function Pipelines({ onClose }) {
             placeholder="e.g. supply-chain status: inventory levels and production output by plant"
             disabled={building}
           />
-          <button className="primary send-btn" onClick={build} disabled={building || !prompt.trim()}>
-            {building ? "…" : "⚙ build"}
+          <button className="primary go-btn" onClick={build} disabled={building || !prompt.trim()}>
+            {building ? "building…" : "⚙ Build pipeline"}
           </button>
         </div>
         <PlanningContextPicker {...planningCatalog}
@@ -445,7 +460,7 @@ export default function Pipelines({ onClose }) {
               </div>
             )}
             {draft.steps.map((s, i) => (
-              <Step key={i} s={s} />
+              <Step key={`${i}-${s.name}`} s={s} onRemove={() => removeStep(i)} />
             ))}
             {draft.dropped?.length > 0 && (
               <>

@@ -6,6 +6,7 @@
 // panel (status / metrics / logs / quality checks) via GET /jobs/{id}/live.
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../api";
+import { ago, jobSummary } from "./pipelineText";
 import PipelineRecovery, { recoveryBlocksJobDecision, recoveryIsActive } from "./PipelineRecovery";
 
 const STATUS_LABEL = {
@@ -329,6 +330,14 @@ export default function Jobs({ onClose }) {
                     <span className="meta">{j.attempts}/{j.max_retries + 1} attempts</span>
                   )}
                   {recoveryIsActive(j.recovery) && <span className="meta">agent recovery: {j.recovery.state.replaceAll("_", " ")}</span>}
+                </div>
+                {/* What ran, by whom, when — without opening the row. */}
+                <div className="job-summary">
+                  {jobSummary(j) && <code className="job-what">{jobSummary(j)}</code>}
+                  <span className="meta">
+                    {[j.requester_email, ago(j.created_at)].filter(Boolean).join(" · ")}
+                    {" · "}{open === j.id ? "▾ hide details" : "▸ details"}
+                  </span>
                 </div>
                 {canApprove && !recoveryBlocksJobDecision(j.recovery, j.id) && (j.status === "awaiting_approval" || j.status === "escalated") && (
                   <div className="query-actions" onClick={(e) => e.stopPropagation()}>

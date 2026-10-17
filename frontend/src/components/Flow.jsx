@@ -6,6 +6,7 @@
 // trace. This view shows the chain, each artifact, and where it stopped.
 import { useEffect, useState } from "react";
 import { api } from "../api";
+import { flowStatusLabel, flowStatusNote } from "./pipelineText";
 
 const ARTIFACT_OF = {
   plan: "spec",
@@ -17,6 +18,7 @@ const ARTIFACT_OF = {
 
 const STATUS_TONE = {
   succeeded: "ok",
+  succeeded_sql_only: "ok",
   awaiting_approval: "warn",
   human_review: "warn",
   escalated: "warn",
@@ -34,10 +36,10 @@ const RUN_BAD = ["deploy_failed", "rejected", "rolled_back", "failed", "execute_
 // The visual DATA pipeline: source -> each transformation (with pass/fail) ->
 // where the scripts run. Generated from the NLP prompt via the planner; step
 // status is the Validator's real RBAC+guard+execution check per step.
-function PipelineGraph({ pv }) {
+export function PipelineGraph({ pv }) {
   const [open, setOpen] = useState(null);
   if (!pv || !pv.steps) return null;
-  const runTone = pv.run_status === "succeeded" ? "ok"
+  const runTone = pv.run_status === "succeeded" || pv.run_status === "succeeded_sql_only" ? "ok"
     : RUN_BAD.includes(pv.run_status) ? "bad" : "warn";
   const mark = { ok: "\u2713", failed: "\u2715", pending: "\u23f8" };
   const dotTone = { ok: "ok", failed: "bad", pending: "warn" };
@@ -46,11 +48,11 @@ function PipelineGraph({ pv }) {
       <div className="pl-graph">
         <div className="pl-gnode pl-src">
           <div className="pl-gnode-kind">source</div>
-          <div className="pl-gnode-title">\u25c6 {pv.source}</div>
+          <div className="pl-gnode-title">◆ {pv.source}</div>
         </div>
         {pv.steps.map((s, i) => (
           <div key={i} style={{ display: "contents" }}>
-            <div className="pl-garrow">\u2192</div>
+            <div className="pl-garrow">→</div>
             <div className={"pl-gnode pl-step-" + s.status}
               onClick={() => s.sql && setOpen(open === i ? null : i)} title={s.detail || ""}>
               <div className="pl-gnode-kind">
@@ -58,19 +60,19 @@ function PipelineGraph({ pv }) {
                 transform {i + 1}
               </div>
               <div className="pl-gnode-title">{s.name}</div>
-              {s.table && <div className="pl-gnode-sub">\u25a6 {s.table}</div>}
+              {s.table && <div className="pl-gnode-sub">▦ {s.table}</div>}
               {open === i && s.sql && <pre className="pl-gsql">{s.sql}</pre>}
               {s.status === "failed" && s.detail && <div className="pl-gerr">{s.detail}</div>}
             </div>
           </div>
         ))}
-        <div className="pl-garrow">\u2192</div>
+        <div className="pl-garrow">→</div>
         <div className={"pl-gnode pl-tgt"}>
           <div className="pl-gnode-kind">runs on</div>
-          <div className="pl-gnode-title">\u25b7 {pv.executor || pv.target}</div>
+          <div className="pl-gnode-title">▷ {pv.executor || pv.target}</div>
           <div className="pl-gnode-sub">{pv.kind}{pv.risk ? " \u00b7 " + pv.risk : ""}</div>
           <div className={"pl-gstatus flow-status-" + runTone}>
-            {(pv.run_status || "").replace(/_/g, " ") || "\u2014"}
+            {flowStatusLabel(pv.run_status)}
           </div>
         </div>
       </div>
@@ -208,8 +210,8 @@ export default function Flow({ onClose, onOpenJobs }) {
           placeholder="e.g. supply-chain status: inventory levels and downtime by plant"
           disabled={busy}
         />
-        <button className="primary send-btn" onClick={run} disabled={busy || !request.trim()}>
-          {busy ? "…" : "▷ run flow"}
+        <button className="primary go-btn" onClick={run} disabled={busy || !request.trim()}>
+          {busy ? "running…" : "▷ Run flow"}
         </button>
       </div>
       <div className="flow-opts">
@@ -224,14 +226,15 @@ export default function Flow({ onClose, onOpenJobs }) {
 
       {flow && (
         <>
-          <div className={"flow-status flow-status-" + tone}>
-            {flow.status.replace(/_/g, " ")}
+          <div className={"flow-status flow-status-sentence flow-status-" + tone}>
+            {flowStatusLabel(flow.status)}
             {flow.status === "awaiting_approval" && (
               <button className="chip" style={{ marginLeft: 10 }} onClick={onOpenJobs}>
                 → approve in Jobs
               </button>
             )}
           </div>
+          {flowStatusNote(flow) && <div className="meta flow-note">{flowStatusNote(flow)}</div>}
           {flow.status === "human_review" && (
             <div className="meta flow-note">
               Automated repair was exhausted — the pipeline needs human review before it can proceed. You were alerted by email.
@@ -268,7 +271,7 @@ export default function Flow({ onClose, onOpenJobs }) {
                   </div>
                   <div className="query-actions">
                     <span className={"query-tag flow-badge-" + (STATUS_TONE[f.status] || "warn")}>
-                      {f.status.replace(/_/g, " ")}
+                      {flowStatusLabel(f.status)}
                     </span>
                     <button className="chip ctx-danger" onClick={(e) => remove(f.id, e)}>✕</button>
                   </div>
