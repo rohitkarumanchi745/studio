@@ -230,6 +230,17 @@ class Connector:
         """
         return None
 
+    def describe_relation(self, name):
+        """describe_relations() for ONE relation, named as list_tables() names
+        it: {"kind", "namespace", "columns"}, or None when it is not found or
+        this is not supported (the caller then uses get_schema() and keeps the
+        kind it knew). Lets change capture re-read just the table that changed
+        (metagraph.discover_asset). Metadata only.
+
+        Default: None.
+        """
+        return None
+
     def describe_constraints(self):
         """Declared keys in this source's scope, keyed as list_tables() names
         tables: {"primary_keys": {table: [col, ...]},
@@ -251,6 +262,17 @@ class Connector:
     def lineage(self):
         """[(upstream, downstream)] table-level lineage the engine itself
         recorded, both named as list_tables() names them. Default: None."""
+        return None
+
+    def table_signals(self):
+        """{table: token} for the tables list_tables() returns, each token
+        changing whenever THAT table's columns or kind change — so a change can
+        be turned into one event for one table instead of a whole-source
+        rediscovery (metacdc.poll). Metadata only, one cheap query.
+
+        Default: None, meaning "not supported" — the source-wide
+        change_signal() and the full-sync cadence are used instead.
+        """
         return None
 
     def change_signal(self):

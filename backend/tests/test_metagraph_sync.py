@@ -281,15 +281,24 @@ def test_reconnecting_queues_a_rediscovery(sync):
 def test_a_supervised_write_queues_one_rediscovery(sync):
     tick(sync), run_queued(sync)
     from app import supervisor
+
+    def events():
+        with sync.db.connect() as c:
+            return [(r["event_id"], r["event_type"], r["origin"]) for r in c.execute(
+                "SELECT * FROM meta_events ORDER BY received_at").fetchall()]
+
     job = {"id": "job-1", "kind": supervisor.SQL_KIND, "target": "retail", "script": "x"}
     supervisor._notify_metadata(job)
-    run_queued(sync)
     supervisor._notify_metadata(job)                              # a polled status, again
-    assert queued(sync) == []
+    assert events() == [("job-job-1", "source_changed", "studio")]
+    warehouse(sync, "CREATE TABLE retail_promotions (promo_id INTEGER)")
+    handler = sync.jobs.handlers()["metagraph_event"]
+    assert handler({"event_id": "job-job-1"}, None) == {"status": "applied"}
+    assert "retail_promotions" in live_names(sync)               # the source was rediscovered
     dag = {"id": "dag-1", "kind": supervisor.DAG_KIND, "target": "airflow",
            "script": json.dumps({"plan": {"source": "retail"}})}
     supervisor._notify_metadata(dag)
-    assert queued(sync) == ["supervised_write"]
+    assert events()[-1] == ("job-dag-1", "source_changed", "studio")
 
 
 def _signed(body, secret="hook-secret"):

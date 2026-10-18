@@ -1484,16 +1484,84 @@ shows it: *grounded in the metadata graph: … (joined through …)*.
 
 **It stays current with no one asking.** The `metagraph_sync` scheduler (every
 `STUDIO_METAGRAPH_TICK_SECONDS`, 300 by default) reads each live source's
-*change signal* — one cheap catalog query: Postgres hashes every relation's
-kind and column names and types, Databricks takes the count and newest
-`last_altered` of `information_schema.tables`, the demo warehouse hashes its
-schema text — and rediscovers only a source whose signal moved since its last
-discovery, or whose last full discovery is older than
-`STUDIO_METAGRAPH_FULL_SYNC_SECONDS` (6 h; the only cadence for a connector
-with no signal). Events queue a rediscovery too: a supervised write against a
-source (an approved SQL job, a successful Airflow DAG), a reconnect, or a
-signed webhook (`POST /api/metagraph/events`, HMAC-SHA256 over the body with
-`STUDIO_METAGRAPH_WEBHOOK_SECRET`; absent secret, absent endpoint).
+*per-table change tokens*, in one cheap catalog query. Postgres hashes each
+relation's kind, column names and types. Databricks reads each relation's type
+and `last_altered`. The demo warehouse hashes each table's schema text. Every
+table whose token moved since the last checkpoint becomes a **change event**,
+and that event re-reads **just that table** (`metacdc.py`). A connector with no
+per-table tokens falls back to its single source-wide *change signal* and is
+rediscovered whole when it moves. Either way, a source whose last full
+discovery is older than `STUDIO_METAGRAPH_FULL_SYNC_SECONDS` (6 h) is
+rediscovered: that reconciles anything no event reported, and it is the only
+cadence for a connector with no signal at all. A reconnect still queues a
+rediscovery.
+
+**Change events** follow one contract, whoever sends them:
+
+```json
+{"event_id": "evt-123", "source": "databricks-3", "asset": "retail_order_items",
+ "event_type": "schema_changed", "source_version": 42,
+ "occurred_at": "2026-10-17T18:00:00Z", "tenant_id": "studio"}
+```
+
+`event_type` is one of `schema_changed`, `asset_created`, `asset_dropped`,
+`data_changed` or `source_changed`. An event with no `asset` is about the
+whole source. Events come from:
+- the per-table poller;
+- a supervised write against a source (an approved SQL job, a successful
+  Airflow DAG), keyed by the job's id;
+- a signed webhook: `POST /api/metagraph/events` takes one event, or
+  `{"events": [...]}` with up to 500 events. The signature is HMAC-SHA256 over
+  the body with `STUDIO_METAGRAPH_WEBHOOK_SECRET`. With no secret set, the
+  endpoint does not exist. The older `{"source": ...}` form still queues a
+  rediscovery.
+
+How events are handled:
+- **Accepted once, durably.** An event is recorded in the event log and its job
+  queued in one commit before the sender is told "accepted". The same
+  `event_id` again is reported as a duplicate and dropped. A malformed event,
+  one for an unknown source, or one whose `tenant_id` is another deployment's
+  is rejected with the reason.
+- **Never rolls the graph back.** An event carries no schema. The worker
+  re-reads the table's current state from the source, so a late, repeated or
+  reordered event cannot undo a newer one. Ordering only saves work. An event
+  is skipped as *superseded* when its table was read after the event arrived.
+  It is also skipped when an event from the same origin, with a later
+  `source_version` (or `occurred_at`), was already applied to that table.
+  Clocks and counters from different origins are never compared.
+- **One table at a time.** A schema event re-reads one table, and the listing
+  stays the authority on what exists. The relationships, metric baselines and
+  Neo4j mirror that depend on it are then refreshed once per source per
+  `STUDIO_METAGRAPH_REFRESH_SECONDS` (30), however many tables changed. A
+  certified metric whose column was dropped turns *broken* as soon as its
+  table is re-read.
+- **Big changes go the safe way.** Some changes go to a full rediscovery
+  instead of per-table events, and that is where the hold on large removals
+  applies:
+  - a removal as large as the hold rule's;
+  - more changed tables than `STUDIO_METAGRAPH_MAX_TABLE_EVENTS` (50).
+
+  A single-table removal is never taken from a truncated listing, or while
+  removals are held.
+- **Rows, not schema.** A `data_changed` event never touches the graph. It
+  records only when that table's data last changed (`data_changed_at` on the
+  table), and never moves that time backwards.
+- **Checkpoints and the snapshot handoff.** The poller's checkpoint moves only
+  after its events are accepted. The same change always gets the same event id,
+  so re-sending after a crash is a duplicate. A full discovery reads the tokens
+  before it lists. It records them as the checkpoint and marks every table as
+  read at the snapshot's start. A change made while the snapshot runs therefore
+  arrives as an event, and an older single-table read never overwrites a newer
+  one (or the other way round).
+- **Retry, then dead letter.** A failing event is retried with backoff, four
+  attempts in all. After that it is *dead*, metadata health turns *stale* for
+  that source, and an admin can replay it. The event log
+  (`GET /api/metagraph/events?source=&status=`) and per-source capture status
+  (`GET /api/metagraph/cdc`: checkpoint, last event, counts by status, oldest
+  wait) are for admins. So are `POST /api/metagraph/events/{id}/replay` and
+  `POST /api/metagraph/sources/{source}/cdc/reset`, which drops the checkpoint
+  and rediscovers the source. Settled events are pruned after
+  `STUDIO_METAGRAPH_EVENTS_KEEP_DAYS` (30); dead ones stay until replayed.
 
 - **One discovery at a time per source**; a queued or running one older than
   `STUDIO_METAGRAPH_STALE_SECONDS` is presumed lost and replaced. A failing

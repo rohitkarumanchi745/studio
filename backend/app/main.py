@@ -12,7 +12,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import (auth, autopilot, catalog, chat, confluence, connections, dashboards, db, flow, freshness,
-               governance, jobs, kag, kag_graph, keys, learned_rules, mcp, memory, metagraph, migrations,
+               governance, jobs, kag, kag_graph, keys, learned_rules, mcp, memory, metacdc, metagraph,
+               migrations,
                pipelines, policy_trajectories, pybuild,
                qcache, queries, redteam, repos, retention, semantic, sessions, supervisor,
                toolbuilder, trainer)
@@ -47,7 +48,7 @@ _ROUTERS = (auth.router, catalog.router, chat.router, dashboards.router,
             freshness.router, objectstore.router,
             semantic.router, autopilot.router, redteam.router, m365.router,
             connections.router, memory.router, learned_rules.router, retention.router,
-            metagraph.router)
+            metagraph.router, metacdc.router)
 for _router in _ROUTERS:
     app.include_router(_router, prefix="/api")
 

@@ -25,11 +25,17 @@ linked to its table and the columns it reads, checked against the record
 (valid / broken / unchecked), and versioned from the applied YAML documents.
 
 It then stays current with no one asking (tick_once, the "metagraph_sync"
-scheduler): every few minutes each source's cheap change signal
-(Connector.change_signal) is compared with the one its last discovery saw, and
-only a source whose signal moved — or whose last full discovery is too old —
-is rediscovered. Events also queue one: a connection saved or reconnected, a
-supervised write against a source, or a signed webhook (/metagraph/events).
+scheduler). Where the source reports a change token per table
+(Connector.table_signals), every few minutes the tables whose token moved
+become change events (metacdc.py), and each event re-reads just that table
+(discover_asset) — then the relationships, metric baselines and mirror are
+refreshed once for the source (refresh). Elsewhere the source's one cheap
+change signal (Connector.change_signal) is compared with the one its last
+discovery saw, and a source whose signal moved is rediscovered. Either way a
+full rediscovery still runs when the last one is too old: the reconciliation
+for any change no event reported. Events also come from a connection saved or
+reconnected, a supervised write against a source, and a signed webhook
+(/metagraph/events).
 
 Design:
 - STUDIO'S DATABASE IS THE SYSTEM OF RECORD. Snapshots, objects and columns
@@ -65,7 +71,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from . import connections, db, jobs, metaentities, metametrics, metarelations, rbac
+from . import connections, db, jobs, metacdc, metaentities, metametrics, metarelations, rbac
 from .auth import current_user
 
 log = logging.getLogger("studio.metagraph")
@@ -73,6 +79,7 @@ log = logging.getLogger("studio.metagraph")
 router = APIRouter(prefix="/metagraph", tags=["metagraph"])
 
 JOB_KIND = "metagraph_discover"
+REFRESH_KIND = "metagraph_refresh"
 
 
 def _max_objects():
@@ -127,6 +134,13 @@ def _confirm_delay_seconds():
 def _retry_seconds():
     """After the job's own retries, a failing source is tried again this often."""
     return max(60, _env_int("STUDIO_METAGRAPH_RETRY_SECONDS", 900))
+
+
+def _refresh_seconds():
+    """After per-table changes, the source's relationships, metric baselines
+    and Neo4j mirror are refreshed once per window of this many seconds, not
+    once per table. 0 refreshes at once, after every table."""
+    return max(0, _env_int("STUDIO_METAGRAPH_REFRESH_SECONDS", 30))
 
 
 def _snapshots_kept():
@@ -201,6 +215,7 @@ def init_tables():
     metarelations.init_tables()
     metaentities.init_tables()
     metametrics.init_tables()
+    metacdc.init_tables()
 
 
 # ── Discovery ────────────────────────────────────────────────────────────
@@ -252,6 +267,8 @@ def _on_source_event(name, trigger, conn=None):
                           "WHERE source=? AND removed_at IS NULL", (now, name))
             c.execute("UPDATE meta_sources SET status=? WHERE source=?", (trigger, name))
             c.commit()
+        if trigger == "removed":
+            metacdc.forget(name)
         mirror_drop(name)
         return
     enqueue(name, trigger, conn=conn)
@@ -311,16 +328,18 @@ def _signal_of(connector):
 
 
 def _read_source(source):
-    """List and describe a source: (objects, complete, signal). Raises when the
-    source cannot be listed at all. An object whose columns could not be read
-    is returned with columns=None, and makes the snapshot incomplete. The
-    change signal is read FIRST, so a change made while the listing runs moves
-    the signal past what this snapshot saw and the next tick catches it."""
+    """List and describe a source: (objects, complete, signal, table tokens).
+    Raises when the source cannot be listed at all. An object whose columns
+    could not be read is returned with columns=None, and makes the snapshot
+    incomplete. The change signal and the per-table tokens are read FIRST, so a
+    change made while the listing runs moves them past what this snapshot saw
+    and the next tick catches it."""
     from .connectors import get_connector
     connector = get_connector(source)
     if not connector.configured():
         raise RuntimeError(f"source '{source}' is not configured")
     signal = _signal_of(connector)
+    tokens = metacdc.read_table_signals(connector)
     names = list(connector.list_tables())
     cap = _max_objects()
     complete = len(names) <= cap and not getattr(connector, "tables_truncated", False)
@@ -346,7 +365,7 @@ def _read_source(source):
         objects.append({"name": str(name)[:512], "kind": kind,
                         "namespace": _namespace_of(name, info),
                         "columns": None if columns is None else _clean_columns(columns)})
-    return objects, complete, signal
+    return objects, complete, signal, tokens
 
 
 def _lock(c, source):
@@ -357,58 +376,39 @@ def _lock(c, source):
         c.execute("SELECT pg_advisory_xact_lock(?)", (key,))
 
 
+def _read_at(row):
+    """When the source was last read about this stored object (seen, or found
+    gone). A write based on an older read must not overwrite it."""
+    return max(row["last_seen_at"] or 0, row["removed_at"] or 0)
+
+
 def _write(source, snapshot_id, objects, complete, now, signal=None):
     """Apply one snapshot in one transaction. Returns (added, changed, removed,
-    held): `held` counts removals waiting for confirmation."""
+    held): `held` counts removals waiting for confirmation. An object re-read
+    on its own (discover_asset) after this snapshot started is newer than what
+    the snapshot saw, and is left as that read recorded it."""
     added = changed = removed = held = 0
     with db.connect() as c:
         _lock(c, source)
         existing = {r["name"]: dict(r) for r in c.execute(
-            "SELECT id, name, fingerprint, removed_at FROM meta_objects WHERE source=?",
-            (source,)).fetchall()}
+            "SELECT id, name, fingerprint, removed_at, last_seen_at FROM meta_objects "
+            "WHERE source=?", (source,)).fetchall()}
         state = c.execute("SELECT held_removals, held_at FROM meta_sources WHERE source=?",
                           (source,)).fetchone()
         seen = set()
         for obj in objects:
             seen.add(obj["name"])
             row = existing.get(obj["name"])
-            columns = obj["columns"]
-            if columns is None and row is not None:
-                # Columns unreadable this time: keep what we knew.
-                c.execute("UPDATE meta_objects SET last_seen_at=?, snapshot_id=? WHERE id=?",
-                          (now, snapshot_id, row["id"]))
+            if row is not None and _read_at(row) > now:
                 continue
-            columns = columns or []
-            fp = _fingerprint(obj["kind"], columns)
-            if row is None:
-                oid = str(uuid.uuid4())
-                c.execute(
-                    "INSERT INTO meta_objects (id, source, name, namespace, kind, fingerprint, "
-                    "column_count, first_seen_at, last_seen_at, changed_at, removed_at, "
-                    "snapshot_id) VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?)",
-                    (oid, source, obj["name"], obj["namespace"], obj["kind"], fp, len(columns),
-                     now, now, now, snapshot_id))
-                _put_columns(c, oid, columns)
-                added += 1
-            elif row["fingerprint"] != fp or row["removed_at"] is not None:
-                c.execute(
-                    "UPDATE meta_objects SET namespace=?, kind=?, fingerprint=?, column_count=?, "
-                    "last_seen_at=?, changed_at=?, removed_at=NULL, snapshot_id=? WHERE id=?",
-                    (obj["namespace"], obj["kind"], fp, len(columns), now, now, snapshot_id,
-                     row["id"]))
-                c.execute("DELETE FROM meta_columns WHERE object_id=?", (row["id"],))
-                _put_columns(c, row["id"], columns)
-                if row["removed_at"] is not None:
-                    added += 1
-                else:
-                    changed += 1
-            else:
-                c.execute("UPDATE meta_objects SET last_seen_at=?, snapshot_id=? WHERE id=?",
-                          (now, snapshot_id, row["id"]))
+            outcome = _upsert_object(c, source, row, obj, now, snapshot_id)
+            added += outcome == "added"
+            changed += outcome == "changed"
         status, held_names, held_at = ("ok" if complete else "partial"), None, None
         if complete:
             gone = sorted(n for n, row in existing.items()
-                          if n not in seen and row["removed_at"] is None)
+                          if n not in seen and row["removed_at"] is None
+                          and _read_at(row) <= now)
             live = sum(1 for row in existing.values() if row["removed_at"] is None)
             minimum, fraction = _hold_rule()
             previous = json.loads(state["held_removals"]) if state and state["held_removals"] \
@@ -441,6 +441,42 @@ def _write(source, snapshot_id, objects, complete, now, signal=None):
              1 if status in ("ok", "partial") else 0, signal, source))
         c.commit()
     return added, changed, removed, held
+
+
+def _upsert_object(c, source, row, obj, now, snapshot_id):
+    """Record one listed object against its stored row (None when new).
+    Returns "added" (new, or back from a tombstone), "changed" (its kind or
+    columns moved), or "unchanged" — including when its columns could not be
+    read this time, which keeps what was known."""
+    columns = obj["columns"]
+    if columns is None and row is not None:
+        c.execute("UPDATE meta_objects SET last_seen_at=?, snapshot_id=? WHERE id=?",
+                  (now, snapshot_id, row["id"]))
+        return "unchanged"
+    columns = columns or []
+    fp = _fingerprint(obj["kind"], columns)
+    if row is None:
+        oid = str(uuid.uuid4())
+        c.execute(
+            "INSERT INTO meta_objects (id, source, name, namespace, kind, fingerprint, "
+            "column_count, first_seen_at, last_seen_at, changed_at, removed_at, "
+            "snapshot_id) VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?)",
+            (oid, source, obj["name"], obj["namespace"], obj["kind"], fp, len(columns),
+             now, now, now, snapshot_id))
+        _put_columns(c, oid, columns)
+        return "added"
+    if row["fingerprint"] != fp or row["removed_at"] is not None:
+        c.execute(
+            "UPDATE meta_objects SET namespace=?, kind=?, fingerprint=?, column_count=?, "
+            "last_seen_at=?, changed_at=?, removed_at=NULL, snapshot_id=? WHERE id=?",
+            (obj["namespace"], obj["kind"], fp, len(columns), now, now, snapshot_id,
+             row["id"]))
+        c.execute("DELETE FROM meta_columns WHERE object_id=?", (row["id"],))
+        _put_columns(c, row["id"], columns)
+        return "added" if row["removed_at"] is not None else "changed"
+    c.execute("UPDATE meta_objects SET last_seen_at=?, snapshot_id=? WHERE id=?",
+              (now, snapshot_id, row["id"]))
+    return "unchanged"
 
 
 def _put_columns(c, object_id, columns):
@@ -477,13 +513,22 @@ def discover(source, trigger="manual"):
     snapshot_id, now = str(uuid.uuid4()), time.time()
     _start(source, snapshot_id, trigger, now)
     try:
-        objects, complete, signal = _read_source(source)
+        objects, complete, signal, tokens = _read_source(source)
         added, changed, removed, held = _write(source, snapshot_id, objects, complete, now,
                                                signal)
     except Exception as exc:
         log.warning("metagraph: discovery of %s failed", source, exc_info=True)
         _fail(source, snapshot_id, _safe_error(exc))
         raise
+    try:
+        # The snapshot-to-stream handoff. A table whose columns could not be
+        # read is left out of the checkpoint, so the poller re-reads it alone.
+        unread = {o["name"] for o in objects if o["columns"] is None}
+        metacdc.after_snapshot(source, now, None if tokens is None else
+                               {t: v for t, v in tokens.items() if t not in unread})
+    except Exception:
+        log.warning("metagraph: change-capture checkpoint of %s failed", source,
+                    exc_info=True)
     relationships = _relate(source)
     try:
         metametrics.ensure_baselines(source)
@@ -515,6 +560,163 @@ def _relate(source):
 def _discover_job(payload, job=None):
     payload = payload or {}
     return discover(payload["source"], payload.get("trigger") or "job")
+
+
+# ── One table at a time (change capture) ─────────────────────────────────
+
+def match_asset(asset, names):
+    """The one name in `names` that `asset` refers to: itself; the same name
+    ignoring case; or, between a bare and a qualified spelling, the one name
+    whose trailing parts agree ("orders" ~ "main.sales.orders"). None when no
+    name, or more than one, fits."""
+    names = list(names)
+    if asset in names:
+        return asset
+    low = str(asset).lower()
+    hits = [n for n in names if n.lower() == low]
+    if hits:
+        return hits[0] if len(hits) == 1 else None
+    want = low.split(".")
+
+    def agrees(name):
+        have = name.lower().split(".")
+        k = min(len(have), len(want))
+        return have[-k:] == want[-k:]
+    hits = [n for n in names if agrees(n)]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _describe_one(connector, name, row):
+    """Kind, namespace and columns of one object: Connector.describe_relation
+    when the source offers it, else get_schema() with the kind and namespace
+    already known (unknown for a new object until the next full discovery)."""
+    fn = getattr(connector, "describe_relation", None)
+    if fn is not None:
+        try:
+            info = fn(name)
+        except Exception:
+            log.warning("metagraph: describe_relation of %s failed", name, exc_info=True)
+            info = None
+        if info is not None:
+            return info
+    return {"kind": (row or {}).get("kind") or "unknown",
+            "namespace": (row or {}).get("namespace"),
+            "columns": connector.get_schema(name)}
+
+
+def discover_asset(source, asset, trigger="event"):
+    """Re-read ONE table or view and update just its record — the per-table
+    path of change capture (metacdc.apply). The listing stays the authority on
+    what exists: a listed object is re-read; one a complete listing no longer
+    shows becomes a tombstone — unless removals on this source are held for
+    confirmation, which the full rediscovery settles. The source's
+    relationships, metric baselines and mirror follow (refresh_soon), queued
+    in the same commit as the change. Raises when the source cannot be read,
+    so the event is retried.
+
+    Returns {"asset", "change"}: change is added, changed, unchanged, removed,
+    absent (neither listed nor known — out of scope, or never existed),
+    deferred (removal not provable now) or superseded (a newer read of this
+    object was recorded while this one ran)."""
+    from .connectors import get_connector
+    connector = get_connector(source)
+    if not connector.configured():
+        raise RuntimeError(f"source '{source}' is not configured")
+    read_at = time.time()
+    listed = list(connector.list_tables())
+    cap = _max_objects()
+    complete = len(listed) <= cap and not getattr(connector, "tables_truncated", False)
+    listed = [str(n)[:512] for n in listed[:cap]]
+    with db.connect() as c:
+        existing = {r["name"]: dict(r) for r in c.execute(
+            "SELECT id, name, kind, namespace, removed_at FROM meta_objects WHERE source=?",
+            (source,)).fetchall()}
+    name = match_asset(asset, listed)
+    if name is None:
+        gone = match_asset(asset, [n for n, r in existing.items() if r["removed_at"] is None])
+        if gone is None:
+            # Not one of the source's objects — a view the listing leaves out,
+            # say. Its change can still move relationships and lineage.
+            with db.connect() as c:
+                refresh = refresh_soon(source, conn=c)
+                c.commit()
+            if refresh == "now":
+                refresh_now(source)
+            return {"asset": asset, "change": "absent", "refresh": refresh}
+        if not complete:
+            return {"asset": gone, "change": "deferred",
+                    "reason": "the listing is truncated, so it cannot prove a removal"}
+        if (_state(source) or {}).get("held_removals"):
+            return {"asset": gone, "change": "deferred",
+                    "reason": "removals on this source are held for confirmation"}
+        obj = None
+    else:
+        info = _describe_one(connector, name, existing.get(name))
+        obj = {"name": name, "kind": info.get("kind") or "other",
+               "namespace": _namespace_of(name, info),
+               "columns": _clean_columns(info.get("columns"))}
+    with db.connect() as c:
+        _lock(c, source)
+        row = c.execute("SELECT id, name, fingerprint, removed_at, last_seen_at "
+                        "FROM meta_objects WHERE source=? AND name=?",
+                        (source, name or gone)).fetchone()
+        row = dict(row) if row else None
+        if row is not None and _read_at(row) > read_at:
+            return {"asset": name or gone, "change": "superseded"}
+        if obj is None:
+            if row is None or row["removed_at"] is not None:
+                return {"asset": gone, "change": "unchanged"}
+            c.execute("UPDATE meta_objects SET removed_at=? WHERE id=?", (read_at, row["id"]))
+            change = "removed"
+        else:
+            change = _upsert_object(c, source, row, obj, read_at, trigger)
+        refresh = refresh_soon(source, conn=c) if change != "unchanged" else None
+        c.commit()
+    if refresh == "now":
+        refresh_now(source)
+    out = {"asset": name or gone, "change": change, "refresh": refresh}
+    if obj is not None:
+        out["columns"] = len(obj["columns"])
+    return out
+
+
+def refresh_now(source):
+    """What follows a change to some of a source's objects: its relationships,
+    metric baselines and Neo4j mirror, recomputed from the record."""
+    relationships = _relate(source)
+    try:
+        metametrics.ensure_baselines(source)
+    except Exception:
+        log.warning("metagraph: metric baselines for %s failed", source, exc_info=True)
+    mirror(source)
+    return {"source": source, "relationships": relationships}
+
+
+def refresh_soon(source, *, conn):
+    """Queue the refresh for the end of the current STUDIO_METAGRAPH_REFRESH_SECONDS
+    window, once per source per window, on the caller's transaction — so many
+    table changes in a burst cost one refresh, and a recorded change always has
+    one coming. Returns the job id, or "now" when the window is 0 (the caller
+    then runs refresh_now after committing). A refresh queued for a window
+    starts only after it ends, so it always follows the change that found it
+    already queued."""
+    window = _refresh_seconds()
+    if window == 0:
+        return "now"
+    bucket = int(time.time() // window)
+    jid = f"mgrefresh-{bucket}-{hashlib.sha256(source.encode()).hexdigest()[:16]}"
+    if conn.execute("SELECT 1 FROM background_jobs WHERE id=?", (jid,)).fetchone() is None:
+        jobs.enqueue(REFRESH_KIND, {"source": source}, max_attempts=3, job_id=jid,
+                     run_after=(bucket + 1) * window + 1, conn=conn)
+    return jid
+
+
+@jobs.handler(REFRESH_KIND)
+def _refresh_job(payload, job=None):
+    source = (payload or {}).get("source")
+    if source not in _live_sources():
+        return {"skipped": True}
+    return refresh_now(source)
 
 
 # ── Reading the graph (permission-aware) ─────────────────────────────────
@@ -630,10 +832,12 @@ def get_source(source: str, user=Depends(current_user)):
             (own.get("") or {}).get("domain")
         obj["owner"] = names.get(entry.get("owner_id"))
     defs = metametrics.for_source(source, {o["name"] for o in objects})
+    data_changed = metacdc.data_changed(source)
     for obj in objects:
         obj["metrics"] = [{"name": d["name"], "kind": d["kind"], "status": d["status"],
                            "certified": d["certified"]}
                           for d in defs if d["object"] == obj["name"]]
+        obj["data_changed_at"] = data_changed.get(obj["name"])
     out = {**_summary(user, source, objects), "relations": objects}
     if user["role"] == "admin":
         out["removed"] = _recently_removed(source)
@@ -901,8 +1105,15 @@ def metadata_health(user=Depends(current_user)):
                   if d["status"] in metametrics.INVALID]
         if broken and fresh == "fresh":
             fresh = "failing"
-        rows.append({"source": source, "freshness": fresh, "reasons": reasons + broken,
-                     "broken_metrics": len(broken)})
+        # A dead or long-waiting change event: a change may not have reached
+        # the graph yet (the full sync will still reconcile it).
+        cdc_reasons, cdc = metacdc.health(source, now)
+        if cdc_reasons and fresh == "fresh":
+            fresh = "stale"
+        rows.append({"source": source, "freshness": fresh,
+                     "reasons": reasons + broken + cdc_reasons,
+                     "broken_metrics": len(broken), "dead_events": cdc["dead"],
+                     "events_waiting_seconds": cdc["waiting_seconds"]})
     worst = next((f for f in ("failing", "stale", "unknown")
                   if any(r["freshness"] == f for r in rows)), "fresh")
     return {"status": worst, "sources": rows}
@@ -969,15 +1180,19 @@ def _due(state, signal, now):
 
 
 def _check(source, now):
-    """Compare one source's change signal with what its last discovery saw and
-    queue a rediscovery when it moved (or is due anyway). Returns the reason
-    queued, or None."""
+    """Turn the tables whose per-table tokens moved into change events
+    (metacdc.poll); where a source has no such tokens, compare its one change
+    signal with what its last discovery saw. Queue a rediscovery when that
+    moved, when the change is too big for per-table events, or when one is due
+    anyway. Returns the reason queued, or None."""
     from .connectors import get_connector
     state = _state(source)
     if state and state["status"] in ("queued", "running") \
             and now - (state.get("queued_at") or state.get("started_at") or 0) < _stale_seconds():
         return None                      # one is on its way; a lost one goes stale
-    signal = _signal_of(get_connector(source))
+    connector = get_connector(source)
+    mode = metacdc.poll(source, connector, state, now)
+    signal = _signal_of(connector) if mode == "fallback" else None
     with db.connect() as c:
         cur = c.execute("UPDATE meta_sources SET checked_at=? WHERE source=?", (now, source))
         if not cur.rowcount:
@@ -985,6 +1200,8 @@ def _check(source, now):
                       (source, "not_discovered", now))
         c.commit()
     reason = _due(state, signal, now)
+    if reason is None and mode == "rediscover" and (state or {}).get("status") != "failed":
+        reason = "large_change"
     if reason:
         enqueue(source, reason)
     return reason
@@ -996,6 +1213,10 @@ def _purge_tombstones(now):
     with db.connect() as c:
         c.execute("DELETE FROM meta_columns WHERE object_id IN (SELECT id FROM meta_objects "
                   "WHERE removed_at IS NOT NULL AND removed_at < ?)", (cutoff,))
+        c.execute("DELETE FROM meta_asset_versions WHERE EXISTS (SELECT 1 FROM meta_objects o "
+                  "WHERE o.source = meta_asset_versions.source "
+                  "AND o.name = meta_asset_versions.asset "
+                  "AND o.removed_at IS NOT NULL AND o.removed_at < ?)", (cutoff,))
         cur = c.execute("DELETE FROM meta_objects WHERE removed_at IS NOT NULL "
                         "AND removed_at < ?", (cutoff,))
         c.commit()
@@ -1033,6 +1254,7 @@ def tick_once():
     try:
         purged = _purge_tombstones(now)
         _prune_snapshots()
+        metacdc.prune(now)
     except Exception:
         log.warning("metagraph: tombstone purge failed", exc_info=True)
         purged = 0
@@ -1070,16 +1292,22 @@ def _watch_freshness(sources, now):
 
 @router.post("/events", status_code=202)
 async def webhook(request: Request):
-    """A system that changed a source (a dbt run, a deployment) says so:
-    {"source": "..."} or {"sources": [...]}, signed with
+    """A system that changed a source says so, signed with
     STUDIO_METAGRAPH_WEBHOOK_SECRET as `X-Studio-Signature: sha256=<hex>` over
-    the raw body. Unset secret → this endpoint does not exist (404)."""
+    the raw body. Unset secret → this endpoint does not exist (404).
+
+    Change events (metacdc's contract): one event, or {"events": [...]} (at
+    most 500). The reply says which were accepted — recorded and queued
+    before this answer — which were duplicates of ones already received, and
+    which were rejected and why; 400 when none was accepted or a duplicate.
+    The older form, {"source": "..."} or {"sources": [...]}, still queues a
+    rediscovery of each source named."""
     import hmac
     secret = os.getenv("STUDIO_METAGRAPH_WEBHOOK_SECRET", "")
     if not secret:
         raise HTTPException(404, "Not found")
     body = await request.body()
-    if len(body) > 64 * 1024:
+    if len(body) > 512 * 1024:
         raise HTTPException(413, "event too large")
     expected = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
     if not hmac.compare_digest(expected, request.headers.get("x-studio-signature", "")):
@@ -1088,6 +1316,16 @@ async def webhook(request: Request):
         event = json.loads(body or b"{}")
     except ValueError:
         raise HTTPException(400, "body must be JSON")
+    if not isinstance(event, dict):
+        raise HTTPException(400, "body must be a JSON object")
+    if "events" in event or "event_id" in event:
+        batch = event["events"] if "events" in event else [event]
+        if not isinstance(batch, list) or not batch:
+            raise HTTPException(400, "events must be a non-empty list")
+        out = metacdc.ingest(batch, "webhook")
+        if not out["accepted"] and not out["duplicates"]:
+            raise HTTPException(400, {"rejected": out["rejected"]})
+        return out
     names = event.get("sources") or ([event["source"]] if event.get("source") else [])
     if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
         raise HTTPException(400, "source must be a name or a list of names")

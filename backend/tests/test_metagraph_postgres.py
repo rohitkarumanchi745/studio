@@ -4,10 +4,15 @@ did). Skipped unless STUDIO_TEST_POSTGRES_DSN names a database this test may
 create and drop a scratch schema in, e.g.
     STUDIO_TEST_POSTGRES_DSN=postgresql://studio@localhost:55432/scratch
 """
+import json
 import os
+import time
+import types
 import uuid
 
 import pytest
+
+ADMIN = {"id": "u-admin", "email": "admin@studio.test", "role": "admin", "name": "Admin"}
 
 DSN = os.getenv("STUDIO_TEST_POSTGRES_DSN", "")
 pytestmark = pytest.mark.skipif(not DSN, reason="STUDIO_TEST_POSTGRES_DSN not set")
@@ -85,3 +90,141 @@ def test_declared_keys_and_view_joins_on_postgres(pg):
     # Postgres stores the view's USING join rewritten; it is still read as one.
     observed = [k for k, v in rels.items() if k[0] == "join" and v["state"] == "observed"]
     assert observed and {observed[0][1], observed[0][3]} == {"retail_orders", "retail_customers"}
+
+
+# ── Change capture ───────────────────────────────────────────────────────
+
+def test_table_signals_move_only_for_the_relation_that_changed(pg):
+    conn, run = pg
+    base = conn.table_signals()
+    assert set(base) == {"retail_orders", "retail_customers", "retail_sales", "retail_stores",
+                         "retail_visits"}                          # the view too
+    assert conn.table_signals() == base                            # stable
+    run("ALTER TABLE {s}.retail_orders ADD COLUMN channel text")
+    after = conn.table_signals()
+    assert [t for t in base if after[t] != base[t]] == ["retail_orders"]
+    previous, signal = after, conn.change_signal()
+    for ddl in ("ALTER TABLE {s}.retail_orders ALTER COLUMN status TYPE varchar(20)",
+                "CREATE TABLE {s}.retail_promotions (promo_id int)",
+                "ALTER TABLE {s}.retail_promotions RENAME TO retail_offers",
+                "CREATE OR REPLACE VIEW {s}.retail_sales AS SELECT o.order_id, c.segment, "
+                "o.status FROM {s}.retail_orders o JOIN {s}.retail_customers c "
+                "USING (customer_id)",
+                "DROP TABLE {s}.retail_offers"):
+        run(ddl)
+        tokens, moved = conn.table_signals(), conn.change_signal()
+        assert tokens != previous and moved != signal, ddl          # whatever moves one…
+        previous, signal = tokens, moved                            # …moves the other
+
+
+def test_describe_relation_reads_one_relation_as_the_bulk_read_does(pg):
+    conn, _ = pg
+    bulk = conn.describe_relations()
+    assert conn.describe_relation("retail_orders") == bulk["retail_orders"]
+    assert conn.describe_relation("retail_sales")["kind"] == "view"
+    assert conn.describe_relation("no_such_table") is None
+
+
+@pytest.fixture()
+def pg_app(pg, tmp_path, monkeypatch):
+    """Studio's own state on Postgres too, as in production: a scratch
+    database for it, dropped afterwards."""
+    import importlib
+    from urllib.parse import urlsplit, urlunsplit
+
+    import psycopg
+    conn, run = pg
+    name = "mgapp_" + uuid.uuid4().hex[:10]
+    with psycopg.connect(DSN, autocommit=True) as admin:
+        admin.execute(f"CREATE DATABASE {name}")
+    parts = urlsplit(DSN)
+    monkeypatch.setenv("DATABASE_URL", urlunsplit(parts._replace(path="/" + name)))
+    monkeypatch.setenv("STUDIO_SECRET", "metagraph-secret")
+    monkeypatch.setenv("STUDIO_METAGRAPH_REFRESH_SECONDS", "0")
+    from app import db as _db
+    importlib.reload(_db)
+    from app import connections, connectors, governance, jobs, metacdc, metagraph
+    from app.connectors import demo
+    try:
+        _db.init_db()
+        jobs.init_tables()
+        metagraph.init_tables()
+        connections.init_tables()
+        monkeypatch.setitem(connectors._REGISTRY, "pg-test", conn)
+        monkeypatch.setattr(demo, "WAREHOUSE_PATH", str(tmp_path / "demo.db"))
+        governance._set('version: 1\nroles:\n  admin: { sources: "*" }\n', "test")
+        yield types.SimpleNamespace(db=_db, mg=metagraph, cdc=metacdc, jobs=jobs, run=run)
+    finally:
+        governance._STATE.update(doc=None, yaml="", source=None)
+        _db.close_pool()
+        monkeypatch.setenv("DATABASE_URL", "")
+        importlib.reload(_db)
+        with psycopg.connect(DSN, autocommit=True) as admin:
+            admin.execute(f"DROP DATABASE {name} WITH (FORCE)")
+
+
+def test_change_capture_end_to_end_on_postgres(pg_app):
+    env = pg_app
+    assert env.db.IS_PG
+    handlers = env.jobs.handlers()
+
+    def drain():
+        while True:
+            with env.db.connect() as c:
+                row = c.execute("SELECT * FROM background_jobs WHERE status='queued' AND kind IN "
+                                "('metagraph_event', 'metagraph_refresh') "
+                                "ORDER BY created_at LIMIT 1").fetchone()
+            if row is None:
+                return
+            handlers[row["kind"]](json.loads(row["payload"]),
+                                  {**dict(row), "attempts": row["attempts"] + 1})
+            with env.db.connect() as c:
+                c.execute("UPDATE background_jobs SET status='done' WHERE id=?", (row["id"],))
+                c.commit()
+
+    def events():
+        with env.db.connect() as c:
+            return [dict(r) for r in c.execute(
+                "SELECT * FROM meta_events WHERE source='pg-test' ORDER BY received_at").fetchall()]
+
+    def columns(table):
+        rel = next(r for r in env.mg.get_source("pg-test", user=ADMIN)["relations"]
+                   if r["name"] == table)
+        return [c["name"] for c in rel["columns"]]
+
+    env.mg.discover("pg-test", "test")
+    assert env.cdc.offsets("pg-test")[0]                              # the handoff
+    assert env.mg.tick_once()["queued"].get("pg-test") is None
+    env.run("ALTER TABLE {s}.retail_orders ADD COLUMN channel text")
+    assert env.mg.tick_once()["queued"].get("pg-test") is None      # no full rediscovery
+    [e] = events()
+    assert (e["asset"], e["event_type"], e["origin"]) == ("retail_orders", "schema_changed",
+                                                          "poller")
+    drain()
+    assert columns("retail_orders")[-1] == "channel"
+    assert events()[0]["status"] == "applied"
+
+    # Duplicates on Postgres: ON CONFLICT DO NOTHING reports no row.
+    first = env.cdc.ingest([{"event_id": "pg-1", "source": "pg-test", "asset": "retail_orders",
+                             "event_type": "data_changed", "occurred_at": 2_000}], "webhook")
+    again = env.cdc.ingest([{"event_id": "pg-1", "source": "pg-test", "asset": "retail_orders",
+                             "event_type": "data_changed", "occurred_at": 2_000}], "webhook")
+    assert first["accepted"] == ["pg-1"] and again["duplicates"] == ["pg-1"]
+    env.cdc.ingest([{"event_id": "pg-0", "source": "pg-test", "asset": "retail_orders",
+                     "event_type": "data_changed", "occurred_at": 1_000}], "webhook")
+    drain()
+    orders = next(r for r in env.mg.get_source("pg-test", user=ADMIN)["relations"]
+                  if r["name"] == "retail_orders")
+    assert orders["data_changed_at"] == 2_000
+
+    env.run("DROP TABLE {s}.retail_visits")
+    env.mg.tick_once()
+    drain()
+    assert "retail_visits" not in {r["name"] for r in
+                                   env.mg.get_source("pg-test", user=ADMIN)["relations"]}
+    assert [r["name"] for r in env.mg.get_source("pg-test", user=ADMIN)["removed"]] == \
+        ["retail_visits"]
+    settled = [e for e in events() if e["status"] in ("applied", "superseded", "ignored")]
+    assert len(settled) == 4
+    assert env.cdc.prune(time.time() + 365 * 86400) == 4 and events() == []
+    assert env.mg._purge_tombstones(time.time() + 365 * 86400) == 1
