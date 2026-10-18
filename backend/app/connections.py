@@ -66,6 +66,7 @@ from .connectors.powerbi_conn import PowerBIConnector, PowerBIError
 from .connectors.snowflake_conn import SnowflakeConnector
 from .connectors.cassandra_conn import CassandraConnector
 from .connectors.jira_conn import JiraConnector
+from .connectors.lancedb_conn import LanceDBConnector
 from .connectors.n8n_conn import N8nConnector
 from .connectors.servicenow_conn import ServiceNowConnector
 from .connectors.sql_conn import SqlConnector
@@ -189,6 +190,11 @@ class _DynCassandra(CassandraConnector):
 
 
 class _DynJira(JiraConnector):
+    def __init__(self, name, cfg):
+        super().__init__(name, cfg)
+
+
+class _DynLanceDB(LanceDBConnector):
     def __init__(self, name, cfg):
         super().__init__(name, cfg)
 
@@ -321,6 +327,48 @@ def _check_cassandra(cfg):
     port = str(cfg.get("port") or "9042").strip()
     if not port.isdigit():
         problems["port"] = "The port is a number, usually 9042."
+    return cfg, problems
+
+
+def _check_lancedb(cfg):
+    """An object-store URI (s3://, gs://, az://) or db:// with an API key; a
+    local path only where the deployment allows database files; storage
+    options as a JSON object; the library installed."""
+    from .connectors.lancedb_conn import REMOTE_SCHEMES, driver_available
+    from .connectors.sql_conn import local_files_allowed
+    cfg = {**cfg, **{k: (cfg.get(k) or "").strip()
+                     for k in ("uri", "api_key", "region", "host_override", "storage_options")}}
+    problems = {}
+    uri = cfg["uri"]
+    scheme = uri.split("://", 1)[0].lower() if "://" in uri else ""
+    if not driver_available():
+        problems["uri"] = "The LanceDB library is not installed here (pip install lancedb)."
+    elif scheme in ("", "file"):
+        if not local_files_allowed():
+            problems["uri"] = ("A path on Studio's own server is not allowed (set "
+                               "STUDIO_SQL_ALLOW_LOCAL_FILES=1 to permit it). Use s3://, gs://, "
+                               "az:// or db://.")
+    elif scheme not in REMOTE_SCHEMES:
+        problems["uri"] = (f"LanceDB does not read {scheme}:// here — use s3://, gs://, az:// "
+                           "(open-source LanceDB) or db:// (LanceDB Cloud).")
+    if scheme == "db" and not cfg["api_key"]:
+        problems["api_key"] = "LanceDB Cloud needs an API key."
+    if cfg["host_override"] and not cfg["host_override"].lower().startswith("https://"):
+        problems["host_override"] = "The Enterprise endpoint is an https:// URL."
+    if cfg["storage_options"]:
+        try:
+            opts = json.loads(cfg["storage_options"])
+            if not isinstance(opts, dict) or any(isinstance(v, (dict, list)) for v in opts.values()):
+                raise ValueError
+            cfg["storage_options"] = json.dumps(
+                {str(k): (str(v).lower() if isinstance(v, bool) else str(v))
+                 for k, v in opts.items()}, sort_keys=True)
+        except ValueError:
+            problems["storage_options"] = ('Storage options are a JSON object of strings, e.g. '
+                                           '{"aws_access_key_id": "…", "region": "us-east-1"}.')
+    rows = str(cfg.get("max_rows") or "1000000").strip()
+    if not rows.isdigit() or int(rows) < 1:
+        problems["max_rows"] = "The row limit is a whole number of rows, e.g. 1000000."
     return cfg, problems
 
 
@@ -506,6 +554,27 @@ TYPES = {
             _field("password", "Password", secret=True),
             _field("datacenter", "Local datacenter", placeholder="dc1"),
             _field("ssl", "TLS", placeholder="true to connect over TLS"),
+        ],
+    },
+    # LanceDB, open source on object storage or LanceDB Cloud: its tables'
+    # non-vector columns as DuckDB SQL.
+    "lancedb": {
+        "needs_tables": True,
+        "label": "LanceDB", "dialect": "duckdb", "build": _DynLanceDB,
+        "check": _check_lancedb,
+        "hint_key": "uri",
+        "fields": [
+            _field("uri", "Database URI", required=True,
+                   placeholder="s3://bucket/path, gs://…, az://…, or db://my-database (Cloud)"),
+            _field("api_key", "API key", secret=True,
+                   placeholder="LanceDB Cloud / Enterprise only"),
+            _field("region", "Cloud region", placeholder="us-east-1 (LanceDB Cloud only)"),
+            _field("host_override", "Enterprise endpoint",
+                   placeholder="https://… (LanceDB Enterprise only)"),
+            _field("storage_options", "Storage options (JSON)", secret=True,
+                   placeholder='{"aws_access_key_id": "…", "aws_secret_access_key": "…", '
+                               '"region": "us-east-1"}'),
+            _field("max_rows", "Row limit per table", default="1000000"),
         ],
     },
     # Atlassian Jira Cloud or Data Center: issues and projects as tables.

@@ -1147,8 +1147,8 @@ flowchart LR
 
 An admin connects a warehouse straight from the **Data connections** screen — no
 env vars, no redeploy. Pick a type (PostgreSQL, Snowflake, Databricks SQL,
-BigQuery, Neo4j, Power BI, Apache Cassandra, Atlassian Jira, ServiceNow, n8n,
-or **Any SQL database**, and every integration of the marketplace below), enter its
+BigQuery, Neo4j, Power BI, Apache Cassandra, LanceDB, Atlassian Jira, ServiceNow,
+n8n, or **Any SQL database**, and every integration of the marketplace below), enter its
 credentials, and test them. For SQL
 warehouses and Power BI the test also lists the visible schemas/datasets/models; select one or several, and Studio
 saves **one independently named and governed source per namespace**. A namespace
@@ -1222,11 +1222,11 @@ skill files all apply to it unchanged.
 **Data connections** is a marketplace: a searchable grid of integrations
 grouped by shelf, each with its icon and name. Above the shelves, when nothing
 is searched, a **Featured** row leads with Databricks SQL, Power BI,
-ServiceNow, Atlassian Jira and n8n (`FEATURED` in `sourceCatalog.jsx`); each
+ServiceNow, Atlassian Jira, n8n and LanceDB (`FEATURED` in `sourceCatalog.jsx`); each
 also stays on its own shelf. The shelves:
 - Databases
 - Data warehouses and lakehouses
-- NoSQL and graph
+- NoSQL, vector and graph
 - Work management and collaboration
 - Automation and workflows
 - BI and semantic models
@@ -1265,6 +1265,21 @@ tile. Icons are geometric marks in each brand's colour, not vendor logo files.
   only, and unquoted names fold to lower case as CQL folds them.
 - Rows are paged and capped. The agent is told CQL has no joins.
 - The same connector reaches ScyllaDB and Amazon Keyspaces (TLS, port 9142).
+
+**LanceDB** (`connectors/lancedb_conn.py`, `lancedb`):
+- **Where:** open-source LanceDB on `s3://`, `gs://` or `az://` (storage
+  credentials as LanceDB storage options, JSON), or `db://<database>` with an
+  API key for LanceDB Cloud / Enterprise (region, Enterprise endpoint).
+- **Tables** are the database's own. Embedding columns (fixed-size lists, or
+  lists of them) are left out of SQL; the other columns keep their types.
+- **Queries** are DuckDB SQL over the tables a query names, each read with
+  only its SQL columns and cached `LANCEDB_CACHE_SECONDS`. DuckDB runs with
+  external access off and its configuration locked: it reads that Arrow and
+  no file, URL or extension.
+- **Size:** at most `LANCEDB_MAX_ROWS` rows per table. A table past it is
+  named in the agent's briefing with its full row count.
+- A path on Studio's own disk needs `STUDIO_SQL_ALLOW_LOCAL_FILES=1`, as a
+  database file does for *Any SQL database*.
 
 **Atlassian Jira** (`connectors/jira_conn.py`):
 - Issues and projects are SQL tables, fetched from Jira's REST API into an

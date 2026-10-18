@@ -28,6 +28,7 @@ cassandra-driver>=3.29
 # snowflake-connector-python>=3.7
 databricks-sql-connector>=3.0
 duckdb>=1.0                      # object storage: s3 / azure_blob / gcs views
+lancedb>=0.40                    # LanceDB source (connectors/lancedb_conn.py); SQL runs in duckdb
 google-cloud-bigquery>=3.25
 # Power BI source: executeDaxQueries answers in Apache Arrow. Without pyarrow
 # the connector still works, over the older JSON executeQueries API (100,000

@@ -17,7 +17,7 @@
 const CATEGORIES = [
   { key: "database", label: "Databases" },
   { key: "warehouse", label: "Data warehouses and lakehouses" },
-  { key: "nosql", label: "NoSQL and graph" },
+  { key: "nosql", label: "NoSQL, vector and graph" },
   { key: "work", label: "Work management and collaboration" },
   { key: "automation", label: "Automation and workflows" },
   { key: "bi", label: "BI and semantic models" },
@@ -213,6 +213,16 @@ const MARKS = {
       <circle cx="29" cy="29" r="3.6" fill={c} opacity=".6" />
     </>
   ),
+  lance: (c) => (
+    <>
+      <path d="M8 32L25.5 14.5" stroke={c} strokeWidth="3" strokeLinecap="round" />
+      <path d="M21.5 10.5L33 7l-3.5 11.5z" fill={c} />
+      <circle cx="10" cy="14" r="2.6" fill={c} opacity=".45" />
+      <circle cx="16" cy="9" r="2" fill={c} opacity=".3" />
+      <circle cx="26" cy="30" r="2.6" fill={c} opacity=".45" />
+      <circle cx="31" cy="24" r="2" fill={c} opacity=".3" />
+    </>
+  ),
   beaker: (c) => (
     <>
       <path d="M16 6v10L9 29a3 3 0 0 0 2.7 4.4h16.6A3 3 0 0 0 31 29l-7-13V6" fill="none" stroke={c} strokeWidth="2.4" strokeLinejoin="round" />
@@ -281,6 +291,8 @@ const META = {
   // Native connectors added with the marketplace.
   cassandra: { label: "Apache Cassandra", color: "#1287b1", mark: "eye", category: "nosql",
                blurb: "A keyspace's tables, read with CQL — also ScyllaDB and Amazon Keyspaces." },
+  lancedb: { label: "LanceDB", color: "#6d5dfc", mark: "lance", category: "nosql",
+             blurb: "Tables beside your embeddings — ids, text, sources, dates — queried with SQL, on object storage or LanceDB Cloud." },
   jira: { label: "Atlassian Jira", color: "#0052cc", mark: "diamond", category: "work",
           blurb: "Issues and projects from Jira Cloud or Data Center, queryable as tables." },
 
@@ -371,7 +383,7 @@ const META = {
  * `ctype` means not available yet.
  */
 /** Shown first, on their own shelf, until the user searches. */
-export const FEATURED = ["databricks", "powerbi", "servicenow", "jira", "n8n"];
+export const FEATURED = ["databricks", "powerbi", "servicenow", "jira", "n8n", "lancedb"];
 
 export const MARKETPLACE = {
   mysql: { ctype: "sql", dialect: "mysql", driver: "pymysql",

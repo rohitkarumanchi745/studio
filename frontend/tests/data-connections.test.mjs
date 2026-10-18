@@ -242,7 +242,7 @@ test("the grid renders a tile per source with an honest status", async () => {
       // Section headings, so the grid reads as a map rather than a flat wall.
       assert.match(html, /Databases/);
       assert.match(html, /Data warehouses and lakehouses/);
-      assert.match(html, /NoSQL and graph/);
+      assert.match(html, /NoSQL, vector and graph/);
       assert.match(html, /Cloud file storage/);
       // Snowflake has one live source (the user's) out of two instances.
       assert.match(html, /Snowflake<\/span><span class="conn-tile-status">1 connected/);
@@ -253,7 +253,7 @@ test("the grid renders a tile per source with an honest status", async () => {
       assert.match(html, /GitHub<\/span><span class="conn-tile-status">1 registered/);
       assert.match(html, /conn-tile-off/);
       // Tiles are icon-led: one inline mark each, no missing-image holes — the
-      // featured shelf repeating its five on top.
+      // featured shelf repeating its six on top.
       const all = buildTiles({ types: TYPES, conns: CONNS, sources: SOURCES, repos: REPOS });
       assert.equal((html.match(/class="srcicon"/g) || []).length,
                    all.length + FEATURED.filter((id) => all.some((t) => t.id === id)).length);
@@ -1176,19 +1176,21 @@ test("every marketplace entry has a name, an icon and a shelf", () => {
 
 
 test("the featured shelf comes first, in its own order, until a search", async () => {
-  assert.deepEqual(FEATURED, ["databricks", "powerbi", "servicenow", "jira", "n8n"]);
+  assert.deepEqual(FEATURED, ["databricks", "powerbi", "servicenow", "jira", "n8n", "lancedb"]);
   const types = [...MARKET_TYPES,
     { ctype: "databricks", label: "Databricks SQL", fields: [] },
     { ctype: "powerbi", label: "Power BI", fields: [] },
     { ctype: "servicenow", label: "ServiceNow", fields: [{ key: "instance", label: "Instance" }] },
-    { ctype: "n8n", label: "n8n", fields: [{ key: "url", label: "n8n URL" }] }];
+    { ctype: "n8n", label: "n8n", fields: [{ key: "url", label: "n8n URL" }] },
+    { ctype: "lancedb", label: "LanceDB", fields: [{ key: "uri", label: "Database URI" }] }];
   const tiles = byId(buildTiles({ types }));
-  for (const id of ["servicenow", "n8n"]) {
+  for (const id of ["servicenow", "n8n", "lancedb"]) {
     assert.equal(tiles[id].connectable, true, id);
     assert.equal(tiles[id].via, undefined, `${id} is native now`);
   }
   assert.equal(metaFor("n8n").category, "automation");
   assert.equal(metaFor("servicenow").category, "work");
+  assert.equal(metaFor("lancedb").category, "nosql");
   await withApi({ __user: ADMIN, "/catalog/sources": [], "/connections/types": types,
                   "/connections": [], "/m365/status": { configured: false, connected: false },
                   "/settings/repos": { repos: [] } },
@@ -1200,7 +1202,8 @@ test("the featured shelf comes first, in its own order, until a search", async (
       const html = panel.render();
       const shelf = html.slice(html.indexOf(">Featured<"), html.indexOf(">Databases<"));
       const names = [...shelf.matchAll(/conn-tile-name">([^<]+)</g)].map((m) => m[1]);
-      assert.deepEqual(names, ["Databricks SQL", "Power BI", "ServiceNow", "Atlassian Jira", "n8n"]);
+      assert.deepEqual(names, ["Databricks SQL", "Power BI", "ServiceNow", "Atlassian Jira", "n8n",
+                               "LanceDB"]);
     });
 });
 
@@ -1217,7 +1220,8 @@ test("a non-admin sees the featured integrations too, and is told who connects t
       await flush();
       const html = panel.render();
       const shelf = html.slice(html.indexOf(">Featured<"), html.indexOf(">Databases<"));
-      for (const name of ["Databricks SQL", "Power BI", "ServiceNow", "Atlassian Jira", "n8n"]) {
+      for (const name of ["Databricks SQL", "Power BI", "ServiceNow", "Atlassian Jira", "n8n",
+                          "LanceDB"]) {
         assert.match(shelf, new RegExp(`${name}</span><span class="conn-tile-status">Ask an admin`));
       }
     });
