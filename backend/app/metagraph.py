@@ -981,9 +981,10 @@ def source_paths(source: str, tables: str, min_confidence: float = 0.6,
     joins, missing = metarelations.join_path(
         metarelations.current(source, visible), [t for t in wanted if t in visible],
         min_confidence)
+    joins = [{**j, "trusted": metarelations.trusted(j)} for j in joins]
     return {"source": source, "tables": wanted, "joins": joins,
             "connected": not missing and not unknown, "unreachable": missing,
-            "unknown": unknown}
+            "unknown": unknown, "unverified": sum(1 for j in joins if not j["trusted"])}
 
 
 @router.post("/sources/{source}/relationships/{rel_id}/review")
@@ -1424,8 +1425,19 @@ class MirrorRefused(RuntimeError):
 
 def _tenant():
     """The deployment's partition of a shared Neo4j. Every mirrored node and
-    edge carries it and every statement is scoped by it."""
+    edge carries it and every statement is scoped by it. The mirror refuses
+    to run until it is set (_mirror_cfg); "studio" only names the deployment
+    in events that check a tenant_id."""
     return (os.getenv("STUDIO_METAGRAPH_TENANT", "").strip() or "studio")[:64]
+
+
+def _http_uri(uri, setting):
+    """Studio talks to Neo4j over its HTTP API; a Bolt URI cannot work."""
+    from urllib.parse import urlsplit
+    scheme = urlsplit(uri).scheme.lower()
+    if scheme not in ("http", "https"):
+        raise MirrorRefused(f"{setting} must be Neo4j's HTTP API — https://host:7473 or "
+                            f"http://host:7474 — not {scheme or 'a bare host'}://")
 
 
 def _mirror_cfg():
@@ -1443,6 +1455,12 @@ def _mirror_cfg():
     if source_uri and source_uri == cfg["uri"] and source_db == cfg["database"]:
         raise MirrorRefused("METAGRAPH_NEO4J_* points at the database agents query as the "
                             "neo4j source; use a separate database or instance")
+    if not os.getenv("STUDIO_METAGRAPH_TENANT", "").strip():
+        # Deployments sharing one Neo4j are kept apart only by this name; a
+        # default every deployment shares would let them overwrite each other.
+        raise MirrorRefused("set STUDIO_METAGRAPH_TENANT to a name unique to this deployment "
+                            "before mirroring to Neo4j")
+    _http_uri(cfg["uri"], "METAGRAPH_NEO4J_URI")
     return cfg
 
 

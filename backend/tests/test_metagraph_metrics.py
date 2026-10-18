@@ -255,7 +255,7 @@ def test_metrics_reach_the_neo4j_mirror(erp, monkeypatch):
     monkeypatch.setattr(erp.mg.urllib.request, "urlopen",
                         lambda req, timeout=None: posted.append(json.loads(req.data)) or Resp())
     for k, v in (("METAGRAPH_NEO4J_URI", "https://g:7473"), ("METAGRAPH_NEO4J_USER", "u"),
-                 ("METAGRAPH_NEO4J_PASSWORD", "p")):
+                 ("METAGRAPH_NEO4J_PASSWORD", "p"), ("STUDIO_METAGRAPH_TENANT", "studio")):
         monkeypatch.setenv(k, v)
     erp.mg.mirror("erp")
     statements = posted[-1]["statements"]

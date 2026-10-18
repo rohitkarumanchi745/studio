@@ -276,6 +276,15 @@ def _check_databricks(cfg):
     return cfg, problems
 
 
+def _check_neo4j(cfg):
+    """Neo4j is reached over its HTTP API; a bolt:// or neo4j:// URI cannot
+    work, so it is refused on its field before any sign-in."""
+    from .connectors.graph_conn import http_uri_problem
+    cfg = {**cfg, "uri": (cfg.get("uri") or "").strip()}
+    problem = http_uri_problem(cfg["uri"])
+    return cfg, ({"uri": problem} if problem else {})
+
+
 def _check_sql(cfg):
     """A usable URL: parseable, a driver installed for it, a network host."""
     cfg = {**cfg, "url": (cfg.get("url") or "").strip(), "schema": (cfg.get("schema") or "").strip()}
@@ -401,9 +410,11 @@ TYPES = {
     },
     "neo4j": {
         "label": "Neo4j (Cypher)", "dialect": "cypher", "build": _DynGraph,
+        "check": _check_neo4j,
         "hint_key": "uri",
         "fields": [
-            _field("uri", "URI", required=True, placeholder="bolt://host:7687"),
+            _field("uri", "HTTP API URI", required=True,
+                   placeholder="https://host:7473 (Neo4j's HTTP API, not bolt://)"),
             _field("user", "User", required=True),
             _field("password", "Password", required=True, secret=True),
             _field("database", "Database", default="neo4j"),
