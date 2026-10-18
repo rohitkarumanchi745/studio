@@ -458,7 +458,7 @@ export default function Sidebar({
           ▤ Knowledge (KAG)
         </button>
         <button className="logout" onClick={() => setDataConnOpen(true)} style={{ marginBottom: 8 }}>
-          ⧉ Data connections
+          ⧉ Integrations
         </button>
         <button className="logout" onClick={onSessions} style={{ marginBottom: 8 }}>
           ⟳ Sessions

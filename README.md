@@ -1147,7 +1147,8 @@ flowchart LR
 
 An admin connects a warehouse straight from the **Data connections** screen — no
 env vars, no redeploy. Pick a type (PostgreSQL, Snowflake, Databricks SQL,
-BigQuery, Neo4j, Power BI, or **Any SQL database** — see below), enter its
+BigQuery, Neo4j, Power BI, Apache Cassandra, Atlassian Jira, or **Any SQL
+database**, and every integration of the marketplace below), enter its
 credentials, and test them. For SQL
 warehouses and Power BI the test also lists the visible schemas/datasets/models; select one or several, and Studio
 saves **one independently named and governed source per namespace**. A namespace
@@ -1215,6 +1216,61 @@ skill files all apply to it unchanged.
   longer decrypts — is unconfigured and fails closed with its reason; it never
   falls back to the environment's credential. Databricks Jobs / Spark
   deployment still reads the `DATABRICKS_*` variables directly.
+
+### The integrations marketplace
+
+**Data connections** is a marketplace: a searchable grid of integrations
+grouped by shelf, each with its icon and name:
+- Databases
+- Data warehouses and lakehouses
+- NoSQL and graph
+- Work management and collaboration
+- BI and semantic models
+- Cloud file storage
+- Marketing and analytics
+- Business apps
+
+Every tile says how it connects:
+
+| Status | Meaning |
+|---|---|
+| **Connect** | A native connector, or an integration that connects through one. |
+| **Driver needed** | Its SQLAlchemy driver is not installed on this deployment. The tile names the package. |
+| **Ask an admin** | Only administrators connect sources. |
+| **Coming soon** | No connector yet. The tile suggests landing the data in a warehouse Studio reads meanwhile. |
+
+An integration that connects through a native type opens that type's form,
+pre-filled for it:
+- **MySQL, MariaDB, SQL Server, Azure SQL, Oracle, SingleStore, TiDB,
+  PlanetScale** through *Any SQL database*.
+- **ClickHouse, Trino/Starburst, Teradata, Db2, SAP HANA, Vertica** the same
+  way, once their driver is installed.
+- **Supabase, Neon, CockroachDB, TimescaleDB, YugabyteDB, Aurora, Cloud SQL /
+  AlloyDB, Redshift** through *PostgreSQL*.
+- **ScyllaDB and Amazon Keyspaces** through *Apache Cassandra*.
+- **Jira Service Management** through *Atlassian Jira*.
+
+A connection made through an integration is listed on that integration's
+tile. Icons are geometric marks in each brand's colour, not vendor logo files.
+
+**Apache Cassandra** (`connectors/cassandra_conn.py`, `cassandra-driver`):
+- One keyspace per source.
+- Tables, views, columns and primary keys (partition, then clustering) come
+  from `system_schema`.
+- Queries are CQL `SELECT`s through the same guard: read-only, this keyspace
+  only, and unquoted names fold to lower case as CQL folds them.
+- Rows are paged and capped. The agent is told CQL has no joins.
+- The same connector reaches ScyllaDB and Amazon Keyspaces (TLS, port 9142).
+
+**Atlassian Jira** (`connectors/jira_conn.py`):
+- Issues and projects are SQL tables, fetched from Jira's REST API into an
+  in-memory SQLite per query.
+- **Cloud:** an email plus an API token, and the paginated
+  `/rest/api/3/search/jql`.
+- **Data Center:** a personal access token, and `/rest/api/2/search`.
+- **Scope:** an optional JQL filter, at most `JIRA_MAX_ISSUES` issues, cached
+  `JIRA_CACHE_SECONDS`.
+- Only a connection test signs in; listing the tables never calls Jira.
 
 ### Any SQL database — one connection URL, nothing vendor-specific
 

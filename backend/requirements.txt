@@ -20,6 +20,8 @@ sqlalchemy>=2.0,<2.1
 pymysql>=1.1
 pymssql>=2.3
 oracledb>=2.0
+# Apache Cassandra / ScyllaDB / Amazon Keyspaces (connectors/cassandra_conn.py).
+cassandra-driver>=3.29
 
 # Optional warehouse connectors — uncomment the ones you use.
 # The app runs without them; the source just shows as "not configured".
