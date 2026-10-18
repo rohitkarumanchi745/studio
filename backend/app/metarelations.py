@@ -580,8 +580,13 @@ def join_path(relationships, tables, min_confidence=0.6):
     targets = list(dict.fromkeys(tables))
     if not targets:
         return [], []
-    tree, used, missing = {targets[0]}, [], []
-    for target in targets[1:]:
+    # Root the tree at the first target that joins anything: an isolated
+    # first target (a view, a table with no known keys) must not strand the rest.
+    root = next((t for t in targets if t in graph), targets[0])
+    tree, used, missing = {root}, [], [t for t in targets if t not in graph and t != root]
+    for target in targets:
+        if target == root or target in missing:
+            continue
         if target in tree:
             continue
         # Dijkstra from the whole tree to this target.

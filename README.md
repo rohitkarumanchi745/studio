@@ -1401,6 +1401,21 @@ the tables (fewer and surer joins win). Both show only relationships whose two
 tables the caller may read, and the Neo4j mirror carries them as `RELATES`
 edges.
 
+**Questions are grounded in it** (`metaground.py`). Before the SQL agent
+runs, the question is matched against the graph — every table's name and
+columns, rare words weighted over words every table shares — so "which
+customer segment brought in the most net sales in each store region" finds the
+tables holding `segment`, `net_sales` and the store's `region` without any of
+them being named. The cheapest join tree then adds the tables needed to
+connect them (`retail_orders`), and the agent gets their governed columns plus
+the join conditions with their state and confidence; a matching view is
+offered too, since it may answer with no join at all. It costs no warehouse
+call and never looks past the tables the turn may read; a source not yet
+discovered falls back to name matching. The multi-source planners see each
+source's relevant tables first instead of whichever twelve come first, and
+every planned node's worker is grounded the same way. The turn's activity
+shows it: *grounded in the metadata graph: … (joined through …)*.
+
 **It stays current with no one asking.** The `metagraph_sync` scheduler (every
 `STUDIO_METAGRAPH_TICK_SECONDS`, 300 by default) reads each live source's
 *change signal* — one cheap catalog query: Postgres hashes every relation's

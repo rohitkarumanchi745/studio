@@ -402,8 +402,13 @@ def _fanout(prompt, sources, user, model):
         conn = s["connector"]
         progress.bind(tid)
         try:
+            from . import metaground
+            focus, hints = metaground.worker_context(conn.name, prompt, s["allowed"],
+                                                     loaded=s["schemas"])
+            grounded = {k: v for k, v in (("focus_schemas", focus), ("join_hints", hints))
+                        if v}
             sub = agent.run_agent(prompt, conn, "*", s["allowed"], s["schemas"],
-                                  [], user, model, skill_md=s["skill"])
+                                  [], user, model, skill_md=s["skill"], **grounded)
             progress.emit_for(tid, f"{roster.name_for(conn.name)}: finished "
                                    f"({len(sub.get('rows') or [])} rows)", agent=roster.name_for(conn.name))
         except Exception as e:
