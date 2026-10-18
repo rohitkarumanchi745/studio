@@ -263,3 +263,68 @@ def test_metrics_reach_the_neo4j_mirror(erp, monkeypatch):
     assert {m["name"] for m in merge["parameters"]["metrics"]} >= {"discounted_line_revenue"}
     assert "tenant: $tenant" in merge["statement"]
     assert not any("discounted_line_revenue" in s["statement"] for s in statements)
+
+
+# ── Drift: a column whose type changes ───────────────────────────────────
+
+def _retype(env, column, new_type):
+    """Rebuild SalesOrderDetail with one column's type changed (SQLite has no
+    ALTER COLUMN TYPE) — what a migration upstream would do."""
+    cols = {"SalesOrderDetailID": "INTEGER", "SalesOrderID": "INTEGER", "OrderQty": "INTEGER",
+            "UnitPrice": "REAL", "UnitPriceDiscount": "REAL"}
+    cols[column] = new_type
+    with sqlite3.connect(env.path) as c:
+        c.execute('ALTER TABLE "SalesOrderDetail" RENAME TO "old_detail"')
+        c.execute('CREATE TABLE "SalesOrderDetail" ('
+                  + ", ".join(f'"{n}" {t}' for n, t in cols.items()) + ")")
+        c.execute('INSERT INTO "SalesOrderDetail" SELECT * FROM "old_detail"')
+        c.execute('DROP TABLE "old_detail"')
+    env.discover()
+
+
+def test_a_changed_column_type_drifts_the_metrics_that_read_it(erp, monkeypatch):
+    from app import progress
+    said = []
+    monkeypatch.setattr(progress, "emit", lambda text, **k: said.append(text))
+    assert metric(erp, "discounted_line_revenue")["baseline_at"] is not None
+    _retype(erp, "OrderQty", "TEXT")
+    m = metric(erp, "discounted_line_revenue")
+    assert m["status"] == "drifted"
+    assert m["reasons"] == ["column OrderQty changed type from INTEGER to TEXT since this "
+                            "definition was validated"]
+    assert metric(erp, "units")["status"] == "drifted"           # it reads OrderQty too
+    assert metric(erp, "territories")["status"] == "valid"       # it does not
+    assert erp.sem.answer(ADMIN, "erp", "turnover") is None      # no certified execution
+    assert any("discounted_line_revenue is drifted" in s for s in said)
+    health = {r["source"]: r for r in erp.mg.metadata_health(user=ADMIN)["sources"]}["erp"]
+    assert health["freshness"] == "failing" and health["broken_metrics"] == 2
+
+
+def test_a_detail_change_inside_a_type_family_is_noted_not_blocking(erp):
+    _retype(erp, "UnitPrice", "DOUBLE")
+    m = metric(erp, "discounted_line_revenue")
+    assert m["status"] == "valid"
+    assert m["reasons"] == ["column UnitPrice type detail changed (REAL → DOUBLE)"]
+
+
+def test_revalidation_accepts_the_columns_as_they_are_now(erp):
+    _retype(erp, "OrderQty", "TEXT")
+    with pytest.raises(HTTPException) as e:
+        erp.mg.revalidate_metric("erp", "units", user=VIEWER)          # cannot even see it
+    assert e.value.status_code == 404
+    out = erp.mg.revalidate_metric("erp", "units", user=ADMIN)
+    assert out["status"] == "valid"
+    assert metric(erp, "discounted_line_revenue")["status"] == "drifted"   # one at a time
+    with sqlite3.connect(erp.path) as c:
+        c.execute('ALTER TABLE "SalesOrderDetail" DROP COLUMN "UnitPriceDiscount"')
+    erp.discover()
+    with pytest.raises(HTTPException) as e:                           # missing needs a new definition
+        erp.mg.revalidate_metric("erp", "discounted_line_revenue", user=ADMIN)
+    assert e.value.status_code == 400
+
+
+def test_a_new_definition_version_gets_its_own_baseline(erp):
+    _retype(erp, "OrderQty", "TEXT")
+    assert metric(erp, "units")["status"] == "drifted"
+    erp.apply(YAML_V1.replace("expr: OrderQty", 'expr: CAST("OrderQty" AS INTEGER)'))
+    assert metric(erp, "units")["status"] == "valid"                  # validated as it is now

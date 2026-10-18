@@ -650,12 +650,14 @@ def answer(user, source, prompt, table=None):
         from . import metametrics, progress
         for kind, picked in (("metric", match["metrics"]), ("dimension", match["dimensions"])):
             for d in picked:
+                # The whole definition: its identity (and so its baseline)
+                # depends on agg and grain as well as the expression.
                 result = metametrics.check({
                     "kind": kind, "source": source, "table": model["table"], "name": d["name"],
-                    "expr": d["expr"], "filter": d.get("filter"),
-                    "model_filter": model.get("filter")})
-                if result["status"] == "broken":
-                    progress.emit(f"the semantic {kind} {d['name']} is broken "
+                    "agg": d.get("agg"), "expr": d["expr"], "filter": d.get("filter"),
+                    "model_filter": model.get("filter"), "grain": d.get("grain")})
+                if result["status"] in metametrics.INVALID:
+                    progress.emit(f"the semantic {kind} {d['name']} is {result['status']} "
                                   f"({'; '.join(result['reasons'])}) — not answering from it")
                     return None
     except Exception:
@@ -806,6 +808,11 @@ def apply_yaml(body: YamlIn, user=Depends(current_user)):
                   (uuid.uuid4().hex, body.yaml, user["email"], time.time()))
         c.commit()
     reload()
+    try:
+        from . import metametrics
+        metametrics.ensure_baselines()      # a new version is validated against today's columns
+    except Exception:
+        pass
     db.log_activity(user, "semantic_apply", ok=loaded())
     return get_config(user)
 
