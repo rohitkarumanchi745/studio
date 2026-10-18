@@ -505,6 +505,34 @@ def _and(names):
     return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
 
 
+def _vmatch(ctx, user, prompt):
+    """The verified query this turn's question matches, looked up once per
+    turn (verified_sql.match). First turns only: a follow-up means something
+    different in every conversation, like the plan cache."""
+    if "_vsql" not in ctx:
+        ctx["_vsql"] = None
+        if not ctx.get("history") and ctx.get("source") not in (None, "*"):
+            try:
+                from . import verified_sql
+                ctx["_vsql"] = verified_sql.match(user, ctx["source"], ctx.get("table_label"),
+                                                  prompt)
+            except Exception:
+                log.warning("verified SQL lookup failed", exc_info=True)
+    return ctx["_vsql"]
+
+
+def _verified_answer(ctx, user, prompt):
+    """An exact verified-query match, re-run as the asker; None otherwise."""
+    m = _vmatch(ctx, user, prompt)
+    if not m or m["kind"] != "exact":
+        return None
+    from . import verified_sql
+    result = verified_sql.answer(user, ctx["source"], m)
+    if result is not None:
+        progress.emit(f"answered with the verified query “{m['query']['title']}”")
+    return result
+
+
 def _usable_sources(user):
     """Live sources this user's role may query — names only, no probing."""
     from .connectors import all_sources
@@ -944,10 +972,26 @@ def _run_turn(ctx, user):
         # certification already says where the number lives.
         certified = None if ctx["history"] else semantic.certified_answer(
             user, _usable_sources(user), prompt)
+        verified = None
+        if certified is None and not ctx["history"]:
+            # Then a verified query someone saved for this exact question.
+            from . import verified_sql
+            try:
+                vsource, vm = verified_sql.best_exact(user, _usable_sources(user), prompt)
+            except Exception:
+                log.warning("verified SQL lookup failed", exc_info=True)
+                vsource, vm = None, None
+            if vm is not None:
+                verified = verified_sql.answer(user, vsource, vm)
+                if verified is not None:
+                    verified["source"] = vsource
+                    progress.emit(f"answered with the verified query “{vm['query']['title']}”")
         clash = None
         if certified is not None:
             progress.emit("answered from a certified metric")
             result = certified
+        elif verified is not None:
+            result = verified
         else:
             # Same-named table in several sources? Don't guess — ask, unless the
             # user already chose "both, side by side" (allow_ambiguous).
@@ -999,12 +1043,25 @@ def _run_turn(ctx, user):
                 focus["schemas"], focus["joins"] = _grounding(ctx, user, prompt)
             except Exception:
                 focus["schemas"], focus["joins"] = {}, []
-        return agent.run_agent(
+            related = _vmatch(ctx, user, prompt)
+            focus["related"] = related if related and related["kind"] == "related" else None
+            if focus["related"]:
+                # A verified query for a close question: a starting point the
+                # agent adapts and verifies — never the answer as it stands.
+                from . import verified_sql
+                focus["joins"] = focus["joins"] + verified_sql.hint_lines(focus["related"])
+                progress.emit(f"guided by the related verified query "
+                              f"“{focus['related']['query']['title']}”")
+        out = agent.run_agent(
             prompt=prompt, connector=connector, table=ctx["table_param"],
             allowed_tables=ctx["allowed"], schemas=ctx["schemas"], history=ctx["history"],
             user=user, model=spec, skill_md=skill_md, kag_first=kag_first,
             visual_mode=visual, conversation_id=cid, focus_schemas=focus["schemas"],
             join_hints=focus["joins"])
+        if focus.get("related") and isinstance(out, dict):
+            from . import verified_sql
+            out["verified_sql"] = verified_sql.provenance(focus["related"], user)
+        return out
 
     if ctx.get("visual") and not ctx["history"] and (certified := semantic.certified_answer(
             user, [ctx["source"]], prompt, ctx["table_param"])) is not None:
@@ -1012,6 +1069,9 @@ def _run_turn(ctx, user):
         # window too; it is drawn with D3, not a custom visual.
         progress.emit("answered from a certified metric — drawing it with D3")
         result = certified
+        agent.d3_only(result)
+    elif ctx.get("visual") and (verified := _verified_answer(ctx, user, prompt)) is not None:
+        result = verified
         agent.d3_only(result)
     elif ctx.get("visual"):
         # The D3 & artifacts window goes straight to the frontier agent: the
@@ -1055,6 +1115,11 @@ def _run_turn(ctx, user):
     # Anything it can't resolve returns None and falls through to the agent.
     elif (result := semantic.answer(user, ctx["source"], prompt, ctx["table_param"])) is not None:
         progress.emit("answered from the semantic layer (canonical metric)")
+    # Tier -½ — the Verified SQL library: SQL a person verified and saved for
+    # this exact question (same intent, values and direction), re-run as the
+    # asker. A related question instead guides the agent (_run).
+    elif (result := _verified_answer(ctx, user, prompt)) is not None:
+        pass
     # Tier 0 — semantic cache: an equivalent prompt reuses its plan (SQL+chart),
     # re-executed fresh, with no model at all. FIRST TURNS ONLY: the cache keys on
     # the prompt alone, and a follow-up ("and by region?") means something different

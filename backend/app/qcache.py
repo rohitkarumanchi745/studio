@@ -177,35 +177,15 @@ def _best(rows, prompt, sig, q_vec, sig_of, vec_of):
     return best, best_score
 
 
-def _shared_template(user, source, table_scope, prompt, sig, q_vec):
-    """The org-shared verified query this prompt matches, or (None, 0.0). The
-    only plans one user's question may reuse from another user: verified SQL
-    its author deliberately shared with the organization (visibility "org" in
-    the saved-query library) — never a private plan, which carries its
-    author's own prompt and context. Its SQL is re-run as the asker, so it
-    reads only what the asker may read."""
-    try:
-        with db.connect() as c:
-            rows = [dict(r) for r in c.execute(
-                "SELECT id, title, prompt, sql, table_label FROM saved_queries "
-                "WHERE visibility='org' AND verified=1 AND source=? AND user_id<>?",
-                (source, user.get("id") or "")).fetchall()]
-    except Exception:
-        return None, 0.0                    # no saved-query library in this process
-    rows = [r for r in rows if (r.get("table_label") or "*") in (table_scope, "*")]
-    return _best(rows, prompt, sig, q_vec, lambda r: _sig(r["prompt"]), lambda r: None)
-
-
 def lookup(user, source, table_scope, prompt):
     """Best semantic hit for this prompt in scope, re-executed fresh. Returns a
     run-result dict (mode='cached') or None.
 
-    PRIVATE first: a cached plan is reused only for the user who asked it —
-    a plan carries its author's prompt and context, so sharing a role is not
-    a reason to see either. Then SHARED: a verified query its author shared
-    with the organization (_shared_template). Never another user's prompt in
-    the reply: an own plan echoes the user's own earlier prompt, a template
-    its title."""
+    PRIVATE: a cached plan is reused only for the user who asked it — a plan
+    carries its author's prompt and context, so sharing a role is not a
+    reason to see either. Reuse across users goes through the Verified SQL
+    library instead (verified_sql.py), which chat consults before this cache:
+    queries their authors verified and shared with the organization."""
     sig = _sig(prompt)
     if not sig or not user.get("id"):
         return None
@@ -218,10 +198,7 @@ def lookup(user, source, table_scope, prompt):
     best, best_score = _best(rows, prompt, sig, q_vec, lambda r: json.loads(r["signature"]),
                              lambda r: json.loads(r["embedding"]) if r["embedding"] else None)
     if not best or best_score < CACHE_THRESHOLD:
-        template, score = _shared_template(user, source, table_scope, prompt, sig, q_vec)
-        if not template or score < CACHE_THRESHOLD:
-            return None
-        return _replay_template(user, source, template, score)
+        return None
 
     executed = _exec_full(user, source, best["sql"])
     if executed is None:
@@ -245,24 +222,7 @@ def lookup(user, source, table_scope, prompt):
         # uses "replace" because its heuristic was already counted.
         "_qcache_feedback_mode": "add",
         "cached": {"similarity": round(best_score, 3), "from_prompt": best["prompt"],
-                   "hits": best["hits"] + 1, "shared": False},
-    }
-
-
-def _replay_template(user, source, template, score):
-    executed = _exec_full(user, source, template["sql"])
-    if executed is None:
-        return None
-    cols, data = executed
-    return {
-        "text": f"Reused the shared query “{template['title']}”.",
-        "sql": template["sql"], "columns": cols, "rows": data, "chart": None,
-        "panels": [{"sql": template["sql"], "columns": cols, "rows": data, "chart": None}]
-        if data else [],
-        "email": None, "errors": [], "mode": "cached", "model": None, "served_by": "cache",
-        "agents": [{"name": "Query cache", "source": source, "role": "cache"}],
-        "cached": {"similarity": round(score, 3), "shared": True,
-                   "template": {"id": template["id"], "title": template["title"]}},
+                   "hits": best["hits"] + 1},
     }
 
 

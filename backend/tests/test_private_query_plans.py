@@ -1,6 +1,7 @@
 """Cached query plans are private: a plan is reused only for the user who
-asked it, and only verified queries their authors shared with the
-organization are reused across users. No reply carries another user's prompt.
+asked it. Reuse across users goes through the Verified SQL library
+(test_verified_sql_first.py), never this cache. No reply carries another
+user's prompt.
 
 The gateway re-checks the asker's permissions on every replay either way —
 this is about whose question and context a plan carries, not table access.
@@ -54,29 +55,12 @@ def test_a_plan_is_reused_only_for_the_user_who_asked_it(qc):
     assert qc.lookup(BOB, "demo", "sales", "revenue by region for my Q3 board deck") is None
     own = qc.lookup(ALICE, "demo", "sales", "revenue by region for my Q3 board deck")
     assert own and own["cached"]["from_prompt"] == "revenue by region for my Q3 board deck"
-    assert own["cached"]["shared"] is False
 
 
-def test_another_users_plan_is_reused_only_once_shared_with_the_organization(qc):
-    secret = "revenue by region excluding the Acme renegotiation"
-    _store(qc, ALICE, secret)
-    _share(qc, ALICE, "revenue by region", "SELECT region, SUM(revenue) FROM sales GROUP BY 1",
-           visibility="private")
-    _share(qc, ALICE, "revenue by region", "SELECT 1 AS unverified", verified=0)
-    assert qc.lookup(BOB, "demo", "sales", "revenue by region") is None    # nothing shared yet
+def test_the_cache_never_replays_another_users_plan_even_when_shared(qc):
+    _store(qc, ALICE, "revenue by region")
     _share(qc, ALICE, "revenue by region", "SELECT region, SUM(revenue) FROM sales GROUP BY 1")
-    hit = qc.lookup(BOB, "demo", "sales", "revenue by region")
-    assert hit and hit["cached"]["shared"] and hit["cached"]["template"]["title"] == \
-        "Revenue by region"
-    assert "Acme" not in json.dumps(hit) and "from_prompt" not in hit["cached"]
-    assert qc.ran[-1] == ("u-bob", "SELECT region, SUM(revenue) FROM sales GROUP BY 1")
-
-
-def test_a_shared_query_never_answers_the_opposite_question(qc, monkeypatch):
-    _share(qc, ALICE, "highest revenue regions", "SELECT ... ORDER BY 2 DESC")
-    monkeypatch.setattr(qc, "_sim", lambda *a: 1.0)              # only the direction decides
-    assert qc.lookup(BOB, "demo", "sales", "lowest revenue regions") is None
-    assert qc.lookup(BOB, "demo", "sales", "highest revenue regions")
+    assert qc.lookup(BOB, "demo", "sales", "revenue by region") is None   # the library's job
 
 
 def test_plans_from_before_owners_were_kept_are_never_replayed(qc):

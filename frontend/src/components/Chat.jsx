@@ -988,10 +988,17 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
               );
             })()}
             {m.cached && (
-              <span title={m.cached.shared
-                ? `reused the shared query “${m.cached.template?.title || ""}”`
-                : `reused your earlier plan for: "${m.cached.from_prompt || ""}"`}>
-                {" · "}{m.cached.shared ? "reused shared query" : "reused plan"}{m.cached.similarity < 1 ? ` (${Math.round(m.cached.similarity * 100)}% match)` : ""} · fresh data
+              <span title={`reused your earlier plan for: "${m.cached.from_prompt || ""}"`}>
+                {" · "}reused plan{m.cached.similarity < 1 ? ` (${Math.round(m.cached.similarity * 100)}% match)` : ""} · fresh data
+              </span>
+            )}
+            {m.verified_sql && (
+              <span title={m.verified_sql.match === "exact"
+                ? `re-ran ${m.verified_sql.mine ? "your" : "the organization's"} verified query “${m.verified_sql.title}” as you — verified to run when saved, not certified`
+                : `the agent adapted the related verified query “${m.verified_sql.title}”`}>
+                {" · "}{m.verified_sql.match === "exact"
+                  ? `verified query “${m.verified_sql.title}” · fresh data`
+                  : `guided by verified query “${m.verified_sql.title}”`}
               </span>
             )}
           </span>

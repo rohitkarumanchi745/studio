@@ -27,6 +27,11 @@ def client(tmp_path, monkeypatch):
         from app import semantic
         c.put("/api/semantic", json={"yaml": semantic.TEMPLATE})
         yield c
+        # The semantic document is process-wide and kept in the database:
+        # clear both, or a later module's chat turns are answered from this
+        # module's models.
+        c.delete("/api/semantic")
+    semantic._STATE.update(doc=None, yaml="", source=None)
 
 
 def compile(c, prompt, table="*"):
