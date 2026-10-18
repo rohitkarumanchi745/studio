@@ -1462,6 +1462,14 @@ the tables (fewer and surer joins win). Both show only relationships whose two
 tables the caller may read, and the Neo4j mirror carries them as `RELATES`
 edges.
 
+**Trusted joins come first.** A declared, verified or observed relationship
+always wins over one inferred from column names, whatever their confidences.
+An inferred join is used only to reach a table that nothing trusted connects.
+Wherever it reaches the agent, it says so: *UNVERIFIED — inferred from column
+names; check the columns hold the same values before relying on it*. The
+paths API marks each join `trusted` and counts the `unverified` ones. An
+administrator (or the table's owner) can verify one, and it becomes trusted.
+
 **Certified metrics live in it** (`metametrics.py`). The semantic YAML stays
 the source of truth for what a metric means; the graph says whether the
 warehouse still holds what it reads. Every metric and dimension is linked to
@@ -1565,7 +1573,13 @@ shows it: *grounded in the metadata graph: … (joined through …)*.
 - **Tenant isolation.** Studio is one organization per deployment (roles and
   private M365 scopes isolate within it). Deployments that share one Neo4j are
   kept apart: every mirrored node and edge carries `STUDIO_METAGRAPH_TENANT`
-  and every statement is scoped by it.
+  and every statement is scoped by it. The mirror refuses to run until the
+  tenant is set: a default that every deployment shares would let them
+  overwrite each other. Both the mirror and the `neo4j` source speak Neo4j's
+  **HTTP API** (`https://host:7473` or `http://host:7474`). A `bolt://` or
+  `neo4j://` URI is refused with that hint, and a Cypher error the API returns
+  inside an HTTP 200 raises as an error instead of reading as an empty
+  result.
 
 **It stays current with no one asking, whatever the source.** Change capture
 needs nothing from a database beyond what every Studio connector already

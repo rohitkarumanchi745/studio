@@ -600,18 +600,32 @@ def review(source, rel_id, decision, user):
     return bool(getattr(cur, "rowcount", 0))
 
 
+#: Relationships a join plan may rely on: the catalog declared it, an
+#: administrator verified it, or a view or a real query was seen joining it.
+TRUSTED = ("declared", "verified", "observed")
+# An inferred hop costs more than any trusted path, so a name-matched join is
+# used only to reach a table no trusted path reaches.
+_INFERRED_COST = 100.0
+
+
+def trusted(rel):
+    return rel.get("state") in TRUSTED
+
+
 def join_path(relationships, tables, min_confidence=0.6):
     """The cheapest join tree connecting `tables`, over join relationships at or
     above `min_confidence`: each hop costs 1 + (1 - confidence), so fewer and
-    surer joins win. Returns (joins, missing) — `missing` are tables no path
-    reaches."""
+    surer joins win — and a TRUSTED relationship (declared, verified,
+    observed) always wins over one inferred from names, which is used only
+    where nothing trusted connects the tables. Returns (joins, missing) —
+    `missing` are tables no path reaches."""
     import heapq
     graph = {}
     for rel in relationships:
         if rel["kind"] != "join" or rel["state"] == "rejected" \
                 or rel["confidence"] < min_confidence:
             continue
-        cost = 1.0 + (1.0 - rel["confidence"])
+        cost = 1.0 + (1.0 - rel["confidence"]) + (0.0 if trusted(rel) else _INFERRED_COST)
         graph.setdefault(rel["from_object"], []).append((rel["to_object"], cost, rel))
         graph.setdefault(rel["to_object"], []).append((rel["from_object"], cost, rel))
     targets = list(dict.fromkeys(tables))

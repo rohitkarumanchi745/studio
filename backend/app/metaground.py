@@ -345,7 +345,14 @@ def join_hint_lines(joins, views=None, metrics=None):
     for rel in joins:
         on = " AND ".join(f"{rel['from_object']}.{a} = {rel['to_object']}.{b}"
                           for a, b in zip(rel["from_columns"], rel["to_columns"]))
-        lines.append(f"{on}  ({rel['state']}, confidence {rel['confidence']})")
+        if metarelations.trusted(rel):
+            lines.append(f"{on}  ({rel['state']}, confidence {rel['confidence']})")
+        else:
+            # A guess from column names, not a business relationship: the
+            # agent is told so, and to check the values match before using it.
+            lines.append(f"{on}  (UNVERIFIED — inferred from column names, confidence "
+                         f"{rel['confidence']}; check the columns hold the same values "
+                         f"before relying on it)")
     for view, reads in (views or {}).items():
         if reads:
             lines.append(f"{view} is a view over {', '.join(reads)} — it may answer this "

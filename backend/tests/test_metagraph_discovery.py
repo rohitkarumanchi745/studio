@@ -336,6 +336,7 @@ def neo4j(env, monkeypatch):
     monkeypatch.setenv("METAGRAPH_NEO4J_USER", "studio")
     monkeypatch.setenv("METAGRAPH_NEO4J_PASSWORD", "secret")
     monkeypatch.setenv("METAGRAPH_NEO4J_DATABASE", "metadata")
+    monkeypatch.setenv("STUDIO_METAGRAPH_TENANT", "studio")     # the mirror needs its own name
     return fake
 
 
