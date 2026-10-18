@@ -39,16 +39,19 @@ class Roster(list):
         self.unreachable = sorted(unreachable)
 
 
-def accessible_sources(user, max_schema_tables=10):
+def accessible_sources(user, max_schema_tables=10, only=None):
     """Roster of [{connector, allowed, schemas, skill}] for every configured
-    source the user's role may query. Sources are probed concurrently
-    (list_tables + schema fetch are independent per source), so the roster's
-    latency is the slowest single source, not their sum."""
+    source the user's role may query — or, with `only` (auto routing), just
+    those of them. Sources are probed concurrently (list_tables + schema fetch
+    are independent per source), so the roster's latency is the slowest single
+    source, not their sum."""
     role = user["role"]
 
     def build(meta):
         name = meta["name"]
         if name not in rbac.allowed_sources(role) or not meta["configured"]:
+            return None
+        if only is not None and name not in only:
             return None
         conn = get_connector(name)
         try:

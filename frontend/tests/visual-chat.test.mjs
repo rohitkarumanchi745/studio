@@ -245,8 +245,18 @@ test("the window opens as a prompt for a visual, without the pipeline controls",
   assert.match(markup, /⊞ your charts/);
   assert.match(markup, /Describe the visualization/);
   assert.doesNotMatch(markup, /Run on Airflow|composer-pipeline-option/);
-  // Any source can be picked, all sources included.
-  assert.match(markup, /<option value="\*">✳ all sources — multi-agent<\/option>/);
+  // Auto is on by default: Studio picks the source; with it off, any source
+  // can be picked by hand, all sources included.
+  assert.match(markup, /role="switch"[^>]*checked=""/);
+  assert.doesNotMatch(markup, /<option value="\*">/);
+  const getItem = globalThis.localStorage.getItem;
+  globalThis.localStorage.getItem = (key) => key === "studio_auto_source" ? "0" : null;
+  try {
+    const manual = chatHarness({ conversationId: null, visualMode: true, onOpenCharts() {} }).render().markup;
+    assert.match(manual, /<option value="\*">✳ all sources — multi-agent<\/option>/);
+  } finally {
+    globalThis.localStorage.getItem = getItem;
+  }
 
   const ordinary = chatHarness({ conversationId: null }).render().markup;
   assert.match(ordinary, /What do you want to know\?/);

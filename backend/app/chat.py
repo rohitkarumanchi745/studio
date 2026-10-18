@@ -10,7 +10,7 @@ from typing import List, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from . import (agent, chat_platforms, chat_workflows, db, email_service, gateway, governance, jobs, keys,
+from . import (agent, autoroute, chat_platforms, chat_workflows, db, email_service, gateway, governance, jobs, keys,
                lightning, orchestrator, progress, qcache, queryguard, rbac,
                roster, router as model_router, semantic, sessions, skills,
                pipeline_sources)
@@ -74,6 +74,14 @@ class Ask(BaseModel):
     # "All sources" only: run even if the prompt names a table that exists in
     # several sources (the user chose "both, side by side" on a clarification).
     allow_ambiguous: bool = False
+    # Auto: the question picks its source and tables (autoroute.py); `source`
+    # and `table` are ignored. The server writes the outcome into the request
+    # before it is queued: `route` (what was decided and why — never taken
+    # from a client) and, for a question that needs several sources,
+    # `route_sources`, which narrows "all sources" to them.
+    auto: bool = False
+    route: Optional[dict] = None
+    route_sources: Optional[List[str]] = None
     # Pipeline controls act on an Airflow DAG drafted in this conversation.
     pipeline_action: Optional[Literal["build", "run", "status"]] = None
     # "read_only_sql" is still accepted so an old client gets a clear refusal:
@@ -393,10 +401,12 @@ def _scope(body, user, before_message_id=None):
             raise HTTPException(400, f"Model '{body.model}' is not offered")
         model = body.model
 
-    # source "*": the orchestrator fans out across per-database agents.
+    # source "*": the orchestrator fans out across per-database agents — every
+    # source, or the ones auto routing found the question needs.
     if body.source == "*":
         return {"mode": "*", "model": model, "prompt": prompt,
-                "allow_ambiguous": bool(getattr(body, "allow_ambiguous", False))}
+                "allow_ambiguous": bool(getattr(body, "allow_ambiguous", False)),
+                "only": list(body.route_sources) if body.route_sources else None}
 
     if not rbac.can_access(user["role"], body.source, body.table):
         raise HTTPException(403, "Your role has no access to this table")
@@ -465,13 +475,16 @@ def _record_user_turn(body, user, scope=None):
                                            "platform_requested_by": user["id"]})
     elif scope["mode"] == "*":
         mid = db.add_message(cid, "user", {"text": prompt, "source": "*",
-                                           "table": "all sources",
+                                           "table": ", ".join(scope["only"]) if scope.get("only")
+                                           else "all sources",
                                            "author_role": user["role"],
-                                           "allow_ambiguous": scope["allow_ambiguous"]})
+                                           "allow_ambiguous": scope["allow_ambiguous"],
+                                           **({"auto_route": body.route} if body.route else {})})
     else:
         mid = db.add_message(cid, "user", {"text": prompt, "source": body.source,
                                            "table": scope["table_label"],
-                                           "author_role": user["role"]})
+                                           "author_role": user["role"],
+                                           **({"auto_route": body.route} if body.route else {})})
     return cid, mid
 
 
@@ -490,8 +503,34 @@ def _build_ctx(body, user, cid, scope=None, user_message_id=None):
                 "repository_id": body.repository_id,
                 "confluence_page_ids": body.confluence_page_ids or [],
                 "visual": bool(body.visual),
+                "auto_route": body.route,
                 "selected_tables": body.tables or ([body.table] if body.table != "*" else None)})
     return ctx
+
+
+def _routed(body, user):
+    """With Auto on, the question picks its source (autoroute.route) — once,
+    at request time, and written into the request itself, so the worker that
+    runs the turn answers exactly what was routed and the user message records
+    where it went. A route is never taken from a client: one sent without
+    Auto is dropped. Pipeline and platform controls act on a version already
+    in the conversation, so they are not routed."""
+    if not body.auto:
+        return body.model_copy(update={"route": None})
+    if (body.pipeline_action in ("run", "status") or body.platform_action
+            or body.pipeline_message_id or body.platform_message_id):
+        return body.model_copy(update={"route": None, "source": "*", "table": "*",
+                                       "tables": None, "route_sources": None})
+    previous = None
+    if body.conversation_id:
+        access = _own_or_404(body.conversation_id, user, need="edit")
+        previous = autoroute.previous_route(_visible_messages(body.conversation_id, user, access))
+    route = autoroute.route(user, body.prompt.strip(), previous)
+    if route["mode"] == "single":
+        where = {"source": route["source"], "route_sources": None}
+    else:
+        where = {"source": "*", "route_sources": route.get("sources") or None}
+    return body.model_copy(update={**where, "table": "*", "tables": None, "route": route})
 
 
 def _prepare(body, user):
@@ -652,6 +691,8 @@ def _answer(ctx, result):
          None, and we discard our answer. This is the guarantee; (1) only
          saves the wasted work.
     """
+    if ctx.get("auto_route") and isinstance(result, dict):
+        result.setdefault("auto_route", ctx["auto_route"])   # where Auto sent it, and why
     reply_to = ctx.get("reply_to")
     if not reply_to:
         return db.add_message(ctx["cid"], "assistant", result)
@@ -863,14 +904,14 @@ def _run_turn(ctx, user):
         # A certified metric is answered from its definition here too — before
         # the fan-out, and before asking which same-named table was meant: a
         # certification already says where the number lives.
-        certified = None if ctx["history"] else semantic.certified_answer(
-            user, _usable_sources(user), prompt)
+        usable = [s for s in _usable_sources(user) if not ctx.get("only") or s in ctx["only"]]
+        certified = None if ctx["history"] else semantic.certified_answer(user, usable, prompt)
         verified = None
         if certified is None and not ctx["history"]:
             # Then a verified query someone saved for this exact question.
             from . import verified_sql
             try:
-                vsource, vm = verified_sql.best_exact(user, _usable_sources(user), prompt)
+                vsource, vm = verified_sql.best_exact(user, usable, prompt)
             except Exception:
                 log.warning("verified SQL lookup failed", exc_info=True)
                 vsource, vm = None, None
@@ -888,7 +929,8 @@ def _run_turn(ctx, user):
         else:
             # Same-named table in several sources? Don't guess — ask, unless the
             # user already chose "both, side by side" (allow_ambiguous).
-            sources = orchestrator.accessible_sources(user)
+            sources = orchestrator.accessible_sources(
+                user, **({"only": ctx["only"]} if ctx.get("only") else {}))
             clash = orchestrator.ambiguous_tables(prompt, sources)
             if clash and not ctx.get("allow_ambiguous"):
                 # Tables this conversation already chose to query across all
@@ -1088,6 +1130,7 @@ def _run_turn(ctx, user):
 @router.post("/chat")
 def ask(body: Ask, user=Depends(current_user)):
     """Synchronous turn — waits for the answer."""
+    body = _routed(body, user)
     ctx = _prepare(body, user)
     result = _run_turn(ctx, user)
     return {"conversation_id": ctx["cid"], "message": result}
@@ -1100,6 +1143,7 @@ def ask_background(body: Ask, user=Depends(current_user)):
     conversation gets an unseen marker (the blue dot) until it's opened. Lets a
     user run tasks in several chats at once. The turn itself is a durable
     chat_turn job: recorded here, run by a worker (jobs.py)."""
+    body = _routed(body, user)                       # Auto: decided once, here
     scope = _scope(body, user)                       # validates now: 4xx before any write
     # The user message, exactly once — its id is what the task answers, and
     # what tells two concurrent turns in this conversation apart.

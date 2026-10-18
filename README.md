@@ -302,6 +302,37 @@ sequenceDiagram
     API-->>U: answer + chart on the canvas
 ```
 
+### Auto — the question picks its source and tables
+
+The chat toolbar's **Auto** switch is on by default, and each browser
+remembers its setting. With Auto on, nobody picks a source or a table. Each
+question is matched against what every source the user's role may query
+contains, and goes where its answer is (`autoroute.py`):
+
+- **One source has it all** → that source answers, exactly as if it had been
+  picked. The agent's own grounding then chooses the tables.
+- **It is split** (one term only in one source, another only in another) →
+  the multi-agent path, its roster limited to the sources the question needs.
+- **Two sources have it about equally** (the same tables in two places) →
+  those sources together, and the multi-agent path asks which one was meant
+  before it guesses.
+- **Nothing matches** → a follow-up stays where the conversation was, whether
+  that source was picked by Auto or by hand. A first question goes to the
+  only usable source, or across every source as *All sources* always has.
+
+The match is the metadata graph's grounding (`metaground.relevance`): table
+and column names, descriptions, the certified metrics' names and synonyms,
+and meaning when Harrier is configured. It reads the graph's record, so
+routing runs no warehouse query; a source not discovered yet is matched by
+its table names. Routing respects permissions: only sources the role may
+query, only tables it may read, only columns governance shows it.
+
+The route is decided once, when the question arrives, and written into the
+queued request and the user message. Every answer then says where it went:
+"✳ Auto · picked shop · orders — matched amount, region". A route is never
+taken from a client. With Auto off, the Source and Table pickers work as
+before.
+
 While a turn runs, the chat shows a **live activity feed** — the routing
 tier taken, which named agent is running which SQL, charts being rendered,
 DAG planning/execution, fan-out fallback, and aggregation across sources —
