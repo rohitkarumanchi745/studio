@@ -230,6 +230,17 @@ class Connector:
         """
         return None
 
+    def change_signal(self):
+        """A cheap token that changes whenever a table or view in this source's
+        scope is created, altered or dropped — or None when the engine offers
+        no such signal. The metadata graph polls it (metagraph.tick_once) and
+        rediscovers only when it moves. Metadata only, one cheap query.
+
+        Default: None, meaning "no signal" — such a source is rediscovered on
+        a fixed interval instead.
+        """
+        return None
+
     def relation_kind(self, namespace, table):
         """Metadata-only lookup outside the connector's readable namespace.
 

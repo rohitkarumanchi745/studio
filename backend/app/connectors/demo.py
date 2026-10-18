@@ -362,6 +362,17 @@ class DemoConnector(Connector):
         c.close()
         return [{"name": r[1], "type": r[2]} for r in rows]
 
+    def change_signal(self):
+        """A hash of the schema text SQLite keeps for every table and view."""
+        import hashlib
+        c = self._conn()
+        try:
+            rows = c.execute("SELECT type, name, sql FROM sqlite_master "
+                             "WHERE type IN ('table', 'view') ORDER BY name").fetchall()
+        finally:
+            c.close()
+        return hashlib.sha256(repr(rows).encode()).hexdigest()
+
     def describe_relations(self):
         """Kind and columns for every table and view in the demo warehouse."""
         c = self._conn()

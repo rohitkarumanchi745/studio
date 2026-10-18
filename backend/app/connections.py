@@ -994,10 +994,11 @@ def _refuse_save(probe):
     raise HTTPException(400, said)
 
 
-# Listeners told when a source is saved or reconnected — metagraph.py queues
-# its discovery here. Each is called as fn(name, trigger, conn=...): on a save,
+# Listeners told about a source's lifecycle — metagraph.py queues its
+# discovery here. Each is called as fn(name, trigger, conn=...) with trigger
+# "connection_saved", "reconnected", "disconnected" or "removed". On a save,
 # `conn` is the transaction holding the new row, so whatever a listener writes
-# lands (or rolls back) with it.
+# lands (or rolls back) with it; the others are announced after their commit.
 _SOURCE_LISTENERS = []
 
 
@@ -1158,6 +1159,7 @@ def disconnect_connection(cid: str, user=Depends(current_user)):
     if row["enabled"]:
         _set_enabled(cid, False)
         _evict_cached(row["name"])
+        _announce(row["name"], "disconnected")
         db.log_activity(user, "connection_disconnect", prompt=row["name"], source=row["ctype"])
     row["enabled"] = 0
     return _public(row)
@@ -1319,5 +1321,6 @@ def delete_connection(cid: str, user=Depends(current_user)):
         c.execute("DELETE FROM data_connections WHERE id=?", (cid,))
         c.commit()
     _evict_cached(r["name"])
+    _announce(r["name"], "removed")
     db.log_activity(user, "connection_delete", prompt=r["name"], source=r["ctype"])
     return {"deleted": r["name"]}

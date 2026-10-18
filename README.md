@@ -1379,6 +1379,33 @@ source from its row in Data connections.
   by a complete snapshot — never by a truncated listing
   (`STUDIO_METAGRAPH_MAX_OBJECTS`) or one where columns could not be read.
 
+**It stays current with no one asking.** The `metagraph_sync` scheduler (every
+`STUDIO_METAGRAPH_TICK_SECONDS`, 300 by default) reads each live source's
+*change signal* — one cheap catalog query: Postgres hashes every relation's
+kind and column names and types, Databricks takes the count and newest
+`last_altered` of `information_schema.tables`, the demo warehouse hashes its
+schema text — and rediscovers only a source whose signal moved since its last
+discovery, or whose last full discovery is older than
+`STUDIO_METAGRAPH_FULL_SYNC_SECONDS` (6 h; the only cadence for a connector
+with no signal). Events queue a rediscovery too: a supervised write against a
+source (an approved SQL job, a successful Airflow DAG), a reconnect, or a
+signed webhook (`POST /api/metagraph/events`, HMAC-SHA256 over the body with
+`STUDIO_METAGRAPH_WEBHOOK_SECRET`; absent secret, absent endpoint).
+
+- **One discovery at a time per source**; a queued or running one older than
+  `STUDIO_METAGRAPH_STALE_SECONDS` is presumed lost and replaced. A failing
+  source is retried by the job queue, then every
+  `STUDIO_METAGRAPH_RETRY_SECONDS`; a failed Neo4j mirror on the next tick.
+- **Large removals are held.** A snapshot that would remove at least
+  `STUDIO_METAGRAPH_HOLD_MIN` objects and `STUDIO_METAGRAPH_HOLD_FRACTION` of
+  the source — what a revoked grant or a half-broken listing looks like —
+  removes nothing; after `STUDIO_METAGRAPH_CONFIRM_SECONDS` a fresh snapshot
+  must report the same set gone before it is applied.
+- **Tombstones.** A removed table disappears from every read at once, stays
+  visible to admins as recently removed, and is purged after
+  `STUDIO_METAGRAPH_TOMBSTONE_DAYS` (30). A disconnected source is hidden and
+  leaves the Neo4j mirror; a deleted connection's objects become tombstones.
+
 ## Adversarial model benchmark — choose attackers with evidence
 
 The admin-only **Red team benchmark** turns attacker-model selection into a

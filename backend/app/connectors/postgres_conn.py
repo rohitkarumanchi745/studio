@@ -5,6 +5,7 @@ optionally POSTGRES_SCHEMA (default "public"). Dormant until the DSN is set.
 Reads through the same gate as every source (queryguard → RBAC → governance);
 run_script exists only for the supervised, human-approved write path.
 """
+import logging
 import os
 import re
 import threading
@@ -213,6 +214,38 @@ class PostgresConnector(Connector):
         try:
             return self._execute(go)
         except Exception:
+            return None
+
+    def change_signal(self):
+        """A hash of every relation in the pinned schema with its kind and its
+        columns' names and types, from pg_catalog in one query — any DDL that
+        changes what discovery would read moves it."""
+        schema = self._schema()
+
+        def go(con):
+            with con.cursor() as cur:
+                cur.execute(
+                    # relkind is the internal "char" type: text || "char" is
+                    # ambiguous, so every part is cast to text explicitly.
+                    "SELECT md5(coalesce(string_agg(c.relname::text || ':' "
+                    "|| c.relkind::text || ':' || coalesce(a.attname::text, '') || ':' "
+                    "|| coalesce(format_type(a.atttypid, a.atttypmod), ''), ',' "
+                    "ORDER BY c.relname, a.attnum), '')) "
+                    "FROM pg_catalog.pg_class c "
+                    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+                    "LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid "
+                    "AND a.attnum > 0 AND NOT a.attisdropped "
+                    "WHERE n.nspname = %s AND c.relkind IN ('r', 'p', 'v', 'm', 'f')",
+                    (schema,))
+                return cur.fetchone()[0]
+        try:
+            return self._execute(go)
+        except Exception:
+            # No signal means "rediscover on the full-sync cadence" — say why,
+            # or a broken query would look like an engine without a signal.
+            logging.getLogger("studio.connectors").warning(
+                "Postgres change_signal failed; falling back to the full-sync cadence",
+                exc_info=True)
             return None
 
     def relation_kind(self, namespace, table):

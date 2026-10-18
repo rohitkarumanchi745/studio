@@ -38,6 +38,11 @@ export function metadataText(summary, now = Date.now() / 1000) {
   if (busy) text += " · rediscovering…";
   if (summary.status === "partial") text += " · some columns could not be read";
   if (summary.status === "failed") text += " · the last discovery failed";
+  if (summary.status === "held") {
+    text += summary.held
+      ? ` · ${summary.held} ${summary.held === 1 ? "removal" : "removals"} waiting to be confirmed`
+      : " · removals waiting to be confirmed";
+  }
   if (summary.mirror_status === "failed") text += " · Neo4j mirror failed";
   if (summary.mirror_status === "refused") text += " · Neo4j mirror refused";
   return text;
