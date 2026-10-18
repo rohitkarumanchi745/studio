@@ -274,3 +274,74 @@ def test_change_capture_needs_only_the_connector_contract(pg_app, monkeypatch):
     assert [c["name"] for c in rels["retail_customers"]["columns"]][-1] == "region"
     assert "retail_coupons" in rels
     assert env.cdc.status("pg-bare")["capture"] == "probe"
+
+
+# ── Any SQL database: real Postgres through one SQLAlchemy URL ───────────
+
+def test_any_sql_database_reads_real_postgres_through_one_url(pg):
+    from app import queryguard
+    from app.connectors import sql_conn
+    from app.connectors.base import unguarded
+    conn, run = pg
+    schema = conn._schema()
+    url = DSN.replace("postgresql://", "postgresql+psycopg://", 1)
+    sql_conn._LEARNED.clear()
+    other = sql_conn.SqlConnector("pg-any", url, schema=schema)    # not the login's default
+    assert other.dialect == "postgresql" and other.dialect.identifier_rule == "lower"
+    assert other.sql_row_limit
+    names = other.list_tables()
+    assert {f"{schema}.retail_orders", f"{schema}.retail_sales"} <= set(names)
+    assert other.qualifiers() is queryguard.FULL_NAMES
+    keys = other.describe_constraints()
+    assert keys["primary_keys"][f"{schema}.retail_stores"] == ["store_id"]
+    assert keys["foreign_keys"][0]["from"] == f"{schema}.retail_visits"
+    assert "retail_orders" in other.view_definitions()[f"{schema}.retail_sales"]
+    quals, dialect = other.qualifiers(), other.dialect
+    queryguard.validate(f"SELECT * FROM {schema}.retail_orders", names, qualifiers=quals,
+                        dialect=dialect)
+    for bad in ("SELECT * FROM retail_orders",                    # the default schema's
+                f'SELECT * FROM {schema}."RETAIL_ORDERS"'):       # not the same table here
+        with pytest.raises(queryguard.QueryRejected):
+            queryguard.validate(bad, names, qualifiers=quals, dialect=dialect)
+    run("INSERT INTO {s}.retail_orders VALUES (1, 1, '2026-10-01', 'ok')")
+    with unguarded():
+        cols, rows = other.run_query(f"SELECT COUNT(*) AS n FROM {schema}.retail_orders")
+    assert cols == ["n"] and rows == [[1]]
+    other.close()
+
+    run("CREATE TABLE public.{s}_probe (id int)")
+    try:
+        pub = sql_conn.SqlConnector("pg-pub", url)                 # the default schema
+        assert f"{schema}_probe" in pub.list_tables()             # bare names
+        assert pub.qualifiers() == frozenset({"public", "mgscratch.public"})
+        pub.close()
+    finally:
+        run("DROP TABLE public.{s}_probe")
+
+
+def test_the_metadata_graph_over_any_sql_database(pg_app, monkeypatch):
+    from app import connectors
+    from app.connectors import sql_conn
+    env = pg_app
+    schema = connectors._REGISTRY["pg-test"]._schema()
+    url = DSN.replace("postgresql://", "postgresql+psycopg://", 1)
+    sql_conn._LEARNED.clear()
+    monkeypatch.setitem(connectors._REGISTRY, "pg-any",
+                        sql_conn.SqlConnector("pg-any", url, schema=schema))
+    env.mg.discover("pg-any", "test")
+    detail = env.mg.get_source("pg-any", user=ADMIN)
+    assert detail["kinds"] == {"table": 4, "view": 1}
+    rels = env.mg.source_relationships("pg-any", user=ADMIN)["relationships"]
+    joins = {(r["from_object"], r["to_object"], r["state"]) for r in rels if r["kind"] == "join"}
+    assert (f"{schema}.retail_visits", f"{schema}.retail_stores", "declared") in joins
+    env.run("ALTER TABLE {s}.retail_stores ADD COLUMN region text")
+    assert env.mg.tick_once()["queued"].get("pg-any") is None
+    with env.db.connect() as c:
+        rows = c.execute("SELECT * FROM background_jobs WHERE kind='metagraph_event'").fetchall()
+    for row in rows:
+        env.jobs.handlers()["metagraph_event"](json.loads(row["payload"]),
+                                               {**dict(row), "attempts": 1})
+    stores = next(r for r in env.mg.get_source("pg-any", user=ADMIN)["relations"]
+                  if r["name"] == f"{schema}.retail_stores")
+    assert [c["name"] for c in stores["columns"]][-1] == "region"
+    assert env.cdc.status("pg-any")["capture"] == "bulk"

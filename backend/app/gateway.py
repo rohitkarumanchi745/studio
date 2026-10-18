@@ -143,7 +143,12 @@ def check(user, source, sql, *, table_label="*", max_rows=None, allow_explain=Fa
         if allow_explain:
             kw["allow_explain"] = True
     cleaned = guard.validate(sql, allowed, **kw)
-    cleaned = guard.enforce_limit(cleaned, _cap(max_rows))
+    if getattr(connector, "sql_row_limit", True):
+        cleaned = guard.enforce_limit(cleaned, _cap(max_rows))
+    # else: the engine spells a limit otherwise (TOP, FETCH FIRST — learned by
+    # connectors.sql_conn from the dialect), so the text is left as the model
+    # wrote it, the connector caps the rows it fetches, and execute() trims to
+    # the caller's cap as for every source.
     return connector, allowed, cleaned
 
 

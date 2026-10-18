@@ -64,6 +64,8 @@ from .connectors.graph_conn import GraphConnector
 from .connectors.postgres_conn import PostgresConnector
 from .connectors.powerbi_conn import PowerBIConnector, PowerBIError
 from .connectors.snowflake_conn import SnowflakeConnector
+from .connectors.sql_conn import SqlConnector
+from .connectors.sql_conn import check_url as check_sql_url
 
 router = APIRouter(prefix="/connections", tags=["connections"])
 
@@ -169,6 +171,14 @@ class _DynGraph(GraphConnector):
         return base
 
 
+class _DynSQL(SqlConnector):
+    """Any database SQLAlchemy has an installed driver for. The URL names the
+    engine; nothing about it is configured here (connectors/sql_conn.py)."""
+
+    def __init__(self, name, cfg):
+        super().__init__(name, (cfg or {}).get("url", ""), (cfg or {}).get("schema", ""))
+
+
 class _DynPowerBI(PowerBIConnector):
     def __init__(self, name, cfg):
         super().__init__()                      # per-connection metadata cache
@@ -264,6 +274,13 @@ def _check_databricks(cfg):
             problems["access_token"] = ("This looks like a host or URL, not an access token — "
                                         "it starts with “dapi”.")
     return cfg, problems
+
+
+def _check_sql(cfg):
+    """A usable URL: parseable, a driver installed for it, a network host."""
+    cfg = {**cfg, "url": (cfg.get("url") or "").strip(), "schema": (cfg.get("schema") or "").strip()}
+    _url, problem = check_sql_url(cfg["url"])
+    return cfg, ({"url": problem} if problem else {})
 
 
 def _resolves(host, wait=5.0):
@@ -390,6 +407,24 @@ TYPES = {
             _field("user", "User", required=True),
             _field("password", "Password", required=True, secret=True),
             _field("database", "Database", default="neo4j"),
+        ],
+    },
+    # Any other database: one SQLAlchemy URL, any installed driver. Its kind of
+    # engine, identifier rules and limit syntax are learned, not listed here.
+    "sql": {
+        "needs_tables": True,
+        "label": "Any SQL database", "dialect": "sql", "build": _DynSQL,
+        "check": _check_sql,
+        # Blank still pins ONE namespace: the login's default schema, which is
+        # where the engine resolves a bare name.
+        "blank_schema_is_default": True,
+        "hint_key": "url",
+        "ns": {"schema": "schema", "database": ""},
+        "fields": [
+            _field("url", "Connection URL", required=True, secret=True,
+                   placeholder="mysql+pymysql://user:password@host:3306/db — any "
+                               "dialect+driver installed here"),
+            _field("schema", "Schema", placeholder="the login's default schema"),
         ],
     },
     # A service principal (Entra app registration) that the workspace has been
@@ -579,7 +614,14 @@ def source_entries():
         if not t:
             continue
         cfg = _config(row)
-        out.append({"name": row["name"], "dialect": t["dialect"],
+        dialect = t["dialect"]
+        if row["ctype"] == "sql" and cfg:
+            try:                     # the engine the URL names; no connection made
+                from sqlalchemy.engine import make_url
+                dialect = make_url(cfg.get("url", "")).get_backend_name()
+            except Exception:
+                pass
+        out.append({"name": row["name"], "dialect": dialect,
                     "configured": cfg is not None,
                     "type_label": t["label"], "ctype": row["ctype"],
                     "namespace": _namespace(row["ctype"], cfg) if cfg else ""})
@@ -734,6 +776,14 @@ def _hint(ctype, cfg):
         try:
             return urlsplit(raw).hostname or ""
         except ValueError:
+            return ""
+    if ctype == "sql":
+        # The engine and host only: the URL carries the password.
+        try:
+            from sqlalchemy.engine import make_url
+            url = make_url(raw)
+            return f"{url.get_backend_name()} · {url.host}" if url.host else url.get_backend_name()
+        except Exception:
             return ""
     return raw
 
@@ -978,7 +1028,7 @@ def _require_pin(ctype, cfg, why):
     a source with nothing in it, so say which field is missing instead of
     letting the probe report a generic "unconfigured"."""
     pin = (TYPES[ctype].get("ns") or {}).get("schema")
-    if pin:
+    if pin and not TYPES[ctype].get("blank_schema_is_default"):
         field = next((f for f in TYPES[ctype]["fields"] if f["key"] == pin), {})
         if not str(cfg.get(pin) or field.get("default") or "").strip():
             raise HTTPException(400, f"pick a {field.get('label', pin).lower()} to connect {why}")
