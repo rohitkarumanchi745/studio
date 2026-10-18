@@ -53,8 +53,9 @@ export function metadataText(summary, now = Date.now() / 1000) {
   return text;
 }
 
-/** Discovery summaries by source name, with a reload. */
-export function useMetadataStatus() {
+/** Discovery summaries by source name, with a reload. `enabled` false
+ *  fetches nothing (the caller may not see them). */
+export function useMetadataStatus(enabled = true) {
   const [byName, setByName] = useState({});
   const alive = useRef(true);
   const reload = useCallback(() => api("/metagraph/sources")
@@ -67,18 +68,18 @@ export function useMetadataStatus() {
     .catch(() => ({})), []);
   useEffect(() => {
     alive.current = true;
-    reload();
+    if (enabled) reload();
     return () => { alive.current = false; };
-  }, [reload]);
+  }, [reload, enabled]);
   // While a discovery is queued or running — a source just connected, say —
   // keep the line current (every 3 s, for about two minutes).
   const polls = useRef(0);
   const pending = Object.values(byName).some((s) => s.status === "queued" || s.status === "running");
   useEffect(() => {
-    if (!pending || polls.current >= 40) return undefined;
+    if (!enabled || !pending || polls.current >= 40) return undefined;
     const timer = setTimeout(() => { polls.current += 1; reload(); }, 3000);
     return () => clearTimeout(timer);
-  }, [pending, byName, reload]);
+  }, [enabled, pending, byName, reload]);
   return { byName, reload };
 }
 

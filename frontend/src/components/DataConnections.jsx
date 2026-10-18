@@ -22,7 +22,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { api, getUser } from "../api";
 import { CATEGORIES, FEATURED, MARKETPLACE, SourceIcon, metaFor } from "./sourceCatalog";
-import MetadataLine, { useMetadataStatus } from "./MetadataLine";
+import MetadataLine, { metadataText, useMetadataStatus } from "./MetadataLine";
 import { backdropClose } from "../backdrop";
 
 const STATUS_LABEL = {
@@ -193,6 +193,25 @@ export default function DataConnections({ onClose }) {
   const [error, setError] = useState("");
   const [note, setNote] = useState("");
   const [repos, setRepos] = useState([]);       // configured GitHub planning repositories
+  // What Studio has scanned from each connected source, for the Connected
+  // sources panel (administrators), and the names being queued for a rescan.
+  const scans = useMetadataStatus(isAdmin);
+  const [rescanning, setRescanning] = useState([]);
+
+  async function rediscover(names) {
+    setRescanning((now) => [...now, ...names]);
+    setError("");
+    try {
+      for (const name of names) {
+        await api(`/metagraph/sources/${encodeURIComponent(name)}/discover`, { method: "POST" });
+      }
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      await scans.reload();          // queued now: the status keeps itself current
+      setRescanning((now) => now.filter((n) => !names.includes(n)));
+    }
+  }
 
   function load() {
     api("/catalog/sources").then((d) => setSources(Array.isArray(d) ? d : [])).catch(() => {});
@@ -281,8 +300,15 @@ export default function DataConnections({ onClose }) {
 
         <div className="conn-body">
           {!tile ? (
-            <Grid tiles={tiles} isAdmin={isAdmin} featured={!q.trim()}
-              onPick={(id) => { setPicked(id); setError(""); setNote(""); }} />
+            <>
+              {isAdmin && !q.trim() && (
+                <ConnectedSources tiles={tiles} scans={scans.byName} rescanning={rescanning}
+                  onRediscover={rediscover}
+                  onPick={(id) => { setPicked(id); setError(""); setNote(""); }} />
+              )}
+              <Grid tiles={tiles} isAdmin={isAdmin} featured={!q.trim()}
+                onPick={(id) => { setPicked(id); setError(""); setNote(""); }} />
+            </>
           ) : tile.id === "m365" ? (
             <M365Panel
               state={m365}
@@ -309,6 +335,69 @@ export default function DataConnections({ onClose }) {
         </div>
       </div>
     </div>
+  );
+}
+
+// ── Connected sources: what Studio has scanned from each ───────────────
+
+/** A source with no scan to show for: never scanned, or its first scan failed. */
+export function needsScan(summary) {
+  if (!summary || !summary.status || summary.status === "not_discovered") return true;
+  return summary.status === "failed";
+}
+
+/**
+ * Every connected source in one place, for administrators: what Studio has
+ * scanned from it (the metadata Auto routes questions with) and a Rediscover
+ * button — the line each integration shows under its connection, without
+ * having to know which tile a source was connected through. Stateless: the
+ * scan status and the rescans in flight belong to the marketplace.
+ */
+export function ConnectedSources({ tiles, scans, rescanning, onRediscover, onPick }) {
+  const rows = tiles.flatMap((tile) => tile.id === "github" || tile.id === "m365" ? []
+    : tile.instances.filter((i) => i.configured && !i.disconnected).map((inst) => ({ tile, inst })))
+    .sort((a, b) => a.inst.name.localeCompare(b.inst.name));
+  if (!rows.length) return null;
+  const running = (name) => rescanning.includes(name)
+    || ["queued", "running"].includes(scans[name]?.status);
+  const waiting = rows.map(({ inst }) => inst.name)
+    .filter((name) => needsScan(scans[name]) && !running(name));
+
+  return (
+    <section className="conn-group conn-connected" aria-label="Connected sources">
+      <div className="conn-group-title conn-connected-head">
+        <span>Connected sources</span>
+        {waiting.length > 0 && (
+          <button className="chip" onClick={() => onRediscover(waiting)}>
+            ↻ Rediscover {waiting.length} not scanned
+          </button>
+        )}
+      </div>
+      <div className="meta conn-connected-note">
+        What Studio has read from each source — its tables, columns and keys. Auto picks the
+        source for a question from this.
+      </div>
+      <div className="conn-instances">
+        {rows.map(({ tile, inst }) => (
+          <div key={inst.name} className="dbconn-row">
+            <SourceIcon id={tile.id} size={20} />
+            <b>{inst.name}</b>
+            <span className="meta">{tile.meta.label}{inst.hint ? ` · ${inst.hint}` : ""}</span>
+            <button className="chip conn-connected-open" onClick={() => onPick(tile.id)}>
+              Manage
+            </button>
+            <div className="metadata-line meta"
+                 title={scans[inst.name]?.error || scans[inst.name]?.mirror_error || ""}>
+              <span>{metadataText(scans[inst.name])}</span>
+              <button className="chip" onClick={() => onRediscover([inst.name])}
+                      disabled={running(inst.name)}>
+                {running(inst.name) ? "discovering…" : "↻ Rediscover"}
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
   );
 }
 
