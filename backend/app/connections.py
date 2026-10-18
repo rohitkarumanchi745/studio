@@ -64,6 +64,8 @@ from .connectors.graph_conn import GraphConnector
 from .connectors.postgres_conn import PostgresConnector
 from .connectors.powerbi_conn import PowerBIConnector, PowerBIError
 from .connectors.snowflake_conn import SnowflakeConnector
+from .connectors.sql_conn import SqlConnector
+from .connectors.sql_conn import check_url as check_sql_url
 
 router = APIRouter(prefix="/connections", tags=["connections"])
 
@@ -169,6 +171,14 @@ class _DynGraph(GraphConnector):
         return base
 
 
+class _DynSQL(SqlConnector):
+    """Any database SQLAlchemy has an installed driver for. The URL names the
+    engine; nothing about it is configured here (connectors/sql_conn.py)."""
+
+    def __init__(self, name, cfg):
+        super().__init__(name, (cfg or {}).get("url", ""), (cfg or {}).get("schema", ""))
+
+
 class _DynPowerBI(PowerBIConnector):
     def __init__(self, name, cfg):
         super().__init__()                      # per-connection metadata cache
@@ -264,6 +274,22 @@ def _check_databricks(cfg):
             problems["access_token"] = ("This looks like a host or URL, not an access token — "
                                         "it starts with “dapi”.")
     return cfg, problems
+
+
+def _check_neo4j(cfg):
+    """Neo4j is reached over its HTTP API; a bolt:// or neo4j:// URI cannot
+    work, so it is refused on its field before any sign-in."""
+    from .connectors.graph_conn import http_uri_problem
+    cfg = {**cfg, "uri": (cfg.get("uri") or "").strip()}
+    problem = http_uri_problem(cfg["uri"])
+    return cfg, ({"uri": problem} if problem else {})
+
+
+def _check_sql(cfg):
+    """A usable URL: parseable, a driver installed for it, a network host."""
+    cfg = {**cfg, "url": (cfg.get("url") or "").strip(), "schema": (cfg.get("schema") or "").strip()}
+    _url, problem = check_sql_url(cfg["url"])
+    return cfg, ({"url": problem} if problem else {})
 
 
 def _resolves(host, wait=5.0):
@@ -384,12 +410,32 @@ TYPES = {
     },
     "neo4j": {
         "label": "Neo4j (Cypher)", "dialect": "cypher", "build": _DynGraph,
+        "check": _check_neo4j,
         "hint_key": "uri",
         "fields": [
-            _field("uri", "URI", required=True, placeholder="bolt://host:7687"),
+            _field("uri", "HTTP API URI", required=True,
+                   placeholder="https://host:7473 (Neo4j's HTTP API, not bolt://)"),
             _field("user", "User", required=True),
             _field("password", "Password", required=True, secret=True),
             _field("database", "Database", default="neo4j"),
+        ],
+    },
+    # Any other database: one SQLAlchemy URL, any installed driver. Its kind of
+    # engine, identifier rules and limit syntax are learned, not listed here.
+    "sql": {
+        "needs_tables": True,
+        "label": "Any SQL database", "dialect": "sql", "build": _DynSQL,
+        "check": _check_sql,
+        # Blank still pins ONE namespace: the login's default schema, which is
+        # where the engine resolves a bare name.
+        "blank_schema_is_default": True,
+        "hint_key": "url",
+        "ns": {"schema": "schema", "database": ""},
+        "fields": [
+            _field("url", "Connection URL", required=True, secret=True,
+                   placeholder="mysql+pymysql://user:password@host:3306/db — any "
+                               "dialect+driver installed here"),
+            _field("schema", "Schema", placeholder="the login's default schema"),
         ],
     },
     # A service principal (Entra app registration) that the workspace has been
@@ -579,7 +625,14 @@ def source_entries():
         if not t:
             continue
         cfg = _config(row)
-        out.append({"name": row["name"], "dialect": t["dialect"],
+        dialect = t["dialect"]
+        if row["ctype"] == "sql" and cfg:
+            try:                     # the engine the URL names; no connection made
+                from sqlalchemy.engine import make_url
+                dialect = make_url(cfg.get("url", "")).get_backend_name()
+            except Exception:
+                pass
+        out.append({"name": row["name"], "dialect": dialect,
                     "configured": cfg is not None,
                     "type_label": t["label"], "ctype": row["ctype"],
                     "namespace": _namespace(row["ctype"], cfg) if cfg else ""})
@@ -734,6 +787,14 @@ def _hint(ctype, cfg):
         try:
             return urlsplit(raw).hostname or ""
         except ValueError:
+            return ""
+    if ctype == "sql":
+        # The engine and host only: the URL carries the password.
+        try:
+            from sqlalchemy.engine import make_url
+            url = make_url(raw)
+            return f"{url.get_backend_name()} · {url.host}" if url.host else url.get_backend_name()
+        except Exception:
             return ""
     return raw
 
@@ -978,7 +1039,7 @@ def _require_pin(ctype, cfg, why):
     a source with nothing in it, so say which field is missing instead of
     letting the probe report a generic "unconfigured"."""
     pin = (TYPES[ctype].get("ns") or {}).get("schema")
-    if pin:
+    if pin and not TYPES[ctype].get("blank_schema_is_default"):
         field = next((f for f in TYPES[ctype]["fields"] if f["key"] == pin), {})
         if not str(cfg.get(pin) or field.get("default") or "").strip():
             raise HTTPException(400, f"pick a {field.get('label', pin).lower()} to connect {why}")
@@ -992,6 +1053,24 @@ def _refuse_save(probe):
         raise HTTPException(400, {"error": said, "fields": probe["fields"],
                                   "stage": probe.get("stage", "check")})
     raise HTTPException(400, said)
+
+
+# Listeners told about a source's lifecycle — metagraph.py queues its
+# discovery here. Each is called as fn(name, trigger, conn=...) with trigger
+# "connection_saved", "reconnected", "disconnected" or "removed". On a save,
+# `conn` is the transaction holding the new row, so whatever a listener writes
+# lands (or rolls back) with it; the others are announced after their commit.
+_SOURCE_LISTENERS = []
+
+
+def on_source_saved(fn):
+    _SOURCE_LISTENERS.append(fn)
+    return fn
+
+
+def _announce(name, trigger, *, conn=None):
+    for fn in list(_SOURCE_LISTENERS):
+        fn(name, trigger, conn=conn)
 
 
 def _create(user, name, ctype, stored, effective, label=""):
@@ -1029,6 +1108,9 @@ def _create(user, name, ctype, stored, effective, label=""):
                   "created_by, created_at, enabled) VALUES (?,?,?,?,?,?,?,1)",
                   (row["id"], row["name"], row["ctype"], row["label"], row["config"],
                    row["created_by"], row["created_at"]))
+        # Listeners (metagraph.py's discovery) write in this transaction, so
+        # the connection and its discovery job land together.
+        _announce(name, "connection_saved", conn=c)
         c.commit()
     _evict_cached(name)
     db.log_activity(user, "connection_create", prompt=name, source=ctype)
@@ -1138,6 +1220,7 @@ def disconnect_connection(cid: str, user=Depends(current_user)):
     if row["enabled"]:
         _set_enabled(cid, False)
         _evict_cached(row["name"])
+        _announce(row["name"], "disconnected")
         db.log_activity(user, "connection_disconnect", prompt=row["name"], source=row["ctype"])
     row["enabled"] = 0
     return _public(row)
@@ -1162,6 +1245,7 @@ def reconnect_connection(cid: str, user=Depends(current_user)):
             raise HTTPException(400, f"connection test failed: {probe['error']}")
         _set_enabled(cid, True)
         _evict_cached(row["name"])
+        _announce(row["name"], "reconnected")
         db.log_activity(user, "connection_reconnect", prompt=row["name"], source=row["ctype"])
     row["enabled"] = 1
     return _public(row)
@@ -1298,5 +1382,6 @@ def delete_connection(cid: str, user=Depends(current_user)):
         c.execute("DELETE FROM data_connections WHERE id=?", (cid,))
         c.commit()
     _evict_cached(r["name"])
+    _announce(r["name"], "removed")
     db.log_activity(user, "connection_delete", prompt=r["name"], source=r["ctype"])
     return {"deleted": r["name"]}

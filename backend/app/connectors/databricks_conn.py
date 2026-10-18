@@ -7,6 +7,7 @@ tasks in it": every task needs a `task_key`, exactly one recognized task type,
 and compute to run on. Checking that body here — next to the credentials it
 needs — refuses a payload the endpoint would reject with a 400 before it is sent.
 """
+import logging
 import os
 import re
 import threading
@@ -22,6 +23,18 @@ ALL_SCHEMAS = "*"
 #: Catalogs never listed in an all-schemas source: `system` holds the
 #: workspace's audit, billing and access logs, not business data.
 _SKIPPED_CATALOGS = {"system"}
+
+
+def _with_comments(cur, sql):
+    """Rows of `sql` with its `comment` column last — `{c}` marks where it
+    goes — or, where information_schema has no such column, the same rows with
+    None in its place: descriptions are a bonus, never a reason to fail."""
+    try:
+        cur.execute(sql.replace("{c}", ", comment"))
+        return [tuple(r) for r in cur.fetchall()]
+    except Exception:
+        cur.execute(sql.replace("{c}", ""))
+        return [tuple(r) + (None,) for r in cur.fetchall()]
 #: Only plain identifiers make a listable name: the catalog endpoints and the
 #: query guard both read a name as dot-separated plain parts.
 _PLAIN = re.compile(r"^[A-Za-z_][\w$]*$")
@@ -567,6 +580,279 @@ class DatabricksConnector(Connector):
                 out.append({"name": col, "type": dtype})
             return out
         return self._execute(go)
+
+    #: information_schema.tables.table_type spellings, by kind.
+    _TABLE_TYPES = {"MANAGED", "EXTERNAL", "BASE TABLE", "STREAMING_TABLE", "FOREIGN"}
+    _VIEW_TYPES = {"VIEW", "MATERIALIZED_VIEW", "MATERIALIZED VIEW", "METRIC_VIEW"}
+
+    def describe_relations(self):
+        """Kind and columns for every relation in this source's scope, from
+        information_schema in two queries rather than a DESCRIBE per table.
+        Keyed as list_tables() names them: bare names when pinned to a schema
+        (current_catalog()/current_schema() are the pinned ones, so nothing is
+        interpolated), catalog.schema.table when the source spans schemas.
+        None where information_schema is unavailable (the Hive metastore) —
+        discovery then DESCRIBEs table by table."""
+        catalog = (self._cfg()["catalog"] or "").strip()
+        if catalog and not _PLAIN.match(catalog):
+            return None
+        if self.all_schemas:
+            prefix = f"`{catalog}`.information_schema" if catalog else "system.information_schema"
+            skipped = ", ".join(f"'{c}'" for c in sorted(_SKIPPED_CATALOGS))
+            where = (f"WHERE table_schema <> 'information_schema' "
+                     f"AND table_catalog NOT IN ({skipped})")
+
+            def key(cat, sch, name):
+                return f"{cat}.{sch}.{name}"
+        else:
+            prefix = "information_schema"
+            where = "WHERE table_catalog = current_catalog() AND table_schema = current_schema()"
+
+            def key(cat, sch, name):
+                return name
+
+        def go(con):
+            cur = con.cursor()
+            out = {}
+            for cat, sch, name, ttype, note in _with_comments(
+                    cur, f"SELECT table_catalog, table_schema, table_name, table_type{{c}} "
+                         f"FROM {prefix}.tables {where}"):
+                kind = str(ttype or "").upper()
+                kind = ("view" if kind in self._VIEW_TYPES
+                        else "table" if kind in self._TABLE_TYPES else "other")
+                out[key(cat, sch, name)] = {"kind": kind, "namespace": f"{cat}.{sch}",
+                                            "columns": [],
+                                            **({"description": note} if note else {})}
+            for type_col in ("full_data_type", "data_type"):
+                try:
+                    rows = _with_comments(
+                        cur, f"SELECT table_catalog, table_schema, table_name, column_name, "
+                             f"{type_col}{{c}} FROM {prefix}.columns {where} "
+                             f"ORDER BY table_catalog, table_schema, table_name, "
+                             f"ordinal_position")
+                    break
+                except Exception:
+                    if type_col == "data_type":
+                        raise
+            for cat, sch, name, col, ctype, note in rows:
+                entry = out.get(key(cat, sch, name))
+                if entry is not None:
+                    entry["columns"].append({"name": col, "type": ctype,
+                                             **({"description": note} if note else {})})
+            return out
+        try:
+            return self._execute(go)
+        except Exception:
+            return None
+
+    def describe_relation(self, name):
+        """describe_relations() for one relation: information_schema filtered
+        to it, the name checked as plain identifiers before it is quoted. None
+        where information_schema is unavailable or the name is not plain."""
+        scope = self._info_scope()
+        if scope is None:
+            return None
+        prefix, where, _key = scope
+        parts = str(name).split(".")
+        if len(parts) != (3 if self.all_schemas else 1) \
+                or not all(_PLAIN.match(p) for p in parts):
+            return None
+        if self.all_schemas:
+            where += (f" AND table_catalog = '{parts[0]}' AND table_schema = '{parts[1]}' "
+                      f"AND table_name = '{parts[2]}'")
+        else:
+            where += f" AND table_name = '{parts[0]}'"
+
+        def go(con):
+            cur = con.cursor()
+            found = _with_comments(cur, f"SELECT table_catalog, table_schema, table_type{{c}} "
+                                        f"FROM {prefix}.tables WHERE {where}")
+            if not found:
+                return None
+            row = found[0]
+            kind = str(row[2] or "").upper()
+            kind = ("view" if kind in self._VIEW_TYPES
+                    else "table" if kind in self._TABLE_TYPES else "other")
+            for type_col in ("full_data_type", "data_type"):
+                try:
+                    rows = _with_comments(cur, f"SELECT column_name, {type_col}{{c}} FROM "
+                                               f"{prefix}.columns WHERE {where} "
+                                               f"ORDER BY ordinal_position")
+                    break
+                except Exception:
+                    if type_col == "data_type":
+                        raise
+            out = {"kind": kind, "namespace": f"{row[0]}.{row[1]}",
+                   "columns": [{"name": r[0], "type": r[1],
+                                **({"description": r[2]} if r[2] else {})} for r in rows]}
+            if row[3]:
+                out["description"] = row[3]
+            return out
+        return self._execute(go)
+
+    def _info_scope(self):
+        """(information_schema prefix, table filter, name of a relation from its
+        catalog/schema/table) for this source's scope — the same scoping as
+        describe_relations()."""
+        catalog = (self._cfg()["catalog"] or "").strip()
+        if catalog and not _PLAIN.match(catalog):
+            return None
+        if self.all_schemas:
+            prefix = f"`{catalog}`.information_schema" if catalog else "system.information_schema"
+            skipped = ", ".join(f"'{c}'" for c in sorted(_SKIPPED_CATALOGS))
+            return (prefix, f"table_schema <> 'information_schema' "
+                            f"AND table_catalog NOT IN ({skipped})",
+                    lambda cat, sch, name: f"{cat}.{sch}.{name}")
+        return ("information_schema",
+                "table_catalog = current_catalog() AND table_schema = current_schema()",
+                lambda cat, sch, name: name)
+
+    def describe_constraints(self):
+        """Unity Catalog primary and foreign keys (informational constraints)
+        from information_schema. A foreign key whose referenced table lies
+        outside this source's scope is left out."""
+        scope = self._info_scope()
+        if scope is None:
+            return None
+        prefix, where, key = scope
+
+        def go(con):
+            cur = con.cursor()
+            cur.execute(f"SELECT constraint_name, constraint_type, table_catalog, table_schema, "
+                        f"table_name FROM {prefix}.table_constraints WHERE {where} "
+                        f"AND constraint_type IN ('PRIMARY KEY', 'FOREIGN KEY')")
+            constraints = {r[0]: (r[1], key(r[2], r[3], r[4])) for r in cur.fetchall()}
+            cur.execute(f"SELECT constraint_name, column_name, ordinal_position "
+                        f"FROM {prefix}.key_column_usage WHERE {where} "
+                        f"ORDER BY constraint_name, ordinal_position")
+            columns = {}
+            for name, col, _pos in cur.fetchall():
+                columns.setdefault(name, []).append(col)
+            cur.execute(f"SELECT constraint_name, unique_constraint_name "
+                        f"FROM {prefix}.referential_constraints")
+            refs = dict(cur.fetchall())
+            out = {"primary_keys": {}, "foreign_keys": []}
+            for name, (ctype, table) in constraints.items():
+                if ctype == "PRIMARY KEY" and columns.get(name):
+                    out["primary_keys"][table] = columns[name]
+            for name, (ctype, table) in constraints.items():
+                target = refs.get(name)
+                if ctype != "FOREIGN KEY" or target not in constraints:
+                    continue
+                _t, to_table = constraints[target]
+                if columns.get(name) and columns.get(target):
+                    out["foreign_keys"].append({
+                        "name": name, "from": table, "from_columns": columns[name],
+                        "to": to_table, "to_columns": columns[target]})
+            return out
+        try:
+            return self._execute(go)
+        except Exception:
+            logging.getLogger("studio.connectors").warning(
+                "Databricks describe_constraints failed", exc_info=True)
+            return None
+
+    def view_definitions(self):
+        scope = self._info_scope()
+        if scope is None:
+            return None
+        prefix, where, key = scope
+
+        def go(con):
+            cur = con.cursor()
+            cur.execute(f"SELECT table_catalog, table_schema, table_name, view_definition "
+                        f"FROM {prefix}.views WHERE {where}")
+            return {key(cat, sch, name): sql for cat, sch, name, sql in cur.fetchall() if sql}
+        try:
+            return self._execute(go)
+        except Exception:
+            return None
+
+    def lineage(self):
+        """Table lineage Unity Catalog recorded (system.access.table_lineage) for
+        the last 90 days, between tables in this source's scope. None when the
+        system tables are not readable with this token."""
+        scope = self._info_scope()
+        if scope is None:
+            return None
+        _prefix, _where, key = scope
+        catalog = (self._cfg()["catalog"] or "").strip()
+        if self.all_schemas:
+            filt = (f"target_table_catalog = '{catalog}'" if catalog
+                    else "target_table_catalog <> 'system'")
+        else:
+            filt = ("target_table_catalog = current_catalog() "
+                    "AND target_table_schema = current_schema() "
+                    "AND source_table_catalog = current_catalog() "
+                    "AND source_table_schema = current_schema()")
+
+        def go(con):
+            cur = con.cursor()
+            cur.execute("SELECT DISTINCT source_table_catalog, source_table_schema, "
+                        "source_table_name, target_table_catalog, target_table_schema, "
+                        "target_table_name FROM system.access.table_lineage "
+                        f"WHERE {filt} AND source_table_name IS NOT NULL "
+                        "AND event_time > current_timestamp() - INTERVAL 90 DAYS LIMIT 5000")
+            return [(key(*r[:3]), key(*r[3:])) for r in cur.fetchall()
+                    if all(r) and r[:3] != r[3:]]
+        try:
+            return self._execute(go)
+        except Exception:
+            return None
+
+    def table_signals(self):
+        """{relation: "type|last_altered"} per relation in scope, from
+        information_schema.tables in one query, named as list_tables() names
+        them. None where last_altered is not available."""
+        scope = self._info_scope()
+        if scope is None:
+            return None
+        prefix, where, key = scope
+
+        def go(con):
+            cur = con.cursor()
+            cur.execute(f"SELECT table_catalog, table_schema, table_name, table_type, "
+                        f"last_altered FROM {prefix}.tables WHERE {where}")
+            return {key(cat, sch, name): f"{ttype}|{altered}"
+                    for cat, sch, name, ttype, altered in cur.fetchall()}
+        try:
+            return self._execute(go)
+        except Exception:
+            logging.getLogger("studio.connectors").warning(
+                "Databricks table_signals failed; falling back to the source signal",
+                exc_info=True)
+            return None
+
+    def change_signal(self):
+        """Count and newest last_altered of the relations in scope: a create,
+        drop, rename or ALTER moves one of them. None where information_schema
+        (or last_altered) is unavailable."""
+        catalog = (self._cfg()["catalog"] or "").strip()
+        if catalog and not _PLAIN.match(catalog):
+            return None
+        if self.all_schemas:
+            prefix = f"`{catalog}`.information_schema" if catalog else "system.information_schema"
+            skipped = ", ".join(f"'{c}'" for c in sorted(_SKIPPED_CATALOGS))
+            where = (f"WHERE table_schema <> 'information_schema' "
+                     f"AND table_catalog NOT IN ({skipped})")
+        else:
+            prefix = "information_schema"
+            where = "WHERE table_catalog = current_catalog() AND table_schema = current_schema()"
+
+        def go(con):
+            cur = con.cursor()
+            cur.execute(f"SELECT COUNT(*), MAX(last_altered) FROM {prefix}.tables {where}")
+            row = cur.fetchone()
+            return f"{row[0]}|{row[1]}"
+        try:
+            return self._execute(go)
+        except Exception:
+            # No signal means "rediscover on the full-sync cadence" — say why,
+            # or a broken query would look like an engine without a signal.
+            logging.getLogger("studio.connectors").warning(
+                "Databricks change_signal failed; falling back to the full-sync cadence",
+                exc_info=True)
+            return None
 
     def relation_kind(self, namespace, table):
         """Classify an output relation from metadata without reading its data.

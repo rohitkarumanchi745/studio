@@ -194,6 +194,29 @@ def _norm_terms(*values):
     return {t for t in out if t}
 
 
+def _stewardship(entry):
+    """({owner, certified, version}, problem) — optional fields saying who
+    answers for a definition, whether it is approved, and its version label."""
+    owner, version, certified = entry.get("owner"), entry.get("version"), entry.get("certified")
+    if owner is not None and (not isinstance(owner, str) or len(owner) > 120):
+        return {}, "owner must be a short string (an email or a team)"
+    if version is not None and (not isinstance(version, (str, int, float))
+                                or len(str(version)) > 40):
+        return {}, "version must be a short label"
+    if certified is not None and not isinstance(certified, bool):
+        return {}, "certified must be true or false"
+    return {"owner": owner, "certified": bool(certified),
+            "version": None if version is None else str(version)}, None
+
+
+def all_models():
+    """Every model of the active document (refreshed if another replica applied
+    a newer one)."""
+    _refresh_if_stale()
+    doc = _STATE["doc"]
+    return list(doc["models"]) if doc else []
+
+
 def validate(text):
     """(ok, errors, doc). Parse and structurally check a semantic YAML document.
 
@@ -211,6 +234,9 @@ def validate(text):
               synonyms: [sales, turnover]
               format: currency                  # optional display hint
               description: Total sales revenue
+              owner: finance@acme.com           # optional: who answers for it
+              certified: true                   # optional: approved for answers
+              version: "2"                      # optional: your own version label
           dimensions:
             - name: region
               expr: region
@@ -263,11 +289,17 @@ def validate(text):
             if name.lower() in metrics:
                 errors.append(f"{where}.metric '{name}': duplicate metric name")
                 continue
+            stewardship, problem = _stewardship(met)
+            if problem:
+                errors.append(f"{where}.metric '{name}': {problem}")
+                continue
             metrics[name.lower()] = {
                 "name": name, "agg": agg, "expr": expr,
                 "filter": (met.get("filter") or "").strip() or None,
                 "format": met.get("format"), "description": met.get("description", ""),
                 "terms": _norm_terms(name, name.replace("_", " "), met.get("synonyms")),
+                "synonyms": [str(x) for x in (met.get("synonyms") or [])],
+                **stewardship,
             }
         for j, dim in enumerate(m.get("dimensions") or []):
             if not isinstance(dim, dict) or not dim.get("name"):
@@ -288,11 +320,17 @@ def validate(text):
             if name.lower() in dims:
                 errors.append(f"{where}.dimension '{name}': duplicate dimension name")
                 continue
+            stewardship, problem = _stewardship(dim)
+            if problem:
+                errors.append(f"{where}.dimension '{name}': {problem}")
+                continue
             dims[name.lower()] = {
                 "name": name, "expr": expr,
                 "grain": str(grain).lower() if grain else None,
                 "description": dim.get("description", ""),
                 "terms": _norm_terms(name, name.replace("_", " "), dim.get("synonyms")),
+                "synonyms": [str(x) for x in (dim.get("synonyms") or [])],
+                **stewardship,
             }
         if not metrics:
             errors.append(f"{where} ({source}.{table}) defines no valid metrics")
@@ -525,21 +563,19 @@ def _agg_sql(metric, dialect="ansi"):
     if agg == "count" and expr == "*":
         base = "*" if not filt else f"CASE WHEN {filt} THEN 1 END"
         return f"COUNT({base})"
+    if agg == "median" and dialect not in _MEDIAN_DIALECTS:
+        raise ValueError(f"median is not supported on the {dialect} dialect")
     if filt:
-        # A per-metric filter only composes cleanly for additive/count aggregates;
-        # for others fall back to an unfiltered agg (validated at author time is
-        # future work — for now the common revenue/count cases are covered).
+        # EVERY aggregate takes its filter. Outside the filter the CASE yields
+        # NULL, which every aggregate skips — so AVG/MIN/MAX/MEDIAN are over the
+        # filtered rows only, never silently over all of them. SUM keeps ELSE 0
+        # (an empty filter sums to 0, as it always has).
         if agg == "sum":
             return f"SUM(CASE WHEN {filt} THEN {expr} ELSE 0 END)"
-        if agg == "count":
-            return f"COUNT(CASE WHEN {filt} THEN {expr} END)"
-        if agg == "count_distinct":
-            return f"COUNT(DISTINCT CASE WHEN {filt} THEN {expr} END)"
+        expr = f"CASE WHEN {filt} THEN {expr} END"
     if agg == "count_distinct":
         return f"COUNT(DISTINCT {expr})"
     if agg == "median":
-        if dialect not in _MEDIAN_DIALECTS:
-            raise ValueError(f"median is not supported on the {dialect} dialect")
         return f"PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY {expr})"
     fn = {"sum": "SUM", "avg": "AVG", "min": "MIN", "max": "MAX", "count": "COUNT"}[agg]
     return f"{fn}({expr})"
@@ -606,6 +642,24 @@ def answer(user, source, prompt, table=None):
         return None
 
     model = match["model"]
+    # A definition the metadata graph shows broken (its table or a column is
+    # gone) is never answered from: decline, say why, and let the agent try.
+    try:
+        from . import metametrics, progress
+        for kind, picked in (("metric", match["metrics"]), ("dimension", match["dimensions"])):
+            for d in picked:
+                # The whole definition: its identity (and so its baseline)
+                # depends on agg and grain as well as the expression.
+                result = metametrics.check({
+                    "kind": kind, "source": source, "table": model["table"], "name": d["name"],
+                    "agg": d.get("agg"), "expr": d["expr"], "filter": d.get("filter"),
+                    "model_filter": model.get("filter"), "grain": d.get("grain")})
+                if result["status"] in metametrics.INVALID:
+                    progress.emit(f"the semantic {kind} {d['name']} is {result['status']} "
+                                  f"({'; '.join(result['reasons'])}) — not answering from it")
+                    return None
+    except Exception:
+        pass
     from .connectors import get_connector
     try:
         dialect = get_connector(source).dialect
@@ -643,6 +697,52 @@ def answer(user, source, prompt, table=None):
             "dimensions": [{"name": d["name"], "grain": d.get("grain")} for d in match["dimensions"]],
         },
     }
+
+
+def certified_answer(user, sources, prompt, table=None):
+    """Answer from CERTIFIED metrics in every mode. Where the general semantic
+    tier does not run — All sources (the orchestrator fans out) and the D3
+    window (the agent draws a custom visual) — a prompt that resolves, in
+    exactly ONE of `sources`, to metrics that are all certified is answered
+    from their definitions, like a single-source turn. Several sources
+    resolving it is ambiguous, so the caller's own path decides. Returns the
+    answer or None."""
+    if not loaded():
+        return None
+    hits = []
+    for source in sources:
+        try:
+            match = resolve(source, prompt, table)
+        except Exception:
+            continue
+        if match and match["metrics"] and all(m.get("certified") for m in match["metrics"]):
+            hits.append(source)
+    if len(hits) != 1:
+        return None
+    out = answer(user, hits[0], prompt, table)
+    if out is not None:
+        out["semantic"]["certified"] = True
+        out["source"] = hits[0]
+    return out
+
+
+def _definition_warnings():
+    """Each applied definition the warehouse does not hold as written —
+    broken, drifted or not yet checked — as one line for the admin who just
+    applied it. Applying is never refused for it: a broken definition is
+    simply not answered from (metametrics)."""
+    try:
+        from . import metametrics
+        out = []
+        for d in metametrics.definitions():
+            result = metametrics.check(d)
+            if result["status"] != "valid":
+                why = "; ".join(result["reasons"]) or result["status"]
+                out.append(f"{d['kind']} {d['name']} on {d['source']}.{d['table']} is "
+                           f"{result['status']}: {why}")
+        return out
+    except Exception:
+        return []
 
 
 # ── Admin API ───────────────────────────────────────────────────────────
@@ -752,8 +852,13 @@ def apply_yaml(body: YamlIn, user=Depends(current_user)):
                   (uuid.uuid4().hex, body.yaml, user["email"], time.time()))
         c.commit()
     reload()
+    try:
+        from . import metametrics
+        metametrics.ensure_baselines()      # a new version is validated against today's columns
+    except Exception:
+        pass
     db.log_activity(user, "semantic_apply", ok=loaded())
-    return get_config(user)
+    return {**get_config(user), "warnings": _definition_warnings()}
 
 
 @router.delete("")

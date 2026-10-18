@@ -504,6 +504,27 @@ button, save / re-verify, a saved query's `/run`, and the internal callers in
 blend, autopilot, flow, pipelines and the semantic layer — leaves a `verify`
 row in the audit log (`ok=0` with the error on rejection or failure).
 
+**Chat consults the library first.** Precedence in every mode is: certified
+semantic definitions → **verified SQL** → the plan cache → the agents
+(`verified_sql.py`).
+- **Candidates:** the asker's own verified queries and those shared with the
+  organization, on the same source.
+- **An exact match** has the same intent, the same values (numbers, years,
+  quoted strings) and the same ranking direction. It is re-run as the asker,
+  through the gateway with purpose `verified_sql`, and the answer names the
+  query.
+- **A related question** gets the saved SQL as a starting point the agent
+  adapts and verifies. It is never executed as the answer.
+- **Dependencies:** a query is linked to the metadata graph by the tables it
+  reads. If one is gone, it is *broken*: never used, and badged in the
+  library. If a semantic definition on its tables changed after it was
+  verified, it may only guide.
+- **Search by meaning:** with Harrier configured, requirements are matched by
+  meaning too. They are embedded on save and re-embedded when a requirement
+  is edited.
+- **Verified is not certified.** It means the query was authorized and ran
+  when it was saved, and the answer says so.
+
 ### Data freshness — "as of when"
 
 Studio reads live data on every question, but it doesn't own the warehouse's
@@ -1062,6 +1083,22 @@ page / sheet) it stood on.
 - **Selectable as an engine.** When your role can reach a collection with content,
   `📄 KAG — your documents` appears in the composer's model menu; choosing it runs
   a documents-first turn that grounds in your files before touching the warehouse.
+- **A graph of what the documents connect** (`kag_graph.py`). Ingest also extracts
+  entities and relationships from each chunk — deterministically by default,
+  with the configured model when `STUDIO_KAG_GRAPH_LLM=1` — under the chunk's own
+  scope, and `knowledge_search` adds the connected subgraph to the passages it
+  returns. Every entity mention and relationship is recorded **per chunk**
+  (`kag_mentions`, `kag_edge_mentions`); counts are recomputed from that
+  evidence, never incremented blindly.
+- **Deleting a document deletes what it said.** Deleting a document, re-ingesting
+  a new version, deleting a collection, an M365 tombstone and an M365 purge all
+  remove the graph evidence in the same transaction as the chunks — even with
+  the graph turned off. A relationship another document still supports stays,
+  with its weight recomputed; nothing only the deleted document said survives,
+  and retrieval ignores any evidence whose chunk is gone. Graphs written before
+  per-chunk provenance are repaired on upgrade: migration 16 drops evidence for
+  deleted chunks and every unprovable relationship, and queues a
+  `kag_graph_rebuild` job that re-derives the graph from the surviving chunks.
 
 ### Microsoft 365 extraction layer
 
@@ -1110,7 +1147,8 @@ flowchart LR
 
 An admin connects a warehouse straight from the **Data connections** screen — no
 env vars, no redeploy. Pick a type (PostgreSQL, Snowflake, Databricks SQL,
-BigQuery, Neo4j, Power BI), enter its credentials, and test them. For SQL
+BigQuery, Neo4j, Power BI, or **Any SQL database** — see below), enter its
+credentials, and test them. For SQL
 warehouses and Power BI the test also lists the visible schemas/datasets/models; select one or several, and Studio
 saves **one independently named and governed source per namespace**. A namespace
 that cannot be listed can still be typed explicitly and probed before save.
@@ -1178,6 +1216,55 @@ skill files all apply to it unchanged.
   falls back to the environment's credential. Databricks Jobs / Spark
   deployment still reads the `DATABRICKS_*` variables directly.
 
+### Any SQL database — one connection URL, nothing vendor-specific
+
+**Any SQL database** connects any engine that has a SQLAlchemy driver installed,
+from one URL. Examples:
+- `mysql+pymysql://reader:…@db:3306/shop`
+- `mssql+pymssql://…/sales`
+- `oracle+oracledb://…/?service_name=orcl`
+- `postgresql+psycopg://…`
+- any dialect a driver package registers: Trino, ClickHouse, Redshift, DB2,
+  Teradata, …
+
+The image ships drivers for MySQL/MariaDB, SQL Server/Azure SQL and Oracle
+(thin mode, no Oracle client), plus `psycopg` for Postgres-compatible engines.
+Reaching another engine is one `pip install` of its driver. Studio holds no list
+of vendors: everything vendor-shaped is learned, from SQLAlchemy or from the
+engine itself (`connectors/sql_conn.py`).
+- **Metadata from SQLAlchemy's inspector.** Tables, views, columns, primary
+  and foreign keys, view definitions and schemas come from the inspector, which
+  every dialect implements. Names are shown as the engine stores them, so the
+  model writes identifiers the engine resolves. The metadata graph,
+  relationships, entities and change capture all work on it, like on any
+  source.
+- **Identifier case is asked of the engine.** Studio asks once per connection:
+  `SELECT 1 AS Abc` comes back as `abc` (bare names fold down), `ABC` (fold
+  up) or `Abc` (kept as written). The query guard enforces that rule for the
+  connection, so a quoted look-alike (`"CUSTOMERS"` vs `customers`) can never
+  stand in for a denied table. If the engine can't be asked, the guard fails
+  closed: only quoted names are accepted until it can (it retries once a
+  minute).
+- **The row cap follows the engine's syntax.** Where the dialect compiles a
+  limit as `LIMIT`, the gateway appends one as usual. Where it uses `TOP` or
+  `FETCH FIRST`, the text is left alone and rows are capped as they are
+  fetched, from a streaming cursor. The model's briefing says which, along with
+  the engine's name and identifier rule, in place of a vendor note.
+- **The namespace is pinned.** A source pinned to the login's default schema
+  lists bare names. One pinned to any other schema lists `schema.table`, and
+  every reference must be written in full; a bare name would otherwise reach
+  the default schema's table of the same name.
+- **Read-only, and refused where unsafe.**
+  - Queries pass the gateway's guard and run in a transaction that is never
+    committed.
+  - A URL with no host, such as a database file on Studio's own server, is
+    refused unless `STUDIO_SQL_ALLOW_LOCAL_FILES=1`.
+  - A missing driver is named, together with the drivers that are installed.
+  - Listings show only the engine and host; the URL is encrypted and its
+    password never appears in a listing or an error.
+
+  Use a read-only database login all the same.
+
 ### Power BI semantic models
 
 A Power BI (or Fabric) **semantic model** is a source like any warehouse: its
@@ -1220,6 +1307,304 @@ let a service principal read a model with **row-level security** or SSO;
 Studio's own RBAC and governance are this source's access boundary.
 
 ---
+
+## Metadata graph — what every source contains, discovered automatically
+
+Saving a connection (or reconnecting one) queues a **discovery** job in the
+same transaction as the connection row (`metagraph.py`). The job lists the
+source's tables and views — exactly the set the catalog, RBAC and the agent
+already see — reads their columns, fingerprints each object (kind plus ordered
+column names and types), and records a **snapshot**: what was added, changed
+and removed since the last one. Connections saved before this existed are
+queued once on upgrade (migration 17); an administrator can rediscover any
+source from its row in Data connections.
+
+- **Bulk where the engine allows.** Databricks reads kind and columns from
+  `information_schema` in two queries (`describe_relations`), scoped by the
+  session's own catalog and schema rather than interpolated names; Postgres
+  and the demo warehouse do the same. Other connectors fall back to one
+  `get_schema` per table, with the kind recorded as unknown.
+- **Studio's database is the system of record.** Snapshots, objects and
+  columns live in `meta_snapshots`, `meta_objects` and `meta_columns`, so
+  discovery needs no Neo4j. When `METAGRAPH_NEO4J_*` is set, each successful
+  snapshot is mirrored to Neo4j as `StudioSource → StudioObject → StudioColumn`
+  in one transaction, with every name passed as a Cypher parameter. The mirror
+  refuses the database agents query as the `neo4j` source, where its labels
+  would surface as tables.
+- **Metadata only, per role.** Names, kinds and column types — never a row.
+  `/api/metagraph` shows a source only to a role that may use it and an object
+  only to a role allowed to read it; counts are computed over what the caller
+  can see.
+- **Safe.** A failed listing changes nothing. An object is marked removed only
+  by a complete snapshot — never by a truncated listing
+  (`STUDIO_METAGRAPH_MAX_OBJECTS`) or one where columns could not be read.
+
+**How the tables relate** (`metarelations.py`). After every snapshot the
+source's relationships are recomputed — how its tables join, and what each view
+is derived from — each with a **state**, a **confidence** and the **evidence**
+behind it, in words:
+
+| State | Evidence | Confidence |
+|---|---|---|
+| declared | a primary/foreign key in the catalog (`describe_constraints`: Postgres `pg_constraint`, Unity Catalog `information_schema`, SQLite) | 1.0 |
+| observed | the join in a view definition (`view_definitions`), or in Studio's own successful queries against the source (`audit_log`) | 0.9 · 0.75–0.9 by count |
+| inferred | a naming pattern, in any convention — `orders.customer_id` → `customers`, `SalesOrderDetail.SalesOrderID` → `SalesOrderHeader`, `fact_sales.customer_sk` → `dim_customer`, `users.fk_account` → `accounts.id`, `ord.cust_no` → `cust` — typed alike | up to 0.85 |
+| verified / rejected | an administrator's review (`POST …/relationships/{id}/review`), which outlives recomputation | 1.0 / hidden |
+
+Names are read as words whatever the convention (`identifiers.py`):
+snake_case, PascalCase and camelCase are split, singular and plural read
+alike, key markers are found at either end (`_id`, `_sk`, `_key`, `_no`,
+`_code`, `fk_`, `_ref` …), table classifiers are ignored (`dim_`, `fact_`,
+`tbl`, `vw_`), a header table is home to its key while a detail/line/item
+table never is, and abbreviations resolve from a short list of standard
+data-modelling forms (`qty`, `cust`, `desc` …) or from a word the same schema
+spells out — never a guess between two. When several tables could equally hold
+a key, every candidate is kept below the join-path threshold, labelled as one
+of several. No table name is special-cased anywhere.
+
+Views also get *derived-from* edges to the tables they read, and Databricks
+adds the table lineage Unity Catalog records (`system.access.table_lineage`,
+when the token may read it). Joins are read from SQL with the query guard's
+tokenizer — a comment or a string literal cannot forge one — and no value is
+ever sampled from a table. `GET /api/metagraph/sources/{name}/relationships`
+lists them; `…/paths?tables=a,b,c` returns the cheapest join tree connecting
+the tables (fewer and surer joins win). Both show only relationships whose two
+tables the caller may read, and the Neo4j mirror carries them as `RELATES`
+edges.
+
+**Trusted joins come first.** A declared, verified or observed relationship
+always wins over one inferred from column names, whatever their confidences.
+An inferred join is used only to reach a table that nothing trusted connects.
+Wherever it reaches the agent, it says so: *UNVERIFIED — inferred from column
+names; check the columns hold the same values before relying on it*. The
+paths API marks each join `trusted` and counts the `unverified` ones. An
+administrator (or the table's owner) can verify one, and it becomes trusted.
+
+**Certified metrics live in it** (`metametrics.py`). The semantic YAML stays
+the source of truth for what a metric means; the graph says whether the
+warehouse still holds what it reads. Every metric and dimension is linked to
+its table and to the columns its expression and filters reference (read with
+the query guard's tokenizer, so a function, a qualifier, a type or a SQL
+keyword is never taken for a column, and quoted `"UnitPrice"` and bare
+`unit_price` both resolve) and checked against the current record: *valid*,
+*broken* (its table or a column is gone — with the reason), *drifted* (a
+column it reads changed type family since the definition was validated — a
+number became text; a detail change such as INT → BIGINT is only noted) or
+*unchecked* (its source has not been discovered). An administrator or the
+table's owner can revalidate a drifted definition against its columns as they
+are now; a new version of the definition is validated afresh. A broken or drifted definition is never
+answered from: the semantic layer declines it and says why, the source's metadata
+health turns *failing*, and grounding ignores it. Each definition has a
+version history from the applied YAML documents (a new version only when its
+calculation changes), and may carry `owner`, `certified` and `version` fields.
+A **certified** metric is answered from its definition in every mode. That
+includes **All sources**, where the orchestrator otherwise fans out, and the
+**D3 & artifacts** window, where it is drawn with D3 instead of a custom visual.
+This holds when exactly one source resolves the question to certified metrics
+only, on a conversation's first turn. Applying a YAML returns `warnings`
+listing every definition the warehouse does not hold as written (broken,
+drifted or unchecked); applying is never refused for it.
+`GET /api/metagraph/metrics` and `…/metrics/{source}/{name}` show them to roles
+that may read their tables; the graph view draws them (`MEASURES`, `USES`), and
+the Neo4j mirror carries them as `StudioMetric` nodes.
+
+**Questions are grounded in it** (`metaground.py`). Before the SQL agent
+runs, the question is matched against the graph — every table's name and
+columns, rare words weighted over words every table shares — so "which
+customer segment brought in the most net sales in each store region" finds the
+tables holding `segment`, `net_sales` and the store's `region` without any of
+them being named. The cheapest join tree then adds the tables needed to
+connect them (`retail_orders`), and the agent gets their governed columns plus
+the join conditions with their state and confidence; a matching view is
+offered too, since it may answer with no join at all. A certified metric's
+name and synonyms point at its table ("turnover" finds the revenue table), and
+the agent is handed its exact definition to use. It costs no warehouse
+call and never looks past the tables the turn may read; a source not yet
+discovered falls back to name matching. The multi-source planners see each
+source's relevant tables first instead of whichever twelve come first, and
+every planned node's worker is grounded the same way. The turn's activity
+shows it: *grounded in the metadata graph: … (joined through …)*.
+
+**Descriptions, and search by meaning.**
+- **Descriptions are read where the catalog keeps them:** Postgres
+  `COMMENT ON`, Databricks comments, and any SQL database through SQLAlchemy's
+  comment reflection.
+- **Where they go:** each source's detail, the graph view, search
+  (`/api/metagraph/search`) and the Neo4j mirror.
+- **Fingerprints:** descriptions are part of an object's fingerprint, so a
+  changed description is a change, and change capture picks it up like a
+  column change. An object without descriptions keeps the fingerprint it
+  always had.
+- **Grounding:** a question word that only a description uses still counts,
+  more weakly than a name.
+- **With Harrier** (`HARRIER_EMBED_URL`):
+  - Each object's name, description and columns are embedded as it is
+    discovered, and on the scheduler tick for a large source. That is at most
+    `STUDIO_METAGRAPH_EMBED_BATCH` (100) per pass, and only objects whose
+    fingerprint changed.
+  - A question is then matched by meaning as well: "how much do clients
+    spend" finds the customers table.
+  - Retrieval stays verified. Only the turn's own tables are considered, and
+    only a vector of the object as it is now. A table found by meaning alone
+    must reach `STUDIO_METAGRAPH_MEANING_ONLY_MIN` (0.65), against
+    `STUDIO_METAGRAPH_MEANING_MIN` (0.5) for one that also matches by words.
+    It is labelled `≈meaning`, so the agent checks its columns before relying
+    on it.
+  - With Harrier unset or unreachable, nothing is embedded and words alone
+    decide, as before.
+
+**Across sources, for a whole organization** (`metaentities.py`).
+
+- **Canonical entities.** The keys that carry one business thing between
+  sources — `crm.customers.id` and `retail.retail_orders.customer_id` are both
+  a *Customer* — are proposed from naming once a key spans two sources (a
+  table named for it is the key's home; a `<name>_id` elsewhere references it;
+  a text key never maps to a number key). Nothing joins on a proposal. An
+  administrator, or the owner of that table, verifies or rejects each member
+  (`POST /api/metagraph/entities/members/{id}/review`); entities and members
+  can also be made by hand. Verified keys reach the multi-source planners
+  ("use them in a dependent node's task to carry ids") and let a cross-source
+  **blend** join parts that share no column name — the result says which
+  verified key it joined on (`join_basis`).
+- **Domain ownership.** A source or one of its tables gets a domain and an
+  owner (`PUT /api/metagraph/sources/{name}/ownership`); readers see both on
+  each table, and the owner may review the relationships and entity members on
+  what they own.
+- **Freshness monitoring.** Every source's metadata is *fresh*, *stale* (not
+  rediscovered in twice the full-sync cadence, or the scheduler has stopped
+  checking it), *failing* (discovery, relationships or the Neo4j mirror
+  failing) or *unknown*, with the reasons — `GET /api/metagraph/health` for
+  administrators, a word on each source's row for everyone, and a log line
+  whenever it changes.
+- **Permission-aware everywhere.** Entities show only the members a role may
+  read; a role without a source learns nothing about it — not its tables,
+  columns, keys, counts or rows — from entities, search
+  (`GET /api/metagraph/search?q=`), relationships or the planners' hints.
+- **Tenant isolation.** Studio is one organization per deployment (roles and
+  private M365 scopes isolate within it). Deployments that share one Neo4j are
+  kept apart: every mirrored node and edge carries `STUDIO_METAGRAPH_TENANT`
+  and every statement is scoped by it. The mirror refuses to run until the
+  tenant is set: a default that every deployment shares would let them
+  overwrite each other. Both the mirror and the `neo4j` source speak Neo4j's
+  **HTTP API** (`https://host:7473` or `http://host:7474`). A `bolt://` or
+  `neo4j://` URI is refused with that hint, and a Cypher error the API returns
+  inside an HTTP 200 raises as an error instead of reading as an empty
+  result.
+
+**It stays current with no one asking, whatever the source.** Change capture
+needs nothing from a database beyond what every Studio connector already
+provides: a table listing (`list_tables`) and a table's columns
+(`get_schema`). Any warehouse, database, API or file store a connector
+reaches is covered, with no code of its own.
+
+Every `STUDIO_METAGRAPH_TICK_SECONDS` (300 by default), the `metagraph_sync`
+scheduler compares each live source with the **graph's own record**:
+- **Created and dropped tables:** the listing against the record, on every
+  tick.
+- **Altered tables:** fresh column fingerprints against the recorded ones.
+  - A connector that offers bulk metadata (`describe_relations`) is checked
+    in one read.
+  - Any other connector is probed table by table, in rotation, up to
+    `STUDIO_METAGRAPH_PROBE_TABLES` (100) tables and
+    `STUDIO_METAGRAPH_PROBE_SECONDS` (20) per tick. Every table comes round
+    in turn.
+- **Optional speed-up:** a connector *may* report its own per-table change
+  tokens (`table_signals`, such as a catalog's last-altered time). Then only
+  the tables whose token moved are re-read and nothing is probed. Postgres,
+  Databricks and the demo warehouse do this today; it is never required.
+
+Every table found changed becomes a **change event** (`metacdc.py`), and
+that event re-reads **just that table**. Because the record is the
+reference, nothing a connector reports is trusted beyond "look at this
+table". A source that can't be listed at the moment falls back to its
+source-wide *change signal*, if it has one. A source whose last full
+discovery is older than `STUDIO_METAGRAPH_FULL_SYNC_SECONDS` (6 h) is
+rediscovered whole, to reconcile anything no event reported. A reconnect
+still queues a rediscovery.
+
+**Change events** follow one contract, whoever sends them:
+
+```json
+{"event_id": "evt-123", "source": "databricks-3", "asset": "retail_order_items",
+ "event_type": "schema_changed", "source_version": 42,
+ "occurred_at": "2026-10-17T18:00:00Z", "tenant_id": "studio"}
+```
+
+`event_type` is one of `schema_changed`, `asset_created`, `asset_dropped`,
+`data_changed` or `source_changed`. An event with no `asset` is about the
+whole source. Events come from:
+- the per-table poller;
+- a supervised write against a source (an approved SQL job, a successful
+  Airflow DAG), keyed by the job's id;
+- a signed webhook: `POST /api/metagraph/events` takes one event, or
+  `{"events": [...]}` with up to 500 events. The signature is HMAC-SHA256 over
+  the body with `STUDIO_METAGRAPH_WEBHOOK_SECRET`. With no secret set, the
+  endpoint does not exist. The older `{"source": ...}` form still queues a
+  rediscovery.
+
+How events are handled:
+- **Accepted once, durably.** An event is recorded in the event log and its job
+  queued in one commit before the sender is told "accepted". The same
+  `event_id` again is reported as a duplicate and dropped. A malformed event,
+  one for an unknown source, or one whose `tenant_id` is another deployment's
+  is rejected with the reason.
+- **Never rolls the graph back.** An event carries no schema. The worker
+  re-reads the table's current state from the source, so a late, repeated or
+  reordered event cannot undo a newer one. Ordering only saves work. An event
+  is skipped as *superseded* when its table was read after the event arrived.
+  It is also skipped when an event from the same origin, with a later
+  `source_version` (or `occurred_at`), was already applied to that table.
+  Clocks and counters from different origins are never compared.
+- **One table at a time.** A schema event re-reads one table, and the listing
+  stays the authority on what exists. The relationships, metric baselines and
+  Neo4j mirror that depend on it are then refreshed once per source per
+  `STUDIO_METAGRAPH_REFRESH_SECONDS` (30), however many tables changed. A
+  certified metric whose column was dropped turns *broken* as soon as its
+  table is re-read.
+- **Big changes go the safe way.** Some changes go to a full rediscovery
+  instead of per-table events, and that is where the hold on large removals
+  applies:
+  - a removal as large as the hold rule's;
+  - more changed tables than `STUDIO_METAGRAPH_MAX_TABLE_EVENTS` (50).
+
+  A single-table removal is never taken from a truncated listing, or while
+  removals are held.
+- **Rows, not schema.** A `data_changed` event never touches the graph. It
+  records only when that table's data last changed (`data_changed_at` on the
+  table), and never moves that time backwards.
+- **Checkpoints and the snapshot handoff.**
+  - **Duplicates:** a change seen again (re-sent after a crash, or found by
+    two schedulers) gets the same event id and is a duplicate. A table that
+    changes and changes back gets a new id each time.
+  - **During a full discovery:** anything a full discovery missed while it
+    ran still differs from the record, so it arrives as an event. A
+    connector's own tokens are read before the snapshot lists, and saved as
+    their checkpoint, for the same effect.
+  - **Race guard:** an older single-table read never overwrites a newer one,
+    or the other way round.
+- **Retry, then dead letter.** A failing event is retried with backoff, four
+  attempts in all. After that it is *dead*, metadata health turns *stale* for
+  that source, and an admin can replay it. The event log
+  (`GET /api/metagraph/events?source=&status=`) and per-source capture status
+  (`GET /api/metagraph/cdc`: checkpoint, last event, counts by status, oldest
+  wait) are for admins. So are `POST /api/metagraph/events/{id}/replay` and
+  `POST /api/metagraph/sources/{source}/cdc/reset`, which drops the checkpoint
+  and rediscovers the source. Settled events are pruned after
+  `STUDIO_METAGRAPH_EVENTS_KEEP_DAYS` (30); dead ones stay until replayed.
+
+- **One discovery at a time per source**; a queued or running one older than
+  `STUDIO_METAGRAPH_STALE_SECONDS` is presumed lost and replaced. A failing
+  source is retried by the job queue, then every
+  `STUDIO_METAGRAPH_RETRY_SECONDS`; a failed Neo4j mirror on the next tick.
+- **Large removals are held.** A snapshot that would remove at least
+  `STUDIO_METAGRAPH_HOLD_MIN` objects and `STUDIO_METAGRAPH_HOLD_FRACTION` of
+  the source — what a revoked grant or a half-broken listing looks like —
+  removes nothing; after `STUDIO_METAGRAPH_CONFIRM_SECONDS` a fresh snapshot
+  must report the same set gone before it is applied.
+- **Tombstones.** A removed table disappears from every read at once, stays
+  visible to admins as recently removed, and is purged after
+  `STUDIO_METAGRAPH_TOMBSTONE_DAYS` (30). A disconnected source is hidden and
+  leaves the Neo4j mirror; a deleted connection's objects become tombstones.
 
 ## Adversarial model benchmark — choose attackers with evidence
 

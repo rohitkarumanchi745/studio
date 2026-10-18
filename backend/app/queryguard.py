@@ -241,8 +241,28 @@ _BARE_FOLD = {
 }
 
 
+# A connector that LEARNED its engine's rule says so on its dialect
+# (connectors.sql_conn.EngineDialect.identifier_rule) — per connection, from
+# the engine's own answer, not from a vendor list:
+#   lower / upper   bare names fold that way; a quoted one is exact
+#   exact           names are taken as written, quoted or not
+#   quoted_only     the rule could not be learned: a bare name that has a case
+#                   is treated as unknown — it matches only the same bare
+#                   spelling (a CTE written the same way), never a table, so
+#                   such an engine is read only through quoted names
+_RULE_FOLD = {"lower": str.lower, "upper": str.upper, "exact": lambda t: t}
+
+
 def _canon(ident, dialect=None):
     """The identity the ENGINE would resolve this written identifier to."""
+    rule = getattr(dialect, "identifier_rule", None)
+    if rule is not None:
+        if ident.quoted:
+            return ident.text
+        fold = _RULE_FOLD.get(rule)
+        if fold is not None:
+            return fold(ident.text)
+        return ident.text if ident.text.lower() == ident.text.upper() else "\x00" + ident.text
     fold = _BARE_FOLD.get((dialect or "").lower())
     if fold is None:
         return ident.text.lower()               # case-insensitive engine (or unknown)
@@ -637,6 +657,13 @@ def validate(sql, allowed_tables, qualifiers=None, dialect=None, allow_explain=F
         # binding launder an outer ref to a denied base table.
         if name in allowed or _cte_legal(ctes, name, at, dialect):
             continue
+        if not parts[-1].quoted and getattr(dialect, "identifier_rule", None) \
+                and _catalog_canon(parts[-1].text, dialect) in allowed:
+            # Allowed as stored, but this engine reads the unquoted spelling as
+            # another name (it was learned to fold case): say how to write it.
+            raise QueryRejected(
+                f"Write '{parts[-1].text}' in quotes, exactly as listed — unquoted, "
+                f"this engine reads it as a different name")
         raise QueryRejected(
             f"Access to table '{parts[-1].text}' is not permitted for your role")
     if not refs:

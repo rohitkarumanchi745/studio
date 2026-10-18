@@ -337,12 +337,10 @@ def disconnect(user_id, purge=False):
 
 
 def _purge_collection(user_id):
-    from .. import db
-    name = f"m365-{user_id}"
-    with db.connect() as c:
-        c.execute("DELETE FROM kag_chunks WHERE collection=?", (name,))
-        c.execute("DELETE FROM kag_collections WHERE name=?", (name,))
-        c.commit()
+    from .. import db, kag
+    # Chunks, graph and collection row together (kag.remove_collection): a
+    # purge must not leave entities or relationships from the user's documents.
+    kag.remove_collection(f"m365-{user_id}")
     with db.connect() as cc:
         cc.execute("DELETE FROM graph_items WHERE user_id=?", (user_id,))
         cc.commit()

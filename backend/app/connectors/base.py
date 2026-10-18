@@ -212,6 +212,85 @@ class Connector:
         """
         return []
 
+    def describe_relations(self):
+        """Bulk metadata for discovery: {name: {"kind", "namespace", "columns"}}
+        for the relations list_tables() returns, keyed exactly as it names
+        them. `kind` is "table", "view" or "other"; `columns` is
+        [{"name", "type"}, ...] in ordinal order. Where the catalog keeps
+        descriptions (COMMENTs), a relation may carry "description" and a
+        column "description" too — they reach grounding and search, and a
+        changed one is a change.
+
+        Metadata only — names and types, never a row. It answers "what is
+        here" for the metadata graph (metagraph.py), in a query or two where
+        the engine has an information schema, instead of one get_schema()
+        round trip per table. It is NOT a widening: list_tables() stays the
+        authoritative object set, and anything returned here that it does not
+        list is ignored.
+
+        Default: None, meaning "not supported" — discovery then falls back to
+        get_schema() per table and records the kind as unknown.
+        """
+        return None
+
+    def describe_relation(self, name):
+        """describe_relations() for ONE relation, named as list_tables() names
+        it: {"kind", "namespace", "columns"}, or None when it is not found or
+        this is not supported (the caller then uses get_schema() and keeps the
+        kind it knew). Lets change capture re-read just the table that changed
+        (metagraph.discover_asset). Metadata only.
+
+        Default: None.
+        """
+        return None
+
+    def describe_constraints(self):
+        """Declared keys in this source's scope, keyed as list_tables() names
+        tables: {"primary_keys": {table: [col, ...]},
+                 "foreign_keys": [{"name", "from", "from_columns", "to",
+                                   "to_columns"}, ...]}.
+        Metadata only. Many warehouses declare none (or only informational
+        ones); the metadata graph then infers candidates instead.
+
+        Default: None, meaning "not supported".
+        """
+        return None
+
+    def view_definitions(self):
+        """{view name: its SQL} for the views in scope — the joins a view
+        performs are evidence of how its tables relate, and the tables it reads
+        are its lineage. Metadata only. Default: None (not supported)."""
+        return None
+
+    def lineage(self):
+        """[(upstream, downstream)] table-level lineage the engine itself
+        recorded, both named as list_tables() names them. Default: None."""
+        return None
+
+    def table_signals(self):
+        """{table: token} for the relations in this source's scope, each token
+        changing whenever THAT relation's columns or kind change. OPTIONAL:
+        change capture (metacdc.poll) works for every connector without it —
+        it compares list_tables()/get_schema() (or describe_relations()) with
+        the metadata graph's record. A token only makes that cheaper: the
+        tables whose token moved are re-read and no others are probed.
+        Metadata only, one cheap query.
+
+        Default: None — change capture then reads the columns itself.
+        """
+        return None
+
+    def change_signal(self):
+        """A cheap token that changes whenever a table or view in this source's
+        scope is created, altered or dropped — or None when the engine offers
+        no such signal. The metadata graph polls it (metagraph.tick_once) and
+        rediscovers only when it moves. Metadata only, one cheap query.
+
+        Default: None, meaning "no signal" — such a source is rediscovered on
+        a fixed interval instead.
+        """
+        return None
+
     def relation_kind(self, namespace, table):
         """Metadata-only lookup outside the connector's readable namespace.
 

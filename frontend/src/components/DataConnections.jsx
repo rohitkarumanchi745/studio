@@ -22,6 +22,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { api, getUser } from "../api";
 import { CATEGORIES, SourceIcon, metaFor } from "./sourceCatalog";
+import MetadataLine, { useMetadataStatus } from "./MetadataLine";
 import { backdropClose } from "../backdrop";
 
 const STATUS_LABEL = {
@@ -1031,6 +1032,7 @@ const ACTION_LABEL = {
 };
 
 export function Instances({ tile, onAct, onManage, busy = "" }) {
+  const metadata = useMetadataStatus();
   if (!tile.instances.length) return null;
   const is = (verb, i) => busy === `${verb}:${i.name}`;
   // Any live source of a type with schemas can bind more of them — the
@@ -1067,6 +1069,10 @@ export function Instances({ tile, onAct, onManage, busy = "" }) {
                 </button>
               ))}
             </span>
+          )}
+          {i.configured && !i.disconnected && (
+            <MetadataLine name={i.name} summary={metadata.byName[i.name]}
+              canRediscover={!!(onAct || onManage)} reload={metadata.reload} />
           )}
         </div>
       ))}

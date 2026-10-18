@@ -362,6 +362,92 @@ class DemoConnector(Connector):
         c.close()
         return [{"name": r[1], "type": r[2]} for r in rows]
 
+    def describe_constraints(self):
+        """Primary keys and foreign keys SQLite records for each table."""
+        c = self._conn()
+        try:
+            out = {"primary_keys": {}, "foreign_keys": []}
+            for (name,) in c.execute("SELECT name FROM sqlite_master WHERE type='table'"):
+                quoted = name.replace('"', '""')
+                pk = sorted((r[5], r[1]) for r in c.execute(f'PRAGMA table_info("{quoted}")')
+                            if r[5])
+                if pk:
+                    out["primary_keys"][name] = [col for _, col in pk]
+                fks = {}
+                for r in c.execute(f'PRAGMA foreign_key_list("{quoted}")'):
+                    fks.setdefault(r[0], {"name": f"{name}_fk{r[0]}", "from": name,
+                                          "from_columns": [], "to": r[2], "to_columns": []})
+                    fks[r[0]]["from_columns"].append(r[3])
+                    fks[r[0]]["to_columns"].append(r[4])
+                out["foreign_keys"] += [fk for fk in fks.values() if all(fk["to_columns"])]
+            return out
+        finally:
+            c.close()
+
+    def view_definitions(self):
+        c = self._conn()
+        try:
+            return {name: sql for name, sql in c.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type='view'") if sql}
+        finally:
+            c.close()
+
+    def table_signals(self):
+        """{relation: hash of its kind and schema text} for every table and
+        view — the same relations change_signal() covers."""
+        import hashlib
+        c = self._conn()
+        try:
+            rows = c.execute("SELECT name, type, sql FROM sqlite_master "
+                             "WHERE type IN ('table', 'view')").fetchall()
+        finally:
+            c.close()
+        return {name: hashlib.sha256(f"{kind}|{sql or ''}".encode()).hexdigest()[:16]
+                for name, kind, sql in rows}
+
+    def change_signal(self):
+        """A hash of the schema text SQLite keeps for every table and view."""
+        import hashlib
+        c = self._conn()
+        try:
+            rows = c.execute("SELECT type, name, sql FROM sqlite_master "
+                             "WHERE type IN ('table', 'view') ORDER BY name").fetchall()
+        finally:
+            c.close()
+        return hashlib.sha256(repr(rows).encode()).hexdigest()
+
+    def describe_relation(self, name):
+        """Kind and columns of one table or view in the demo warehouse."""
+        c = self._conn()
+        try:
+            row = c.execute("SELECT type FROM sqlite_master WHERE name = ? "
+                            "AND type IN ('table', 'view')", (name,)).fetchone()
+            if row is None:
+                return None
+            quoted = name.replace('"', '""')
+            cols = c.execute(f'PRAGMA table_info("{quoted}")').fetchall()
+            return {"kind": row[0], "namespace": None,
+                    "columns": [{"name": r[1], "type": r[2]} for r in cols]}
+        finally:
+            c.close()
+
+    def describe_relations(self):
+        """Kind and columns for every table and view in the demo warehouse."""
+        c = self._conn()
+        try:
+            rows = c.execute("SELECT name, type FROM sqlite_master "
+                             "WHERE type IN ('table', 'view') ORDER BY name").fetchall()
+            out = {}
+            for name, kind in rows:
+                # PRAGMA can't be parameterized; names come from sqlite_master.
+                quoted = name.replace('"', '""')
+                cols = c.execute(f'PRAGMA table_info("{quoted}")').fetchall()
+                out[name] = {"kind": kind, "namespace": None,
+                             "columns": [{"name": r[1], "type": r[2]} for r in cols]}
+            return out
+        finally:
+            c.close()
+
     def run_query(self, sql):
         c = self._conn()
         cur = c.execute(sql)

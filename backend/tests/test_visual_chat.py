@@ -8,8 +8,9 @@ Locked in here:
 - in visual mode render_chart records D3 panels of any type, and the agent is
   told the window is D3-only — naming render_visual only when that tool is
   offered;
-- a visual turn goes straight to the agent in visual mode (no semantic layer,
-  plan cache or BitNet routing, and nothing stored in the plan cache), its
+- a visual turn goes straight to the agent in visual mode (no semantic layer —
+  save a certified metric, test_certified_everywhere.py — plan cache or BitNet
+  routing, and nothing stored in the plan cache), its
   answer is stored D3-only, and its conversation's title carries the 🎨;
 - the multi-agent path is coerced the same way;
 - there, commands that would build or submit work are read as questions, and

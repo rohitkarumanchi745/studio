@@ -422,6 +422,7 @@ def _run(job):
                     log.warning("Could not queue platform monitor for %s", job["id"], exc_info=True)
                 return job
             _save(job, status="succeeded", result=json.dumps(result, default=str), last_error=None)
+            _notify_metadata(job)
             # Write→read bridge. A supervised spark_job that DECLARED an S3
             # parquet output has now produced it (this path runs only after an
             # admin approved the job — spark jobs are always human-gated), so
@@ -526,6 +527,30 @@ def _insert(job, *, deduplicate=False):
             tuple(job[k] for k in cols.split(",")))
         c.commit()
         return cur.rowcount == 1
+
+
+def _notify_metadata(job):
+    """A supervised write against a source finished: the tables it created or
+    altered should reach the metadata graph without waiting for the next
+    signal check. It goes in as a change event (metacdc) whose id is the job's,
+    so repeated status polls record it once."""
+    try:
+        if job["kind"] == SQL_KIND:
+            source = job.get("target")
+        elif job["kind"] == DAG_KIND:
+            source = (json.loads(job.get("script") or "{}").get("plan") or {}).get("source")
+        else:
+            return
+        if source and source != "*":
+            from . import metacdc
+            out = metacdc.ingest([{"event_id": f"job-{job['id']}", "source": source,
+                                   "event_type": "source_changed"}], "studio")
+            for r in out["rejected"]:
+                log.info("Job %s: no metadata event for %s (%s)", job.get("id"), source,
+                         r["reason"])
+    except Exception:
+        log.warning("Could not notify the metadata graph about job %s", job.get("id"),
+                    exc_info=True)
 
 
 def _save(job, **fields):
@@ -754,6 +779,7 @@ def live_job(jid: str, user=Depends(current_user)):
     # not duplicate or re-log the registration.
     if st["state"] == "succeeded":
         _bridge_output(row, _requester(row))
+        _notify_metadata(row)
     if st["state"] in ("succeeded", "failed"):
         _learn_platform_outcome(row, run_ref, st)
         if row["kind"] == DAG_KIND and st["state"] == "failed":

@@ -507,6 +507,41 @@ def _and(names):
     return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
 
 
+def _vmatch(ctx, user, prompt):
+    """The verified query this turn's question matches, looked up once per
+    turn (verified_sql.match). First turns only: a follow-up means something
+    different in every conversation, like the plan cache."""
+    if "_vsql" not in ctx:
+        ctx["_vsql"] = None
+        if not ctx.get("history") and ctx.get("source") not in (None, "*"):
+            try:
+                from . import verified_sql
+                ctx["_vsql"] = verified_sql.match(user, ctx["source"], ctx.get("table_label"),
+                                                  prompt)
+            except Exception:
+                log.warning("verified SQL lookup failed", exc_info=True)
+    return ctx["_vsql"]
+
+
+def _verified_answer(ctx, user, prompt):
+    """An exact verified-query match, re-run as the asker; None otherwise."""
+    m = _vmatch(ctx, user, prompt)
+    if not m or m["kind"] != "exact":
+        return None
+    from . import verified_sql
+    result = verified_sql.answer(user, ctx["source"], m)
+    if result is not None:
+        progress.emit(f"answered with the verified query “{m['query']['title']}”")
+    return result
+
+
+def _usable_sources(user):
+    """Live sources this user's role may query — names only, no probing."""
+    from .connectors import all_sources
+    allowed = set(rbac.allowed_sources(user["role"]))
+    return [s["name"] for s in all_sources() if s.get("configured") and s["name"] in allowed]
+
+
 def _resolved_tables(cid):
     """Shared tables this conversation already chose to query across ALL sources
     ("both / all, side by side"). Remembered on the assistant result of that
@@ -564,6 +599,37 @@ def _focus_schemas(ctx, user, prompt):
     cols = util.pmap(connector.get_schema, picks, default=None)
     return {t: governance.governed_schema(ctx["source"], t, c)
             for t, c in zip(picks, cols) if c and rbac.can_access(user["role"], ctx["source"], t)}
+
+
+def _grounding(ctx, user, prompt):
+    """(focus schemas, join hints) for this question. The metadata graph first
+    (metaground.ground): the tables whose names or columns the question
+    touches, the tables needed to join them, and how they join — from the
+    record, with no warehouse call, and only within ctx["allowed"]. Then the
+    name-based picks (_focus_schemas), which also keep a follow-up's tables
+    from this conversation's earlier SQL. Never raises."""
+    from . import metaground
+    schemas, hints = {}, []
+    try:
+        grounded = metaground.ground(ctx["source"], prompt, ctx["allowed"])
+    except Exception:
+        log.warning("metadata grounding failed for %s", ctx.get("source"), exc_info=True)
+        grounded = None
+    if grounded:
+        loaded = set(ctx["schemas"])
+        schemas = {t: cols for t, cols in grounded["schemas"].items()
+                   if t not in loaded and rbac.can_access(user["role"], ctx["source"], t)}
+        hints = metaground.join_hint_lines(grounded["joins"], grounded["views"],
+                                           grounded["metrics"])
+        named = ", ".join([t for t in grounded["tables"] if t in grounded["matched"]][:6])
+        bridges = f" (joined through {', '.join(grounded['bridges'])})" \
+            if grounded["bridges"] else ""
+        progress.emit(f"grounded in the metadata graph: {named}{bridges}")
+    try:
+        extra = _focus_schemas({**ctx, "schemas": {**ctx["schemas"], **schemas}}, user, prompt)
+    except Exception:
+        extra = {}
+    return {**schemas, **extra}, hints
 
 
 def _answer(ctx, result):
@@ -794,19 +860,45 @@ def _run_turn(ctx, user):
         return _workflow_turn(ctx, user)
 
     if ctx["mode"] == "*":
-        # Same-named table in several sources? Don't guess — ask, unless the
-        # user already chose "both, side by side" (allow_ambiguous).
-        sources = orchestrator.accessible_sources(user)
-        clash = orchestrator.ambiguous_tables(prompt, sources)
-        if clash and not ctx.get("allow_ambiguous"):
-            # Tables this conversation already chose to query across all sources
-            # are settled; only a NEW shared table asks again.
-            resolved = _resolved_tables(cid)
-            clash = [c for c in clash if c["table"] not in resolved]
-            if clash:
-                return _clarify_turn(ctx, user, clash, t0)
-        result = orchestrator.run_orchestrated(prompt, user, ctx["history"], model,
-                                               conversation_id=cid, sources=sources)
+        # A certified metric is answered from its definition here too — before
+        # the fan-out, and before asking which same-named table was meant: a
+        # certification already says where the number lives.
+        certified = None if ctx["history"] else semantic.certified_answer(
+            user, _usable_sources(user), prompt)
+        verified = None
+        if certified is None and not ctx["history"]:
+            # Then a verified query someone saved for this exact question.
+            from . import verified_sql
+            try:
+                vsource, vm = verified_sql.best_exact(user, _usable_sources(user), prompt)
+            except Exception:
+                log.warning("verified SQL lookup failed", exc_info=True)
+                vsource, vm = None, None
+            if vm is not None:
+                verified = verified_sql.answer(user, vsource, vm)
+                if verified is not None:
+                    verified["source"] = vsource
+                    progress.emit(f"answered with the verified query “{vm['query']['title']}”")
+        clash = None
+        if certified is not None:
+            progress.emit("answered from a certified metric")
+            result = certified
+        elif verified is not None:
+            result = verified
+        else:
+            # Same-named table in several sources? Don't guess — ask, unless the
+            # user already chose "both, side by side" (allow_ambiguous).
+            sources = orchestrator.accessible_sources(user)
+            clash = orchestrator.ambiguous_tables(prompt, sources)
+            if clash and not ctx.get("allow_ambiguous"):
+                # Tables this conversation already chose to query across all
+                # sources are settled; only a NEW shared table asks again.
+                resolved = _resolved_tables(cid)
+                clash = [c for c in clash if c["table"] not in resolved]
+                if clash:
+                    return _clarify_turn(ctx, user, clash, t0)
+            result = orchestrator.run_orchestrated(prompt, user, ctx["history"], model,
+                                                   conversation_id=cid, sources=sources)
         if clash and ctx.get("allow_ambiguous"):
             result["resolved_tables"] = [c["table"] for c in clash]   # sticky for this chat
         result.setdefault("source", "*")
@@ -840,16 +932,40 @@ def _run_turn(ctx, user):
         # hit), and once per turn however many models are tried.
         if "schemas" not in focus:
             try:
-                focus["schemas"] = _focus_schemas(ctx, user, prompt)
+                focus["schemas"], focus["joins"] = _grounding(ctx, user, prompt)
             except Exception:
-                focus["schemas"] = {}
-        return agent.run_agent(
+                focus["schemas"], focus["joins"] = {}, []
+            related = _vmatch(ctx, user, prompt)
+            focus["related"] = related if related and related["kind"] == "related" else None
+            if focus["related"]:
+                # A verified query for a close question: a starting point the
+                # agent adapts and verifies — never the answer as it stands.
+                from . import verified_sql
+                focus["joins"] = focus["joins"] + verified_sql.hint_lines(focus["related"])
+                progress.emit(f"guided by the related verified query "
+                              f"“{focus['related']['query']['title']}”")
+        out = agent.run_agent(
             prompt=prompt, connector=connector, table=ctx["table_param"],
             allowed_tables=ctx["allowed"], schemas=ctx["schemas"], history=ctx["history"],
             user=user, model=spec, skill_md=skill_md, kag_first=kag_first,
-            visual_mode=visual, conversation_id=cid, focus_schemas=focus["schemas"])
+            visual_mode=visual, conversation_id=cid, focus_schemas=focus["schemas"],
+            join_hints=focus["joins"])
+        if focus.get("related") and isinstance(out, dict):
+            from . import verified_sql
+            out["verified_sql"] = verified_sql.provenance(focus["related"], user)
+        return out
 
-    if ctx.get("visual"):
+    if ctx.get("visual") and not ctx["history"] and (certified := semantic.certified_answer(
+            user, [ctx["source"]], prompt, ctx["table_param"])) is not None:
+        # A certified metric's number comes from its definition in the D3
+        # window too; it is drawn with D3, not a custom visual.
+        progress.emit("answered from a certified metric — drawing it with D3")
+        result = certified
+        agent.d3_only(result)
+    elif ctx.get("visual") and (verified := _verified_answer(ctx, user, prompt)) is not None:
+        result = verified
+        agent.d3_only(result)
+    elif ctx.get("visual"):
         # The D3 & artifacts window goes straight to the frontier agent: the
         # semantic layer, the plan cache and BitNet return stock charts and
         # cannot write a custom visual. (BitNet/KAG are engines, not models,
@@ -891,6 +1007,11 @@ def _run_turn(ctx, user):
     # Anything it can't resolve returns None and falls through to the agent.
     elif (result := semantic.answer(user, ctx["source"], prompt, ctx["table_param"])) is not None:
         progress.emit("answered from the semantic layer (canonical metric)")
+    # Tier -½ — the Verified SQL library: SQL a person verified and saved for
+    # this exact question (same intent, values and direction), re-run as the
+    # asker. A related question instead guides the agent (_run).
+    elif (result := _verified_answer(ctx, user, prompt)) is not None:
+        pass
     # Tier 0 — semantic cache: an equivalent prompt reuses its plan (SQL+chart),
     # re-executed fresh, with no model at all. FIRST TURNS ONLY: the cache keys on
     # the prompt alone, and a follow-up ("and by region?") means something different

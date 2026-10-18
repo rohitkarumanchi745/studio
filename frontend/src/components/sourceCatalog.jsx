@@ -175,6 +175,8 @@ const META = {
               blurb: "A BigQuery dataset, read with a service account." },
   neo4j: { label: "Neo4j", color: "#018bff", mark: "graph", category: "warehouse",
            blurb: "A property graph queried with Cypher." },
+  sql: { label: "Any SQL database", color: "#5b6b7a", mark: "cylinder", category: "warehouse",
+         blurb: "Anything with a SQLAlchemy driver installed — MySQL, MariaDB, SQL Server, Oracle, and more — from one connection URL." },
   powerbi: { label: "Power BI", color: "#c8a415", mark: "panel", category: "warehouse",
              blurb: "Semantic models in a Power BI or Fabric workspace, read with a service principal." },
 

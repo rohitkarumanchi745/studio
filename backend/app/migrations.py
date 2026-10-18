@@ -351,6 +351,95 @@ def _m15_user_memory_rank_columns(c, is_pg):
     _add_column(c, "user_memory", "updated_at", "REAL", is_pg)
 
 
+def _m16_kag_graph_provenance(c, is_pg):
+    # Before per-chunk provenance, a relationship summed its weight across
+    # documents under ONE source_name and entity counts only ever went up; no
+    # delete path touched the graph. So an old graph can hold evidence for
+    # chunks that are gone, relationships nothing proves any more, and
+    # inflated counts. The graph is derived data, and the chunks are the source
+    # of truth: drop evidence whose chunk is gone, drop every relationship that
+    # has no per-chunk provenance (that is every legacy one — its source_name
+    # cannot say which documents support it), recount entities, and queue a
+    # rebuild that re-derives relationships and exact counts from the chunks
+    # that survive. Retrieval already ignores anything without live evidence.
+    needed = ("kag_chunks", "kag_entities", "kag_edges", "kag_mentions",
+              "kag_edge_mentions", "background_jobs")
+    if not all(_table_exists(c, t, is_pg) for t in needed):
+        return
+    live = "EXISTS (SELECT 1 FROM kag_chunks k WHERE k.id = {t}.chunk_id)"
+    c.execute(f"DELETE FROM kag_mentions WHERE NOT {live.format(t='kag_mentions')}")
+    c.execute(f"DELETE FROM kag_edge_mentions WHERE NOT {live.format(t='kag_edge_mentions')}")
+    c.execute(
+        "DELETE FROM kag_edges WHERE NOT EXISTS (SELECT 1 FROM kag_edge_mentions m "
+        "WHERE m.collection = kag_edges.collection AND m.src = kag_edges.src "
+        "AND m.dst = kag_edges.dst AND m.relation = kag_edges.relation "
+        "AND m.access_scope = kag_edges.access_scope)")
+    c.execute(
+        "UPDATE kag_entities SET mentions = (SELECT COUNT(*) FROM kag_mentions m "
+        "WHERE m.collection = kag_entities.collection AND m.norm = kag_entities.norm "
+        "AND m.access_scope = kag_entities.access_scope)")
+    c.execute("DELETE FROM kag_entities WHERE mentions = 0")
+    job_id = "kag-graph-rebuild-m16"
+    if (c.execute("SELECT 1 FROM kag_chunks LIMIT 1").fetchone()
+            and not c.execute("SELECT 1 FROM background_jobs WHERE id=?", (job_id,)).fetchone()):
+        from . import jobs
+        jobs.enqueue("kag_graph_rebuild", {}, job_id=job_id, conn=c)
+
+
+def _m17_metagraph_backfill(c, is_pg):
+    # Sources saved before automatic discovery existed have never been
+    # discovered. Queue one discovery per enabled saved connection, so the
+    # metadata graph covers them without anyone re-saving a connection.
+    if not (_table_exists(c, "data_connections", is_pg)
+            and _table_exists(c, "background_jobs", is_pg)):
+        return
+    from . import jobs
+    for row in c.execute("SELECT name FROM data_connections WHERE enabled=1 "
+                         "ORDER BY name").fetchall():
+        job_id = f"metagraph-backfill-{row['name']}"
+        if not c.execute("SELECT 1 FROM background_jobs WHERE id=?", (job_id,)).fetchone():
+            jobs.enqueue("metagraph_discover", {"source": row["name"], "trigger": "backfill"},
+                         job_id=job_id, max_attempts=3, conn=c)
+
+
+def _m18_metagraph_sync_columns(c, is_pg):
+    # Continuous sync: when a discovery was queued, the change signal the last
+    # discovery saw, when the scheduler last checked, and a held removal.
+    for column, ctype in (("queued_at", "REAL"), ("synced_signal", "TEXT"),
+                          ("checked_at", "REAL"), ("held_removals", "TEXT"),
+                          ("held_at", "REAL")):
+        _add_column(c, "meta_sources", column, ctype, is_pg)
+
+
+def _m19_metagraph_relate_columns(c, is_pg):
+    # Relationship discovery: when relationships were last recomputed, and why
+    # the last attempt failed.
+    _add_column(c, "meta_sources", "related_at", "REAL", is_pg)
+    _add_column(c, "meta_sources", "relate_error", "TEXT", is_pg)
+
+
+def _m20_metagraph_freshness(c, is_pg):
+    # Freshness monitoring: the last freshness the scheduler recorded, so a
+    # change of it is logged once.
+    _add_column(c, "meta_sources", "freshness", "TEXT", is_pg)
+
+
+def _m21_query_cache_user_id(c, is_pg):
+    # Private query plans: a cached plan belongs to the user who asked it.
+    # Rows from before have no owner and are never replayed; their seen /
+    # reward counts still feed the learned-pattern statistics.
+    _add_column(c, "query_cache", "user_id", "TEXT", is_pg)
+    if db._has_column(c, "query_cache", "user_id"):        # skipped with a missing table
+        c.execute("CREATE INDEX IF NOT EXISTS idx_qcache_user "
+                  "ON query_cache(user_id, source, table_scope)")
+
+
+def _m22_metagraph_descriptions(c, is_pg):
+    # Table and column descriptions (catalog COMMENTs) in the metadata graph.
+    _add_column(c, "meta_objects", "description", "TEXT", is_pg)
+    _add_column(c, "meta_columns", "description", "TEXT", is_pg)
+
+
 MIGRATIONS = [
     (1, "users.verified", _m1_users_verified),
     (2, "conversations.folder_id", _m2_conversations_folder_id),
@@ -367,6 +456,13 @@ MIGRATIONS = [
     (13, "agent_sessions.is_fork", _m13_agent_sessions_forks),
     (14, "agent_traces.scrub_private_graph_context", _m14_scrub_private_graph_trace_context),
     (15, "user_memory.embedding+updated_at", _m15_user_memory_rank_columns),
+    (16, "kag graph per-chunk provenance + rebuild", _m16_kag_graph_provenance),
+    (17, "metagraph discovery backfill", _m17_metagraph_backfill),
+    (18, "meta_sources sync columns", _m18_metagraph_sync_columns),
+    (19, "meta_sources relate columns", _m19_metagraph_relate_columns),
+    (20, "meta_sources freshness", _m20_metagraph_freshness),
+    (21, "query_cache.user_id", _m21_query_cache_user_id),
+    (22, "meta_objects/meta_columns description", _m22_metagraph_descriptions),
 ]
 
 

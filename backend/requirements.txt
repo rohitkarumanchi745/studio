@@ -10,6 +10,17 @@ langgraph>=0.2
 langchain-anthropic>=0.3
 langchain-openai>=0.2
 
+# Any SQL database (connectors/sql_conn.py): one connection URL, any dialect
+# whose driver is installed. SQLAlchemy reads the metadata the same way for
+# every engine; the drivers below cover MySQL/MariaDB, SQL Server/Azure SQL
+# and Oracle (thin mode, no Oracle client) — Postgres-compatible engines use
+# psycopg, below. Add a driver package to reach another engine (trino,
+# clickhouse-sqlalchemy, sqlalchemy-redshift, ibm_db_sa, teradatasqlalchemy…).
+sqlalchemy>=2.0,<2.1
+pymysql>=1.1
+pymssql>=2.3
+oracledb>=2.0
+
 # Optional warehouse connectors — uncomment the ones you use.
 # The app runs without them; the source just shows as "not configured".
 # snowflake-connector-python>=3.7

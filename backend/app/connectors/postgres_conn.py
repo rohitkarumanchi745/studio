@@ -5,6 +5,7 @@ optionally POSTGRES_SCHEMA (default "public"). Dormant until the DSN is set.
 Reads through the same gate as every source (queryguard → RBAC → governance);
 run_script exists only for the supervised, human-approved write path.
 """
+import logging
 import os
 import re
 import threading
@@ -189,6 +190,214 @@ class PostgresConnector(Connector):
                     (self._schema(), table))
                 return [{"name": r[0], "type": r[1]} for r in cur.fetchall()]
         return self._execute(go)
+
+    @staticmethod
+    def _comments(cur, schema, name=None):
+        """({relation: description}, {(relation, column): description}) — the
+        COMMENTs in the pinned schema (or on one relation), from pg_catalog.
+        Read last and fail soft: a relation is described without them rather
+        than not at all."""
+        try:
+            cur.execute(
+                "SELECT c.relname::text, a.attname::text, d.description "
+                "FROM pg_catalog.pg_description d "
+                "JOIN pg_catalog.pg_class c ON c.oid = d.objoid "
+                "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+                "LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid "
+                "AND a.attnum = d.objsubid "
+                "WHERE d.classoid = 'pg_catalog.pg_class'::regclass AND n.nspname = %s"
+                + (" AND c.relname = %s" if name is not None else ""),
+                (schema,) if name is None else (schema, name))
+            rows = cur.fetchall()
+        except Exception:
+            logging.getLogger("studio.connectors").warning(
+                "Postgres comments could not be read", exc_info=True)
+            return {}, {}
+        tables, columns = {}, {}
+        for rel, col, text in rows:
+            if col is None:
+                tables[rel] = text
+            else:
+                columns[(rel, col)] = text
+        return tables, columns
+
+    def describe_relations(self):
+        """Kind, columns and descriptions (COMMENTs) for every relation in the
+        pinned schema, in three catalog queries."""
+        schema = self._schema()
+
+        def go(con):
+            with con.cursor() as cur:
+                cur.execute("SELECT table_name, table_type FROM information_schema.tables "
+                            "WHERE table_schema = %s", (schema,))
+                out = {name: {"kind": "table" if ttype == "BASE TABLE"
+                              else "view" if ttype == "VIEW" else "other",
+                              "namespace": schema, "columns": []}
+                       for name, ttype in cur.fetchall()}
+                cur.execute("SELECT table_name, column_name, data_type "
+                            "FROM information_schema.columns WHERE table_schema = %s "
+                            "ORDER BY table_name, ordinal_position", (schema,))
+                for name, col, ctype in cur.fetchall():
+                    if name in out:
+                        out[name]["columns"].append({"name": col, "type": ctype})
+                tables, columns = self._comments(cur, schema)
+                for name, entry in out.items():
+                    if tables.get(name):
+                        entry["description"] = tables[name]
+                    for col in entry["columns"]:
+                        if columns.get((name, col["name"])):
+                            col["description"] = columns[(name, col["name"])]
+                return out
+        try:
+            return self._execute(go)
+        except Exception:
+            return None
+
+    def describe_relation(self, name):
+        """Kind and columns of one relation in the pinned schema."""
+        schema = self._schema()
+
+        def go(con):
+            with con.cursor() as cur:
+                cur.execute("SELECT table_type FROM information_schema.tables "
+                            "WHERE table_schema = %s AND table_name = %s", (schema, name))
+                row = cur.fetchone()
+                if row is None:
+                    return None
+                cur.execute("SELECT column_name, data_type FROM information_schema.columns "
+                            "WHERE table_schema = %s AND table_name = %s "
+                            "ORDER BY ordinal_position", (schema, name))
+                cols = [{"name": r[0], "type": r[1]} for r in cur.fetchall()]
+                tables, columns = self._comments(cur, schema, name)
+                for col in cols:
+                    if columns.get((name, col["name"])):
+                        col["description"] = columns[(name, col["name"])]
+                out = {"kind": "table" if row[0] == "BASE TABLE"
+                       else "view" if row[0] == "VIEW" else "other",
+                       "namespace": schema, "columns": cols}
+                if tables.get(name):
+                    out["description"] = tables[name]
+                return out
+        return self._execute(go)
+
+    def describe_constraints(self):
+        """Primary and foreign keys in the pinned schema, from pg_constraint,
+        with columns in key order. A foreign key into another schema names a
+        table outside this source and is left out."""
+        schema = self._schema()
+
+        def cols(rel, keys):
+            return ("ARRAY(SELECT a.attname::text FROM unnest(" + keys + ") WITH ORDINALITY "
+                    "k(num, pos) JOIN pg_catalog.pg_attribute a ON a.attrelid = " + rel +
+                    " AND a.attnum = k.num ORDER BY k.pos)")
+
+        def go(con):
+            with con.cursor() as cur:
+                cur.execute(
+                    "SELECT con.contype::text, con.conname::text, rel.relname::text, "
+                    + cols("con.conrelid", "con.conkey") + ", frel.relname::text, "
+                    "fns.nspname::text, " + cols("con.confrelid", "con.confkey") + " "
+                    "FROM pg_catalog.pg_constraint con "
+                    "JOIN pg_catalog.pg_class rel ON rel.oid = con.conrelid "
+                    "JOIN pg_catalog.pg_namespace ns ON ns.oid = rel.relnamespace "
+                    "LEFT JOIN pg_catalog.pg_class frel ON frel.oid = con.confrelid "
+                    "LEFT JOIN pg_catalog.pg_namespace fns ON fns.oid = frel.relnamespace "
+                    "WHERE ns.nspname = %s AND con.contype IN ('p', 'f')", (schema,))
+                out = {"primary_keys": {}, "foreign_keys": []}
+                for ctype, name, table, columns, ftable, fschema, fcolumns in cur.fetchall():
+                    if ctype == "p":
+                        out["primary_keys"][table] = list(columns)
+                    elif ftable and fschema == schema:
+                        out["foreign_keys"].append({
+                            "name": name, "from": table, "from_columns": list(columns),
+                            "to": ftable, "to_columns": list(fcolumns)})
+                return out
+        try:
+            return self._execute(go)
+        except Exception:
+            logging.getLogger("studio.connectors").warning(
+                "Postgres describe_constraints failed", exc_info=True)
+            return None
+
+    def view_definitions(self):
+        schema = self._schema()
+
+        def go(con):
+            with con.cursor() as cur:
+                cur.execute("SELECT table_name, view_definition FROM information_schema.views "
+                            "WHERE table_schema = %s", (schema,))
+                return {name: sql for name, sql in cur.fetchall() if sql}
+        try:
+            return self._execute(go)
+        except Exception:
+            return None
+
+    def table_signals(self):
+        """{relation: md5 of its kind and its columns' names and types}, from
+        pg_catalog in one query — over the same relations and attributes as
+        change_signal(), so whatever moves that moves one of these. Views are
+        included: list_tables() leaves them out, but their changes still
+        matter to relationships and lineage."""
+        schema = self._schema()
+
+        def go(con):
+            with con.cursor() as cur:
+                cur.execute(
+                    # Kind, columns and every COMMENT: a changed description
+                    # is a change, as the metadata graph's fingerprint has it.
+                    "SELECT c.relname::text, md5(c.relkind::text || '|' "
+                    "|| coalesce(obj_description(c.oid, 'pg_class'), '') || '|' "
+                    "|| coalesce(string_agg("
+                    "coalesce(a.attname::text, '') || ':' "
+                    "|| coalesce(format_type(a.atttypid, a.atttypmod), '') || ':' "
+                    "|| coalesce(col_description(c.oid, a.attnum), ''), ',' "
+                    "ORDER BY a.attnum), '')) "
+                    "FROM pg_catalog.pg_class c "
+                    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+                    "LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid "
+                    "AND a.attnum > 0 AND NOT a.attisdropped "
+                    "WHERE n.nspname = %s AND c.relkind IN ('r', 'p', 'v', 'm', 'f') "
+                    "GROUP BY c.oid, c.relname, c.relkind", (schema,))
+                return {name: token for name, token in cur.fetchall()}
+        try:
+            return self._execute(go)
+        except Exception:
+            logging.getLogger("studio.connectors").warning(
+                "Postgres table_signals failed; falling back to the source signal",
+                exc_info=True)
+            return None
+
+    def change_signal(self):
+        """A hash of every relation in the pinned schema with its kind and its
+        columns' names and types, from pg_catalog in one query — any DDL that
+        changes what discovery would read moves it."""
+        schema = self._schema()
+
+        def go(con):
+            with con.cursor() as cur:
+                cur.execute(
+                    # relkind is the internal "char" type: text || "char" is
+                    # ambiguous, so every part is cast to text explicitly.
+                    "SELECT md5(coalesce(string_agg(c.relname::text || ':' "
+                    "|| c.relkind::text || ':' || coalesce(a.attname::text, '') || ':' "
+                    "|| coalesce(format_type(a.atttypid, a.atttypmod), ''), ',' "
+                    "ORDER BY c.relname, a.attnum), '')) "
+                    "FROM pg_catalog.pg_class c "
+                    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+                    "LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid "
+                    "AND a.attnum > 0 AND NOT a.attisdropped "
+                    "WHERE n.nspname = %s AND c.relkind IN ('r', 'p', 'v', 'm', 'f')",
+                    (schema,))
+                return cur.fetchone()[0]
+        try:
+            return self._execute(go)
+        except Exception:
+            # No signal means "rediscover on the full-sync cadence" — say why,
+            # or a broken query would look like an engine without a signal.
+            logging.getLogger("studio.connectors").warning(
+                "Postgres change_signal failed; falling back to the full-sync cadence",
+                exc_info=True)
+            return None
 
     def relation_kind(self, namespace, table):
         """Inspect pg_catalog without selecting any output-table data."""

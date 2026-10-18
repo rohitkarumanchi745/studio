@@ -34,17 +34,28 @@ LEARN_THRESHOLD = float(os.getenv("STUDIO_BITNET_MATCH", "0.6"))
 MIN_SEEN = int(os.getenv("STUDIO_BITNET_MIN_SEEN", "2"))
 MIN_REWARD = float(os.getenv("STUDIO_BITNET_MIN_REWARD", "0.6"))
 
-# Stopwords include query filler AND ranking words (top / most / highest / best):
-# those map to the same stored SQL plan (whose ORDER BY already encodes the
-# ranking), so dropping them groups "top products by revenue" with "which
-# products made the most revenue" onto one entry. Measure words (count, sum,
-# total, average) are deliberately NOT stopped — they change the plan.
+# Stopwords are query filler. Measure words (count, sum, total, average) are
+# deliberately NOT stopped — they change the plan.
 _STOP = {"the", "a", "an", "of", "for", "and", "to", "in", "on", "by", "with",
          "from", "our", "show", "me", "what", "which", "how", "is", "are", "was",
          "give", "get", "list", "find", "please", "can", "you", "all", "that",
          "this", "do", "does", "did", "my", "we", "their", "over", "per", "each",
-         "top", "most", "highest", "lowest", "best", "worst", "many", "much",
+         "many", "much",
          "made", "make", "have", "has", "had", "be", "been", "will", "would"}
+
+# Ranking words are a DIRECTION, never filler: "highest" and "lowest" ask
+# opposite questions, and a plan's ORDER BY answers only one of them. Words of
+# one direction share a token, so "top products by revenue" and "products that
+# made the most revenue" still meet on one plan; best/worst keep their own
+# (which way is better depends on the measure). The tokens start with "~",
+# which a prompt's words never do.
+_DIRECTION = {
+    **dict.fromkeys(("top", "most", "highest", "largest", "biggest", "greatest",
+                     "max", "maximum"), "~high"),
+    **dict.fromkeys(("bottom", "least", "lowest", "smallest", "fewest", "min",
+                     "minimum"), "~low"),
+    "best": "~best", "worst": "~worst",
+}
 
 
 def init_tables():
@@ -66,14 +77,19 @@ def init_tables():
                 avg_reward REAL,
                 embedding TEXT,
                 created_at REAL NOT NULL,
-                updated_at REAL NOT NULL
+                updated_at REAL NOT NULL,
+                user_id TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_qcache_scope
                 ON query_cache(role, source, table_scope);
             """
         )
-        # seen / avg_reward / embedding arrived with routing and embeddings; a
-        # table created before them gets them from migration 5 (app/migrations.py).
+        # seen / avg_reward / embedding arrived with routing and embeddings, and
+        # user_id with private plans; a table created before them gets them
+        # from migrations 5 and 21 (app/migrations.py), which also index user_id.
+        if db._has_column(c, "query_cache", "user_id"):
+            c.execute("CREATE INDEX IF NOT EXISTS idx_qcache_user "
+                      "ON query_cache(user_id, source, table_scope)")
         c.commit()
 
 
@@ -86,9 +102,21 @@ def _stem(t):
 
 
 def _sig(prompt):
-    toks = [_stem(t) for t in re.split(r"[^a-z0-9]+", (prompt or "").lower())
-            if t and t not in _STOP and len(t) > 1]
+    toks = []
+    for t in re.split(r"[^a-z0-9]+", (prompt or "").lower()):
+        if t in _DIRECTION:
+            toks.append(_DIRECTION[t])
+        elif t and t not in _STOP and len(t) > 1:
+            toks.append(_stem(t))
     return sorted(set(t for t in toks if t not in _STOP))
+
+
+def _direction(prompt):
+    """The ranking direction(s) a prompt asks for — compared exactly before
+    any reuse, whatever the similarity score (an embedding can find "highest"
+    and "lowest" near-identical). Read from the stored PROMPT, so an entry
+    saved before directions were kept is judged correctly too."""
+    return frozenset(t for t in _sig(prompt) if t.startswith("~"))
 
 
 def _jaccard(a, b):
@@ -136,24 +164,39 @@ def _exec_full(user, source, sql):
         return None
 
 
+def _best(rows, prompt, sig, q_vec, sig_of, vec_of):
+    """(row, score) of the most similar row asking the same direction."""
+    best, best_score = None, 0.0
+    direction = _direction(prompt)
+    for r in rows:
+        if _direction(r["prompt"]) != direction:
+            continue                        # the opposite question: never its plan
+        score = _sim(q_vec, sig, vec_of(r), sig_of(r))
+        if score > best_score:
+            best, best_score = r, score
+    return best, best_score
+
+
 def lookup(user, source, table_scope, prompt):
     """Best semantic hit for this prompt in scope, re-executed fresh. Returns a
-    run-result dict (mode='cached') or None."""
+    run-result dict (mode='cached') or None.
+
+    PRIVATE: a cached plan is reused only for the user who asked it — a plan
+    carries its author's prompt and context, so sharing a role is not a
+    reason to see either. Reuse across users goes through the Verified SQL
+    library instead (verified_sql.py), which chat consults before this cache:
+    queries their authors verified and shared with the organization."""
     sig = _sig(prompt)
-    if not sig:
+    if not sig or not user.get("id"):
         return None
     q_vec = _query_vec(sig)
     with db.connect() as c:
         rows = c.execute(
-            "SELECT * FROM query_cache WHERE role=? AND source=? AND table_scope=? "
-            "AND avg_reward >= ?",
-            (user["role"], source, table_scope, MIN_REWARD)).fetchall()
-    best, best_score = None, 0.0
-    for r in rows:
-        e_vec = json.loads(r["embedding"]) if r["embedding"] else None
-        score = _sim(q_vec, sig, e_vec, json.loads(r["signature"]))
-        if score > best_score:
-            best, best_score = r, score
+            "SELECT * FROM query_cache WHERE user_id=? AND role=? AND source=? "
+            "AND table_scope=? AND avg_reward >= ?",
+            (user["id"], user["role"], source, table_scope, MIN_REWARD)).fetchall()
+    best, best_score = _best(rows, prompt, sig, q_vec, lambda r: json.loads(r["signature"]),
+                             lambda r: json.loads(r["embedding"]) if r["embedding"] else None)
     if not best or best_score < CACHE_THRESHOLD:
         return None
 
@@ -214,10 +257,13 @@ def store(user, source, table_scope, prompt, result, reward=None):
     emb = _doc_vec(sig)                            # stored pattern = document side
     emb_json = json.dumps(emb) if emb else None
     now = time.time()
+    if not user.get("id"):
+        return None                         # a plan belongs to the user who asked it
     with db.connect() as c:
-        row = c.execute("SELECT id, seen, avg_reward, embedding FROM query_cache WHERE role=? "
-                        "AND source=? AND table_scope=? AND signature=?",
-                        (user["role"], source, table_scope, json.dumps(sig))).fetchone()
+        row = c.execute("SELECT id, seen, avg_reward, embedding FROM query_cache WHERE "
+                        "user_id=? AND role=? AND source=? AND table_scope=? AND signature=?",
+                        (user["id"], user["role"], source, table_scope,
+                         json.dumps(sig))).fetchone()
         if row:
             cache_id = row["id"]
             seen = (row["seen"] or 0) + 1
@@ -231,10 +277,11 @@ def store(user, source, table_scope, prompt, result, reward=None):
             cache_id = str(uuid.uuid4())
             c.execute(
                 "INSERT INTO query_cache (id, role, source, table_scope, prompt, signature, sql, "
-                "chart, text, hits, seen, avg_reward, embedding, created_at, updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "chart, text, hits, seen, avg_reward, embedding, created_at, updated_at, "
+                "user_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (cache_id, user["role"], source, table_scope, prompt[:500],
-                 json.dumps(sig), sql, chart, text[:2000], 0, 1, reward, emb_json, now, now))
+                 json.dumps(sig), sql, chart, text[:2000], 0, 1, reward, emb_json, now, now,
+                 user["id"]))
         c.commit()
     return cache_id
 
@@ -258,7 +305,10 @@ def learned(source, table_scope, prompt):
             "HAVING SUM(seen) >= ? AND AVG(avg_reward) >= ?",
             (source, table_scope, MIN_SEEN, MIN_REWARD)).fetchall()
     best, score = None, 0.0
+    direction = _direction(prompt)
     for r in rows:
+        if _direction(r["prompt"]) != direction:
+            continue
         e_vec = json.loads(r["embedding"]) if r["embedding"] else None
         s = _sim(q_vec, sig, e_vec, json.loads(r["signature"]))
         if s > score:
