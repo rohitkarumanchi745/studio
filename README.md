@@ -1147,8 +1147,8 @@ flowchart LR
 
 An admin connects a warehouse straight from the **Data connections** screen — no
 env vars, no redeploy. Pick a type (PostgreSQL, Snowflake, Databricks SQL,
-BigQuery, Neo4j, Power BI, Apache Cassandra, Atlassian Jira, or **Any SQL
-database**, and every integration of the marketplace below), enter its
+BigQuery, Neo4j, Power BI, Apache Cassandra, Atlassian Jira, ServiceNow, n8n,
+or **Any SQL database**, and every integration of the marketplace below), enter its
 credentials, and test them. For SQL
 warehouses and Power BI the test also lists the visible schemas/datasets/models; select one or several, and Studio
 saves **one independently named and governed source per namespace**. A namespace
@@ -1220,11 +1220,15 @@ skill files all apply to it unchanged.
 ### The integrations marketplace
 
 **Data connections** is a marketplace: a searchable grid of integrations
-grouped by shelf, each with its icon and name:
+grouped by shelf, each with its icon and name. Above the shelves, when nothing
+is searched, a **Featured** row leads with Databricks SQL, Power BI,
+ServiceNow, Atlassian Jira and n8n (`FEATURED` in `sourceCatalog.jsx`); each
+also stays on its own shelf. The shelves:
 - Databases
 - Data warehouses and lakehouses
 - NoSQL and graph
 - Work management and collaboration
+- Automation and workflows
 - BI and semantic models
 - Cloud file storage
 - Marketing and analytics
@@ -1271,6 +1275,30 @@ tile. Icons are geometric marks in each brand's colour, not vendor logo files.
 - **Scope:** an optional JQL filter, at most `JIRA_MAX_ISSUES` issues, cached
   `JIRA_CACHE_SECONDS`.
 - Only a connection test signs in; listing the tables never calls Jira.
+
+**ServiceNow** (`connectors/servicenow_conn.py`):
+- `incident`, `change_request`, `problem` and `sc_req_item` are SQL tables,
+  read from the Table API (`/api/now/table/…`) into an in-memory SQLite per
+  query.
+- **Auth:** a user and password (Basic), or an OAuth access token (Bearer).
+  Give the account a read role such as `itil`, or narrower.
+- **Values** are display values: a state reads "In Progress", a reference
+  (assignment group, caller) its name.
+- **Paging** by offset, to the end `X-Total-Count` reports, so an instance
+  that caps its page size is still read in full.
+- **Scope:** an optional encoded query, at most `SERVICENOW_MAX_ROWS` records
+  per table, cached `SERVICENOW_CACHE_SECONDS`.
+- Only a connection test signs in.
+
+**n8n** (`connectors/n8n_conn.py`), self-hosted or n8n Cloud:
+- `workflows` (name, active, tags, node count) and `executions` (workflow,
+  status, mode, start, stop, duration in seconds) are SQL tables, from the
+  public API (`/api/v1`, an `X-N8N-API-KEY`), paged by cursor.
+- Execution data, the items a run processed, is never read
+  (`includeData=false`). Nothing is triggered or changed.
+- **Scope:** at most `N8N_MAX_ROWS` executions, newest first, cached
+  `N8N_CACHE_SECONDS`. A self-hosted port (`:5678`) is kept.
+- Only a connection test signs in.
 
 ### Any SQL database — one connection URL, nothing vendor-specific
 

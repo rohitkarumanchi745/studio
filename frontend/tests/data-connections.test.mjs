@@ -19,7 +19,7 @@ const bundle = await build({
   stdin: {
     contents: `export {default as DataConnections, buildTiles, suggestName, planConnections, connectionReadiness, Namespaces, namespaceKey, namespaceLabel, remainingPickedNamespaces, GithubPanel, githubRegistrationReady, ConnectForm, instanceBadge, envActions, userActions, Instances, planSchemaAdds, marketplaceStatus}
       from "./src/components/DataConnections.jsx";
-      export {metaFor, MARKETPLACE, CATEGORIES} from "./src/components/sourceCatalog.jsx";`,
+      export {metaFor, MARKETPLACE, CATEGORIES, FEATURED} from "./src/components/sourceCatalog.jsx";`,
     resolveDir: frontend, loader: "jsx",
   },
   bundle: true, write: false, format: "cjs", platform: "node", jsx: "automatic",
@@ -38,7 +38,7 @@ compiled._compile(bundle.outputFiles[0].text, compiled.filename);
 const { DataConnections, buildTiles, suggestName, planConnections, connectionReadiness,
         Namespaces, namespaceKey, namespaceLabel, remainingPickedNamespaces, GithubPanel,
         githubRegistrationReady, metaFor, ConnectForm, instanceBadge, envActions,
-        marketplaceStatus, MARKETPLACE, CATEGORIES,
+        marketplaceStatus, MARKETPLACE, CATEGORIES, FEATURED,
         userActions, Instances, planSchemaAdds } = compiled.exports;
 
 // What the four endpoints answer on a deployment with Postgres configured from
@@ -252,9 +252,12 @@ test("the grid renders a tile per source with an honest status", async () => {
       assert.match(html, /Amazon S3<\/span><span class="conn-tile-status">Not configured/);
       assert.match(html, /GitHub<\/span><span class="conn-tile-status">1 registered/);
       assert.match(html, /conn-tile-off/);
-      // Tiles are icon-led: one inline mark each, no missing-image holes.
+      // Tiles are icon-led: one inline mark each, no missing-image holes — the
+      // featured shelf repeating its five on top.
+      const all = buildTiles({ types: TYPES, conns: CONNS, sources: SOURCES, repos: REPOS });
       assert.equal((html.match(/class="srcicon"/g) || []).length,
-                   buildTiles({ types: TYPES, conns: CONNS, sources: SOURCES, repos: REPOS }).length);
+                   all.length + FEATURED.filter((id) => all.some((t) => t.id === id)).length);
+      assert.ok(html.indexOf(">Featured<") < html.indexOf(">Databases<"));
     });
 });
 
@@ -1169,4 +1172,53 @@ test("every marketplace entry has a name, an icon and a shelf", () => {
   for (const [id, via] of Object.entries(MARKETPLACE)) {
     if (via.ctype === "sql") assert.ok(via.dialect && via.driver && via.preset?.url, id);
   }
+});
+
+
+test("the featured shelf comes first, in its own order, until a search", async () => {
+  assert.deepEqual(FEATURED, ["databricks", "powerbi", "servicenow", "jira", "n8n"]);
+  const types = [...MARKET_TYPES,
+    { ctype: "databricks", label: "Databricks SQL", fields: [] },
+    { ctype: "powerbi", label: "Power BI", fields: [] },
+    { ctype: "servicenow", label: "ServiceNow", fields: [{ key: "instance", label: "Instance" }] },
+    { ctype: "n8n", label: "n8n", fields: [{ key: "url", label: "n8n URL" }] }];
+  const tiles = byId(buildTiles({ types }));
+  for (const id of ["servicenow", "n8n"]) {
+    assert.equal(tiles[id].connectable, true, id);
+    assert.equal(tiles[id].via, undefined, `${id} is native now`);
+  }
+  assert.equal(metaFor("n8n").category, "automation");
+  assert.equal(metaFor("servicenow").category, "work");
+  await withApi({ __user: ADMIN, "/catalog/sources": [], "/connections/types": types,
+                  "/connections": [], "/m365/status": { configured: false, connected: false },
+                  "/settings/repos": { repos: [] } },
+    async ({ flush }) => {
+      const panel = harness(DataConnections, { onClose() {} });
+      panel.render();
+      panel.start();
+      await flush();
+      const html = panel.render();
+      const shelf = html.slice(html.indexOf(">Featured<"), html.indexOf(">Databases<"));
+      const names = [...shelf.matchAll(/conn-tile-name">([^<]+)</g)].map((m) => m[1]);
+      assert.deepEqual(names, ["Databricks SQL", "Power BI", "ServiceNow", "Atlassian Jira", "n8n"]);
+    });
+});
+
+test("a non-admin sees the featured integrations too, and is told who connects them", async () => {
+  const tiles = byId(buildTiles({}));                  // no connection types for a non-admin
+  for (const id of FEATURED) assert.ok(tiles[id], `${id} missing for a non-admin`);
+  await withApi({ __user: ANALYST, "/catalog/sources": [],
+                  "/m365/status": { configured: false, connected: false },
+                  "/repos": { repos: [] } },
+    async ({ flush }) => {
+      const panel = harness(DataConnections, { onClose() {} });
+      panel.render();
+      panel.start();
+      await flush();
+      const html = panel.render();
+      const shelf = html.slice(html.indexOf(">Featured<"), html.indexOf(">Databases<"));
+      for (const name of ["Databricks SQL", "Power BI", "ServiceNow", "Atlassian Jira", "n8n"]) {
+        assert.match(shelf, new RegExp(`${name}</span><span class="conn-tile-status">Ask an admin`));
+      }
+    });
 });
