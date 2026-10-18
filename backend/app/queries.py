@@ -54,6 +54,8 @@ def init_tables():
             """
         )
         c.commit()
+    from . import verified_sql
+    verified_sql.init_tables()
 
 
 # ── Verification: the gate everything passes through ────────────────────
@@ -227,7 +229,32 @@ def create(body: SaveIn, user=Depends(current_user)):
         c.commit()
     db.log_activity(user, "query_save", prompt=title, source=body.source,
                     sql=result["sql"], row_count=result["row_count"])
+    _reindex(qid)
     return get(qid, user)
+
+
+def _reindex(qid):
+    """Keep the requirement's Harrier vector current (best-effort)."""
+    try:
+        from . import verified_sql
+        with db.connect() as c:
+            row = c.execute("SELECT * FROM saved_queries WHERE id=?", (qid,)).fetchone()
+        if row:
+            verified_sql.index_one(dict(row))
+    except Exception:
+        pass
+
+
+def _with_dependencies(d):
+    """The query's link to the metadata graph: are the tables it reads still
+    there? (verified_sql.dependencies)"""
+    try:
+        from . import verified_sql
+        status, reasons, tables = verified_sql.dependencies(d)
+        d["dependencies"] = {"status": status, "reasons": reasons, "tables": tables}
+    except Exception:
+        d["dependencies"] = {"status": "unchecked", "reasons": [], "tables": []}
+    return d
 
 
 @router.get("")
@@ -245,7 +272,7 @@ def listing(user=Depends(current_user)):
         d["can_edit"] = d["user_id"] == user["id"]
         d["mine"] = d["user_id"] == user["id"]
         d.pop("rows", None)
-        out.append(d)
+        out.append(_with_dependencies(d))
     return {"queries": out}
 
 
@@ -254,7 +281,7 @@ def get(qid: str, user=Depends(current_user)):
     d = _own_or_404(qid, user)
     d["can_edit"] = d["user_id"] == user["id"]
     d["mine"] = d["user_id"] == user["id"]
-    return d
+    return _with_dependencies(d)
 
 
 class UpdateIn(BaseModel):
@@ -300,6 +327,8 @@ def update(qid: str, body: UpdateIn, user=Depends(current_user)):
         with db.connect() as c:
             c.execute(f"UPDATE saved_queries SET {sets} WHERE id=?", params)
             c.commit()
+        if "prompt" in fields:
+            _reindex(qid)
     return get(qid, user)
 
 
@@ -309,6 +338,11 @@ def remove(qid: str, user=Depends(current_user)):
     with db.connect() as c:
         c.execute("DELETE FROM saved_queries WHERE id=?", (qid,))
         c.commit()
+    try:
+        from . import verified_sql
+        verified_sql.forget(qid)
+    except Exception:
+        pass
     return {"deleted": True}
 
 

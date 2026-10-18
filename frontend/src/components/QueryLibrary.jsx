@@ -82,7 +82,12 @@ export default function QueryLibrary({ onClose }) {
                 <div className="query-head" onClick={() => setOpen(open === q.id ? null : q.id)}>
                   <div className="query-title">
                     {q.title}
-                    <span className="query-badge" title="Verified on save">✓ verified</span>
+                    <span className="query-badge" title="Verified on save: it was authorized and ran. Its calculation is not certified.">✓ verified</span>
+                    {q.dependencies?.status === "broken" && (
+                      <span className="query-tag" title={(q.dependencies.reasons || []).join("; ")}>
+                        ⚠ table gone — not used in chat
+                      </span>
+                    )}
                     {q.edited && <span className="query-tag">edited</span>}
                     {q.visibility === "org" && <span className="query-tag">team</span>}
                     {!q.mine && <span className="query-tag">shared by {q.owner_email || "teammate"}</span>}

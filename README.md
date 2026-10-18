@@ -518,6 +518,27 @@ button, save / re-verify, a saved query's `/run`, and the internal callers in
 blend, autopilot, flow, pipelines and the semantic layer — leaves a `verify`
 row in the audit log (`ok=0` with the error on rejection or failure).
 
+**Chat consults the library first.** Precedence in every mode is: certified
+semantic definitions → **verified SQL** → the plan cache → the agents
+(`verified_sql.py`).
+- **Candidates:** the asker's own verified queries and those shared with the
+  organization, on the same source.
+- **An exact match** has the same intent, the same values (numbers, years,
+  quoted strings) and the same ranking direction. It is re-run as the asker,
+  through the gateway with purpose `verified_sql`, and the answer names the
+  query.
+- **A related question** gets the saved SQL as a starting point the agent
+  adapts and verifies. It is never executed as the answer.
+- **Dependencies:** a query is linked to the metadata graph by the tables it
+  reads. If one is gone, it is *broken*: never used, and badged in the
+  library. If a semantic definition on its tables changed after it was
+  verified, it may only guide.
+- **Search by meaning:** with Harrier configured, requirements are matched by
+  meaning too. They are embedded on save and re-embedded when a requirement
+  is edited.
+- **Verified is not certified.** It means the query was authorized and ran
+  when it was saved, and the answer says so.
+
 ### Data freshness — "as of when"
 
 Studio reads live data on every question, but it doesn't own the warehouse's
