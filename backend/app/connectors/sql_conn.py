@@ -337,6 +337,22 @@ class SqlConnector(Connector):
             finally:
                 c.rollback()
 
+    def _column(self, col):
+        out = {"name": self._out(col["name"]), "type": self._type(col)}
+        if col.get("comment"):
+            out["description"] = str(col["comment"])
+        return out
+
+    @staticmethod
+    def _table_comments(i, schema):
+        """{inspector name: description} where the dialect reflects comments."""
+        from sqlalchemy.engine.reflection import ObjectKind
+        try:
+            got = i.get_multi_table_comment(schema=schema, kind=ObjectKind.ANY)
+        except Exception:
+            return {}
+        return {key[1]: (v or {}).get("text") for key, v in got.items() if (v or {}).get("text")}
+
     @staticmethod
     def _type(col):
         try:
@@ -352,7 +368,7 @@ class SqlConnector(Connector):
     def get_schema(self, table):
         schema, _bare = self._schema()
         name = self._unlisted(table)
-        return self._inspect(lambda i: [{"name": self._out(c["name"]), "type": self._type(c)}
+        return self._inspect(lambda i: [self._column(c)
                                         for c in i.get_columns(name, schema=schema)])
 
     def describe_relations(self):
@@ -375,9 +391,10 @@ class SqlConnector(Connector):
                     except Exception:
                         continue
             ns = self._out(schema) if schema else None
+            notes = self._table_comments(i, schema)
             return {self._listed(n): {"kind": kinds[n], "namespace": ns,
-                                      "columns": [{"name": self._out(c["name"]),
-                                                   "type": self._type(c)} for c in cols[n]]}
+                                      "columns": [self._column(c) for c in cols[n]],
+                                      **({"description": notes[n]} if notes.get(n) else {})}
                     for n in kinds if n in cols}
         return self._inspect(go)
 
@@ -389,9 +406,15 @@ class SqlConnector(Connector):
             kind = self._relations(i).get(inner)
             if kind is None:
                 return None
-            return {"kind": kind, "namespace": self._out(schema) if schema else None,
-                    "columns": [{"name": self._out(c["name"]), "type": self._type(c)}
-                                for c in i.get_columns(inner, schema=schema)]}
+            out = {"kind": kind, "namespace": self._out(schema) if schema else None,
+                   "columns": [self._column(c) for c in i.get_columns(inner, schema=schema)]}
+            try:
+                note = (i.get_table_comment(inner, schema=schema) or {}).get("text")
+            except Exception:
+                note = None
+            if note:
+                out["description"] = str(note)
+            return out
         return self._inspect(go)
 
     def describe_constraints(self):

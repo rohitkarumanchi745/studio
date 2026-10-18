@@ -18,8 +18,9 @@ COLUMNS = {"retail_orders": [("order_id", "bigint"), ("customer_id", "bigint"),
 
 
 class _Cur:
-    def __init__(self, script):
+    def __init__(self, script, comments=None):
         self.script, self.rows, self.sql = script, [], []
+        self.comments = comments or {}
 
     def execute(self, sql, params=None):
         self.sql.append(sql)
@@ -28,6 +29,12 @@ class _Cur:
                 if isinstance(rows, Exception):
                     raise rows
                 self.rows = rows
+                if ", comment" in sql:
+                    # As a warehouse answers a query that selects the comment
+                    # column: the rows carry it, null unless one was set.
+                    self.rows = [tuple(r) + (self.comments.get(tuple(r[2:4] if "columns"
+                                                                     in sql else r[2:3])),)
+                                 for r in rows]
                 return
         raise AssertionError(f"unexpected SQL: {sql}")
 
@@ -35,11 +42,11 @@ class _Cur:
         return self.rows
 
 
-def _connector(script, catalog="studio_dev", schema="retail_qa"):
+def _connector(script, catalog="studio_dev", schema="retail_qa", comments=None):
     conn = connections._DynDatabricks("databricks-3", {
         "server_hostname": "dbc-1.cloud.databricks.com", "http_path": "/sql/1.0/warehouses/a",
         "access_token": "dapi-x", "catalog": catalog, "schema": schema})
-    cur = _Cur(script)
+    cur = _Cur(script, comments)
     conn._conn = lambda: types.SimpleNamespace(cursor=lambda: cur, close=lambda: None)
     return conn, cur
 
@@ -186,3 +193,22 @@ def test_discovering_the_retail_schema_end_to_end(tmp_path, monkeypatch):
         assert {r["name"] for r in detail["relations"]} == set(TABLES) | {VIEW}
     finally:
         governance._STATE.update(doc=None, yaml="", source=None)
+
+
+def test_databricks_comments_become_descriptions():
+    conn, cur = _connector(_pinned_script(), comments={
+        ("retail_orders",): "One row per order, as placed",
+        ("retail_orders", "status"): "placed, shipped, returned or cancelled"})
+    out = conn.describe_relations()
+    assert out["retail_orders"]["description"] == "One row per order, as placed"
+    status = next(c for c in out["retail_orders"]["columns"] if c["name"] == "status")
+    assert status["description"] == "placed, shipped, returned or cancelled"
+    assert "description" not in out[VIEW]
+    assert any(", comment" in sql for sql in cur.sql)
+
+
+def test_a_catalog_without_comment_columns_is_still_described():
+    script = [("comment", RuntimeError("[UNRESOLVED_COLUMN] comment"))] + _pinned_script()
+    conn, cur = _connector(script)
+    out = conn.describe_relations()
+    assert out["retail_orders"]["kind"] == "table" and "description" not in out["retail_orders"]

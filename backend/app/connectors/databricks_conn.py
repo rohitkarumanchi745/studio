@@ -24,6 +24,18 @@ ALL_SCHEMAS = "*"
 #: Catalogs never listed in an all-schemas source: `system` holds the
 #: workspace's audit, billing and access logs, not business data.
 _SKIPPED_CATALOGS = {"system"}
+
+
+def _with_comments(cur, sql):
+    """Rows of `sql` with its `comment` column last — `{c}` marks where it
+    goes — or, where information_schema has no such column, the same rows with
+    None in its place: descriptions are a bonus, never a reason to fail."""
+    try:
+        cur.execute(sql.replace("{c}", ", comment"))
+        return [tuple(r) for r in cur.fetchall()]
+    except Exception:
+        cur.execute(sql.replace("{c}", ""))
+        return [tuple(r) + (None,) for r in cur.fetchall()]
 #: Only plain identifiers make a listable name: the catalog endpoints and the
 #: query guard both read a name as dot-separated plain parts.
 _PLAIN = re.compile(r"^[A-Za-z_][\w$]*$")
@@ -658,30 +670,32 @@ class DatabricksConnector(Connector):
 
         def go(con):
             cur = con.cursor()
-            cur.execute(f"SELECT table_catalog, table_schema, table_name, table_type "
-                        f"FROM {prefix}.tables {where}")
             out = {}
-            for cat, sch, name, ttype in cur.fetchall():
+            for cat, sch, name, ttype, note in _with_comments(
+                    cur, f"SELECT table_catalog, table_schema, table_name, table_type{{c}} "
+                         f"FROM {prefix}.tables {where}"):
                 kind = str(ttype or "").upper()
                 kind = ("view" if kind in self._VIEW_TYPES
                         else "table" if kind in self._TABLE_TYPES else "other")
                 out[key(cat, sch, name)] = {"kind": kind, "namespace": f"{cat}.{sch}",
-                                            "columns": []}
+                                            "columns": [],
+                                            **({"description": note} if note else {})}
             for type_col in ("full_data_type", "data_type"):
                 try:
-                    cur.execute(f"SELECT table_catalog, table_schema, table_name, column_name, "
-                                f"{type_col} FROM {prefix}.columns {where} "
-                                f"ORDER BY table_catalog, table_schema, table_name, "
-                                f"ordinal_position")
-                    rows = cur.fetchall()
+                    rows = _with_comments(
+                        cur, f"SELECT table_catalog, table_schema, table_name, column_name, "
+                             f"{type_col}{{c}} FROM {prefix}.columns {where} "
+                             f"ORDER BY table_catalog, table_schema, table_name, "
+                             f"ordinal_position")
                     break
                 except Exception:
                     if type_col == "data_type":
                         raise
-            for cat, sch, name, col, ctype in rows:
+            for cat, sch, name, col, ctype, note in rows:
                 entry = out.get(key(cat, sch, name))
                 if entry is not None:
-                    entry["columns"].append({"name": col, "type": ctype})
+                    entry["columns"].append({"name": col, "type": ctype,
+                                             **({"description": note} if note else {})})
             return out
         try:
             return self._execute(go)
@@ -708,25 +722,29 @@ class DatabricksConnector(Connector):
 
         def go(con):
             cur = con.cursor()
-            cur.execute(f"SELECT table_catalog, table_schema, table_type FROM {prefix}.tables "
-                        f"WHERE {where}")
-            row = cur.fetchone()
-            if row is None:
+            found = _with_comments(cur, f"SELECT table_catalog, table_schema, table_type{{c}} "
+                                        f"FROM {prefix}.tables WHERE {where}")
+            if not found:
                 return None
+            row = found[0]
             kind = str(row[2] or "").upper()
             kind = ("view" if kind in self._VIEW_TYPES
                     else "table" if kind in self._TABLE_TYPES else "other")
             for type_col in ("full_data_type", "data_type"):
                 try:
-                    cur.execute(f"SELECT column_name, {type_col} FROM {prefix}.columns "
-                                f"WHERE {where} ORDER BY ordinal_position")
-                    rows = cur.fetchall()
+                    rows = _with_comments(cur, f"SELECT column_name, {type_col}{{c}} FROM "
+                                               f"{prefix}.columns WHERE {where} "
+                                               f"ORDER BY ordinal_position")
                     break
                 except Exception:
                     if type_col == "data_type":
                         raise
-            return {"kind": kind, "namespace": f"{row[0]}.{row[1]}",
-                    "columns": [{"name": r[0], "type": r[1]} for r in rows]}
+            out = {"kind": kind, "namespace": f"{row[0]}.{row[1]}",
+                   "columns": [{"name": r[0], "type": r[1],
+                                **({"description": r[2]} if r[2] else {})} for r in rows]}
+            if row[3]:
+                out["description"] = row[3]
+            return out
         return self._execute(go)
 
     def _info_scope(self):

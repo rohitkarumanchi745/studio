@@ -476,7 +476,8 @@ def _examine(source, connector, names, record):
             info = bulk.get(name)
             if info is not None:
                 out[name] = metagraph._fingerprint(
-                    info.get("kind") or "other", metagraph._clean_columns(info.get("columns")))
+                    info.get("kind") or "other", metagraph._clean_columns(info.get("columns")),
+                    metagraph._description(info.get("description")))
     rest = sorted(n for n in names if n not in out)
     if not rest:
         return out, "bulk"
@@ -493,7 +494,8 @@ def _examine(source, connector, names, record):
             log.debug("metagraph: probe of %s.%s failed", source, name, exc_info=True)
             continue
         out[name] = metagraph._fingerprint(info.get("kind") or record[name]["kind"],
-                                           metagraph._clean_columns(info.get("columns")))
+                                           metagraph._clean_columns(info.get("columns")),
+                                           metagraph._description(info.get("description")))
     save_offsets(source, {"cursor": (start + probed) % len(rest)}, "probe")
     return out, ("bulk" if isinstance(bulk, dict) else "probe")
 
