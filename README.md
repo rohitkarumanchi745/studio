@@ -1237,7 +1237,8 @@ flowchart LR
 
 An admin connects a warehouse straight from the **Data connections** screen — no
 env vars, no redeploy. Pick a type (PostgreSQL, Snowflake, Databricks SQL,
-BigQuery, Neo4j, Power BI), enter its credentials, and test them. For SQL
+BigQuery, Neo4j, Power BI, or **Any SQL database** — see below), enter its
+credentials, and test them. For SQL
 warehouses and Power BI the test also lists the visible schemas/datasets/models; select one or several, and Studio
 saves **one independently named and governed source per namespace**. A namespace
 that cannot be listed can still be typed explicitly and probed before save.
@@ -1304,6 +1305,55 @@ skill files all apply to it unchanged.
   longer decrypts — is unconfigured and fails closed with its reason; it never
   falls back to the environment's credential. Databricks Jobs / Spark
   deployment still reads the `DATABRICKS_*` variables directly.
+
+### Any SQL database — one connection URL, nothing vendor-specific
+
+**Any SQL database** connects any engine that has a SQLAlchemy driver installed,
+from one URL. Examples:
+- `mysql+pymysql://reader:…@db:3306/shop`
+- `mssql+pymssql://…/sales`
+- `oracle+oracledb://…/?service_name=orcl`
+- `postgresql+psycopg://…`
+- any dialect a driver package registers: Trino, ClickHouse, Redshift, DB2,
+  Teradata, …
+
+The image ships drivers for MySQL/MariaDB, SQL Server/Azure SQL and Oracle
+(thin mode, no Oracle client), plus `psycopg` for Postgres-compatible engines.
+Reaching another engine is one `pip install` of its driver. Studio holds no list
+of vendors: everything vendor-shaped is learned, from SQLAlchemy or from the
+engine itself (`connectors/sql_conn.py`).
+- **Metadata from SQLAlchemy's inspector.** Tables, views, columns, primary
+  and foreign keys, view definitions and schemas come from the inspector, which
+  every dialect implements. Names are shown as the engine stores them, so the
+  model writes identifiers the engine resolves. The metadata graph,
+  relationships, entities and change capture all work on it, like on any
+  source.
+- **Identifier case is asked of the engine.** Studio asks once per connection:
+  `SELECT 1 AS Abc` comes back as `abc` (bare names fold down), `ABC` (fold
+  up) or `Abc` (kept as written). The query guard enforces that rule for the
+  connection, so a quoted look-alike (`"CUSTOMERS"` vs `customers`) can never
+  stand in for a denied table. If the engine can't be asked, the guard fails
+  closed: only quoted names are accepted until it can (it retries once a
+  minute).
+- **The row cap follows the engine's syntax.** Where the dialect compiles a
+  limit as `LIMIT`, the gateway appends one as usual. Where it uses `TOP` or
+  `FETCH FIRST`, the text is left alone and rows are capped as they are
+  fetched, from a streaming cursor. The model's briefing says which, along with
+  the engine's name and identifier rule, in place of a vendor note.
+- **The namespace is pinned.** A source pinned to the login's default schema
+  lists bare names. One pinned to any other schema lists `schema.table`, and
+  every reference must be written in full; a bare name would otherwise reach
+  the default schema's table of the same name.
+- **Read-only, and refused where unsafe.**
+  - Queries pass the gateway's guard and run in a transaction that is never
+    committed.
+  - A URL with no host, such as a database file on Studio's own server, is
+    refused unless `STUDIO_SQL_ALLOW_LOCAL_FILES=1`.
+  - A missing driver is named, together with the drivers that are installed.
+  - Listings show only the engine and host; the URL is encrypted and its
+    password never appears in a listing or an error.
+
+  Use a read-only database login all the same.
 
 ### Power BI semantic models
 

@@ -75,6 +75,11 @@ def _build(connector, role, allowed_tables, schemas, fp):
             table_lines.append(f"### {t}\n  (columns not listed — call describe_table before using it)")
     tables_md = "\n\n".join(table_lines) or "(no accessible tables)"
     dialect_note = _DIALECT_NOTES.get(connector.dialect, "- Standard ANSI SQL.")
+    learned = getattr(connector, "query_guidance", None)
+    if callable(learned):
+        # A connector that learned its engine's rules (connectors/sql_conn.py)
+        # says what it learned, in place of a vendor note.
+        dialect_note = "\n".join(f"- {line}" for line in learned())
     if getattr(connector, "full_names", False):
         dialect_note += ("\n- This source spans catalogs and schemas: write EVERY table "
                          "exactly as listed, in full — catalog.schema.table. A shorter "
