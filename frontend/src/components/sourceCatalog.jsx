@@ -19,6 +19,7 @@ const CATEGORIES = [
   { key: "warehouse", label: "Data warehouses and lakehouses" },
   { key: "nosql", label: "NoSQL and graph" },
   { key: "work", label: "Work management and collaboration" },
+  { key: "automation", label: "Automation and workflows" },
   { key: "bi", label: "BI and semantic models" },
   { key: "storage", label: "Cloud file storage" },
   { key: "marketing", label: "Marketing and analytics" },
@@ -203,6 +204,15 @@ const MARKS = {
         stroke={c} strokeWidth="2.4" strokeLinejoin="round" />
     </>
   ),
+  nodes: (c) => (
+    <>
+      <path d="M9 20h22M20 20l7-8M20 20l7 8" stroke={c} strokeWidth="2.4" strokeLinecap="round" />
+      <circle cx="8" cy="20" r="4.2" fill={c} />
+      <circle cx="20" cy="20" r="3.6" fill={c} opacity=".75" />
+      <circle cx="29" cy="11" r="3.6" fill={c} opacity=".6" />
+      <circle cx="29" cy="29" r="3.6" fill={c} opacity=".6" />
+    </>
+  ),
   beaker: (c) => (
     <>
       <path d="M16 6v10L9 29a3 3 0 0 0 2.7 4.4h16.6A3 3 0 0 0 31 29l-7-13V6" fill="none" stroke={c} strokeWidth="2.4" strokeLinejoin="round" />
@@ -341,8 +351,10 @@ const META = {
             blurb: "Not available yet." },
   zendesk: { label: "Zendesk", color: "#17494d", mark: "diamond", category: "apps",
              blurb: "Not available yet." },
-  servicenow: { label: "ServiceNow", color: "#3f9a5f", mark: "orbit", category: "apps",
-                blurb: "Not available yet." },
+  servicenow: { label: "ServiceNow", color: "#3f9a5f", mark: "orbit", category: "work",
+                blurb: "Incidents, changes, problems and requests from a ServiceNow instance, queryable as tables." },
+  n8n: { label: "n8n", color: "#ea4b71", mark: "nodes", category: "automation",
+         blurb: "Workflows and their executions from n8n Cloud or self-hosted n8n — what ran, what failed, how long it took." },
   shopify: { label: "Shopify", color: "#5e8e3e", mark: "bucket", category: "apps",
              blurb: "Not available yet." },
   google_sheets: { label: "Google Sheets", color: "#0f9d58", mark: "panel", category: "apps",
@@ -358,6 +370,9 @@ const META = {
  * connections are listed under), `driver` the package that provides it. No
  * `ctype` means not available yet.
  */
+/** Shown first, on their own shelf, until the user searches. */
+export const FEATURED = ["databricks", "powerbi", "servicenow", "jira", "n8n"];
+
 export const MARKETPLACE = {
   mysql: { ctype: "sql", dialect: "mysql", driver: "pymysql",
            preset: { url: "mysql+pymysql://user:password@host:3306/database" } },
@@ -409,7 +424,7 @@ export const MARKETPLACE = {
   jira_sm: { ctype: "jira",
              preset: { jql: 'projectType = "service_desk" ORDER BY updated DESC' } },
   mongodb: {}, dynamodb: {}, elasticsearch: {}, salesforce: {}, hubspot: {}, stripe: {},
-  zendesk: {}, servicenow: {}, shopify: {}, google_sheets: {}, tableau: {},
+  zendesk: {}, shopify: {}, google_sheets: {}, tableau: {},
 };
 
 function humanize(id) {

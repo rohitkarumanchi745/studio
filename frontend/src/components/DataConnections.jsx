@@ -21,7 +21,7 @@
 // map of available sources and who to ask.
 import { useEffect, useMemo, useState } from "react";
 import { api, getUser } from "../api";
-import { CATEGORIES, MARKETPLACE, SourceIcon, metaFor } from "./sourceCatalog";
+import { CATEGORIES, FEATURED, MARKETPLACE, SourceIcon, metaFor } from "./sourceCatalog";
 import MetadataLine, { useMetadataStatus } from "./MetadataLine";
 import { backdropClose } from "../backdrop";
 
@@ -109,6 +109,8 @@ export function buildTiles({ types = [], conns = [], sources = [], repos = [], e
   for (const t of types) put(t.ctype, { connectable: true, fields: t.fields, ns: t.ns || {} });
   put("m365");
   put("github");
+  // The featured integrations are on everyone's map, connectable or not.
+  for (const id of FEATURED) put(id);
   // The marketplace: every integration on the map, each saying how it connects.
   const typeById = new Map(types.map((t) => [t.ctype, t]));
   for (const [id, via] of Object.entries(MARKETPLACE)) {
@@ -279,7 +281,7 @@ export default function DataConnections({ onClose }) {
 
         <div className="conn-body">
           {!tile ? (
-            <Grid tiles={tiles} isAdmin={isAdmin}
+            <Grid tiles={tiles} isAdmin={isAdmin} featured={!q.trim()}
               onPick={(id) => { setPicked(id); setError(""); setNote(""); }} />
           ) : tile.id === "m365" ? (
             <M365Panel
@@ -312,10 +314,18 @@ export default function DataConnections({ onClose }) {
 
 // ── The grid ────────────────────────────────────────────────────────────
 
-function Grid({ tiles, isAdmin, onPick }) {
-  const groups = CATEGORIES
+function Grid({ tiles, isAdmin, onPick, featured = false }) {
+  const shelves = CATEGORIES
     .map((c) => ({ ...c, items: tiles.filter((t) => t.meta.category === c.key) }))
     .filter((g) => g.items.length);
+  // The featured shelf repeats tiles that also sit on their own shelf, in the
+  // order chosen rather than alphabetically.
+  const picks = featured
+    ? FEATURED.map((id) => tiles.find((t) => t.id === id)).filter(Boolean)
+    : [];
+  const groups = picks.length
+    ? [{ key: "featured", label: "Featured", items: picks, ordered: true }, ...shelves]
+    : shelves;
 
   if (!groups.length) {
     return <div className="meta conn-empty">No source matches that search.</div>;
@@ -327,9 +337,8 @@ function Grid({ tiles, isAdmin, onPick }) {
         <section key={g.key} className="conn-group">
           <div className="conn-group-title">{g.label}</div>
           <div className="conn-grid">
-            {g.items
-              .slice()
-              .sort((a, b) => a.meta.label.localeCompare(b.meta.label))
+            {(g.ordered ? g.items : g.items.slice()
+              .sort((a, b) => a.meta.label.localeCompare(b.meta.label)))
               .map((t) => <Tile key={t.id} tile={t} isAdmin={isAdmin} onPick={onPick} />)}
           </div>
         </section>
@@ -362,7 +371,7 @@ function Tile({ tile, isAdmin, onPick }) {
             ? "Connect"
             : tile.via
               ? VIA_LABEL[tile.via.status]
-              : "Not configured"}
+              : isAdmin ? "Not configured" : "Ask an admin"}
       </span>
       {live.length > 0 && <span className="conn-dot" aria-hidden="true" />}
     </button>

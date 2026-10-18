@@ -66,6 +66,8 @@ from .connectors.powerbi_conn import PowerBIConnector, PowerBIError
 from .connectors.snowflake_conn import SnowflakeConnector
 from .connectors.cassandra_conn import CassandraConnector
 from .connectors.jira_conn import JiraConnector
+from .connectors.n8n_conn import N8nConnector
+from .connectors.servicenow_conn import ServiceNowConnector
 from .connectors.sql_conn import SqlConnector
 from .connectors.sql_conn import check_url as check_sql_url
 
@@ -191,6 +193,16 @@ class _DynJira(JiraConnector):
         super().__init__(name, cfg)
 
 
+class _DynServiceNow(ServiceNowConnector):
+    def __init__(self, name, cfg):
+        super().__init__(name, cfg)
+
+
+class _DynN8n(N8nConnector):
+    def __init__(self, name, cfg):
+        super().__init__(name, cfg)
+
+
 class _DynPowerBI(PowerBIConnector):
     def __init__(self, name, cfg):
         super().__init__()                      # per-connection metadata cache
@@ -312,15 +324,35 @@ def _check_cassandra(cfg):
     return cfg, problems
 
 
-def _check_jira(cfg):
-    """The site as https://host — a pasted page URL is reduced to it."""
-    raw = (cfg.get("site") or "").strip()
+def _https_site(cfg, key, example, *, keep_port=False):
+    """`cfg[key]` as https://host[:port] — a pasted page URL is reduced to its
+    site, and anything but https is refused on that field."""
+    raw = (cfg.get(key) or "").strip()
     parts = urlsplit(raw if "://" in raw else f"https://{raw}")
-    cfg = {**cfg, "site": f"https://{parts.hostname}" if parts.hostname else ""}
+    host = parts.hostname or ""
+    if keep_port and parts.port:
+        host = f"{host}:{parts.port}"
+    cfg = {**cfg, key: f"https://{host}" if host else ""}
     problems = {}
     if parts.scheme not in ("https", "") or not parts.hostname:
-        problems["site"] = "Use your Jira site's https address, e.g. https://acme.atlassian.net"
+        problems[key] = f"Use the https address, e.g. {example}"
     return cfg, problems
+
+
+def _check_jira(cfg):
+    return _https_site(cfg, "site", "https://acme.atlassian.net")
+
+
+def _check_servicenow(cfg):
+    cfg, problems = _https_site(cfg, "instance", "https://acme.service-now.com")
+    if not problems and not (cfg.get("token") or (cfg.get("username") and cfg.get("password"))):
+        problems["username"] = "Give a user and password, or an OAuth access token."
+    return cfg, problems
+
+
+def _check_n8n(cfg):
+    # Self-hosted n8n often runs on its own port (5678): keep it.
+    return _https_site(cfg, "url", "https://n8n.example.com", keep_port=True)
 
 
 def _check_sql(cfg):
@@ -489,6 +521,35 @@ TYPES = {
             _field("jql", "JQL scope", placeholder="project = OPS ORDER BY updated DESC "
                                                    "(blank: every issue you can see)"),
             _field("max_issues", "Issue limit", default="5000"),
+        ],
+    },
+    # ServiceNow ITSM: incidents, changes, problems and requested items.
+    "servicenow": {
+        "label": "ServiceNow", "dialect": "sqlite", "build": _DynServiceNow,
+        "check": _check_servicenow,
+        "hint_key": "instance",
+        "fields": [
+            _field("instance", "Instance", required=True,
+                   placeholder="https://acme.service-now.com"),
+            _field("username", "User", placeholder="an integration user with read roles"),
+            _field("password", "Password", secret=True),
+            _field("token", "OAuth access token", secret=True,
+                   placeholder="instead of user and password"),
+            _field("query", "Encoded query", placeholder="active=true (blank: every record)"),
+            _field("max_rows", "Record limit per table", default="5000"),
+        ],
+    },
+    # n8n: workflows and their executions.
+    "n8n": {
+        "label": "n8n", "dialect": "sqlite", "build": _DynN8n,
+        "check": _check_n8n,
+        "hint_key": "url",
+        "fields": [
+            _field("url", "n8n URL", required=True,
+                   placeholder="https://n8n.example.com or https://acme.app.n8n.cloud"),
+            _field("api_key", "API key", required=True, secret=True,
+                   placeholder="Settings → n8n API → Create an API key"),
+            _field("max_rows", "Execution limit", default="5000"),
         ],
     },
     # Any other database: one SQLAlchemy URL, any installed driver. Its kind of
