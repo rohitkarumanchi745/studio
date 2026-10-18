@@ -23,9 +23,8 @@ Design:
   catalog's schema endpoint shapes them.
 """
 import math
-import re
 
-from . import db, governance, metarelations
+from . import db, governance, identifiers, metarelations
 
 _STOP = {"the", "and", "for", "with", "show", "what", "which", "how", "many", "much", "per",
          "over", "last", "this", "that", "from", "table", "tables", "data", "chart", "level",
@@ -37,19 +36,11 @@ _GENERIC_NAME = {"id", "key", "code", "no", "num", "number", "name", "fact", "di
                  "vw", "view"}
 
 
-def _singular(word):
-    if word.endswith("ies") and len(word) > 4:
-        return word[:-3] + "y"
-    if word.endswith("ses") and len(word) > 4:
-        return word[:-2]
-    if word.endswith("s") and not word.endswith("ss") and len(word) > 3:
-        return word[:-1]
-    return word
-
-
-def _words(text):
-    return [_singular(w) for w in re.findall(r"[a-z0-9]+", str(text).lower())
-            if len(w) >= 2 and w not in _STOP]
+def _words(text, vocab=None):
+    """Singular, expanded words — a question's or an identifier's, in any
+    naming convention (identifiers.py): OrderQty → order quantity, prod_desc →
+    product description."""
+    return [w for w in identifiers.words(text, vocab) if len(w) >= 2 and w not in _STOP]
 
 
 def _terms(prompt):
@@ -85,15 +76,16 @@ def _objects(source, allowed):
 
 
 def _vocabulary(objects):
-    """Per object: its name words and column words (both singular), and every
-    column's full name — the units a question is matched against."""
+    """Per object: its name words and column words (singular, abbreviations
+    expanded against the schema's own words), and every column's full name —
+    the units a question is matched against."""
+    schema = metarelations._vocab(objects)
     vocab = {}
     for name, obj in objects.items():
-        bare = name.split(".")[-1]
-        name_words = set(_words(bare.replace("_", " "))) - _GENERIC_NAME
+        name_words = set(identifiers.table_words(name, schema)) - _GENERIC_NAME
         col_words, col_names = set(), set()
         for col in obj["columns"]:
-            parts = _words(col["name"].replace("_", " "))
+            parts = [w for w in identifiers.words(col["name"], schema) if len(w) >= 2]
             col_words |= set(parts) - _GENERIC_NAME
             col_names.add("_".join(parts))
         vocab[name] = (name_words, col_words, col_names)
@@ -155,7 +147,17 @@ def ground(source, prompt, allowed, *, limit=6, min_confidence=0.6, cutoff=0.35)
     if not ranked:
         return None
     top = ranked[0][1]
-    picked = [(t, s, w) for t, s, w in ranked if s >= cutoff * top][:limit]
+    picked = [(t, s, w) for t, s, w in ranked if s >= cutoff * top]
+    # Every term of the question needs a home: a table that is the best match
+    # for a term no picked table covers joins even when another table matches
+    # so many terms that it lifts the cutoff above it.
+    covered = {term for _t, _s, why in picked for term in why}
+    for t, s, why in ranked:
+        new = set(why) - covered
+        if new and all(t != p[0] for p in picked):
+            picked.append((t, s, why))
+            covered |= new
+    picked = picked[:limit]
     matched = {t: w for t, _s, w in picked}
     tables = [t for t, _s, _w in picked]
     rels = metarelations.current(source, set(objects))

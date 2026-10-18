@@ -32,11 +32,10 @@ import re
 import time
 import uuid
 
-from . import db, queryguard
+from . import db, identifiers, queryguard
 
 log = logging.getLogger("studio.metagraph")
 
-_KEY_SUFFIXES = ("_id", "_key", "_code", "_no", "_number", "_num", "id")
 _JOIN_STOP = {"on", "join", "inner", "left", "right", "full", "outer", "cross", "where",
               "group", "order", "limit", "union", "having", "using", "natural", "lateral",
               "window", "qualify", "except", "intersect", "as", "with", "select", "from",
@@ -80,27 +79,27 @@ def _bare(name):
     return str(name).split(".")[-1].lower()
 
 
-def _stem(column):
-    """'customer_id' → 'customer'; None for a column that does not look like a key."""
-    col = column.lower()
-    for suffix in _KEY_SUFFIXES:
-        if col.endswith(suffix) and len(col) > len(suffix) + 1:
-            return col[: -len(suffix)].rstrip("_") or None
-    return None
+def _stem(column, vocab=None):
+    """The subject a key column refers to, as words — ("customer",) for
+    customer_id, CustomerID, customer_sk, fk_customer or cust_no — or None.
+    Any schema's conventions: see identifiers.py."""
+    return identifiers.key_stem(column, vocab)
 
 
-def _forms(stem):
-    forms = {stem, stem + "s", stem + "es"}
-    if stem.endswith("y"):
-        forms.add(stem[:-1] + "ies")
-    return forms
+def _named_for(table, stem, vocab=None):
+    """Is `table` the home of the subject `stem`? retail_customers,
+    dim_customer and Customer are homes of ("customer",); SalesOrderHeader is
+    the home of ("sales", "order"), SalesOrderDetail is not."""
+    return identifiers.names_entity(table, stem, vocab)
 
 
-def _named_for(table, stem):
-    """Is `table` the table a `<stem>_id` column points at? retail_customers is
-    named for 'customer'; retail_order_items is not named for 'order'."""
-    bare = _bare(table)
-    return any(bare == f or bare.endswith("_" + f) for f in _forms(stem))
+def _vocab(objects):
+    """The words this schema spells out — what its abbreviations stand for."""
+    names = []
+    for name, obj in objects.items():
+        names.append(name.split(".")[-1])
+        names += [c["name"] for c in obj.get("columns") or []]
+    return identifiers.vocabulary(names)
 
 
 def _family(sql_type):
@@ -247,11 +246,13 @@ def _orient(a, a_cols, b, b_cols, objects, pks):
     """(child, child cols, parent, parent cols, directed): the side holding the
     reference is the child. Known when the other side's columns are its
     declared primary key or it is the table the column is named for."""
+    vocab = _vocab(objects)
+
     def parent_side(table, cols, other_cols):
         if [c.lower() for c in pks.get(table, [])] == [c.lower() for c in cols]:
             return True
-        stems = {_stem(c) for c in other_cols} | {_stem(c) for c in cols}
-        return any(s and _named_for(table, s) for s in stems)
+        stems = {_stem(c, vocab) for c in other_cols} | {_stem(c, vocab) for c in cols}
+        return any(s and _named_for(table, s, vocab) for s in stems)
     if parent_side(b, b_cols, a_cols) and not parent_side(a, a_cols, b_cols):
         return a, a_cols, b, b_cols, True
     if parent_side(a, a_cols, b_cols) and not parent_side(b, b_cols, a_cols):
@@ -260,28 +261,54 @@ def _orient(a, a_cols, b, b_cols, objects, pks):
     return x, xc, y, yc, False
 
 
+def _parent_column(parent, col, stem, objects, pks, vocab):
+    """Which column of `parent` a reference to its subject points at:
+    (column, confidence, why), or None."""
+    pcols = objects[parent].get("columns") or []
+    by_name = {c["name"].lower(): c for c in pcols}
+    key = [c.lower() for c in pks.get(parent, [])]
+    if col["name"].lower() in by_name:
+        return by_name[col["name"].lower()], 0.75, "same column name"
+    if len(key) == 1 and key[0] in by_name:
+        return by_name[key[0]], 0.75, "its declared primary key"
+    for c in pcols:
+        if _stem(c["name"], vocab) == stem:
+            return c, 0.7, f"its {c['name']} names the same subject"
+    if "id" in by_name:
+        return by_name["id"], 0.65, f"{_bare(parent)}.{by_name['id']['name']}"
+    return None
+
+
 def infer(objects, pks):
     """Name-pattern candidates: a key-like column in one table pointing at the
-    table named for it. {key: [evidence]} keyed like build()."""
+    table that is home to its subject — in any naming convention (snake_case,
+    PascalCase, surrogate _sk keys, fk_ prefixes, standard abbreviations, and
+    abbreviations the schema itself spells out). When several tables could be
+    the home, the best-supported one wins; a true tie is kept for every
+    candidate at lower confidence, labelled as one of several.
+    {key: [evidence]} keyed like build()."""
+    vocab = _vocab(objects)
     tables = [n for n, o in objects.items() if o.get("kind") != "view"]
     out = {}
     for child in tables:
         for col in objects[child].get("columns") or []:
-            stem = _stem(col["name"])
+            stem = _stem(col["name"], vocab)
             if not stem:
                 continue
+            options = []
             for parent in tables:
-                if parent == child or not _named_for(parent, stem):
+                if parent == child or not _named_for(parent, stem, vocab):
                     continue
-                pcols = _columns(objects, parent)
-                if col["name"].lower() in pcols:
-                    pcol, conf, why = pcols[col["name"].lower()], 0.75, "same column name"
-                elif "id" in pcols:
-                    pcol, conf, why = pcols["id"], 0.65, f"{_bare(parent)}.id"
-                else:
+                picked = _parent_column(parent, col, stem, objects, pks, vocab)
+                if picked is None:
                     continue
+                pcol, conf, why = picked
                 labels = [f"name pattern: {_bare(child)}.{col['name']} points at "
                           f"{_bare(parent)} ({why})"]
+                raw = " ".join(identifiers.raw_words(col["name"]))
+                if " ".join(stem) not in raw:
+                    conf -= 0.05
+                    labels.append(f"reads {col['name']} as {' '.join(stem)}")
                 parent_key = [c.lower() for c in pks.get(parent, [])]
                 if parent_key == [pcol["name"].lower()]:
                     conf += 0.1
@@ -297,10 +324,20 @@ def infer(objects, pks):
                 else:
                     conf -= 0.3
                     labels.append(f"types differ ({col.get('type')} ↔ {pcol.get('type')})")
+                options.append((round(min(conf, 0.85), 2), parent, pcol, labels))
+            if not options:
+                continue
+            options.sort(key=lambda o: -o[0])
+            best = options[0][0]
+            tied = [o for o in options if o[0] == best]
+            for conf, parent, pcol, labels in tied:
+                if len(tied) > 1:
+                    conf = round(conf - 0.15, 2)
+                    labels = labels + [f"one of {len(tied)} tables that could hold "
+                                       f"{' '.join(stem)}"]
                 key = ("join", child, (col["name"],), parent, (pcol["name"],), True)
                 out.setdefault(key, []).append(
-                    {"type": "name_pattern", "label": "; ".join(labels),
-                     "confidence": round(min(conf, 0.85), 2)})
+                    {"type": "name_pattern", "label": "; ".join(labels), "confidence": conf})
     return out
 
 
