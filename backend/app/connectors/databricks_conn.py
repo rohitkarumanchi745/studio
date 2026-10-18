@@ -8,6 +8,7 @@ one recognized task type, and compute to run on. Building and checking that
 body here — next to the credentials it needs — keeps flow.py from hand-rolling
 a payload the endpoint would reject with a 400.
 """
+import logging
 import os
 import re
 import threading
@@ -685,6 +686,37 @@ class DatabricksConnector(Connector):
         try:
             return self._execute(go)
         except Exception:
+            return None
+
+    def change_signal(self):
+        """Count and newest last_altered of the relations in scope: a create,
+        drop, rename or ALTER moves one of them. None where information_schema
+        (or last_altered) is unavailable."""
+        catalog = (self._cfg()["catalog"] or "").strip()
+        if catalog and not _PLAIN.match(catalog):
+            return None
+        if self.all_schemas:
+            prefix = f"`{catalog}`.information_schema" if catalog else "system.information_schema"
+            skipped = ", ".join(f"'{c}'" for c in sorted(_SKIPPED_CATALOGS))
+            where = (f"WHERE table_schema <> 'information_schema' "
+                     f"AND table_catalog NOT IN ({skipped})")
+        else:
+            prefix = "information_schema"
+            where = "WHERE table_catalog = current_catalog() AND table_schema = current_schema()"
+
+        def go(con):
+            cur = con.cursor()
+            cur.execute(f"SELECT COUNT(*), MAX(last_altered) FROM {prefix}.tables {where}")
+            row = cur.fetchone()
+            return f"{row[0]}|{row[1]}"
+        try:
+            return self._execute(go)
+        except Exception:
+            # No signal means "rediscover on the full-sync cadence" — say why,
+            # or a broken query would look like an engine without a signal.
+            logging.getLogger("studio.connectors").warning(
+                "Databricks change_signal failed; falling back to the full-sync cadence",
+                exc_info=True)
             return None
 
     def relation_kind(self, namespace, table):

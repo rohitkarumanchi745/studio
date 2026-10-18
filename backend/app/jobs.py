@@ -505,9 +505,11 @@ def _default_schedulers():
     module-level import here would be a cycle. `enabled` is read on every
     tick so the STUDIO_*_TICKER kill-switches keep their meaning: a disabled
     ticker means the scheduler skips that lease entirely."""
-    from . import autopilot, learned_rules, retention
+    from . import autopilot, learned_rules, metagraph, retention
     from .extraction import sync as m365_sync
     return [
+        {"name": "metagraph_sync", "fn": metagraph.tick_once,
+         "enabled": metagraph.ticker_enabled, "interval_s": metagraph._TICK_SECONDS},
         {"name": "autopilot", "fn": autopilot.tick_once,
          "enabled": autopilot.ticker_enabled, "interval_s": autopilot._TICK_SECONDS},
         {"name": "m365_sync", "fn": m365_sync.tick_once,

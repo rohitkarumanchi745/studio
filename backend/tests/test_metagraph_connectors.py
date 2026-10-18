@@ -103,6 +103,23 @@ def test_relation_types_map_to_kinds(ttype, kind):
     assert conn.describe_relations()["t"]["kind"] == kind
 
 
+class _SignalCur(_Cur):
+    def fetchone(self):
+        return self.rows[0]
+
+
+def test_the_change_signal_is_one_cheap_metadata_query():
+    cur = _SignalCur([("MAX(last_altered)", [(8, "2026-10-17 12:00:00")])])
+    conn = connections._DynDatabricks("databricks-3", {
+        "server_hostname": "dbc-1.cloud.databricks.com", "http_path": "/sql/1.0/warehouses/a",
+        "access_token": "dapi-x", "catalog": "studio_dev", "schema": "retail_qa"})
+    conn._conn = lambda: types.SimpleNamespace(cursor=lambda: cur, close=lambda: None)
+    assert conn.change_signal() == "8|2026-10-17 12:00:00"
+    assert len(cur.sql) == 1 and "current_schema()" in cur.sql[0]
+    cur.script = [("MAX(last_altered)", RuntimeError("no last_altered here"))]
+    assert conn.change_signal() is None              # no signal: full-sync cadence instead
+
+
 def test_discovering_the_retail_schema_end_to_end(tmp_path, monkeypatch):
     """Connect studio_dev.retail_qa → discovery finds seven tables plus the view."""
     monkeypatch.setenv("STUDIO_DB_PATH", str(tmp_path / "e2e.db"))

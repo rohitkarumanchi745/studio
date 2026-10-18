@@ -402,6 +402,15 @@ def _m17_metagraph_backfill(c, is_pg):
                          job_id=job_id, max_attempts=3, conn=c)
 
 
+def _m18_metagraph_sync_columns(c, is_pg):
+    # Continuous sync: when a discovery was queued, the change signal the last
+    # discovery saw, when the scheduler last checked, and a held removal.
+    for column, ctype in (("queued_at", "REAL"), ("synced_signal", "TEXT"),
+                          ("checked_at", "REAL"), ("held_removals", "TEXT"),
+                          ("held_at", "REAL")):
+        _add_column(c, "meta_sources", column, ctype, is_pg)
+
+
 MIGRATIONS = [
     (1, "users.verified", _m1_users_verified),
     (2, "conversations.folder_id", _m2_conversations_folder_id),
@@ -420,6 +429,7 @@ MIGRATIONS = [
     (15, "user_memory.embedding+updated_at", _m15_user_memory_rank_columns),
     (16, "kag graph per-chunk provenance + rebuild", _m16_kag_graph_provenance),
     (17, "metagraph discovery backfill", _m17_metagraph_backfill),
+    (18, "meta_sources sync columns", _m18_metagraph_sync_columns),
 ]
 
 

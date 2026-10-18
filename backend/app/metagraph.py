@@ -4,9 +4,16 @@ automatically and kept as snapshots.
 Saving a connection queues a `metagraph_discover` job, in the same
 transaction as the connection row (connections.on_source_saved). The job lists
 the source's tables and views, reads their columns, fingerprints each object,
-and records a snapshot: what was added, changed and removed since the last one. The result is a graph —
-source → namespace → table/view → column — readable through /api/metagraph
-and mirrored to Neo4j when one is configured for it.
+and records a snapshot: what was added, changed and removed since the last
+one. The result is a graph — source → namespace → table/view → column —
+readable through /api/metagraph and mirrored to Neo4j when one is configured.
+
+It then stays current with no one asking (tick_once, the "metagraph_sync"
+scheduler): every few minutes each source's cheap change signal
+(Connector.change_signal) is compared with the one its last discovery saw, and
+only a source whose signal moved — or whose last full discovery is too old —
+is rediscovered. Events also queue one: a connection saved or reconnected, a
+supervised write against a source, or a signed webhook (/metagraph/events).
 
 Design:
 - STUDIO'S DATABASE IS THE SYSTEM OF RECORD. Snapshots, objects and columns
@@ -23,7 +30,10 @@ Design:
   Counts are computed over what the caller can see, so they leak nothing.
 - SAFE. A failed listing changes nothing. An object is marked removed only by
   a complete, successful snapshot — never by a truncated listing or one where
-  columns could not be read.
+  columns could not be read. A large removal (half the source, say — what a
+  revoked grant or a half-broken listing looks like) is HELD until a later
+  complete snapshot confirms the same set. Removed objects are tombstones,
+  hidden at once and purged only after STUDIO_METAGRAPH_TOMBSTONE_DAYS.
 - BOUNDED. At most STUDIO_METAGRAPH_MAX_OBJECTS objects and
   STUDIO_METAGRAPH_MAX_COLUMNS columns per object per snapshot.
 - INERT. Names and types are data: bound as SQL parameters and passed to
@@ -37,7 +47,7 @@ import time
 import urllib.request
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from . import connections, db, jobs, rbac
 from .auth import current_user
@@ -55,6 +65,60 @@ def _max_objects():
 
 def _max_columns():
     return max(1, int(os.getenv("STUDIO_METAGRAPH_MAX_COLUMNS", "1000")))
+
+
+def _env_int(name, default):
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+# How often the scheduler checks every source's change signal.
+_TICK_SECONDS = max(30, _env_int("STUDIO_METAGRAPH_TICK_SECONDS", 300))
+
+
+def _full_sync_seconds():
+    """Rediscover at least this often even when the signal has not moved (and
+    on this cadence for a source that offers no signal)."""
+    return max(60, _env_int("STUDIO_METAGRAPH_FULL_SYNC_SECONDS", 6 * 3600))
+
+
+def _stale_seconds():
+    """A discovery queued or running longer than this is presumed lost."""
+    return max(60, _env_int("STUDIO_METAGRAPH_STALE_SECONDS", 1800))
+
+
+def _tombstone_seconds():
+    return max(0, _env_int("STUDIO_METAGRAPH_TOMBSTONE_DAYS", 30)) * 86400
+
+
+def _hold_rule():
+    """(minimum count, fraction): a removal at least this large is held for
+    confirmation by a later snapshot."""
+    try:
+        fraction = float(os.getenv("STUDIO_METAGRAPH_HOLD_FRACTION", "0.5"))
+    except ValueError:
+        fraction = 0.5
+    return max(1, _env_int("STUDIO_METAGRAPH_HOLD_MIN", 5)), fraction
+
+
+def _confirm_delay_seconds():
+    """How long a held removal waits before the confirming rediscovery."""
+    return max(0, _env_int("STUDIO_METAGRAPH_CONFIRM_SECONDS", 600))
+
+
+def _retry_seconds():
+    """After the job's own retries, a failing source is tried again this often."""
+    return max(60, _env_int("STUDIO_METAGRAPH_RETRY_SECONDS", 900))
+
+
+def _snapshots_kept():
+    return max(10, _env_int("STUDIO_METAGRAPH_SNAPSHOTS_KEPT", 200))
+
+
+def ticker_enabled():
+    return os.getenv("STUDIO_METAGRAPH_TICKER", "1").lower() not in ("0", "false", "no")
 
 
 def init_tables():
@@ -106,7 +170,12 @@ def init_tables():
             error TEXT,
             mirror_status TEXT,
             mirror_error TEXT,
-            mirrored_at REAL
+            mirrored_at REAL,
+            queued_at REAL,
+            synced_signal TEXT,
+            checked_at REAL,
+            held_removals TEXT,
+            held_at REAL
         );
         """)
         c.commit()
@@ -114,35 +183,72 @@ def init_tables():
 
 # ── Discovery ────────────────────────────────────────────────────────────
 
-def enqueue(source, trigger, *, conn=None):
+def enqueue(source, trigger, *, conn=None, job_id=None, run_after=None):
     """Queue discovery of one source and mark it queued. `conn` enlists both in
     the caller's open transaction (a connection save), so the row, its job and
-    its status land together."""
-    job_id = jobs.enqueue(JOB_KIND, {"source": source, "trigger": trigger},
-                          max_attempts=3, conn=conn)
+    its status land together. `job_id` makes the enqueue idempotent: a second
+    call with the same id queues nothing and returns None."""
+    def go(c):
+        if job_id and c.execute("SELECT 1 FROM background_jobs WHERE id=?",
+                                (job_id,)).fetchone():
+            return None
+        jid = jobs.enqueue(JOB_KIND, {"source": source, "trigger": trigger},
+                           max_attempts=3, job_id=job_id, run_after=run_after, conn=c)
+        _mark_queued(c, source)
+        return jid
     if conn is not None:
-        _mark_queued(conn, source)
-    else:
-        with db.connect() as c:
-            _mark_queued(c, source)
-            c.commit()
-    return job_id
+        return go(conn)
+    with db.connect() as c:
+        jid = go(c)
+        c.commit()
+    return jid
 
 
 def _mark_queued(c, source):
     """'queued' until the job starts — unless a discovery is running now, in
     which case it stays 'running' (the queued one follows it)."""
+    now = time.time()
     row = c.execute("SELECT status FROM meta_sources WHERE source=?", (source,)).fetchone()
     if row is None:
-        c.execute("INSERT INTO meta_sources (source, status) VALUES (?, 'queued')", (source,))
+        c.execute("INSERT INTO meta_sources (source, status, queued_at) VALUES (?, 'queued', ?)",
+                  (source, now))
     elif row["status"] != "running":
-        c.execute("UPDATE meta_sources SET status='queued' WHERE source=?", (source,))
+        c.execute("UPDATE meta_sources SET status='queued', queued_at=? WHERE source=?",
+                  (now, source))
 
 
 @connections.on_source_saved
-def _discover_saved_source(name, trigger, conn=None):
-    """A connection was saved or reconnected: queue its discovery."""
+def _on_source_event(name, trigger, conn=None):
+    """Connection lifecycle: a saved or reconnected source is discovered; a
+    disconnected one leaves the Neo4j mirror (its record stays, hidden, for a
+    reconnect); a removed one becomes tombstones, purged after the grace."""
+    if trigger in ("disconnected", "removed"):
+        now = time.time()
+        with db.connect() as c:
+            if trigger == "removed":
+                c.execute("UPDATE meta_objects SET removed_at=? "
+                          "WHERE source=? AND removed_at IS NULL", (now, name))
+            c.execute("UPDATE meta_sources SET status=? WHERE source=?", (trigger, name))
+            c.commit()
+        mirror_drop(name)
+        return
     enqueue(name, trigger, conn=conn)
+
+
+def notify_changed(source, reason, *, key=None):
+    """Something outside discovery changed `source` — a supervised write, a
+    webhook. Queue a rediscovery unless one is already queued or running.
+    `key` dedupes repeated notices of the same event (a polled job status)."""
+    state = _state(source)
+    if state and state["status"] in ("queued", "running") \
+            and time.time() - (state.get("queued_at") or state.get("started_at") or 0) \
+            < _stale_seconds():
+        return None
+    try:
+        return enqueue(source, reason, job_id=f"metagraph-{key}" if key else None)
+    except Exception:
+        log.warning("metagraph: could not queue discovery of %s", source, exc_info=True)
+        return None
 
 
 def _fingerprint(kind, columns):
@@ -174,14 +280,25 @@ def _safe_error(exc):
     return f"{type(exc).__name__}: {text}"[:300]
 
 
+def _signal_of(connector):
+    try:
+        signal = connector.change_signal()
+    except Exception:
+        return None
+    return None if signal is None else str(signal)[:512]
+
+
 def _read_source(source):
-    """List and describe a source: (objects, complete). Raises when the source
-    cannot be listed at all. An object whose columns could not be read is
-    returned with columns=None, and makes the snapshot incomplete."""
+    """List and describe a source: (objects, complete, signal). Raises when the
+    source cannot be listed at all. An object whose columns could not be read
+    is returned with columns=None, and makes the snapshot incomplete. The
+    change signal is read FIRST, so a change made while the listing runs moves
+    the signal past what this snapshot saw and the next tick catches it."""
     from .connectors import get_connector
     connector = get_connector(source)
     if not connector.configured():
         raise RuntimeError(f"source '{source}' is not configured")
+    signal = _signal_of(connector)
     names = list(connector.list_tables())
     cap = _max_objects()
     complete = len(names) <= cap and not getattr(connector, "tables_truncated", False)
@@ -207,7 +324,7 @@ def _read_source(source):
         objects.append({"name": str(name)[:512], "kind": kind,
                         "namespace": _namespace_of(name, info),
                         "columns": None if columns is None else _clean_columns(columns)})
-    return objects, complete
+    return objects, complete, signal
 
 
 def _lock(c, source):
@@ -218,14 +335,17 @@ def _lock(c, source):
         c.execute("SELECT pg_advisory_xact_lock(?)", (key,))
 
 
-def _write(source, snapshot_id, objects, complete, now):
-    """Apply one snapshot in one transaction. Returns (added, changed, removed)."""
-    added = changed = removed = 0
+def _write(source, snapshot_id, objects, complete, now, signal=None):
+    """Apply one snapshot in one transaction. Returns (added, changed, removed,
+    held): `held` counts removals waiting for confirmation."""
+    added = changed = removed = held = 0
     with db.connect() as c:
         _lock(c, source)
         existing = {r["name"]: dict(r) for r in c.execute(
             "SELECT id, name, fingerprint, removed_at FROM meta_objects WHERE source=?",
             (source,)).fetchall()}
+        state = c.execute("SELECT held_removals, held_at FROM meta_sources WHERE source=?",
+                          (source,)).fetchone()
         seen = set()
         for obj in objects:
             seen.add(obj["name"])
@@ -263,21 +383,42 @@ def _write(source, snapshot_id, objects, complete, now):
             else:
                 c.execute("UPDATE meta_objects SET last_seen_at=?, snapshot_id=? WHERE id=?",
                           (now, snapshot_id, row["id"]))
+        status, held_names, held_at = ("ok" if complete else "partial"), None, None
         if complete:
-            for name, row in existing.items():
-                if name not in seen and row["removed_at"] is None:
+            gone = sorted(n for n, row in existing.items()
+                          if n not in seen and row["removed_at"] is None)
+            live = sum(1 for row in existing.values() if row["removed_at"] is None)
+            minimum, fraction = _hold_rule()
+            previous = json.loads(state["held_removals"]) if state and state["held_removals"] \
+                else None
+            if gone and len(gone) >= minimum and len(gone) >= fraction * live \
+                    and previous != gone:
+                # A large removal is held until a later complete snapshot
+                # reports exactly the same set gone (tick_once queues that one).
+                status, held_names, held_at, held = "held", gone, now, len(gone)
+            else:
+                for name in gone:
                     c.execute("UPDATE meta_objects SET removed_at=? WHERE id=?",
-                              (now, row["id"]))
+                              (now, existing[name]["id"]))
                     removed += 1
+        elif state and state["held_removals"]:
+            # An incomplete snapshot can neither confirm nor cancel a hold.
+            held_names, held_at = json.loads(state["held_removals"]), state["held_at"]
+            held = len(held_names)
         c.execute(
             "UPDATE meta_snapshots SET status=?, finished_at=?, objects=?, added=?, changed=?, "
-            "removed=?, complete=? WHERE id=?",
-            ("ok" if complete else "partial", time.time(), len(objects), added, changed,
-             removed, 1 if complete else 0, snapshot_id))
-        c.execute("UPDATE meta_sources SET status=?, snapshot_id=?, ok_at=?, error=NULL "
-                  "WHERE source=?", ("ok" if complete else "partial", snapshot_id, now, source))
+            "removed=?, complete=?, error=? WHERE id=?",
+            (status, time.time(), len(objects), added, changed, removed, 1 if complete else 0,
+             f"{held} removals held for confirmation" if status == "held" else None,
+             snapshot_id))
+        c.execute(
+            "UPDATE meta_sources SET status=?, snapshot_id=?, ok_at=?, error=NULL, "
+            "held_removals=?, held_at=?, "
+            "synced_signal=CASE WHEN ? = 1 THEN ? ELSE synced_signal END WHERE source=?",
+            (status, snapshot_id, now, json.dumps(held_names) if held_names else None, held_at,
+             1 if status in ("ok", "partial") else 0, signal, source))
         c.commit()
-    return added, changed, removed
+    return added, changed, removed, held
 
 
 def _put_columns(c, object_id, columns):
@@ -314,15 +455,17 @@ def discover(source, trigger="manual"):
     snapshot_id, now = str(uuid.uuid4()), time.time()
     _start(source, snapshot_id, trigger, now)
     try:
-        objects, complete = _read_source(source)
-        added, changed, removed = _write(source, snapshot_id, objects, complete, now)
+        objects, complete, signal = _read_source(source)
+        added, changed, removed, held = _write(source, snapshot_id, objects, complete, now,
+                                               signal)
     except Exception as exc:
         log.warning("metagraph: discovery of %s failed", source, exc_info=True)
         _fail(source, snapshot_id, _safe_error(exc))
         raise
     mirror(source)
     return {"source": source, "snapshot_id": snapshot_id, "objects": len(objects),
-            "added": added, "changed": changed, "removed": removed, "complete": complete}
+            "added": added, "changed": changed, "removed": removed, "held": held,
+            "complete": complete}
 
 
 @jobs.handler(JOB_KIND)
@@ -366,10 +509,18 @@ def visible_objects(user, source, *, with_columns=True):
     return rows
 
 
+def _live_sources():
+    """Sources configured and connected right now. A disconnected or removed
+    connection is absent, so its metadata is hidden even from a role that
+    still holds a governance grant for it."""
+    from .connectors import all_sources
+    return [s["name"] for s in all_sources() if s.get("configured")]
+
+
 def _visible_source(user, source):
     """404 for a source this user cannot use — indistinguishable from one that
     does not exist."""
-    if source not in rbac.allowed_sources(user["role"]):
+    if source not in rbac.allowed_sources(user["role"]) or source not in _live_sources():
         raise HTTPException(404, "Not found")
 
 
@@ -382,16 +533,26 @@ def _summary(user, source, objects=None):
     out = {"source": source, "status": state.get("status"), "discovered_at": state.get("ok_at"),
            "objects": len(objects), "kinds": kinds}
     if user["role"] == "admin":
+        held = json.loads(state["held_removals"]) if state.get("held_removals") else []
         out.update({"error": state.get("error"), "mirror_status": state.get("mirror_status"),
-                    "mirror_error": state.get("mirror_error")})
+                    "mirror_error": state.get("mirror_error"), "held": len(held),
+                    "checked_at": state.get("checked_at")})
     return out
+
+
+def _recently_removed(source, limit=50):
+    """Tombstones still inside their grace period, newest first (admins)."""
+    with db.connect() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT name, kind, removed_at FROM meta_objects WHERE source=? "
+            "AND removed_at IS NOT NULL ORDER BY removed_at DESC LIMIT ?",
+            (source, limit)).fetchall()]
 
 
 @router.get("/sources")
 def list_sources(user=Depends(current_user)):
     """Discovery status of every source this user may use."""
-    from .connectors import all_sources
-    names = [s["name"] for s in all_sources() if s.get("configured")]
+    names = _live_sources()
     allowed = set(rbac.allowed_sources(user["role"]))
     return {"sources": [_summary(user, n) for n in names if n in allowed]}
 
@@ -401,7 +562,10 @@ def get_source(source: str, user=Depends(current_user)):
     """The objects and columns of one source that this user may read."""
     _visible_source(user, source)
     objects = visible_objects(user, source)
-    return {**_summary(user, source, objects), "relations": objects}
+    out = {**_summary(user, source, objects), "relations": objects}
+    if user["role"] == "admin":
+        out["removed"] = _recently_removed(source)
+    return out
 
 
 @router.get("/sources/{source}/graph")
@@ -435,10 +599,133 @@ def request_discovery(source: str, user=Depends(current_user)):
     """Queue a fresh discovery of one source (administrators)."""
     if user["role"] != "admin":
         raise HTTPException(403, "Only administrators can run discovery")
-    from .connectors import all_sources
-    if source not in {s["name"] for s in all_sources() if s.get("configured")}:
+    if source not in _live_sources():
         raise HTTPException(404, "Not found")
     return {"job_id": enqueue(source, "manual"), "source": source}
+
+
+# ── Continuous sync: the scheduler tick ──────────────────────────────────
+
+def _due(state, signal, now):
+    """Why this source should be rediscovered now, or None."""
+    if state is None or not state.get("ok_at"):
+        if state and state.get("status") == "failed" \
+                and now - (state.get("started_at") or 0) < _retry_seconds():
+            return None
+        return "first_discovery"
+    if state.get("held_removals"):
+        # A held removal is confirmed by a fresh snapshot after the delay —
+        # never sooner, whatever the signal says.
+        held_for = now - (state.get("held_at") or now)
+        return "confirm_removals" if held_for >= _confirm_delay_seconds() else None
+    if state.get("status") == "failed":
+        return "retry" if now - (state.get("started_at") or 0) >= _retry_seconds() else None
+    if signal is not None and signal != state.get("synced_signal"):
+        return "change_detected"
+    if now - state["ok_at"] >= _full_sync_seconds():
+        return "scheduled"
+    return None
+
+
+def _check(source, now):
+    """Compare one source's change signal with what its last discovery saw and
+    queue a rediscovery when it moved (or is due anyway). Returns the reason
+    queued, or None."""
+    from .connectors import get_connector
+    state = _state(source)
+    if state and state["status"] in ("queued", "running") \
+            and now - (state.get("queued_at") or state.get("started_at") or 0) < _stale_seconds():
+        return None                      # one is on its way; a lost one goes stale
+    signal = _signal_of(get_connector(source))
+    with db.connect() as c:
+        cur = c.execute("UPDATE meta_sources SET checked_at=? WHERE source=?", (now, source))
+        if not cur.rowcount:
+            c.execute("INSERT INTO meta_sources (source, status, checked_at) VALUES (?,?,?)",
+                      (source, "not_discovered", now))
+        c.commit()
+    reason = _due(state, signal, now)
+    if reason:
+        enqueue(source, reason)
+    return reason
+
+
+def _purge_tombstones(now):
+    """Delete tombstones whose grace period is over, columns first."""
+    cutoff = now - _tombstone_seconds()
+    with db.connect() as c:
+        c.execute("DELETE FROM meta_columns WHERE object_id IN (SELECT id FROM meta_objects "
+                  "WHERE removed_at IS NOT NULL AND removed_at < ?)", (cutoff,))
+        cur = c.execute("DELETE FROM meta_objects WHERE removed_at IS NOT NULL "
+                        "AND removed_at < ?", (cutoff,))
+        c.commit()
+    return getattr(cur, "rowcount", 0) or 0
+
+
+def _prune_snapshots():
+    """Keep the newest snapshots per source; the objects carry the current state."""
+    keep = _snapshots_kept()
+    with db.connect() as c:
+        for row in c.execute("SELECT source, COUNT(*) n FROM meta_snapshots GROUP BY source "
+                             "HAVING COUNT(*) > ?", (keep,)).fetchall():
+            c.execute("DELETE FROM meta_snapshots WHERE source=? AND id NOT IN "
+                      "(SELECT id FROM meta_snapshots WHERE source=? "
+                      "ORDER BY started_at DESC LIMIT ?)", (row["source"], row["source"], keep))
+        c.commit()
+
+
+def tick_once():
+    """One scheduler pass ("metagraph_sync" lease): check every live source,
+    retry a failed Neo4j mirror, purge expired tombstones, prune snapshots.
+    One source's failure never stops the others."""
+    now = time.time()
+    queued = {}
+    for source in _live_sources():
+        try:
+            reason = _check(source, now)
+            if reason:
+                queued[source] = reason
+            state = _state(source) or {}
+            if state.get("mirror_status") == "failed":
+                mirror(source)
+        except Exception:
+            log.warning("metagraph: sync check of %s failed", source, exc_info=True)
+    try:
+        purged = _purge_tombstones(now)
+        _prune_snapshots()
+    except Exception:
+        log.warning("metagraph: tombstone purge failed", exc_info=True)
+        purged = 0
+    return {"queued": queued, "purged": purged}
+
+
+# ── Events from outside: a signed webhook ───────────────────────────────
+
+@router.post("/events", status_code=202)
+async def webhook(request: Request):
+    """A system that changed a source (a dbt run, a deployment) says so:
+    {"source": "..."} or {"sources": [...]}, signed with
+    STUDIO_METAGRAPH_WEBHOOK_SECRET as `X-Studio-Signature: sha256=<hex>` over
+    the raw body. Unset secret → this endpoint does not exist (404)."""
+    import hmac
+    secret = os.getenv("STUDIO_METAGRAPH_WEBHOOK_SECRET", "")
+    if not secret:
+        raise HTTPException(404, "Not found")
+    body = await request.body()
+    if len(body) > 64 * 1024:
+        raise HTTPException(413, "event too large")
+    expected = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, request.headers.get("x-studio-signature", "")):
+        raise HTTPException(401, "bad signature")
+    try:
+        event = json.loads(body or b"{}")
+    except ValueError:
+        raise HTTPException(400, "body must be JSON")
+    names = event.get("sources") or ([event["source"]] if event.get("source") else [])
+    if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+        raise HTTPException(400, "source must be a name or a list of names")
+    live = set(_live_sources())
+    queued = [n for n in names[:50] if n in live and notify_changed(n, "webhook")]
+    return {"queued": queued, "unknown": [n for n in names[:50] if n not in live]}
 
 
 # ── Neo4j mirror ─────────────────────────────────────────────────────────
@@ -548,6 +835,31 @@ def mirror(source):
         _mirror_state(source, "failed", _safe_error(exc))
         return False
     _mirror_state(source, "ok", None)
+    return True
+
+
+def mirror_drop(source):
+    """Remove one source's subgraph from Neo4j (a disconnected or removed
+    connection). Best-effort, like the mirror itself."""
+    try:
+        cfg = _mirror_cfg()
+    except MirrorRefused:
+        return False
+    if cfg is None:
+        return False
+    try:
+        _neo4j_commit(cfg, [
+            {"statement": "MATCH (c:StudioColumn {source: $source}) DETACH DELETE c",
+             "parameters": {"source": source}},
+            {"statement": "MATCH (t:StudioObject {source: $source}) DETACH DELETE t",
+             "parameters": {"source": source}},
+            {"statement": "MATCH (s:StudioSource {name: $source}) DETACH DELETE s",
+             "parameters": {"source": source}}])
+    except Exception as exc:
+        log.warning("metagraph: Neo4j removal of %s failed", source, exc_info=True)
+        _mirror_state(source, "failed", _safe_error(exc))
+        return False
+    _mirror_state(source, "removed", None)
     return True
 
 
