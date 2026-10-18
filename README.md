@@ -1416,6 +1416,38 @@ source's relevant tables first instead of whichever twelve come first, and
 every planned node's worker is grounded the same way. The turn's activity
 shows it: *grounded in the metadata graph: … (joined through …)*.
 
+**Across sources, for a whole organization** (`metaentities.py`).
+
+- **Canonical entities.** The keys that carry one business thing between
+  sources — `crm.customers.id` and `retail.retail_orders.customer_id` are both
+  a *Customer* — are proposed from naming once a key spans two sources (a
+  table named for it is the key's home; a `<name>_id` elsewhere references it;
+  a text key never maps to a number key). Nothing joins on a proposal. An
+  administrator, or the owner of that table, verifies or rejects each member
+  (`POST /api/metagraph/entities/members/{id}/review`); entities and members
+  can also be made by hand. Verified keys reach the multi-source planners
+  ("use them in a dependent node's task to carry ids") and let a cross-source
+  **blend** join parts that share no column name — the result says which
+  verified key it joined on (`join_basis`).
+- **Domain ownership.** A source or one of its tables gets a domain and an
+  owner (`PUT /api/metagraph/sources/{name}/ownership`); readers see both on
+  each table, and the owner may review the relationships and entity members on
+  what they own.
+- **Freshness monitoring.** Every source's metadata is *fresh*, *stale* (not
+  rediscovered in twice the full-sync cadence, or the scheduler has stopped
+  checking it), *failing* (discovery, relationships or the Neo4j mirror
+  failing) or *unknown*, with the reasons — `GET /api/metagraph/health` for
+  administrators, a word on each source's row for everyone, and a log line
+  whenever it changes.
+- **Permission-aware everywhere.** Entities show only the members a role may
+  read; a role without a source learns nothing about it — not its tables,
+  columns, keys, counts or rows — from entities, search
+  (`GET /api/metagraph/search?q=`), relationships or the planners' hints.
+- **Tenant isolation.** Studio is one organization per deployment (roles and
+  private M365 scopes isolate within it). Deployments that share one Neo4j are
+  kept apart: every mirrored node and edge carries `STUDIO_METAGRAPH_TENANT`
+  and every statement is scoped by it.
+
 **It stays current with no one asking.** The `metagraph_sync` scheduler (every
 `STUDIO_METAGRAPH_TICK_SECONDS`, 300 by default) reads each live source's
 *change signal* — one cheap catalog query: Postgres hashes every relation's

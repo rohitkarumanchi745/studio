@@ -46,6 +46,8 @@ export function metadataText(summary, now = Date.now() / 1000) {
       ? ` · ${summary.held} ${summary.held === 1 ? "removal" : "removals"} waiting to be confirmed`
       : " · removals waiting to be confirmed";
   }
+  if (summary.freshness === "stale") text += " · out of date";
+  if (summary.freshness === "failing" && summary.status !== "failed") text += " · needs attention";
   if (summary.mirror_status === "failed") text += " · Neo4j mirror failed";
   if (summary.mirror_status === "refused") text += " · Neo4j mirror refused";
   return text;

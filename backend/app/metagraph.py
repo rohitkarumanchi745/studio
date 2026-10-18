@@ -12,6 +12,14 @@ the tables join — declared keys, joins seen in views and in Studio's own
 queries, naming patterns — and what each view is derived from, every edge with
 its evidence, state and confidence.
 
+Across sources (metaentities.py): canonical entities — the keys that carry a
+customer or an order from one source to another — proposed from naming and
+used only once verified; domain ownership of sources and tables, with owners
+reviewing what they own; freshness monitoring of every source's metadata; and
+a permission-aware search over all of it. The Neo4j mirror is tenant-scoped
+(STUDIO_METAGRAPH_TENANT), so deployments sharing one Neo4j never see or
+overwrite each other's graph.
+
 It then stays current with no one asking (tick_once, the "metagraph_sync"
 scheduler): every few minutes each source's cheap change signal
 (Connector.change_signal) is compared with the one its last discovery saw, and
@@ -53,7 +61,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from . import connections, db, jobs, metarelations, rbac
+from . import connections, db, jobs, metaentities, metarelations, rbac
 from .auth import current_user
 
 log = logging.getLogger("studio.metagraph")
@@ -181,11 +189,13 @@ def init_tables():
             held_removals TEXT,
             held_at REAL,
             related_at REAL,
-            relate_error TEXT
+            relate_error TEXT,
+            freshness TEXT
         );
         """)
         c.commit()
     metarelations.init_tables()
+    metaentities.init_tables()
 
 
 # ── Discovery ────────────────────────────────────────────────────────────
@@ -556,15 +566,29 @@ def _summary(user, source, objects=None):
         kinds[o["kind"]] = kinds.get(o["kind"], 0) + 1
     names = {o["name"] for o in objects}
     joins = [r for r in metarelations.current(source, names) if r["kind"] == "join"]
+    fresh, reasons = metaentities.freshness(state, time.time(), tick_s=_TICK_SECONDS,
+                                            full_s=_full_sync_seconds())
     out = {"source": source, "status": state.get("status"), "discovered_at": state.get("ok_at"),
-           "objects": len(objects), "kinds": kinds, "relationships": len(joins)}
+           "objects": len(objects), "kinds": kinds, "relationships": len(joins),
+           "freshness": fresh}
     if user["role"] == "admin":
         held = json.loads(state["held_removals"]) if state.get("held_removals") else []
         out.update({"error": state.get("error"), "mirror_status": state.get("mirror_status"),
                     "mirror_error": state.get("mirror_error"), "held": len(held),
                     "checked_at": state.get("checked_at"),
-                    "relate_error": state.get("relate_error")})
+                    "relate_error": state.get("relate_error"),
+                    "freshness_reasons": reasons})
     return out
+
+
+def _user_names(ids):
+    ids = [i for i in ids if i]
+    if not ids:
+        return {}
+    with db.connect() as c:
+        ph = ",".join("?" for _ in ids)
+        return {r["id"]: r["name"] for r in c.execute(
+            f"SELECT id, name FROM users WHERE id IN ({ph})", tuple(ids)).fetchall()}
 
 
 def _recently_removed(source, limit=50):
@@ -589,6 +613,13 @@ def get_source(source: str, user=Depends(current_user)):
     """The objects and columns of one source that this user may read."""
     _visible_source(user, source)
     objects = visible_objects(user, source)
+    own = metaentities.ownership(source)
+    names = _user_names({e.get("owner_id") for e in own.values()})
+    for obj in objects:
+        entry = own.get(obj["name"]) or own.get("") or {}
+        obj["domain"] = (own.get(obj["name"]) or {}).get("domain") or \
+            (own.get("") or {}).get("domain")
+        obj["owner"] = names.get(entry.get("owner_id"))
     out = {**_summary(user, source, objects), "relations": objects}
     if user["role"] == "admin":
         out["removed"] = _recently_removed(source)
@@ -656,9 +687,16 @@ def source_paths(source: str, tables: str, min_confidence: float = 0.6,
 def review_relationship(source: str, rel_id: str, body: dict, user=Depends(current_user)):
     """An administrator confirms or rejects a relationship ({"decision":
     "verified" | "rejected" | "clear"}). The review outlives recomputation."""
-    if user["role"] != "admin":
-        raise HTTPException(403, "Only administrators can review relationships")
     _visible_source(user, source)
+    with db.connect() as c:
+        row = c.execute("SELECT from_object, to_object FROM meta_relationships WHERE id=? "
+                        "AND source=?", (rel_id, source)).fetchone()
+    if row is None:
+        raise HTTPException(404, "Not found")
+    if not (metaentities.may_review(user, source, row["from_object"])
+            or metaentities.may_review(user, source, row["to_object"])):
+        raise HTTPException(403, "Only administrators or the owner of these tables can "
+                                 "review this relationship")
     try:
         found = metarelations.review(source, rel_id, (body or {}).get("decision"), user)
     except ValueError as exc:
@@ -668,6 +706,130 @@ def review_relationship(source: str, rel_id: str, body: dict, user=Depends(curre
     db.log_activity(user, "metagraph_review", prompt=f"{rel_id}: {body.get('decision')}",
                     source=source)
     return {"id": rel_id, "decision": body.get("decision")}
+
+
+@router.get("/entities")
+def list_entities(user=Depends(current_user)):
+    """Canonical entities and the members this user may see. Nothing about a
+    hidden member leaves; rejected members only for administrators."""
+    return {"entities": metaentities.visible(user, _live_sources(),
+                                             include_rejected=user["role"] == "admin")}
+
+
+@router.post("/entities", status_code=201)
+def create_entity(body: dict, user=Depends(current_user)):
+    if user["role"] != "admin":
+        raise HTTPException(403, "Only administrators can create entities")
+    try:
+        eid = metaentities.create_entity((body or {}).get("name"), body.get("description"),
+                                         body.get("domain"), user)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"id": eid}
+
+
+@router.post("/entities/{entity_id}/members", status_code=201)
+def add_entity_member(entity_id: str, body: dict, user=Depends(current_user)):
+    """Map a column to an entity by hand (verified at once): administrators,
+    or the owner of that table."""
+    body = body or {}
+    source, obj, column = body.get("source"), body.get("object"), body.get("column")
+    if source not in _live_sources() or source not in rbac.allowed_sources(user["role"]) \
+            or obj not in set(rbac.allowed_tables(user["role"], source, [obj])):
+        raise HTTPException(404, "Not found")
+    try:
+        mid = metaentities.add_member(entity_id, source, obj, column, user)
+    except PermissionError:
+        raise HTTPException(403, "Only administrators or this table's owner can map it")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    if mid is None:
+        raise HTTPException(404, "Not found")
+    db.log_activity(user, "metagraph_map", prompt=f"{entity_id}: {obj}.{column}", source=source)
+    return {"id": mid}
+
+
+@router.post("/entities/members/{member_id}/review")
+def review_entity_member(member_id: str, body: dict, user=Depends(current_user)):
+    """Verify, reject, or return to proposed one entity member: administrators,
+    or the owner of the member's table."""
+    try:
+        row = metaentities.review_member(member_id, (body or {}).get("decision"), user)
+    except PermissionError:
+        raise HTTPException(403, "Only administrators or this table's owner can review it")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    if row is None:
+        raise HTTPException(404, "Not found")
+    db.log_activity(user, "metagraph_entity_review",
+                    prompt=f"{member_id}: {body.get('decision')}", source=row["source"])
+    return {"id": member_id, "decision": body.get("decision")}
+
+
+@router.put("/sources/{source}/ownership")
+def set_ownership(source: str, body: dict, user=Depends(current_user)):
+    """Give a source — or one of its tables — a domain and an owner
+    ({"domain", "owner_email", "object"}); empty values clear it."""
+    if user["role"] != "admin":
+        raise HTTPException(403, "Only administrators can assign ownership")
+    _visible_source(user, source)
+    body = body or {}
+    owner_id = None
+    if body.get("owner_email"):
+        owner = db.get_user_by_email(str(body["owner_email"]).strip().lower())
+        if not owner:
+            raise HTTPException(400, "No Studio user with that email")
+        owner_id = owner["id"]
+    metaentities.set_ownership(source, body.get("object") or "", body.get("domain"), owner_id,
+                               user)
+    db.log_activity(user, "metagraph_ownership", source=source,
+                    prompt=f"{body.get('object') or '(source)'}: {body.get('domain')} / "
+                           f"{body.get('owner_email')}")
+    return {"source": source, "object": body.get("object") or "",
+            "domain": body.get("domain"), "owner_id": owner_id}
+
+
+@router.get("/health")
+def metadata_health(user=Depends(current_user)):
+    """Freshness of every live source's metadata, with the reasons
+    (administrators)."""
+    if user["role"] != "admin":
+        raise HTTPException(403, "Only administrators can see metadata health")
+    now, rows = time.time(), []
+    for source in _live_sources():
+        fresh, reasons = metaentities.freshness(_state(source), now, tick_s=_TICK_SECONDS,
+                                                full_s=_full_sync_seconds())
+        rows.append({"source": source, "freshness": fresh, "reasons": reasons})
+    worst = next((f for f in ("failing", "stale", "unknown")
+                  if any(r["freshness"] == f for r in rows)), "fresh")
+    return {"status": worst, "sources": rows}
+
+
+@router.get("/search")
+def search(q: str, user=Depends(current_user)):
+    """Tables, columns and entities matching `q` across every source this user
+    may use — only what the user may read; nothing else is counted."""
+    term = " ".join(str(q or "").lower().split())[:80]
+    if len(term) < 2:
+        raise HTTPException(400, "search for at least two characters")
+    live = set(_live_sources())
+    hits = []
+    for source in sorted(live & set(rbac.allowed_sources(user["role"]))):
+        for obj in visible_objects(user, source):
+            if term in obj["name"].lower():
+                hits.append({"type": obj["kind"], "source": source, "object": obj["name"]})
+            for col in obj["columns"]:
+                if term in col["name"].lower():
+                    hits.append({"type": "column", "source": source, "object": obj["name"],
+                                 "column": col["name"], "data_type": col["type"]})
+            if len(hits) >= 100:
+                break
+    for ent in metaentities.visible(user, live):
+        if term in ent["name"].lower():
+            hits.append({"type": "entity", "entity": ent["name"],
+                         "members": [f"{m['source']}.{m['object']}.{m['column']}"
+                                     for m in ent["members"]]})
+    return {"q": term, "results": hits[:100]}
 
 
 @router.post("/sources/{source}/discover", status_code=202)
@@ -771,7 +933,30 @@ def tick_once():
     except Exception:
         log.warning("metagraph: tombstone purge failed", exc_info=True)
         purged = 0
+    live = _live_sources()
+    try:
+        metaentities.propose(live)
+        mirror_entities()
+    except Exception:
+        log.warning("metagraph: entity proposals failed", exc_info=True)
+    _watch_freshness(live, now)
     return {"queued": queued, "purged": purged}
+
+
+def _watch_freshness(sources, now):
+    """Record each source's freshness and log every change of it, so a source
+    going stale or failing is visible in the logs as well as on its row."""
+    for source in sources:
+        state = _state(source)
+        fresh, reasons = metaentities.freshness(state, now, tick_s=_TICK_SECONDS,
+                                                full_s=_full_sync_seconds())
+        if state and state.get("freshness") != fresh:
+            (log.warning if fresh in ("stale", "failing") else log.info)(
+                "metagraph: %s metadata is %s%s", source, fresh,
+                f" ({'; '.join(reasons)})" if reasons else "")
+            with db.connect() as c:
+                c.execute("UPDATE meta_sources SET freshness=? WHERE source=?", (fresh, source))
+                c.commit()
 
 
 # ── Events from outside: a signed webhook ───────────────────────────────
@@ -808,6 +993,12 @@ async def webhook(request: Request):
 
 class MirrorRefused(RuntimeError):
     pass
+
+
+def _tenant():
+    """The deployment's partition of a shared Neo4j. Every mirrored node and
+    edge carries it and every statement is scoped by it."""
+    return (os.getenv("STUDIO_METAGRAPH_TENANT", "").strip() or "studio")[:64]
 
 
 def _mirror_cfg():
@@ -885,42 +1076,43 @@ def mirror(source):
              "confidence": r["confidence"], "evidence": json.dumps(r["evidence"])}
             for r in metarelations.current(source, {o["name"] for o in objects},
                                            include_rejected=True)]
-    params = {"source": source, "now": time.time(), "objects": objects, "columns": columns,
+    params = {"tenant": _tenant(), "source": source, "now": time.time(),
+              "objects": objects, "columns": columns,
               "names": [o["name"] for o in objects],
               "pairs": [[col["object"], col["name"]] for col in columns],
               "relationships": rels,
               "rel_keys": [[r["kind"], r["from"], r["from_columns"], r["to"], r["to_columns"]]
                            for r in rels]}
     statements = [
-        {"statement": "MERGE (s:StudioSource {name: $source}) SET s.synced_at = $now",
+        {"statement": "MERGE (s:StudioSource {tenant: $tenant, name: $source}) SET s.synced_at = $now",
          "parameters": params},
         {"statement": "UNWIND $objects AS o "
-                      "MERGE (t:StudioObject {source: $source, name: o.name}) "
+                      "MERGE (t:StudioObject {tenant: $tenant, source: $source, name: o.name}) "
                       "SET t.kind = o.kind, t.namespace = o.namespace, "
                       "t.fingerprint = o.fingerprint, t.column_count = o.column_count "
-                      "WITH t MATCH (s:StudioSource {name: $source}) MERGE (s)-[:CONTAINS]->(t)",
+                      "WITH t MATCH (s:StudioSource {tenant: $tenant, name: $source}) MERGE (s)-[:CONTAINS]->(t)",
          "parameters": params},
         {"statement": "UNWIND $columns AS col "
-                      "MATCH (t:StudioObject {source: $source, name: col.object}) "
-                      "MERGE (c:StudioColumn {source: $source, object: col.object, name: col.name}) "
+                      "MATCH (t:StudioObject {tenant: $tenant, source: $source, name: col.object}) "
+                      "MERGE (c:StudioColumn {tenant: $tenant, source: $source, object: col.object, name: col.name}) "
                       "SET c.type = col.type, c.ordinal = col.ordinal "
                       "MERGE (t)-[:HAS_COLUMN]->(c)",
          "parameters": params},
-        {"statement": "MATCH (c:StudioColumn {source: $source}) "
+        {"statement": "MATCH (c:StudioColumn {tenant: $tenant, source: $source}) "
                       "WHERE NOT [c.object, c.name] IN $pairs DETACH DELETE c",
          "parameters": params},
-        {"statement": "MATCH (t:StudioObject {source: $source}) "
+        {"statement": "MATCH (t:StudioObject {tenant: $tenant, source: $source}) "
                       "WHERE NOT t.name IN $names DETACH DELETE t",
          "parameters": params},
         {"statement": "UNWIND $relationships AS r "
-                      "MATCH (a:StudioObject {source: $source, name: r.from}) "
-                      "MATCH (b:StudioObject {source: $source, name: r.to}) "
+                      "MATCH (a:StudioObject {tenant: $tenant, source: $source, name: r.from}) "
+                      "MATCH (b:StudioObject {tenant: $tenant, source: $source, name: r.to}) "
                       "MERGE (a)-[e:RELATES {kind: r.kind, from_columns: r.from_columns, "
                       "to_columns: r.to_columns}]->(b) "
                       "SET e.state = r.state, e.confidence = r.confidence, "
                       "e.evidence = r.evidence",
          "parameters": params},
-        {"statement": "MATCH (a:StudioObject {source: $source})-[e:RELATES]->(b:StudioObject) "
+        {"statement": "MATCH (a:StudioObject {tenant: $tenant, source: $source})-[e:RELATES]->(b:StudioObject) "
                       "WHERE NOT [e.kind, a.name, e.from_columns, b.name, e.to_columns] "
                       "IN $rel_keys DELETE e",
          "parameters": params},
@@ -946,17 +1138,67 @@ def mirror_drop(source):
         return False
     try:
         _neo4j_commit(cfg, [
-            {"statement": "MATCH (c:StudioColumn {source: $source}) DETACH DELETE c",
-             "parameters": {"source": source}},
-            {"statement": "MATCH (t:StudioObject {source: $source}) DETACH DELETE t",
-             "parameters": {"source": source}},
-            {"statement": "MATCH (s:StudioSource {name: $source}) DETACH DELETE s",
-             "parameters": {"source": source}}])
+            {"statement": "MATCH (c:StudioColumn {tenant: $tenant, source: $source}) DETACH DELETE c",
+             "parameters": {"tenant": _tenant(), "source": source}},
+            {"statement": "MATCH (t:StudioObject {tenant: $tenant, source: $source}) DETACH DELETE t",
+             "parameters": {"tenant": _tenant(), "source": source}},
+            {"statement": "MATCH (s:StudioSource {tenant: $tenant, name: $source}) DETACH DELETE s",
+             "parameters": {"tenant": _tenant(), "source": source}}])
     except Exception as exc:
         log.warning("metagraph: Neo4j removal of %s failed", source, exc_info=True)
         _mirror_state(source, "failed", _safe_error(exc))
         return False
     _mirror_state(source, "removed", None)
+    return True
+
+
+def mirror_entities():
+    """Rewrite this tenant's entities in Neo4j: (:StudioEntity)-[:KEYED_BY
+    {column, role, state}]->(:StudioObject). Best-effort, like the rest."""
+    try:
+        cfg = _mirror_cfg()
+    except MirrorRefused:
+        return False
+    if cfg is None:
+        return False
+    with db.connect() as c:
+        ents = [dict(r) for r in c.execute("SELECT id, name, description, domain "
+                                           "FROM meta_entities").fetchall()]
+        members = [dict(r) for r in c.execute(
+            "SELECT entity_id, source, object, column_name, role, state, confidence "
+            "FROM meta_entity_members WHERE removed_at IS NULL").fetchall()]
+    names = {e["id"]: e["name"] for e in ents}
+    rows = [{"entity": names[m["entity_id"]], "source": m["source"], "object": m["object"],
+             "column": m["column_name"], "role": m["role"], "state": m["state"],
+             "confidence": m["confidence"]} for m in members if m["entity_id"] in names]
+    params = {"tenant": _tenant(),
+              "entities": [{"name": e["name"], "description": e["description"],
+                            "domain": e["domain"]} for e in ents],
+              "members": rows, "names": [e["name"] for e in ents],
+              "keys": [[r["entity"], r["source"], r["object"], r["column"]] for r in rows]}
+    try:
+        _neo4j_commit(cfg, [
+            {"statement": "UNWIND $entities AS e "
+                          "MERGE (n:StudioEntity {tenant: $tenant, name: e.name}) "
+                          "SET n.description = e.description, n.domain = e.domain",
+             "parameters": params},
+            {"statement": "UNWIND $members AS m "
+                          "MATCH (n:StudioEntity {tenant: $tenant, name: m.entity}) "
+                          "MATCH (t:StudioObject {tenant: $tenant, source: m.source, "
+                          "name: m.object}) "
+                          "MERGE (n)-[k:KEYED_BY {column: m.column}]->(t) "
+                          "SET k.role = m.role, k.state = m.state, k.confidence = m.confidence",
+             "parameters": params},
+            {"statement": "MATCH (n:StudioEntity {tenant: $tenant})-[k:KEYED_BY]->"
+                          "(t:StudioObject) WHERE NOT [n.name, t.source, t.name, k.column] "
+                          "IN $keys DELETE k",
+             "parameters": params},
+            {"statement": "MATCH (n:StudioEntity {tenant: $tenant}) "
+                          "WHERE NOT n.name IN $names DETACH DELETE n",
+             "parameters": params}])
+    except Exception:
+        log.warning("metagraph: Neo4j entity mirror failed", exc_info=True)
+        return False
     return True
 
 
