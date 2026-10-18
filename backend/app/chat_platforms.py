@@ -212,7 +212,7 @@ new named DAG/job starts with an empty payload, even on the same platform.
     tail = text[command.end():].strip() if command else text
     if not selected:
         # Recognize external-platform commands even when no platform was
-        # supplied; leave generic local SQL pipeline commands to chat_pipelines.
+        # supplied; anything else is an ordinary chat question.
         if not re.search(r"\b(?:dag|databricks|airflow|dbt|kubernetes|k8s)\b", tail, re.I):
             return None
     reference = bool(re.match(r"^(?:(?:this|that|the) (?:pipeline|job|run|dag)|it|this|that)\b", tail, re.I))

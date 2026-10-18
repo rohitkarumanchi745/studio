@@ -162,14 +162,14 @@ def test_confluence_text_cannot_authorize_a_cross_schema_read(client, monkeypatc
     assert not plan["tasks"]
 
 
-def test_explicit_read_only_mode_cannot_be_redirected_to_airflow(client):
-    message = ask(
-        client,
-        "Build an Airflow pipeline for monthly revenue by region",
-        pipeline_action="build", pipeline_mode="read_only_sql",
-    )["message"]
-    assert message["pipeline"]["execution_mode"] == "read_only_sql"
-    assert "artifact" not in message["pipeline"]
+def test_removed_read_only_mode_is_refused_not_redirected_to_airflow(client):
+    response = client.post("/api/chat", json={
+        "prompt": "Build an Airflow pipeline for monthly revenue by region",
+        "source": "demo", "table": "*", "conversation_id": None,
+        "pipeline_action": "build", "pipeline_mode": "read_only_sql"})
+    assert response.status_code == 400
+    assert "removed" in response.json()["detail"]
+    assert db.list_conversations(client.user["id"]) == []
 
 
 def test_natural_followup_submits_exact_plan_for_approval_only(client):

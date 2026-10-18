@@ -6,8 +6,8 @@ import ShareDialog from "./ShareDialog";
 
 export default function Sidebar({
   conversations, activeId, onSelect, onNew, onDelete, onActivity, onCollapse,
-  onDashboards, onRename, onRefresh, onKeysChanged, onQueries, onVisuals, onPipelines, onGovernance, onSemantic, onJobs, onPyBuild,
-  onSessions, onAgents, onFlow, onSkills, onMemory, onLearnedRules, onAutopilot, onToolBuilder, onKag, onRedTeam,
+  onDashboards, onRename, onRefresh, onKeysChanged, onQueries, onVisuals, onGovernance, onSemantic, onJobs, onPyBuild,
+  onSessions, onAgents, onSkills, onMemory, onLearnedRules, onAutopilot, onToolBuilder, onKag, onRedTeam,
 }) {
   const user = getUser();
   const [menu, setMenu] = useState(null);     // {id, title, x, y, canEdit, owned, folderId}
@@ -445,12 +445,6 @@ export default function Sidebar({
             ✨ Visuals — D3 & artifacts
           </button>
         )}
-        <button className="logout" onClick={onPipelines} style={{ marginBottom: 8 }}>
-          ⑃ Pipelines
-        </button>
-        <button className="logout" onClick={onFlow} style={{ marginBottom: 8 }}>
-          ⇉ Pipeline flow
-        </button>
         <button className="logout" onClick={onJobs} style={{ marginBottom: 8 }}>
           ⚙ Jobs
         </button>

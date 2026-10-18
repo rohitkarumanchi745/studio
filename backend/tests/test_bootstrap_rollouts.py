@@ -3,7 +3,7 @@
 A new deployment cannot train a tool_call adapter (router.bitnet_ready's second
 gate) because training needs reward-labeled rollouts and there is no usage yet.
 The bootstrap script breaks that circle by pairing app/suggest.py's
-schema-grounded questions with app/pipelines.py's deterministic drafter and
+schema-grounded questions with app/sqldraft.py's deterministic drafter and
 VERIFYING every pair through the real gateway.
 
 What these tests pin is the part that makes the corpus worth training on:

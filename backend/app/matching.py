@@ -3,8 +3,8 @@
 match_tables() scores each table by the overlap between a request's terms and
 the table's name / column names. It used to live in catalog.py, but catalog
 is a router that pulls in gateway, governance, suggest (→ agent) and more, so
-callers that only wanted the ranking (chat, pipelines) had to import the whole
-catalog — pipelines did so lazily to stay off that import chain. Here it has
+callers that only wanted the ranking (chat) had to import the whole
+catalog. Here it has
 no dependencies at all, so anyone can import it at module level.
 
 Invariants:

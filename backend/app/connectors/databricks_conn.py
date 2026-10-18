@@ -1,12 +1,11 @@
 """Databricks SQL warehouse connector. Configure via env (see .env.example);
 requires `pip install databricks-sql-connector` (commented in requirements.txt).
 
-This module also owns the shape of a Databricks **Jobs run-submit body**
-(`build_submission` / `validate_submission`), because the Jobs API is far
-pickier than "a dict with tasks in it": every task needs a `task_key`, exactly
-one recognized task type, and compute to run on. Building and checking that
-body here — next to the credentials it needs — keeps flow.py from hand-rolling
-a payload the endpoint would reject with a 400.
+This module also checks the shape of a Databricks **Jobs run-submit body**
+(`validate_submission`), because the Jobs API is far pickier than "a dict with
+tasks in it": every task needs a `task_key`, exactly one recognized task type,
+and compute to run on. Checking that body here — next to the credentials it
+needs — refuses a payload the endpoint would reject with a 400 before it is sent.
 """
 import logging
 import os
@@ -84,62 +83,6 @@ def warehouse_id():
     """The configured SQL warehouse id, or "" when unset. Read from the
     environment on every call, like every other Databricks setting."""
     return os.getenv(WAREHOUSE_VAR, "").strip()
-
-
-def _task_key(name, used):
-    """A stable, API-legal task_key slugged from a step name, made unique
-    within the run. Two steps that slug identically (or repeat a name) must
-    still get DIFFERENT keys — the Jobs API rejects a duplicate task_key, and
-    silently merging two steps into one task would drop a verified statement."""
-    base = re.sub(r"[^A-Za-z0-9_-]+", "_", (name or "").strip()).strip("_-")[:90]
-    base = base or "step"
-    key = base
-    n = 1
-    while key in used:
-        n += 1
-        key = f"{base}_{n}"[:100]
-    used.add(key)
-    return key
-
-
-def build_submission(steps, run_name=None, warehouse=None):
-    """Build a Jobs 2.1 run-submit body from verified SQL steps.
-
-    `steps` is a sequence of (name, sql) pairs — the flow's verified steps.
-    Each becomes a `sql_task` with a unique task_key and the warehouse that
-    runs it, which is the minimum the API accepts.
-
-    The statement rides inline under sql_task.query.query_text; a workspace
-    that only runs SAVED queries would need the query registered first and its
-    id substituted in the same slot. Either way `warehouse_id` is the compute
-    and is mandatory — so with no warehouse configured this REFUSES (ValueError
-    naming DATABRICKS_WAREHOUSE_ID) instead of returning a body that 400s.
-    """
-    wid = (warehouse if warehouse is not None else warehouse_id()).strip()
-    if not wid:
-        raise ValueError(
-            f"No Databricks SQL warehouse is configured — set {WAREHOUSE_VAR} to the "
-            "warehouse that should run the job's SQL tasks. Refusing to submit a "
-            "Jobs run the API would reject.")
-
-    used = set()
-    tasks = []
-    for name, sql in steps:
-        statement = (sql or "").strip()
-        if not statement:
-            continue
-        tasks.append({
-            "task_key": _task_key(name, used),
-            "sql_task": {"warehouse_id": wid, "query": {"query_text": statement}},
-        })
-    if not tasks:
-        raise ValueError("No verified SQL steps to submit — nothing to build a job from.")
-
-    body = {"tasks": tasks}
-    if run_name:
-        body["run_name"] = str(run_name)[:100]
-    validate_submission(body)      # never hand out a body we would refuse to post
-    return body
 
 
 def _check_task(i, task, seen):

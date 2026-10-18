@@ -13,7 +13,7 @@ an ImportError at boot. This test makes the layering explicit and keeps it:
   break lazy cycles) may import only what LAYERS lists, so a cycle cannot
   silently return through them.
 * ``test_broken_edges_stay_broken`` — the specific edges removed by the split
-  (governance → rbac, pipelines → catalog) must not come back in either graph.
+  (governance → rbac) must not come back in either graph.
 * ``test_report_lazy_cycles`` — prints the strongly connected components of the
   lazy graph (and of the combined graph, for information) and asserts that
   only the cycles in INTENTIONAL_LAZY_CYCLES exist. Those encode real runtime
@@ -56,10 +56,10 @@ LAYERS: dict[str, set[str]] = {
 }
 
 # Edges that the policies.py / matching.py split removed. If one of these
-# reappears the governance ↔ rbac or pipelines → catalog → … chain is back.
+# reappears the governance ↔ rbac chain is back. (pipelines → catalog went
+# with pipelines.py.)
 BROKEN_EDGES = [
     ("governance", "rbac"),
-    ("pipelines", "catalog"),
 ]
 
 # Lazy (in-function) cycles that are intentional because they encode a genuine

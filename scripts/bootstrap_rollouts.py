@@ -15,7 +15,7 @@ WHAT THIS DOES
     and no organic usage:
 
       app/suggest.py      questions grounded in a table's REAL schema
-      app/pipelines.py    _draft_sql: table + columns + prompt -> aggregate SQL
+      app/sqldraft.py     draft_sql: table + columns + prompt -> aggregate SQL
       app/grains.py       the prompt's time grain -> the dialect's bucket
       app/gateway.py      the ONE data gate — RBAC, guard, governance, audit
 
@@ -82,7 +82,7 @@ if BACKEND not in sys.path:
     sys.path.insert(0, BACKEND)
 
 from app import (agent, catalog, db, gateway, governance, grains,  # noqa: E402
-                 pipelines, rbac, suggest)
+                 rbac, sqldraft, suggest)
 from app.connectors import all_sources  # noqa: E402
 from app.matching import _tokens  # noqa: E402
 
@@ -115,7 +115,7 @@ DEFAULT_MAX_ROWS = 200
 # is also the main source of distinct SQL shapes.
 TEMPLATE_GRAINS = ("month", "quarter", "year")
 
-# Question constructs app/pipelines.py's _draft_sql provably cannot express: it
+# Question constructs app/sqldraft.py's draft_sql provably cannot express: it
 # emits one bucketed/grouped SUM ordered by the first column. A question asking
 # for a ranking, a window function or a relationship is dropped rather than
 # paired with SQL that does not answer it.
@@ -289,7 +289,7 @@ def pairs_for_table(connector, table, columns, rows=None, use_llm=False):
     is testable without a warehouse."""
     out = []
     for q in question_set(connector, table, columns, rows, use_llm=use_llm):
-        sql = pipelines._draft_sql(connector, table, columns, q["prompt"])
+        sql = sqldraft.draft_sql(connector, table, columns, q["prompt"])
         ok, reason = is_faithful(q["prompt"], sql, columns, rows)
         out.append({"prompt": q["prompt"], "sql": sql, "origin": q["origin"],
                     "table": table, "faithful": ok, "reason": reason})

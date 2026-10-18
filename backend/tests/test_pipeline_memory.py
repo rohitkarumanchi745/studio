@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from app import chat_pipelines, db, governance, jobs, lightning, pipeline_memory, pipelines, queries
+from app import db, governance, jobs, lightning, pipeline_memory, queries
 from app.connectors import demo
 
 
@@ -22,12 +22,10 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "IS_PG", False)
     monkeypatch.setattr(demo, "WAREHOUSE_PATH", str(tmp_path / "warehouse.db"))
     monkeypatch.delenv("STUDIO_AGL_URL", raising=False)
-    monkeypatch.setattr(pipelines.agent, "llm_available", lambda *a, **kw: False)
-    monkeypatch.setattr(pipelines, "_pick_repo", lambda *a: None)
     governance._STATE.update(doc=None, yaml="", source=None)
     governance._FRESH.update(at=0.0, ident=None)
     db.init_db()
-    for module in (jobs, pipelines, queries, governance):
+    for module in (jobs, queries, governance):
         module.init_tables()
     demo.seed()
     yield
@@ -160,148 +158,3 @@ def test_malformed_memory_is_ignored_not_an_error():
     assert candidates() == []
 
 
-def test_exact_successful_recipe_is_verified_again_without_model(monkeypatch):
-    tid = record()
-    verified = []
-    real = queries.verify_sql
-
-    def verify(*args, **kw):
-        verified.append(args[3])
-        return real(*args, **kw)
-
-    monkeypatch.setattr(queries, "verify_sql", verify)
-    monkeypatch.setattr(pipelines, "build", lambda *a, **kw: pytest.fail("redrafted exact successful SQL"))
-    result = chat_pipelines.build(USER, "Build a pipeline for " + PROMPT, source="demo", tables=["sales"])
-    assert verified == [SQL]
-    assert result["status"] == "ready" and result["steps"][0]["sql"] == SQL
-    assert result["generation"] == "memory"
-    assert result["memory"]["reuse_type"] == "exact_reverified"
-    assert result["memory"]["trace_id"] == tid
-
-
-def test_exact_old_recipe_that_no_longer_executes_is_blocked(monkeypatch):
-    record()
-    monkeypatch.setattr(queries, "verify_sql", lambda *a, **kw: {"ok": False, "error": "column removed"})
-    result = chat_pipelines.build(USER, PROMPT, source="demo")
-    assert result["status"] == "blocked" and not result["steps"]
-    assert result["dropped"][0]["error"] == "column removed"
-
-
-def test_changed_requirement_without_model_never_runs_old_parameters(monkeypatch):
-    record()
-    monkeypatch.setattr(queries, "verify_sql", lambda *a, **kw: pytest.fail("unadapted SQL executed"))
-    result = chat_pipelines.build(USER, "Revenue by region for 'South'", source="demo")
-    assert result["status"] == "blocked" and not result["steps"]
-    assert result["memory"]["reuse_type"] == "adaptation_required"
-    assert "request differs" in result["warnings"][0]
-
-
-def test_similar_prompt_is_adapted_by_model_and_verified_as_new_sql(monkeypatch):
-    record()
-    seen = {}
-    adapted = SQL.replace("'North'", "'South'")  # model fixture, not application replacement
-
-    def model(user, source, schemas, prompt, spec):
-        seen.update(prompt=prompt, source=source, spec=spec)
-        return [{"name": "South revenue", "table": "sales", "sql": adapted}]
-
-    monkeypatch.setattr(pipelines.agent, "llm_available", lambda *a: True)
-    monkeypatch.setattr(pipelines, "_llm_steps", model)
-    requirement = "Revenue by region for 'South'"
-    result = chat_pipelines.build(USER, requirement, source="demo", tables=["sales"], model="stub:model")
-    assert result["status"] == "ready" and result["steps"][0]["sql"] == adapted
-    assert result["memory"]["reuse_type"] == "model_adapted"
-    assert result["prompt"] == requirement
-    assert SQL in seen["prompt"] and requirement in seen["prompt"]
-    assert seen["prompt"].index(requirement) < seen["prompt"].index("Best matching proven")
-    assert "CURRENT request" in seen["prompt"] and seen["spec"] == "stub:model"
-
-
-def test_adaptation_model_failure_never_returns_runnable_deterministic_fallback(monkeypatch):
-    record()
-    monkeypatch.setattr(pipelines.agent, "llm_available", lambda *a: True)
-
-    def fail(*a):
-        raise RuntimeError("model down")
-
-    monkeypatch.setattr(pipelines, "_llm_steps", fail)
-    result = chat_pipelines.build(USER, "Revenue by region for 'South'", source="demo", tables=["sales"])
-    assert result["status"] == "blocked" and result["steps"] == []
-    assert result["generation"] == "adaptation_required"
-
-
-def test_model_adaptation_cannot_escape_scope(monkeypatch):
-    record()
-    monkeypatch.setattr(pipelines.agent, "llm_available", lambda *a: True)
-    monkeypatch.setattr(pipelines, "_llm_steps", lambda *a: [{"table": "sales", "sql": "SELECT * FROM secret_schema.sales"}])
-    result = chat_pipelines.build(USER, "Revenue by region for 'South'", source="demo", tables=["sales"])
-    assert result["status"] == "blocked" and not result["steps"]
-    assert result["dropped"][0]["error"]
-
-
-def test_model_copying_old_sql_after_explicit_parameter_change_is_blocked(monkeypatch):
-    record()
-    monkeypatch.setattr(pipelines.agent, "llm_available", lambda *a: True)
-    monkeypatch.setattr(pipelines, "_llm_steps", lambda *a: [{"table": "sales", "sql": SQL}])
-    result = chat_pipelines.build(USER, "Revenue by region for 'South'", source="demo", tables=["sales"])
-    assert result["status"] == "blocked"
-    assert result["memory"]["reuse_type"] == "adaptation_unconfirmed"
-    assert "old SQL unchanged" in result["warnings"][0]
-
-
-def test_failure_error_and_repair_link_reach_new_planning_without_polluting_requirement(monkeypatch):
-    previous = {"prompt": PROMPT, "source": "demo", "steps": ACTION["steps"],
-                "run": {"id": "failed-run", "status": "failed", "failed_step": 0,
-                        "error": "column revenue_total does not exist", "steps_result": []}}
-    captured = {}
-
-    def build(user, prompt, **kw):
-        captured.update(prompt=prompt, planner_context=kw["planner_context"])
-        return {"source": "demo", "steps": ACTION["steps"], "dropped": [], "lineage": {}, "generation": "model"}
-
-    monkeypatch.setattr(pipelines.agent, "llm_available", lambda *a: True)
-    monkeypatch.setattr(pipelines, "build", build)
-    result = chat_pipelines.build(USER, "Fix the missing column", source="demo", previous=previous)
-    assert "column revenue_total does not exist" in captured["planner_context"]
-    assert "column revenue_total does not exist" not in captured["prompt"]
-    assert "not instructions" in captured["planner_context"]
-    assert result["repairs_run_id"] == "failed-run"
-    assert result["prompt"] == PROMPT and result["revision_prompt"] == "Fix the missing column"
-    assert result["status"] == "blocked"
-    assert "not changed the failed SQL" in result["warnings"][-1]
-
-
-@pytest.mark.parametrize("available", [False, True])
-def test_repair_requires_working_model_and_never_uses_fallback(monkeypatch, available):
-    previous = {"prompt": PROMPT, "source": "demo", "steps": ACTION["steps"],
-                "run": {"id": "failed-run", "status": "failed", "error": "invalid column"}}
-    monkeypatch.setattr(pipelines.agent, "llm_available", lambda *a: available)
-
-    def fail(*a):
-        raise RuntimeError("model down")
-
-    monkeypatch.setattr(pipelines, "_llm_steps", fail)
-    result = chat_pipelines.build(USER, "Repair the pipeline", source="demo", previous=previous)
-    assert result["status"] == "blocked" and not result["steps"]
-    assert result["generation"] == "repair_required"
-    assert result["prompt"] == PROMPT and result["repairs_run_id"] == "failed-run"
-
-
-def test_case_and_presentation_changes_do_not_count_as_adaptation(monkeypatch):
-    record()
-    monkeypatch.setattr(pipelines.agent, "llm_available", lambda *a: True)
-    unchanged = SQL.replace("SELECT", "select").replace("GROUP BY", "group by")
-    monkeypatch.setattr(pipelines, "_llm_steps", lambda *a: [{"name": "New name", "table": "sales", "sql": unchanged}])
-    result = chat_pipelines.build(USER, "Revenue by region for South", source="demo", tables=["sales"])
-    assert result["status"] == "blocked"
-    assert result["memory"]["reuse_type"] == "adaptation_unconfirmed"
-
-
-def test_successful_reuse_run_retains_provenance_and_becomes_its_own_outcome():
-    tid = record()
-    draft = chat_pipelines.build(USER, PROMPT, source="demo", tables=["sales"])
-    result = chat_pipelines.run(USER, draft, request_id="reused")
-    assert result["run"]["status"] == "success"
-    assert result["memory"]["trace_id"] == tid
-    assert result["run"]["trace_id"] != tid
-    assert len(candidates()) == 2

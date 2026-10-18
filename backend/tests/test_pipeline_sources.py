@@ -3,7 +3,7 @@
 import pytest
 from fastapi import HTTPException
 
-from app import confluence, pipeline_sources, pipelines, repos
+from app import confluence, pipeline_sources, repos
 
 
 USER = {"id": "analyst", "role": "analyst"}
@@ -57,27 +57,6 @@ def test_context_cap_and_provenance_excludes_page_text(monkeypatch):
     assert error.value.status_code == 413
 
 
-def test_pipelines_build_endpoint_passes_selected_ids_to_source_resolver(monkeypatch):
-    seen = {}
-
-    def resolve(user, **kwargs):
-        seen["selection"] = kwargs
-        return "Selected GitHub context", {"github_repository": {"ref": "a" * 40}}
-
-    def build(user, prompt, **kwargs):
-        seen["build"] = kwargs
-        return {"prompt": prompt, "planning_sources": kwargs["planning_sources"]}
-
-    monkeypatch.setattr(pipeline_sources, "resolve", resolve)
-    monkeypatch.setattr(pipelines, "build", build)
-    result = pipelines.build_endpoint(pipelines.BuildIn(
-        prompt="Summarize sales", repository_id="repo-1", confluence_page_ids=["123"]), USER)
-    assert seen["selection"] == {"repository_id": "repo-1", "confluence_page_ids": ["123"]}
-    assert seen["build"]["planner_context"] == "Selected GitHub context"
-    assert seen["build"]["require_model_for_context"] is True
-    assert result["planning_sources"]["github_repository"]["ref"] == "a" * 40
-
-
 def test_source_selection_routes_are_mounted_once():
     from app import main
 
@@ -86,6 +65,7 @@ def test_source_selection_routes_are_mounted_once():
     paths = main.app.openapi()["paths"]
     assert "/api/repos" in paths
     assert "/api/confluence/pages" in paths
-    assert "/api/pipelines/build" in paths
+    # Read-only pipelines and Pipeline flow were removed; their routes stay gone.
+    assert not [p for p in paths if p.startswith(("/api/pipelines", "/api/flow"))]
     assert main._ROUTERS.count(repos.router) == 1
     assert main._ROUTERS.count(confluence.router) == 1

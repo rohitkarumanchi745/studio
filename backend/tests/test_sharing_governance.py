@@ -295,7 +295,7 @@ def test_blend_requires_stable_identity_and_every_verified_input(monkeypatch):
     checked = []
     monkeypatch.setattr(governance, "identity", lambda: next(identities))
     monkeypatch.setattr(
-        chat, "_stored_pipeline_step_allowed",
+        chat, "_stored_step_allowed",
         lambda role, step, source=None: checked.append((source, step["sql"])) or True)
 
     assert chat._msg_allowed("analyst", _blend_content())
@@ -305,7 +305,7 @@ def test_blend_requires_stable_identity_and_every_verified_input(monkeypatch):
     # provenance check would let the aggregate retain the denied input's rows.
     monkeypatch.setattr(governance, "identity", lambda: "gov-a")
     monkeypatch.setattr(
-        chat, "_stored_pipeline_step_allowed",
+        chat, "_stored_step_allowed",
         lambda role, step, source=None: "customers" not in step["sql"])
     assert not chat._msg_allowed("analyst", _blend_content())
 
@@ -323,14 +323,14 @@ def test_blend_provenance_is_fail_closed(monkeypatch, mutate):
     content = _blend_content()
     mutate(content)
     monkeypatch.setattr(governance, "identity", lambda: "gov-a")
-    monkeypatch.setattr(chat, "_stored_pipeline_step_allowed", lambda *a, **k: True)
+    monkeypatch.setattr(chat, "_stored_step_allowed", lambda *a, **k: True)
     assert not chat._msg_allowed("analyst", content)
 
 
 def test_blend_read_closes_policy_change_race_and_survives_row_retention(monkeypatch):
     identities = iter(["gov-a", "gov-b"])
     monkeypatch.setattr(governance, "identity", lambda: next(identities))
-    monkeypatch.setattr(chat, "_stored_pipeline_step_allowed", lambda *a, **k: True)
+    monkeypatch.setattr(chat, "_stored_step_allowed", lambda *a, **k: True)
     assert not chat._msg_allowed("analyst", _blend_content())
 
     # Retention removes values but deliberately keeps prose and columns.  The
@@ -346,7 +346,7 @@ def test_blend_read_closes_policy_change_race_and_survives_row_retention(monkeyp
 def test_visible_messages_rechecks_blend_identity_immediately_before_release(monkeypatch):
     identities = iter(["gov-a", "gov-a", "gov-b"])
     monkeypatch.setattr(governance, "identity", lambda: next(identities))
-    monkeypatch.setattr(chat, "_stored_pipeline_step_allowed", lambda *a, **k: True)
+    monkeypatch.setattr(chat, "_stored_step_allowed", lambda *a, **k: True)
     cid, _ = _chat_with(ANA, _blend_content())
 
     shown = chat._visible_messages(cid, ANA, "owner")[0]["content"]
@@ -372,7 +372,7 @@ def test_multi_source_reason_checks_every_panel_before_wildcard_return(monkeypat
         checked.append(source)
         return source != "private"
 
-    monkeypatch.setattr(chat, "_stored_pipeline_step_allowed", allowed)
+    monkeypatch.setattr(chat, "_stored_step_allowed", allowed)
     assert not chat._msg_allowed("analyst", content)
     assert "private" in checked
 
@@ -391,7 +391,7 @@ def test_unattributed_stored_frames_fail_closed_even_with_author_role(monkeypatc
                     "columns": ["secret"], "rows": [["value"]]}],
     }
     monkeypatch.setattr(chat, "_unrestricted", lambda *a: True)
-    monkeypatch.setattr(chat, "_stored_pipeline_step_allowed", lambda *a, **k: True)
+    monkeypatch.setattr(chat, "_stored_step_allowed", lambda *a, **k: True)
     assert not chat._msg_allowed("analyst", content)
 
 
@@ -548,7 +548,7 @@ def test_canvas_edits_keep_a_siblings_custom_visual_and_drop_the_edited_ones(mon
 def test_conversation_session_read_resume_and_fork_rebuild_visible_transcript(monkeypatch):
     current = {"identity": "gov-a"}
     monkeypatch.setattr(governance, "identity", lambda: current["identity"])
-    monkeypatch.setattr(chat, "_stored_pipeline_step_allowed", lambda *a, **k: True)
+    monkeypatch.setattr(chat, "_stored_step_allowed", lambda *a, **k: True)
 
     secret = "Ada's lifetime value is 4200 across both systems."
     cid = db.create_conversation(ANA["id"], "governed blend")
@@ -588,7 +588,7 @@ def test_conversation_session_read_resume_and_fork_rebuild_visible_transcript(mo
 
 
 def test_deleting_canonical_session_never_turns_a_fork_into_live_checkpoint(monkeypatch):
-    monkeypatch.setattr(chat, "_stored_pipeline_step_allowed", lambda *a, **k: True)
+    monkeypatch.setattr(chat, "_stored_step_allowed", lambda *a, **k: True)
     content = {"text": "first answer", "source": "demo", "table": "sales",
                "author_role": "analyst", "sql": "SELECT region FROM sales",
                "columns": ["region"], "rows": [["EU"]]}

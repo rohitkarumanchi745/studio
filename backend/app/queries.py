@@ -64,8 +64,8 @@ def verify_sql(user, source, table_label, sql, full_rows=False):
     """RBAC + query guard + real execution + governance, via gateway.execute.
     Returns {ok, columns, rows, row_count, sql, took_ms} or {ok: False, error,
     sql?}. Never raises for a rejected query — a failed verification is a
-    normal result the caller surfaces (and blend/autopilot/flow/pipelines/
-    semantic all rely on that: they branch on `ok`, never on exceptions).
+    normal result the caller surfaces (and blend/autopilot/semantic all rely
+    on that: they branch on `ok`, never on exceptions).
 
     This is a thin wrapper, not a second pipeline: the gateway owns the order
     RBAC → guard → LIMIT → execute → governance → audit, and every verify shows
@@ -124,9 +124,9 @@ def verify_agent(user, source, table_label, sql):
     """Run verify_sql AND record it as an Agent Lightning rollout attributed to
     the named "SQL verifier" agent. This is the user-facing verify action; the
     reward feeds the learning loop (failed verifications become recent_failures
-    that get injected into the analyst agent's prompt). Internal callers
-    (pipelines, the flow Validator) call verify_sql directly to avoid flooding
-    the trace store with one rollout per step."""
+    that get injected into the analyst agent's prompt). Internal callers call
+    verify_sql directly to avoid flooding the trace store with one rollout per
+    step."""
     from . import roster
     result = verify_sql(user, source, table_label, sql)
     try:

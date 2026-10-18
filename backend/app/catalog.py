@@ -18,7 +18,7 @@ from . import gateway, governance, rbac, skills, suggest
 from .auth import current_user
 from .connectors import all_sources
 # match_tables (prompt → ranked tables) lives in matching.py, a leaf module, so
-# chat / pipelines can rank without importing this router. Re-exported for one
+# chat can rank without importing this router. Re-exported for one
 # release so `from .catalog import match_tables` keeps working.
 from .matching import match_tables  # noqa: F401
 from .queryguard import QueryRejected

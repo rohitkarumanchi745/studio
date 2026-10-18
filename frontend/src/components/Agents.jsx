@@ -168,13 +168,13 @@ export default function Agents({ onClose }) {
         </div>
       )}
 
-      {(data?.pipeline_crew?.length > 0 || data?.utility_agents?.length > 0) && (
+      {data?.utility_agents?.length > 0 && (
         <>
           <div className="meta" style={{ margin: "14px 0 6px" }}>
-            Pipeline &amp; utility agents — each scored on its own artifact (per-agent reward)
+            Utility agents — each scored on its own artifact (per-agent reward)
           </div>
           <div className="offline-agents">
-            {[...(data.pipeline_crew || []), ...(data.utility_agents || [])].map((a) => {
+            {data.utility_agents.map((a) => {
               const r = rw(a.name);
               return (
                 <span key={a.name} className="chip chip-on" title={a.produces ? `emits ${a.produces}` : ""}>

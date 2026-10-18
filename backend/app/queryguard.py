@@ -27,7 +27,7 @@ import re
 # Write/DDL keywords, plus the extension/config statements a file-reading
 # engine (DuckDB) would need. Matched against individual identifier tokens, so
 # `created_at`, `'create'` and `"copy"` no longer trip it. Other modules
-# (supervisor, flow) reuse this as a write detector over raw text.
+# (supervisor) reuse this as a write detector over raw text.
 FORBIDDEN = re.compile(
     r"\b(insert|update|delete|drop|alter|create|grant|revoke|truncate|merge|copy|"
     r"call|execute|attach|detach|pragma|vacuum|replace|install|load|set|export|"
@@ -36,7 +36,7 @@ FORBIDDEN = re.compile(
 )
 
 # Lexical helper only — NOT the security boundary; validate() resolves refs
-# from tokens. Kept because governance, router, pipelines and chat read table
+# from tokens. Kept because governance, router and chat read table
 # names out of SQL with it, and widened (quoted/backticked/bracketed names, a
 # comment instead of a space) so those callers stop silently seeing zero tables
 # for `FROM "customers"` — that is what made PII masking skippable.

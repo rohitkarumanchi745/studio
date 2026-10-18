@@ -21,7 +21,7 @@ const bundle = await build({
   plugins: [{
     name: "stub-chat-children",
     setup(bundler) {
-      bundler.onResolve({filter: /^\.\/(Canvas|ChartView|SqlLab|ChatPipeline|ChatWorkflow|ChatPlatformRun)$/},
+      bundler.onResolve({filter: /^\.\/(Canvas|ChartView|SqlLab|ChatWorkflow|ChatPlatformRun)$/},
         ({path: specifier}) => ({path: specifier, namespace: "chat-child"}));
       bundler.onLoad({filter: /.*/, namespace: "chat-child"}, () => ({
         contents: "export default function Stub() { return null; } export function PlatformComposer() { return null; }",

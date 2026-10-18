@@ -14,7 +14,7 @@ Locked in here:
 """
 import pytest
 
-from app import agent_graph as ag, chat_pipelines, orchestrator
+from app import agent_graph as ag, orchestrator
 
 
 class _Conn:
@@ -417,53 +417,6 @@ def test_single_node_table_plan_returns_worker_result_without_blending(monkeypat
     assert out["source"] == "postgres" and out["sql"] == result["sql"]
     assert out["columns"] == ["id"] and out["rows"] == [[1]]
     assert out["graph"]["combine"] == "reason"
-
-
-def test_orchestrator_returns_the_blended_table_and_scores_that_artifact(monkeypatch):
-    plan, run = _table_plan_and_run()
-    blended = {"columns": ["id", "amount"], "rows": [[1, 9], [2, 8]],
-               "row_count": 2, "sql": "SELECT * FROM left JOIN right USING (id)",
-               "parts": [{"name": "left"}, {"name": "right"}],
-               "lineage": {"steps": [{"id": "blend"}]},
-               "blend_provenance": {
-                   "kind": "blend_v1", "governance_identity": "policy-1",
-                   "inputs": [
-                       {"source": "postgres", "table": None, "sql": "SELECT id FROM a"},
-                       {"source": "snowflake", "table": None, "sql": "SELECT id FROM b"},
-                   ],
-               }}
-    calls, rewards = [], []
-    monkeypatch.setenv("STUDIO_AGENT_GRAPH", "1")
-    monkeypatch.setattr(orchestrator.agent_graph, "plan_graph", lambda *a, **k: plan)
-    monkeypatch.setattr(orchestrator.agent_graph, "execute", lambda *a, **k: run)
-    monkeypatch.setattr(orchestrator.agent_graph, "blend_parts",
-                        lambda got_plan, got_results, got_user:
-                        calls.append((got_plan, got_results, got_user)) or blended)
-    monkeypatch.setattr(orchestrator, "_aggregate", lambda *a, **k: "A joined answer")
-    monkeypatch.setattr(orchestrator.lightning, "record_agent_rollout",
-                        lambda *args, **kwargs: rewards.append(args))
-
-    out = orchestrator.run_orchestrated("q", USER, [], sources=SOURCES[:2])
-
-    assert calls == [(plan, run["results"], USER)]
-    assert out["columns"] == blended["columns"] and out["rows"] == blended["rows"]
-    assert out["sql"] is None and out["blend_sql"] == blended["sql"]
-    assert out["source"] == "*"
-    assert out["row_count"] == 2 and out["lineage"] == blended["lineage"]
-    assert out["blend_provenance"] == blended["blend_provenance"]
-    assert len(out["panels"]) == 1 and out["panels"][0]["rows"] == blended["rows"]
-    assert out["panels"][0]["sql"] is None
-    # DuckDB part names exist only during this request.  They must never become
-    # a phantom warehouse pipeline or a refreshable SQL action.
-    assert chat_pipelines.from_result(USER, "q", out) is None
-    terminal = next(n for n in out["graph"]["nodes"] if n["id"] == "__reason__")
-    assert terminal["task"] == "blend into one table"
-    assert terminal["status"] == "ok" and terminal["rows"] == 2
-    # The terminal rollout contains the artifact that was actually returned.
-    reward = rewards[-1]
-    assert reward[4] == "aggregator"
-    assert reward[5]["rows"] == blended["rows"] and reward[5]["errors"] == []
-    assert reward[5]["sql"] is None
 
 
 def test_aggregator_rollout_records_the_worker_answers_it_was_conditioned_on(monkeypatch):

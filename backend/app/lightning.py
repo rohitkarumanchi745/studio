@@ -537,62 +537,6 @@ def record_pipeline_outcome(user, *, run_id, prompt, source, action, status,
         return None
 
 
-def recent_pipeline_examples(user, source=None, limit=3):
-    """The caller's recent pipeline outcomes, for prompt context only.
-
-    SQL recipes are rechecked against current permissions and namespaces
-    without execution. Platform payloads stay owner-scoped; their consumer
-    must apply the usual platform validation/approval before any submission.
-    A user's thumbs-up does not turn an observed failed run into a proven
-    success: ``status`` comes from the immutable execution metadata.
-    """
-    from . import queryguard, rbac
-    from .connectors import get_connector
-
-    limit = max(1, min(int(limit), 10))
-    with db.connect() as c:
-        rows = c.execute(
-            "SELECT id,prompt,source,error,reward,meta FROM agent_traces "
-            "WHERE user_id=? AND mode='pipeline' ORDER BY created_at DESC LIMIT ?",
-            (user["id"], max(30, limit * 10))).fetchall()
-    examples = []
-    for row in rows:
-        try:
-            meta = json.loads(row["meta"] or "{}")
-            action = meta.get("action") or {}
-            if meta.get("status") not in {"success", "succeeded", "succeeded_sql_only", "failed"}:
-                continue
-            if source and source != "*" and row["source"] != source:
-                continue
-            if action.get("type") == "sql_pipeline":
-                steps = action.get("steps") or []
-                if not steps:
-                    continue
-                for step in steps:
-                    src = step.get("source") or row["source"]
-                    if source and source != "*" and src != source:
-                        raise ValueError("outside selected source")
-                    connector = get_connector(src)
-                    dialect = getattr(connector, "dialect", None)
-                    tokens, _ = queryguard._tokens(step["sql"])
-                    allowed = [queryguard._canon(parts[-1], dialect)
-                               for parts, _ in queryguard._table_refs(tokens)
-                               if rbac.can_access(user["role"], src, parts[-1].text)]
-                    queryguard.validate(step["sql"], allowed,
-                                        qualifiers=connector.qualifiers(), dialect=dialect)
-            elif action.get("type") != "platform_run":
-                continue
-            examples.append({"trace_id": row["id"], "run_id": meta.get("run_id"),
-                             "prompt": row["prompt"], "source": row["source"],
-                             "action": action, "status": meta["status"], "error": row["error"],
-                             "reward": row["reward"], "repairs_run_id": meta.get("repairs_run_id")})
-        except (KeyError, TypeError, ValueError, queryguard.QueryRejected):
-            continue
-        if len(examples) >= limit:
-            break
-    return examples
-
-
 def export_rollouts(path, limit=5000):
     """Write traces as JSONL in the shape RL/APO training jobs consume."""
     n = 0

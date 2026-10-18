@@ -2,16 +2,12 @@
 
 A "monthly revenue by region" request must produce MONTHLY buckets, not a
 daily aggregate that happens to mention revenue. Two callers need the same
-vocabulary to make that true:
-
-  * agent.py's keyless fallback, which already owned the SQLite strftime
-    table (``_GRAN_FMT``) and now imports it from here;
-  * pipelines.py's deterministic drafter, which buckets a drafted step by the
-    grain named in the prompt and warns when an LLM-drafted step does not.
+vocabulary to make that true; agent.py's keyless fallback, which already
+owned the SQLite strftime table (``_GRAN_FMT``), imports it from here.
 
 Invariants:
   - Imports nothing from ``app`` — a pure leaf, so anyone may import it at
-    module level (agent, pipelines and anything below them).
+    module level (agent and anything below it).
   - Deterministic: no model call, no I/O, same answer for the same input.
   - ``bucket_expr`` emits READ-ONLY scalar SQL. It never interpolates user
     text — only a caller-supplied column name and a grain from ``GRAINS`` —

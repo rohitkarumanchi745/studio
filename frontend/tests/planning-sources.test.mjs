@@ -13,7 +13,7 @@ let hooks = null;
 const bundle = await build({
   stdin: {
     contents: `export {planningContextFields, chatPipelineFields, usePlanningCatalog,
-      PlanningContextPicker, PlanningSources} from "./src/components/Pipelines.jsx";`,
+      PlanningContextPicker, PlanningSources} from "./src/components/planningContext.jsx";`,
     resolveDir: frontend,
     loader: "jsx",
   },
@@ -39,16 +39,16 @@ const { planningContextFields, chatPipelineFields, usePlanningCatalog,
 const html = (component, props) =>
   renderToStaticMarkup(React.createElement(component, props));
 
-test("chat includes planning-source IDs only for build turns", () => {
-  assert.deepEqual(chatPipelineFields(false, false, "repo-1", ["page-1"]), {});
-  assert.deepEqual(chatPipelineFields(true, false, " repo-1 ",
+test("chat includes planning-source IDs only for Airflow build turns", () => {
+  assert.deepEqual(chatPipelineFields(false, "repo-1", ["page-1"]), {});
+  assert.deepEqual(chatPipelineFields(true, " repo-1 ",
     ["page-1", "page-1", "", 2]), {
     pipeline_action: "build",
-    pipeline_mode: "read_only_sql",
+    pipeline_mode: "airflow_dag",
     repository_id: "repo-1",
     confluence_page_ids: ["page-1"],
   });
-  assert.deepEqual(chatPipelineFields(false, true, "", []), {
+  assert.deepEqual(chatPipelineFields(true, "", []), {
     pipeline_action: "build",
     pipeline_mode: "airflow_dag",
     repository_id: null,

@@ -36,7 +36,7 @@ const bundle = await build({
       // stub is named after what it replaces so a test can look for it.
       name: "stub-chat-children",
       setup(b) {
-        b.onResolve({ filter: /^\.\/(Canvas|SqlLab|ChatPipeline|ChatWorkflow|ChatPlatformRun)$/ },
+        b.onResolve({ filter: /^\.\/(Canvas|SqlLab|ChatWorkflow|ChatPlatformRun)$/ },
                     ({ path: p }) => ({ path: p.slice(2), namespace: "chat-child" }));
         b.onLoad({ filter: /.*/, namespace: "chat-child" }, ({ path: name }) => ({
           contents: `export default function ${name}() { return null; }
@@ -252,6 +252,27 @@ test("the window opens as a prompt for a visual, without the pipeline controls",
   assert.match(ordinary, /What do you want to know\?/);
   assert.match(ordinary, /Run on Airflow/);
   assert.doesNotMatch(ordinary, /D3 &amp; artifacts|your charts/);
+  // Read-only SQL pipelines were removed: only the Airflow DAG build remains.
+  assert.match(ordinary, /Build an approval-gated Airflow DAG from this prompt/);
+  assert.doesNotMatch(ordinary, /read-only pipeline/);
+  assert.equal(ordinary.match(/class="composer-pipeline-option"/g)?.length, 1);
+});
+
+test("a read-only pipeline saved before the removal shows its SQL as a record, with no Run button", () => {
+  const saved = { role: "assistant", text: "Pipeline ready: 1 verified read-only SQL step(s).",
+    mode: "pipeline", message_id: "m1", columns: [], rows: [], panels: [],
+    pipeline: { execution_mode: "read_only_sql", status: "ready", source: "demo",
+      steps: [{ name: "Revenue by region", source: "demo", table: "sales", verified: true,
+                sql: "SELECT region, SUM(revenue) FROM sales GROUP BY region" }] } };
+  const markup = html(AssistantMessage, { m: saved, onRunPipeline() {}, onOpenCanvas() {} });
+  assert.match(markup, /aria-label="Saved SQL pipeline"/);
+  assert.match(markup, /Record only/);
+  assert.match(markup, /no longer runs/);
+  assert.match(markup, /SELECT region, SUM\(revenue\) FROM sales GROUP BY region/);
+  assert.doesNotMatch(markup, /<button[^>]*>[^<]*Run pipeline/);
+  // A message with no stored steps shows no card at all.
+  const empty = html(AssistantMessage, { m: { ...saved, pipeline: { execution_mode: "read_only_sql", steps: [] } } });
+  assert.doesNotMatch(empty, /Saved SQL pipeline/);
 });
 
 test("a question asked in the window is sent as a visual turn", async () => {

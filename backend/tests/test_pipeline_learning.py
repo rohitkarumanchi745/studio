@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app import chat_pipelines, db, governance, jobs, lightning, pipelines, trainer
+from app import db, governance, jobs, lightning, trainer
 from app.connectors import demo
 
 
@@ -28,7 +28,7 @@ def isolated(tmp_path, monkeypatch):
     governance._STATE.update(doc=None, yaml="", source=None)
     governance._FRESH.update(at=0.0, ident=None)
     db.init_db()
-    for module in (governance, jobs, pipelines):
+    for module in (governance, jobs):
         module.init_tables()
     demo.seed()
     monkeypatch.setattr(lightning, "_client", lambda: pytest.fail("Learning must only enqueue, never contact AGL here"))
@@ -142,129 +142,3 @@ def test_platform_actions_stay_out_of_generic_training_stream_and_scalar_sql():
     assert lightning.rollout_metadata(trace)["action"] == action
 
 
-def test_recent_examples_are_owner_scoped_and_follow_current_permissions():
-    record("mine-failed", status="failed", error="column does not exist")
-    record("mine-fixed", repairs_run_id="mine-failed")
-    record("theirs", user=OTHER)
-    examples = lightning.recent_pipeline_examples(USER, source="demo")
-    assert {e["run_id"] for e in examples} == {"mine-failed", "mine-fixed"}
-    assert {e["status"] for e in examples} == {"failed", "success"}
-    governance._set("version: 1\nroles:\n  viewer:\n    sources:\n      demo: [web_traffic]\n", "test")
-    assert lightning.recent_pipeline_examples(USER, source="demo") == []
-
-
-def test_real_runner_records_failed_and_corrected_full_recipes():
-    bad = {"id": "bad-pipeline", "name": "Revenue", "prompt": "Revenue by region",
-           "source": "demo", "steps": [{"name": "Revenue", "source": "demo", "table": "sales",
-                                         "sql": "SELECT missing_column FROM sales"}]}
-    failed = pipelines.run_pipeline(bad, USER, run_id="failed-run", notify_failure=False)
-    assert failed["status"] == "failed"
-    fixed = {**bad, "id": "fixed-pipeline", "steps": ACTION["steps"], "repairs_run_id": "failed-run"}
-    success = pipelines.run_pipeline(fixed, USER, run_id="fixed-run", notify_failure=False)
-    assert success["status"] == "success"
-    trace = lightning._trace(success["trace_id"])
-    assert trace["meta"]["repairs_run_id"] == "failed-run"
-    assert trace["meta"]["action"] == ACTION
-    assert lightning._trace(failed["trace_id"])["reward"] == 0
-
-
-def test_terminal_replay_repairs_missing_outcome_after_execution(monkeypatch):
-    pipeline = {"id": "pipeline", "name": "Revenue", "prompt": "Revenue by region",
-                "source": "demo", "steps": ACTION["steps"]}
-    real = lightning.record_pipeline_outcome
-    monkeypatch.setattr(lightning, "record_pipeline_outcome", lambda *a, **k: None)
-    result = pipelines.run_pipeline(pipeline, USER, run_id="run", notify_failure=False)
-    assert result["status"] == "success" and not result["trace_id"]
-    monkeypatch.setattr(lightning, "record_pipeline_outcome", real)
-    result = pipelines.run_pipeline(pipeline, USER, run_id="run", notify_failure=False)
-    assert result["trace_id"] and len(rows("agent_traces")) == 1
-
-
-def test_future_builder_uses_only_allowed_owner_experience(monkeypatch):
-    record("success")
-    record("private-other", user=OTHER)
-    captured = {}
-
-    def build(user, prompt, **kwargs):
-        captured.update(prompt=prompt, planner_context=kwargs.get("planner_context"))
-        return {"source": "demo", "steps": ACTION["steps"], "lineage": {}, "dropped": [], "generation": "model"}
-
-    monkeypatch.setattr(pipelines.agent, "llm_available", lambda *a, **k: True)
-    monkeypatch.setattr(pipelines, "build", build)
-    chat_pipelines.build(USER, "Build a pipeline for regional revenue", source="demo", tables=["sales"])
-    assert "prior execution examples" in captured["planner_context"]
-    assert "private-other" not in captured["planner_context"]
-    assert SQL in captured["planner_context"]
-    assert SQL not in captured["prompt"]
-    chat_pipelines.build(USER, "Build a traffic pipeline", source="demo", tables=["web_traffic"])
-    assert captured["planner_context"] is None
-
-
-@pytest.mark.parametrize("model_fails", [False, True])
-def test_historical_grains_and_table_tokens_cannot_change_fallback(monkeypatch, model_fails):
-    monkeypatch.setattr(pipelines.agent, "llm_available", lambda *a, **k: False)
-    connector = pipelines.get_connector("demo")
-    source = {"connector": connector, "allowed": ["sales", "web_traffic"],
-              "schemas": {t: connector.get_schema(t) for t in ("sales", "web_traffic")}}
-    monkeypatch.setattr(pipelines, "_accessible", lambda user: [source])
-    prompt = "Build a pipeline for revenue by region"
-    baseline = chat_pipelines.build(USER, prompt)
-    lightning.record_pipeline_outcome(USER, run_id="old-monthly-traffic", prompt="Monthly traffic by page",
-        source="demo", action={"type": "sql_pipeline", "steps": [{"name": "Monthly visits",
-            "source": "demo", "table": "web_traffic", "sql": "SELECT page, visits FROM web_traffic"}]},
-        status="success")
-    model_inputs = []
-    if model_fails:
-        monkeypatch.setattr(pipelines.agent, "llm_available", lambda *a, **k: True)
-
-        def fail_model(user, source, schemas, prompt, spec):
-            model_inputs.append(prompt)
-            raise RuntimeError("model unavailable")
-
-        monkeypatch.setattr(pipelines, "_llm_steps", fail_model)
-    current = chat_pipelines.build(USER, prompt)
-    assert current["generation"] == "deterministic"
-    assert current["source"] == baseline["source"]
-    assert [s["sql"] for s in current["steps"]] == [s["sql"] for s in baseline["steps"]]
-    assert [s["intent_warnings"] for s in current["steps"]] == [s["intent_warnings"] for s in baseline["steps"]]
-    assert current["prompt"] == prompt
-    if model_fails:
-        assert "Monthly traffic by page" in model_inputs[0]
-        assert "prior execution examples" in model_inputs[0]
-
-
-def test_model_receives_experience_but_routing_and_saved_prompt_do_not(monkeypatch):
-    captured = {}
-    route = pipelines.route
-
-    def traced_route(user, prompt):
-        captured["routing"] = prompt
-        return route(user, prompt)
-
-    def model(user, source, schemas, prompt, spec):
-        captured["model"] = prompt
-        return [{"name": "Revenue", "table": "sales", "sql": SQL}]
-
-    monkeypatch.setattr(pipelines, "route", traced_route)
-    monkeypatch.setattr(pipelines.agent, "llm_available", lambda *a, **k: True)
-    monkeypatch.setattr(pipelines, "_llm_steps", model)
-    requirement = "Revenue by region"
-    experience = "Past monthly Snowflake inventory pipeline succeeded."
-    result = pipelines.build(USER, requirement, planner_context=experience)
-    assert captured["routing"] == result["prompt"] == requirement
-    assert experience in captured["model"]
-    assert result["steps"][0]["intent_warnings"] == []
-
-
-def test_correction_draft_carries_failed_run_link_to_execution(monkeypatch):
-    monkeypatch.setattr(pipelines.agent, "llm_available", lambda *a, **k: True)
-    monkeypatch.setattr(pipelines, "build", lambda *a, **k: {
-        "source": "demo", "steps": ACTION["steps"], "lineage": {}, "dropped": [], "generation": "model"})
-    previous = {"prompt": "Revenue by region", "run": {"id": "failed-run", "status": "failed"},
-                "steps": [{**ACTION["steps"][0], "sql": "SELECT missing_column FROM sales"}]}
-    draft = chat_pipelines.build(USER, "Fix the revenue query", source="demo", previous=previous)
-    assert draft["repairs_run_id"] == "failed-run"
-    result = chat_pipelines.run(USER, draft, request_id="corrected-request")
-    trace = lightning._trace(result["run"]["trace_id"])
-    assert trace["meta"]["repairs_run_id"] == "failed-run"
-    assert trace["prompt"] == previous["prompt"]

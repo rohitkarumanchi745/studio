@@ -10,14 +10,14 @@ from typing import List, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from . import (agent, chat_pipelines, chat_platforms, chat_workflows, db, email_service, gateway, governance, jobs, keys,
+from . import (agent, chat_platforms, chat_workflows, db, email_service, gateway, governance, jobs, keys,
                lightning, orchestrator, progress, qcache, queryguard, rbac,
                roster, router as model_router, semantic, sessions, skills,
                pipeline_sources)
 from .auth import current_user
 from .matching import focus_tables, match_tables
-from .pipelines import stored_step_allowed as _stored_pipeline_step_allowed
 from .sources import connector_or_400
+from .stored_access import stored_step_allowed as _stored_step_allowed
 
 log = logging.getLogger("studio.chat")
 
@@ -74,9 +74,10 @@ class Ask(BaseModel):
     # "All sources" only: run even if the prompt names a table that exists in
     # several sources (the user chose "both, side by side" on a clarification).
     allow_ambiguous: bool = False
+    # Pipeline controls act on an Airflow DAG drafted in this conversation.
     pipeline_action: Optional[Literal["build", "run", "status"]] = None
-    # Disambiguates the build control. Omitted preserves the original
-    # read-only SQL pipeline; Airflow is an explicit, typed DAG planning mode.
+    # "read_only_sql" is still accepted so an old client gets a clear refusal:
+    # read-only SQL pipelines were removed.
     pipeline_mode: Optional[Literal["read_only_sql", "airflow_dag"]] = None
     # Optional registered planning references. The worker resolves IDs under
     # current permissions; the client never supplies a URL or source text.
@@ -329,10 +330,13 @@ def _scope(body, user, before_message_id=None):
         raise HTTPException(400, "A pipeline version can only be selected for a run")
     if body.pipeline_mode and body.pipeline_action != "build":
         raise HTTPException(400, "A pipeline mode can only be selected while building")
+    if body.pipeline_mode == "read_only_sql":
+        raise HTTPException(400, "Read-only SQL pipelines were removed. Ask the question in chat "
+                                 "for fresh results, or build an Airflow pipeline")
     if body.platform_message_id and not body.platform_action:
         raise HTTPException(400, "Choose a platform action for this job version")
     if body.pipeline_action and (body.platform_action or body.platform_target or body.platform_payload is not None):
-        raise HTTPException(400, "Choose either a SQL pipeline action or a platform action")
+        raise HTTPException(400, "Choose either a pipeline action or a platform action")
     if body.visual and (body.pipeline_action or body.pipeline_mode or body.platform_action
                         or body.platform_target or body.platform_payload is not None
                         or body.repository_id or body.confluence_page_ids):
@@ -343,13 +347,13 @@ def _scope(body, user, before_message_id=None):
     # In the D3 & artifacts window every prompt asks for a visual, so commands
     # that would build or submit work there are read as questions instead.
     workflow_action = None if body.visual else chat_workflows.intent(prompt, workflow_previous)
-    if body.pipeline_action == "build" and body.pipeline_mode:
-        # An explicit UI/API mode is authoritative. Airflow accepts arbitrary
-        # natural-language requirements without depending on a classifier;
-        # read_only_sql cannot be redirected into a write-capable workflow by
-        # words in the prompt or by an older Airflow draft in the conversation.
-        workflow_action = "build" if body.pipeline_mode == "airflow_dag" else None
-    if body.pipeline_action == "run" and chat_workflows.is_plan(workflow_previous):
+    if body.pipeline_action == "build":
+        # The build control is authoritative: Airflow accepts arbitrary
+        # natural-language requirements without depending on a classifier.
+        workflow_action = "build"
+    if body.pipeline_action == "run":
+        if not chat_workflows.is_plan(workflow_previous):
+            raise HTTPException(400, "Select an Airflow pipeline to run")
         workflow_action = "submit"
     if body.pipeline_action == "status":
         if not chat_workflows.is_plan(workflow_previous):
@@ -483,8 +487,6 @@ def _build_ctx(body, user, cid, scope=None, user_message_id=None):
     ctx = dict(scope)
     ctx.update({"cid": cid, "history": history,
                 "user_message_id": user_message_id,
-                "pipeline_action": body.pipeline_action,
-                "pipeline_message_id": body.pipeline_message_id,
                 "repository_id": body.repository_id,
                 "confluence_page_ids": body.confluence_page_ids or [],
                 "visual": bool(body.visual),
@@ -847,110 +849,6 @@ def _platform_turn(ctx, user):
     return result
 
 
-def _pipeline_context(ctx, user):
-    access = _own_or_404(ctx["cid"], user, need="edit")
-    messages = _messages_before(_visible_messages(ctx["cid"], user, access),
-                                ctx.get("user_message_id"))
-    target = ctx.get("pipeline_message_id")
-    if target:
-        message = next((m for m in messages if m["id"] == target), None)
-        if not message or message["role"] != "assistant":
-            raise HTTPException(404, "Pipeline version not found in this conversation")
-        content = message["content"]
-        if content.get("redacted") or not content.get("pipeline"):
-            raise HTTPException(403, "This pipeline is not available to your role")
-        return content["pipeline"]
-    for message in reversed(messages):
-        if message["role"] != "assistant":
-            continue
-        content = message.get("content") or {}
-        # Never fall back to an older version if the latest version is hidden
-        # or failed verification: 'run it' must not silently run other SQL.
-        if content.get("redacted"):
-            return None
-        if content.get("platform_run"):
-            return None
-        if content.get("pipeline"):
-            return content["pipeline"]
-        if content.get("sql") or content.get("panels"):
-            return chat_pipelines.from_result(user, content.get("text", ""), content)
-    return None
-
-
-def _pipeline_turn(ctx, user, action, previous):
-    """Pipeline commands share the durable chat queue and its answer fence."""
-    request_id = ":".join((ctx["cid"], user["id"],
-                           ctx.get("user_message_id") or ctx.get("reply_to") or str(uuid.uuid4())))
-
-    def execute(draft):
-        progress.emit("running this pipeline with your current data permissions")
-        return chat_pipelines.run(user, {**draft, "conversation_id": ctx["cid"]}, request_id=request_id)
-
-    def run_summary(draft):
-        run = draft.get("run") or {}
-        if run.get("status") == "success":
-            return f"Pipeline completed: {len(run.get('steps_result') or [])} read-only SQL step(s) ran against fresh data."
-        if run.get("status") == "failed":
-            return "Pipeline failed. The step results below show where execution stopped."
-        return "This pipeline could not run. Review the verification details below."
-
-    draft = None
-    if action == "run" and previous is None:
-        text = "There is no runnable pipeline in this conversation yet. Ask a data question or describe a pipeline to build first."
-    else:
-        jobs.check_claim()
-        if action == "run":
-            draft = execute(previous)
-            text = run_summary(draft)
-        else:
-            progress.emit("building a pipeline from this conversation")
-            # An interrupted combined build/run already saved its recipe.
-            # Recover that exact recipe before consulting a model again.
-            draft = chat_pipelines.recover(user, request_id=request_id) if action == "build_run" else None
-            if draft is not None and previous:
-                draft["repairs_run_id"] = draft.get("repairs_run_id") or chat_pipelines._repair_run_id(previous)
-            if draft is None:
-                source_context, planning_sources = pipeline_sources.resolve(
-                    user, repository_id=ctx.get("repository_id"),
-                    confluence_page_ids=ctx.get("confluence_page_ids"))
-                draft = chat_pipelines.build(
-                    user, ctx["prompt"], context=ctx["history"],
-                    source=ctx.get("source"), tables=ctx.get("selected_tables"),
-                    model=ctx.get("model"), previous=previous,
-                    source_context=source_context, planning_sources=planning_sources)
-            if draft.get("status") == "ready" and draft.get("steps"):
-                if action == "build_run":
-                    draft = execute(draft)
-                    text = run_summary(draft)
-                else:
-                    text = (f"Pipeline ready: {len(draft['steps'])} verified read-only SQL step(s). "
-                            "Say 'run this pipeline' to execute it, or describe a change.")
-            else:
-                text = "The pipeline needs changes before it can run. Review the verification details below."
-    source = (draft or {}).get("source") or ctx.get("source") or "*"
-    tables = sorted({t for step in (draft or {}).get("steps", [])
-                     for t in queryguard.base_tables(step.get("sql") or "")})
-    result = {"text": text, "mode": "pipeline", "model": ctx.get("model"),
-              "source": source, "table": ", ".join(tables) or ctx.get("table_label") or "*",
-              "columns": [], "rows": [], "panels": [], "sql": None,
-              "author_role": user["role"]}
-    if draft is not None:
-        result["pipeline"] = draft
-    _answer(ctx, result)
-    db.log_activity(user, "chat_pipeline_" + action, prompt=ctx["prompt"], source=source,
-                    ok=bool(draft and (draft.get("run") or {}).get("status", draft.get("status")) in ("ready", "success")))
-    _checkpoint(user, ctx["cid"], result, ctx.get("model"), source, result["table"])
-    return result
-
-
-def _attach_pipeline(ctx, user, result):
-    if ctx.get("visual"):
-        return          # the D3 & artifacts window answers with the visual alone
-    draft = chat_pipelines.from_result(user, ctx["prompt"], result)
-    if draft is not None:
-        result["pipeline"] = draft
-
-
 def _run_turn(ctx, user):
     """Heavy half of a turn: run the agent, append the assistant message, trace,
     and checkpoint. Pure work off the prepared context — safe in a thread."""
@@ -960,11 +858,6 @@ def _run_turn(ctx, user):
         return _platform_turn(ctx, user)
     if ctx["mode"] == "workflow":
         return _workflow_turn(ctx, user)
-    previous = _pipeline_context(ctx, user)
-    action = ctx.get("pipeline_action") or (
-        None if ctx.get("visual") else chat_pipelines.intent(prompt, previous))
-    if action:
-        return _pipeline_turn(ctx, user, action, previous)
 
     if ctx["mode"] == "*":
         # A certified metric is answered from its definition here too — before
@@ -1014,7 +907,6 @@ def _run_turn(ctx, user):
         result["table"] = "all sources"
         result["matched_tables"] = []
         result["inputs"] = _query_inputs(result)
-        _attach_pipeline(ctx, user, result)
         tid = lightning.record_chat_trace(user, cid, prompt, result, int((time.time() - t0) * 1000),
                                           history=ctx["history"])
         if tid:
@@ -1173,7 +1065,6 @@ def _run_turn(ctx, user):
     except Exception:
         result["matched_tables"] = []
     result["inputs"] = _query_inputs(result)
-    _attach_pipeline(ctx, user, result)
     tid = lightning.record_chat_trace(user, cid, prompt, result, int((time.time() - t0) * 1000),
                                       history=ctx["history"])
     if tid:
@@ -2309,7 +2200,7 @@ def _sql_tables_allowed(role, source, content):
             continue
         if not src or src == "*":
             return False
-        if not _stored_pipeline_step_allowed(role, {"source": src, "sql": sql}, src):
+        if not _stored_step_allowed(role, {"source": src, "sql": sql}, src):
             return False
         attributed = True
 
@@ -2358,7 +2249,7 @@ def _blend_provenance_allowed(role, content):
                     or not isinstance(sql, str) or not sql.strip()
                     or (table is not None and not isinstance(table, str))):
                 return False
-            if not _stored_pipeline_step_allowed(
+            if not _stored_step_allowed(
                     role, {"source": src, "table": table, "sql": sql}, src):
                 return False
         if governance.identity() != stored_identity:
@@ -2386,7 +2277,7 @@ def _blend_provenance_allowed(role, content):
             if has_frame:
                 return False
             continue
-        if src == "*" or not _stored_pipeline_step_allowed(
+        if src == "*" or not _stored_step_allowed(
                 role, {"source": src, "sql": sql}, src):
             return False
     return True
@@ -2413,7 +2304,7 @@ def _pipeline_diagnostics(content, role):
         return content
     dropped = []
     for step in draft["dropped"]:
-        if _stored_pipeline_step_allowed(role, step, draft.get("source")):
+        if _stored_step_allowed(role, step, draft.get("source")):
             dropped.append(step)
         else:
             dropped.append({"name": "Excluded step", "verified": False,
@@ -2442,7 +2333,7 @@ def _msg_allowed(role, content, msg_role=None):
             return False
         steps = list(draft.get("steps") or []) + list((draft.get("run") or {}).get("steps_result") or [])
         for step in steps:
-            if not _stored_pipeline_step_allowed(role, step, draft.get("source")):
+            if not _stored_step_allowed(role, step, draft.get("source")):
                 return False
     # A message carrying no data — a user's question, a clarification, an
     # agent error — has nothing the whole-source / table rules protect: they
@@ -2569,7 +2460,7 @@ def _visible_messages(cid, user, access):
         if chat_workflows.is_plan(workflow):
             allowed = (workflow.get("requested_by") == user["id"] or user["role"] == "admin") and user["role"] in ("admin", "analyst")
             if allowed:
-                allowed = all(_stored_pipeline_step_allowed(user["role"], {
+                allowed = all(_stored_step_allowed(user["role"], {
                     "source": task.get("source") or workflow.get("source"),
                     "sql": task.get("read_sql") or task.get("sql")}, workflow.get("source"))
                     for task in workflow.get("tasks", []) if isinstance(task, dict))
