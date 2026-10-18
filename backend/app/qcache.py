@@ -77,14 +77,19 @@ def init_tables():
                 avg_reward REAL,
                 embedding TEXT,
                 created_at REAL NOT NULL,
-                updated_at REAL NOT NULL
+                updated_at REAL NOT NULL,
+                user_id TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_qcache_scope
                 ON query_cache(role, source, table_scope);
             """
         )
-        # seen / avg_reward / embedding arrived with routing and embeddings; a
-        # table created before them gets them from migration 5 (app/migrations.py).
+        # seen / avg_reward / embedding arrived with routing and embeddings, and
+        # user_id with private plans; a table created before them gets them
+        # from migrations 5 and 21 (app/migrations.py), which also index user_id.
+        if db._has_column(c, "query_cache", "user_id"):
+            c.execute("CREATE INDEX IF NOT EXISTS idx_qcache_user "
+                      "ON query_cache(user_id, source, table_scope)")
         c.commit()
 
 
@@ -159,29 +164,64 @@ def _exec_full(user, source, sql):
         return None
 
 
-def lookup(user, source, table_scope, prompt):
-    """Best semantic hit for this prompt in scope, re-executed fresh. Returns a
-    run-result dict (mode='cached') or None."""
-    sig = _sig(prompt)
-    if not sig:
-        return None
-    q_vec = _query_vec(sig)
-    with db.connect() as c:
-        rows = c.execute(
-            "SELECT * FROM query_cache WHERE role=? AND source=? AND table_scope=? "
-            "AND avg_reward >= ?",
-            (user["role"], source, table_scope, MIN_REWARD)).fetchall()
+def _best(rows, prompt, sig, q_vec, sig_of, vec_of):
+    """(row, score) of the most similar row asking the same direction."""
     best, best_score = None, 0.0
     direction = _direction(prompt)
     for r in rows:
         if _direction(r["prompt"]) != direction:
             continue                        # the opposite question: never its plan
-        e_vec = json.loads(r["embedding"]) if r["embedding"] else None
-        score = _sim(q_vec, sig, e_vec, json.loads(r["signature"]))
+        score = _sim(q_vec, sig, vec_of(r), sig_of(r))
         if score > best_score:
             best, best_score = r, score
-    if not best or best_score < CACHE_THRESHOLD:
+    return best, best_score
+
+
+def _shared_template(user, source, table_scope, prompt, sig, q_vec):
+    """The org-shared verified query this prompt matches, or (None, 0.0). The
+    only plans one user's question may reuse from another user: verified SQL
+    its author deliberately shared with the organization (visibility "org" in
+    the saved-query library) — never a private plan, which carries its
+    author's own prompt and context. Its SQL is re-run as the asker, so it
+    reads only what the asker may read."""
+    try:
+        with db.connect() as c:
+            rows = [dict(r) for r in c.execute(
+                "SELECT id, title, prompt, sql, table_label FROM saved_queries "
+                "WHERE visibility='org' AND verified=1 AND source=? AND user_id<>?",
+                (source, user.get("id") or "")).fetchall()]
+    except Exception:
+        return None, 0.0                    # no saved-query library in this process
+    rows = [r for r in rows if (r.get("table_label") or "*") in (table_scope, "*")]
+    return _best(rows, prompt, sig, q_vec, lambda r: _sig(r["prompt"]), lambda r: None)
+
+
+def lookup(user, source, table_scope, prompt):
+    """Best semantic hit for this prompt in scope, re-executed fresh. Returns a
+    run-result dict (mode='cached') or None.
+
+    PRIVATE first: a cached plan is reused only for the user who asked it —
+    a plan carries its author's prompt and context, so sharing a role is not
+    a reason to see either. Then SHARED: a verified query its author shared
+    with the organization (_shared_template). Never another user's prompt in
+    the reply: an own plan echoes the user's own earlier prompt, a template
+    its title."""
+    sig = _sig(prompt)
+    if not sig or not user.get("id"):
         return None
+    q_vec = _query_vec(sig)
+    with db.connect() as c:
+        rows = c.execute(
+            "SELECT * FROM query_cache WHERE user_id=? AND role=? AND source=? "
+            "AND table_scope=? AND avg_reward >= ?",
+            (user["id"], user["role"], source, table_scope, MIN_REWARD)).fetchall()
+    best, best_score = _best(rows, prompt, sig, q_vec, lambda r: json.loads(r["signature"]),
+                             lambda r: json.loads(r["embedding"]) if r["embedding"] else None)
+    if not best or best_score < CACHE_THRESHOLD:
+        template, score = _shared_template(user, source, table_scope, prompt, sig, q_vec)
+        if not template or score < CACHE_THRESHOLD:
+            return None
+        return _replay_template(user, source, template, score)
 
     executed = _exec_full(user, source, best["sql"])
     if executed is None:
@@ -205,7 +245,24 @@ def lookup(user, source, table_scope, prompt):
         # uses "replace" because its heuristic was already counted.
         "_qcache_feedback_mode": "add",
         "cached": {"similarity": round(best_score, 3), "from_prompt": best["prompt"],
-                   "hits": best["hits"] + 1},
+                   "hits": best["hits"] + 1, "shared": False},
+    }
+
+
+def _replay_template(user, source, template, score):
+    executed = _exec_full(user, source, template["sql"])
+    if executed is None:
+        return None
+    cols, data = executed
+    return {
+        "text": f"Reused the shared query “{template['title']}”.",
+        "sql": template["sql"], "columns": cols, "rows": data, "chart": None,
+        "panels": [{"sql": template["sql"], "columns": cols, "rows": data, "chart": None}]
+        if data else [],
+        "email": None, "errors": [], "mode": "cached", "model": None, "served_by": "cache",
+        "agents": [{"name": "Query cache", "source": source, "role": "cache"}],
+        "cached": {"similarity": round(score, 3), "shared": True,
+                   "template": {"id": template["id"], "title": template["title"]}},
     }
 
 
@@ -240,10 +297,13 @@ def store(user, source, table_scope, prompt, result, reward=None):
     emb = _doc_vec(sig)                            # stored pattern = document side
     emb_json = json.dumps(emb) if emb else None
     now = time.time()
+    if not user.get("id"):
+        return None                         # a plan belongs to the user who asked it
     with db.connect() as c:
-        row = c.execute("SELECT id, seen, avg_reward, embedding FROM query_cache WHERE role=? "
-                        "AND source=? AND table_scope=? AND signature=?",
-                        (user["role"], source, table_scope, json.dumps(sig))).fetchone()
+        row = c.execute("SELECT id, seen, avg_reward, embedding FROM query_cache WHERE "
+                        "user_id=? AND role=? AND source=? AND table_scope=? AND signature=?",
+                        (user["id"], user["role"], source, table_scope,
+                         json.dumps(sig))).fetchone()
         if row:
             cache_id = row["id"]
             seen = (row["seen"] or 0) + 1
@@ -257,10 +317,11 @@ def store(user, source, table_scope, prompt, result, reward=None):
             cache_id = str(uuid.uuid4())
             c.execute(
                 "INSERT INTO query_cache (id, role, source, table_scope, prompt, signature, sql, "
-                "chart, text, hits, seen, avg_reward, embedding, created_at, updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "chart, text, hits, seen, avg_reward, embedding, created_at, updated_at, "
+                "user_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (cache_id, user["role"], source, table_scope, prompt[:500],
-                 json.dumps(sig), sql, chart, text[:2000], 0, 1, reward, emb_json, now, now))
+                 json.dumps(sig), sql, chart, text[:2000], 0, 1, reward, emb_json, now, now,
+                 user["id"]))
         c.commit()
     return cache_id
 

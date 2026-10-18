@@ -103,11 +103,11 @@ def test_an_entry_stored_before_directions_were_kept_is_judged_by_its_prompt(cac
     now = time.time()
     with cache.db.connect() as c:
         c.execute("INSERT INTO query_cache (id, role, source, table_scope, prompt, signature, "
-                  "sql, chart, text, hits, seen, avg_reward, embedding, created_at, updated_at) "
-                  "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  "sql, chart, text, hits, seen, avg_reward, embedding, created_at, updated_at, "
+                  "user_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                   (str(uuid.uuid4()), "analyst", "demo", "sales",
                    "Show the highest-revenue products", json.dumps(old_sig),
-                   "SELECT ... DESC", None, "ok", 0, 3, 1.0, None, now, now))
+                   "SELECT ... DESC", None, "ok", 0, 3, 1.0, None, now, now, USER["id"]))
         c.commit()
     assert cache.learned("demo", "sales", "lowest revenue products") is None   # in the band
     monkeypatch.setattr(cache, "_sim", lambda *a: 1.0)          # only the guard can stop it
