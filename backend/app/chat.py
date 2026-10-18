@@ -505,6 +505,13 @@ def _and(names):
     return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
 
 
+def _usable_sources(user):
+    """Live sources this user's role may query — names only, no probing."""
+    from .connectors import all_sources
+    allowed = set(rbac.allowed_sources(user["role"]))
+    return [s["name"] for s in all_sources() if s.get("configured") and s["name"] in allowed]
+
+
 def _resolved_tables(cid):
     """Shared tables this conversation already chose to query across ALL sources
     ("both / all, side by side"). Remembered on the assistant result of that
@@ -932,19 +939,29 @@ def _run_turn(ctx, user):
         return _pipeline_turn(ctx, user, action, previous)
 
     if ctx["mode"] == "*":
-        # Same-named table in several sources? Don't guess — ask, unless the
-        # user already chose "both, side by side" (allow_ambiguous).
-        sources = orchestrator.accessible_sources(user)
-        clash = orchestrator.ambiguous_tables(prompt, sources)
-        if clash and not ctx.get("allow_ambiguous"):
-            # Tables this conversation already chose to query across all sources
-            # are settled; only a NEW shared table asks again.
-            resolved = _resolved_tables(cid)
-            clash = [c for c in clash if c["table"] not in resolved]
-            if clash:
-                return _clarify_turn(ctx, user, clash, t0)
-        result = orchestrator.run_orchestrated(prompt, user, ctx["history"], model,
-                                               conversation_id=cid, sources=sources)
+        # A certified metric is answered from its definition here too — before
+        # the fan-out, and before asking which same-named table was meant: a
+        # certification already says where the number lives.
+        certified = None if ctx["history"] else semantic.certified_answer(
+            user, _usable_sources(user), prompt)
+        clash = None
+        if certified is not None:
+            progress.emit("answered from a certified metric")
+            result = certified
+        else:
+            # Same-named table in several sources? Don't guess — ask, unless the
+            # user already chose "both, side by side" (allow_ambiguous).
+            sources = orchestrator.accessible_sources(user)
+            clash = orchestrator.ambiguous_tables(prompt, sources)
+            if clash and not ctx.get("allow_ambiguous"):
+                # Tables this conversation already chose to query across all
+                # sources are settled; only a NEW shared table asks again.
+                resolved = _resolved_tables(cid)
+                clash = [c for c in clash if c["table"] not in resolved]
+                if clash:
+                    return _clarify_turn(ctx, user, clash, t0)
+            result = orchestrator.run_orchestrated(prompt, user, ctx["history"], model,
+                                                   conversation_id=cid, sources=sources)
         if clash and ctx.get("allow_ambiguous"):
             result["resolved_tables"] = [c["table"] for c in clash]   # sticky for this chat
         result.setdefault("source", "*")
@@ -989,7 +1006,14 @@ def _run_turn(ctx, user):
             visual_mode=visual, conversation_id=cid, focus_schemas=focus["schemas"],
             join_hints=focus["joins"])
 
-    if ctx.get("visual"):
+    if ctx.get("visual") and not ctx["history"] and (certified := semantic.certified_answer(
+            user, [ctx["source"]], prompt, ctx["table_param"])) is not None:
+        # A certified metric's number comes from its definition in the D3
+        # window too; it is drawn with D3, not a custom visual.
+        progress.emit("answered from a certified metric — drawing it with D3")
+        result = certified
+        agent.d3_only(result)
+    elif ctx.get("visual"):
         # The D3 & artifacts window goes straight to the frontier agent: the
         # semantic layer, the plan cache and BitNet return stock charts and
         # cannot write a custom visual. (BitNet/KAG are engines, not models,

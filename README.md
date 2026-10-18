@@ -1479,6 +1479,13 @@ answered from: the semantic layer declines it and says why, the source's metadat
 health turns *failing*, and grounding ignores it. Each definition has a
 version history from the applied YAML documents (a new version only when its
 calculation changes), and may carry `owner`, `certified` and `version` fields.
+A **certified** metric is answered from its definition in every mode. That
+includes **All sources**, where the orchestrator otherwise fans out, and the
+**D3 & artifacts** window, where it is drawn with D3 instead of a custom visual.
+This holds when exactly one source resolves the question to certified metrics
+only, on a conversation's first turn. Applying a YAML returns `warnings`
+listing every definition the warehouse does not hold as written (broken,
+drifted or unchecked); applying is never refused for it.
 `GET /api/metagraph/metrics` and `…/metrics/{source}/{name}` show them to roles
 that may read their tables; the graph view draws them (`MEASURES`, `USES`), and
 the Neo4j mirror carries them as `StudioMetric` nodes.

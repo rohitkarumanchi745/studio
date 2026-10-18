@@ -699,6 +699,52 @@ def answer(user, source, prompt, table=None):
     }
 
 
+def certified_answer(user, sources, prompt, table=None):
+    """Answer from CERTIFIED metrics in every mode. Where the general semantic
+    tier does not run — All sources (the orchestrator fans out) and the D3
+    window (the agent draws a custom visual) — a prompt that resolves, in
+    exactly ONE of `sources`, to metrics that are all certified is answered
+    from their definitions, like a single-source turn. Several sources
+    resolving it is ambiguous, so the caller's own path decides. Returns the
+    answer or None."""
+    if not loaded():
+        return None
+    hits = []
+    for source in sources:
+        try:
+            match = resolve(source, prompt, table)
+        except Exception:
+            continue
+        if match and match["metrics"] and all(m.get("certified") for m in match["metrics"]):
+            hits.append(source)
+    if len(hits) != 1:
+        return None
+    out = answer(user, hits[0], prompt, table)
+    if out is not None:
+        out["semantic"]["certified"] = True
+        out["source"] = hits[0]
+    return out
+
+
+def _definition_warnings():
+    """Each applied definition the warehouse does not hold as written —
+    broken, drifted or not yet checked — as one line for the admin who just
+    applied it. Applying is never refused for it: a broken definition is
+    simply not answered from (metametrics)."""
+    try:
+        from . import metametrics
+        out = []
+        for d in metametrics.definitions():
+            result = metametrics.check(d)
+            if result["status"] != "valid":
+                why = "; ".join(result["reasons"]) or result["status"]
+                out.append(f"{d['kind']} {d['name']} on {d['source']}.{d['table']} is "
+                           f"{result['status']}: {why}")
+        return out
+    except Exception:
+        return []
+
+
 # ── Admin API ───────────────────────────────────────────────────────────
 
 def _admin(user):
@@ -812,7 +858,7 @@ def apply_yaml(body: YamlIn, user=Depends(current_user)):
     except Exception:
         pass
     db.log_activity(user, "semantic_apply", ok=loaded())
-    return get_config(user)
+    return {**get_config(user), "warnings": _definition_warnings()}
 
 
 @router.delete("")
