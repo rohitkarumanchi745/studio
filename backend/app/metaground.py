@@ -217,9 +217,10 @@ def index(source, budget=None):
     return done
 
 
-def _by_meaning(source, prompt, objects):
+def _by_meaning(source, prompt, objects, qvec=None):
     """{table: cosine} for the objects with a CURRENT vector, or {} — no
-    Harrier, nothing indexed, or the question could not be embedded."""
+    Harrier, nothing indexed, or the question could not be embedded. `qvec`:
+    the question already embedded (one embedding serves every source)."""
     if not embed.available() or not objects:
         return {}
     with db.connect() as c:
@@ -229,7 +230,7 @@ def _by_meaning(source, prompt, objects):
                if r["object"] in objects and r["fingerprint"] == objects[r["object"]]["fingerprint"]}
     if not vectors:
         return {}
-    q = embed.embed(prompt, kind="query", instruct=_INSTRUCT)
+    q = qvec if qvec is not None else query_vector(prompt)
     if q is None:
         return {}
     return {name: embed.cosine(q, vec) for name, vec in vectors.items()}
@@ -253,6 +254,30 @@ def _with_meaning(ranked, meaning):
     out = [(t, round(s, 3), w) for t, (s, w) in merged.items()]
     out.sort(key=lambda t: (-t[1], t[0]))
     return out
+
+
+def query_vector(prompt):
+    """The question embedded for table retrieval, or None (no Harrier)."""
+    if not embed.available():
+        return None
+    return embed.embed(prompt, kind="query", instruct=_INSTRUCT)
+
+
+def discovered(source, allowed):
+    """The metadata graph's record of `allowed` on `source`: {name: {"kind",
+    "description", "fingerprint", "columns"}}, raw columns (govern them
+    before showing or scoring them for a role)."""
+    return _objects(source, allowed)
+
+
+def relevance(source, prompt, objects, qvec=None):
+    """[(table, score, why)] best first for one source's `objects`, by every
+    signal grounding uses — names, columns, descriptions, the certified
+    metrics' names and synonyms, and meaning (Harrier). What auto routing
+    (autoroute.py) compares across sources."""
+    ranked = score(prompt, objects, _definitions(source, objects))
+    meaning = _by_meaning(source, prompt, objects, qvec)
+    return _with_meaning(ranked, meaning) if meaning else ranked
 
 
 def rank(source, prompt, allowed):

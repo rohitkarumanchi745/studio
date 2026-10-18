@@ -187,6 +187,43 @@ export function AgentActivity({ steps = [], graph, running = false, failed = fal
   );
 }
 
+// Auto: Studio picks the source and tables from each question (the server's
+// autoroute.py). On unless this browser's user turned it off.
+const AUTO_KEY = "studio_auto_source";
+
+export function readAutoPref() {
+  try {
+    return localStorage.getItem(AUTO_KEY) !== "0";
+  } catch {
+    return true;                       // storage blocked: the default
+  }
+}
+
+function writeAutoPref(on) {
+  try {
+    localStorage.setItem(AUTO_KEY, on ? "1" : "0");
+  } catch {
+    /* storage blocked: the choice lasts this visit */
+  }
+}
+
+/** Where Auto sent a question, in words — the line under an auto-routed answer. */
+export function describeRoute(route) {
+  if (!route) return "";
+  const list = (names) => names.length < 3 ? names.join(" and ")
+    : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+  const terms = (route.terms || []).map((t) => t.replace(/_/g, " "));
+  const matched = terms.length ? ` — matched ${terms.join(", ")}` : "";
+  if (route.mode === "single") {
+    const tables = route.tables?.length ? ` · ${route.tables.join(", ")}` : "";
+    return `${route.kept ? "stayed with" : "picked"} ${route.source}${tables}${matched}`;
+  }
+  if (route.mode === "multi") {
+    return `${route.kept ? "stayed with" : "asked"} ${list(route.sources || [])}${matched}`;
+  }
+  return "asked every source — no source's tables matched the question";
+}
+
 /** A D3 & artifacts conversation (its title carries the 🎨 the server gave it). */
 export function isVisualConversation(c) {
   return typeof c?.title === "string" && c.title.startsWith("🎨");
@@ -217,6 +254,10 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
   useEffect(() => {
     if (model) localStorage.setItem("studio_model", model);
   }, [model]);
+  const [auto, setAuto] = useState(readAutoPref);
+  useEffect(() => {
+    writeAutoPref(auto);
+  }, [auto]);
   const [sources, setSources] = useState([]);
   const [source, setSource] = useState("demo");
   const [tables, setTables] = useState([]);
@@ -296,14 +337,16 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
   useEffect(() => {
     setTables([]);
     setSel([]);
-    if (!source || source === "*") return;
+    // With Auto on the pickers are hidden: nothing to list, and nothing to
+    // report if the last source picked by hand cannot be read.
+    if (!source || source === "*" || auto) return;
     api(`/catalog/sources/${source}/tables`)
       .then((t) => {
         setTables(t);
         // default: chat across the whole source (empty selection)
       })
       .catch((e) => setError(e.message));
-  }, [source]);
+  }, [source, auto]);
 
   useEffect(() => {
     const epoch = ++taskViewEpochRef.current;
@@ -405,7 +448,9 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
     // Optimistically show the question + a working placeholder; the answer is
     // produced in the background, so the user can switch to another chat and
     // start a different task without waiting.
-    setMessages((m) => [...m, { role: "user", text: q, source, table: tableLabel }]);
+    setMessages((m) => [...m, auto
+      ? { role: "user", text: q, source: "auto", table: "picked from your question" }
+      : { role: "user", text: q, source, table: tableLabel }]);
     setBusy(true);
     setLiveSteps([]);
     setActiveStartedAt(Date.now());
@@ -414,9 +459,12 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
         method: "POST",
         body: JSON.stringify({
           prompt: q,
-          source,
-          table: orchestrated || sel.length !== 1 ? "*" : sel[0],
-          tables: !orchestrated && sel.length > 1 ? sel : undefined,
+          // Auto: the server picks the source and tables from the question.
+          ...(auto ? { source: "*", table: "*", auto: true } : {
+            source,
+            table: orchestrated || sel.length !== 1 ? "*" : sel[0],
+            tables: !orchestrated && sel.length > 1 ? sel : undefined,
+          }),
           conversation_id: conversationId,
           model: model || undefined,
           ...(visualMode ? { visual: true } : chatPipelineFields(buildAirflow,
@@ -627,21 +675,22 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
   // actually be answered by the data in front of you.
   const [suggestions, setSuggestions] = useState([]);
   const [sugBusy, setSugBusy] = useState(false);
-  const selKey = orchestrated ? "*" : sel.length ? sel.join(",") : "*";
+  const studioPicks = auto || orchestrated;
+  const selKey = studioPicks ? "*" : sel.length ? sel.join(",") : "*";
 
   useEffect(() => {
     if (!source) return;
     let cancelled = false;
     setSugBusy(true);
     setSuggestions([]);
-    api(`/catalog/sources/${orchestrated ? "demo" : source}/suggestions?table=${encodeURIComponent(selKey)}`)
+    api(`/catalog/sources/${studioPicks ? "demo" : source}/suggestions?table=${encodeURIComponent(selKey)}`)
       .then((d) => !cancelled && setSuggestions(d.suggestions || []))
       .catch(() => !cancelled && setSuggestions([]))
       .finally(() => !cancelled && setSugBusy(false));
     return () => {
       cancelled = true;
     };
-  }, [source, selKey, orchestrated]);
+  }, [source, selKey, studioPicks]);
 
   return (
     <div className={"workspace" + (canvas ? " with-canvas" : "") + (canvas && !chatOpen ? " chat-hidden" : "")}>
@@ -665,49 +714,63 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
       )}
       <main className={"chatpane" + (visualMode ? " visual-chat" : "")}>
       <div className="toolbar">
-        <label>Source</label>
-        <select value={source} onChange={(e) => setSource(e.target.value)}>
-          <option value="*">✳ all sources — multi-agent</option>
-          {sourceGroups.map((g) => (
-            <optgroup key={g.label} label={g.label}>
-              {g.items.map((s) => (
-                <option key={s.name} value={s.name} disabled={!s.allowed || !s.configured}>
-                  {s.name}{s.namespace ? ` · ${s.namespace}` : ""}
-                  {!s.configured ? " (not configured)" : !s.allowed ? " (no access)" : ""}
-                </option>
+        <label className={"auto-switch" + (auto ? " on" : "")}
+               title={auto ? "Studio picks the source and tables from each question. Turn off to choose them yourself."
+                 : "Turn on to let Studio pick the source and tables from each question."}>
+          <input type="checkbox" role="switch" aria-checked={auto} checked={auto}
+                 onChange={(e) => setAuto(e.target.checked)} />
+          <span className="auto-switch-track" aria-hidden="true"><span className="auto-switch-thumb" /></span>
+          Auto
+        </label>
+        {auto ? (
+          <span className="auto-hint">✳ Studio picks the source and tables from each question</span>
+        ) : (
+          <>
+            <label>Source</label>
+            <select value={source} onChange={(e) => setSource(e.target.value)}>
+              <option value="*">✳ all sources — multi-agent</option>
+              {sourceGroups.map((g) => (
+                <optgroup key={g.label} label={g.label}>
+                  {g.items.map((s) => (
+                    <option key={s.name} value={s.name} disabled={!s.allowed || !s.configured}>
+                      {s.name}{s.namespace ? ` · ${s.namespace}` : ""}
+                      {!s.configured ? " (not configured)" : !s.allowed ? " (no access)" : ""}
+                    </option>
+                  ))}
+                </optgroup>
               ))}
-            </optgroup>
-          ))}
-        </select>
-        <label>Table</label>
-        <div className="tpicker">
-          <button type="button" className="tpicker-btn" disabled={orchestrated} onClick={() => setPickerOpen(!pickerOpen)}>
-            {orchestrated ? "agent-routed" : tableLabel} ▾
-          </button>
-          {pickerOpen && (
-            <div className="tpicker-panel">
-              <label className="tpicker-item">
-                <input type="checkbox" checked={sel.length === 0} onChange={() => setSel([])} />
-                ✳ All tables
-              </label>
-              {tables.map((t) => (
-                <label key={t} className="tpicker-item">
-                  <input
-                    type="checkbox"
-                    checked={sel.includes(t)}
-                    onChange={() =>
-                      setSel(sel.includes(t) ? sel.filter((x) => x !== t) : [...sel, t])
-                    }
-                  />
-                  {t}
-                </label>
-              ))}
-              <button type="button" className="chip" onClick={() => setPickerOpen(false)}>
-                done
+            </select>
+            <label>Table</label>
+            <div className="tpicker">
+              <button type="button" className="tpicker-btn" disabled={orchestrated} onClick={() => setPickerOpen(!pickerOpen)}>
+                {orchestrated ? "agent-routed" : tableLabel} ▾
               </button>
+              {pickerOpen && (
+                <div className="tpicker-panel">
+                  <label className="tpicker-item">
+                    <input type="checkbox" checked={sel.length === 0} onChange={() => setSel([])} />
+                    ✳ All tables
+                  </label>
+                  {tables.map((t) => (
+                    <label key={t} className="tpicker-item">
+                      <input
+                        type="checkbox"
+                        checked={sel.includes(t)}
+                        onChange={() =>
+                          setSel(sel.includes(t) ? sel.filter((x) => x !== t) : [...sel, t])
+                        }
+                      />
+                      {t}
+                    </label>
+                  ))}
+                  <button type="button" className="chip" onClick={() => setPickerOpen(false)}>
+                    done
+                  </button>
+                </div>
+              )}
             </div>
-          )}
-        </div>
+          </>
+        )}
         {visualMode && (
           <span className="visual-toolbar-right">
             <span className="artifact-badge">🎨 D3 &amp; artifacts</span>
@@ -807,6 +870,8 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
             placeholder={
               visualMode
                 ? "Describe the visualization — e.g. “revenue by region as circle packing” or “a custom radial timeline of orders”…"
+                : auto
+                ? "Ask about your data — Studio finds the source and tables…"
                 : orchestrated
                 ? "Ask across all your databases — agents route the question…"
                 : tables.length ? `Ask about ${sel.length ? sel.join(", ") : "your data"}…` : "Choose a data source, or ask to run a platform job…"
@@ -1068,6 +1133,11 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
                   : `▣ Use ${o.source}`}
               </button>
             ))}
+          </div>
+        )}
+        {m.auto_route && (
+          <div className="auto-route-row" title={m.auto_route.why || ""}>
+            <span className="auto-route-tag">✳ Auto</span> {describeRoute(m.auto_route)}
           </div>
         )}
         {/* What the answer was computed from — read off the executed SQL, so it
