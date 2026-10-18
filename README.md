@@ -1419,9 +1419,13 @@ its table and to the columns its expression and filters reference (read with
 the query guard's tokenizer, so a function, a qualifier, a type or a SQL
 keyword is never taken for a column, and quoted `"UnitPrice"` and bare
 `unit_price` both resolve) and checked against the current record: *valid*,
-*broken* (its table or a column is gone — with the reason) or *unchecked*
-(its source has not been discovered). A broken definition is never answered
-from: the semantic layer declines it and says why, the source's metadata
+*broken* (its table or a column is gone — with the reason), *drifted* (a
+column it reads changed type family since the definition was validated — a
+number became text; a detail change such as INT → BIGINT is only noted) or
+*unchecked* (its source has not been discovered). An administrator or the
+table's owner can revalidate a drifted definition against its columns as they
+are now; a new version of the definition is validated afresh. A broken or drifted definition is never
+answered from: the semantic layer declines it and says why, the source's metadata
 health turns *failing*, and grounding ignores it. Each definition has a
 version history from the applied YAML documents (a new version only when its
 calculation changes), and may carry `owner`, `certified` and `version` fields.

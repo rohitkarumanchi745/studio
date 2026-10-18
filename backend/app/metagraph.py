@@ -200,6 +200,7 @@ def init_tables():
         c.commit()
     metarelations.init_tables()
     metaentities.init_tables()
+    metametrics.init_tables()
 
 
 # ── Discovery ────────────────────────────────────────────────────────────
@@ -484,6 +485,10 @@ def discover(source, trigger="manual"):
         _fail(source, snapshot_id, _safe_error(exc))
         raise
     relationships = _relate(source)
+    try:
+        metametrics.ensure_baselines(source)
+    except Exception:
+        log.warning("metagraph: metric baselines for %s failed", source, exc_info=True)
     mirror(source)
     return {"source": source, "snapshot_id": snapshot_id, "objects": len(objects),
             "added": added, "changed": changed, "removed": removed, "held": held,
@@ -734,6 +739,7 @@ def _metric_view(d, user, *, detail=False):
                              "model_filter", "grain", "description", "synonyms", "owner",
                              "certified", "declared_version", "status", "columns")}
     out["object"] = d["object"]
+    out["baseline_at"] = d.get("baseline_at")
     if user["role"] == "admin" or detail:
         out["reasons"] = d["reasons"]
     hist = metametrics.history(d["source"], d["table"], d["name"], d["kind"])
@@ -775,6 +781,28 @@ def get_metric(source: str, name: str, kind: str = "metric", user=Depends(curren
     if d is None:
         raise HTTPException(404, "Not found")
     return _metric_view(d, user, detail=True)
+
+
+@router.post("/metrics/{source}/{name}/revalidate")
+def revalidate_metric(source: str, name: str, kind: str = "metric",
+                      user=Depends(current_user)):
+    """Accept a drifted definition against its columns as they are now: an
+    administrator, or the owner of its table."""
+    _visible_source(user, source)
+    d = next((d for d in _metrics_for(user, source)
+              if d["name"].lower() == name.lower() and d["kind"] == kind), None)
+    if d is None:
+        raise HTTPException(404, "Not found")
+    if not d.get("object") or not metaentities.may_review(user, source, d["object"]):
+        raise HTTPException(403, "Only administrators or the owner of this table can "
+                                 "revalidate it")
+    try:
+        result = metametrics.revalidate(d, user)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    db.log_activity(user, "metagraph_revalidate", source=source, prompt=f"{kind} {name}")
+    return {"name": d["name"], "kind": kind, "status": result["status"],
+            "reasons": result["reasons"]}
 
 
 @router.get("/entities")
@@ -868,8 +896,9 @@ def metadata_health(user=Depends(current_user)):
     for source in _live_sources():
         fresh, reasons = metaentities.freshness(_state(source), now, tick_s=_TICK_SECONDS,
                                                 full_s=_full_sync_seconds())
-        broken = [f"{d['kind']} {d['name']}: {'; '.join(d['reasons'])}"
-                  for d in metametrics.for_source(source) if d["status"] == "broken"]
+        broken = [f"{d['kind']} {d['name']} is {d['status']}: {'; '.join(d['reasons'])}"
+                  for d in metametrics.for_source(source)
+                  if d["status"] in metametrics.INVALID]
         if broken and fresh == "fresh":
             fresh = "failing"
         rows.append({"source": source, "freshness": fresh, "reasons": reasons + broken,
@@ -1013,6 +1042,10 @@ def tick_once():
         mirror_entities()
     except Exception:
         log.warning("metagraph: entity proposals failed", exc_info=True)
+    try:
+        metametrics.ensure_baselines()
+    except Exception:
+        log.warning("metagraph: metric baselines failed", exc_info=True)
     _watch_freshness(live, now)
     return {"queued": queued, "purged": purged}
 

@@ -201,12 +201,12 @@ def ground(source, prompt, allowed, *, limit=6, min_confidence=0.6, cutoff=0.35)
 
 
 def _definitions(source, objects):
-    """Valid or unchecked semantic definitions on these tables — a broken one
-    never steers grounding or the agent."""
+    """Valid or unchecked semantic definitions on these tables — a broken or
+    drifted one never steers grounding or the agent."""
     try:
         from . import metametrics
         return [d for d in metametrics.for_source(source, set(objects))
-                if d["status"] != "broken" and d.get("object") in objects]
+                if d["status"] not in metametrics.INVALID and d.get("object") in objects]
     except Exception:
         return []
 
