@@ -1482,19 +1482,36 @@ shows it: *grounded in the metadata graph: … (joined through …)*.
   kept apart: every mirrored node and edge carries `STUDIO_METAGRAPH_TENANT`
   and every statement is scoped by it.
 
-**It stays current with no one asking.** The `metagraph_sync` scheduler (every
-`STUDIO_METAGRAPH_TICK_SECONDS`, 300 by default) reads each live source's
-*per-table change tokens*, in one cheap catalog query. Postgres hashes each
-relation's kind, column names and types. Databricks reads each relation's type
-and `last_altered`. The demo warehouse hashes each table's schema text. Every
-table whose token moved since the last checkpoint becomes a **change event**,
-and that event re-reads **just that table** (`metacdc.py`). A connector with no
-per-table tokens falls back to its single source-wide *change signal* and is
-rediscovered whole when it moves. Either way, a source whose last full
+**It stays current with no one asking, whatever the source.** Change capture
+needs nothing from a database beyond what every Studio connector already
+provides: a table listing (`list_tables`) and a table's columns
+(`get_schema`). Any warehouse, database, API or file store a connector
+reaches is covered, with no code of its own.
+
+Every `STUDIO_METAGRAPH_TICK_SECONDS` (300 by default), the `metagraph_sync`
+scheduler compares each live source with the **graph's own record**:
+- **Created and dropped tables:** the listing against the record, on every
+  tick.
+- **Altered tables:** fresh column fingerprints against the recorded ones.
+  - A connector that offers bulk metadata (`describe_relations`) is checked
+    in one read.
+  - Any other connector is probed table by table, in rotation, up to
+    `STUDIO_METAGRAPH_PROBE_TABLES` (100) tables and
+    `STUDIO_METAGRAPH_PROBE_SECONDS` (20) per tick. Every table comes round
+    in turn.
+- **Optional speed-up:** a connector *may* report its own per-table change
+  tokens (`table_signals`, such as a catalog's last-altered time). Then only
+  the tables whose token moved are re-read and nothing is probed. Postgres,
+  Databricks and the demo warehouse do this today; it is never required.
+
+Every table found changed becomes a **change event** (`metacdc.py`), and
+that event re-reads **just that table**. Because the record is the
+reference, nothing a connector reports is trusted beyond "look at this
+table". A source that can't be listed at the moment falls back to its
+source-wide *change signal*, if it has one. A source whose last full
 discovery is older than `STUDIO_METAGRAPH_FULL_SYNC_SECONDS` (6 h) is
-rediscovered: that reconciles anything no event reported, and it is the only
-cadence for a connector with no signal at all. A reconnect still queues a
-rediscovery.
+rediscovered whole, to reconcile anything no event reported. A reconnect
+still queues a rediscovery.
 
 **Change events** follow one contract, whoever sends them:
 
@@ -1546,13 +1563,16 @@ How events are handled:
 - **Rows, not schema.** A `data_changed` event never touches the graph. It
   records only when that table's data last changed (`data_changed_at` on the
   table), and never moves that time backwards.
-- **Checkpoints and the snapshot handoff.** The poller's checkpoint moves only
-  after its events are accepted. The same change always gets the same event id,
-  so re-sending after a crash is a duplicate. A full discovery reads the tokens
-  before it lists. It records them as the checkpoint and marks every table as
-  read at the snapshot's start. A change made while the snapshot runs therefore
-  arrives as an event, and an older single-table read never overwrites a newer
-  one (or the other way round).
+- **Checkpoints and the snapshot handoff.**
+  - **Duplicates:** a change seen again (re-sent after a crash, or found by
+    two schedulers) gets the same event id and is a duplicate. A table that
+    changes and changes back gets a new id each time.
+  - **During a full discovery:** anything a full discovery missed while it
+    ran still differs from the record, so it arrives as an event. A
+    connector's own tokens are read before the snapshot lists, and saved as
+    their checkpoint, for the same effect.
+  - **Race guard:** an older single-table read never overwrites a newer one,
+    or the other way round.
 - **Retry, then dead letter.** A failing event is retried with backoff, four
   attempts in all. After that it is *dead*, metadata health turns *stale* for
   that source, and an admin can replay it. The event log

@@ -2,7 +2,10 @@
 
 Acceptance: alter, create or drop one table and exactly that table is re-read
 — no whole-source rediscovery — with the relationships and certified metrics
-that depend on it following. Events are accepted durably and once, applied in
+that depend on it following. It works for ANY connector: one offering only
+list_tables() and get_schema() is captured per table too, within a probe
+budget; bulk metadata or the connector's own per-table tokens only make it
+cheaper. Events are accepted durably and once, applied in
 a way that a late or reordered one cannot roll the graph back, retried and then
 dead-lettered for replay; the poller's checkpoint moves only after acceptance;
 a change too big for events (a mass drop) goes to a full rediscovery where the
@@ -24,9 +27,10 @@ from test_metagraph_discovery import ADMIN, VIEWER, RetailConnector, env, stored
 
 
 class TrackedRetail(RetailConnector):
-    """The retail stand-in with what Postgres and Databricks offer change
-    capture — a token per table, a one-table describe, a source-wide signal —
-    and a record of which tables were read."""
+    """The retail stand-in with every optional speed-up a connector can offer
+    change capture — a token per table (a hash of its columns, as Postgres
+    computes it), a one-table describe, a source-wide signal — and a record of
+    which tables were read."""
 
     def __init__(self, path):
         super().__init__(path)
@@ -42,8 +46,10 @@ class TrackedRetail(RetailConnector):
     def table_signals(self):
         if not self.signals_on:
             return None
-        return {n: hashlib.sha256(f"{t}|{s}".encode()).hexdigest()[:16]
-                for n, t, s in self._master()}
+        with self._c() as c:
+            return {n: hashlib.sha256(repr((t, c.execute(
+                f'PRAGMA table_info("{n}")').fetchall())).encode()).hexdigest()[:16]
+                for n, t, _s in self._master()}
 
     def change_signal(self):
         return hashlib.sha256(repr(self._master()).encode()).hexdigest()
@@ -444,21 +450,41 @@ def test_a_table_whose_columns_could_not_be_read_is_reread_on_its_own(cdc):
     cdc.retail.fail_columns = set()
     tick(cdc)
     assert [(e["asset"], e["event_type"]) for e in events(cdc)] == \
-        [("retail_stores", "asset_created")]
+        [("retail_stores", "schema_changed")]
 
 
-def test_a_source_without_table_tokens_keeps_its_source_wide_signal(cdc):
+def test_without_its_own_tokens_a_source_is_compared_with_the_record_in_bulk(cdc):
     cdc.retail.signals_on = False
     warehouse(cdc, "ALTER TABLE retail_stores ADD COLUMN opened_on TEXT")
-    assert tick(cdc) == "change_detected" and events(cdc) == []
+    assert tick(cdc) is None                            # no source-wide rediscovery
+    assert [e["asset"] for e in events(cdc)] == ["retail_stores"]
+    assert cdc.retail.reads == ["*"]                    # one bulk read found it
+    drain(cdc)
+    assert columns_of(cdc, "retail_stores")[-1] == "opened_on"
+    tick(cdc)
+    assert len(events(cdc)) == 1                        # the record now agrees
 
 
-def test_a_source_discovered_before_change_capture_starts_its_checkpoint_safely(cdc):
-    cdc.cdc.reset_offsets("retail")                    # as an upgraded deployment has it
+def test_a_source_discovered_before_change_capture_misses_nothing(cdc):
+    cdc.cdc.reset_offsets("retail")                     # as an upgraded deployment has it
     warehouse(cdc, "ALTER TABLE retail_stores ADD COLUMN opened_on TEXT")
-    assert tick(cdc) == "change_detected"              # caught by the source-wide signal
-    assert cdc.cdc.offsets("retail")[0] is not None     # and the checkpoint has begun
-    assert events(cdc) == []
+    assert tick(cdc) is None
+    assert [e["asset"] for e in events(cdc)] == ["retail_stores"]   # found against the record
+    assert cdc.cdc.offsets("retail", "native")[0] is not None        # tokens from here on
+
+
+@pytest.mark.parametrize("signals", [True, False])
+def test_a_table_changed_back_and_forth_is_followed_every_time(cdc, signals):
+    cdc.retail.signals_on = signals
+    for _ in range(2):
+        warehouse(cdc, "ALTER TABLE retail_stores ADD COLUMN opened_on TEXT")
+        tick(cdc), drain(cdc)
+        assert columns_of(cdc, "retail_stores")[-1] == "opened_on"
+        warehouse(cdc, "ALTER TABLE retail_stores DROP COLUMN opened_on")
+        tick(cdc), drain(cdc)
+        assert columns_of(cdc, "retail_stores") == ["store_id", "store_name", "region"]
+    assert len({e["event_id"] for e in events(cdc)}) == 4 and \
+        {e["status"] for e in events(cdc)} == {"applied"}
 
 
 def test_a_burst_of_table_changes_costs_one_refresh(cdc):
@@ -514,9 +540,9 @@ def test_a_removal_is_never_taken_from_a_listing_that_cannot_prove_it(cdc):
 
 
 def test_a_removed_connection_forgets_its_checkpoint(cdc):
-    assert cdc.cdc.offsets("retail")[0] is not None
+    assert cdc.cdc.offsets("retail", "native")[0] is not None
     cdc.mg._on_source_event("retail", "removed")
-    assert cdc.cdc.offsets("retail")[0] is None
+    assert cdc.cdc.offsets("retail", "native")[0] is None
 
 
 def test_settled_events_are_pruned_and_dead_ones_kept(cdc):
@@ -578,8 +604,133 @@ def test_the_event_log_and_change_capture_status_are_for_administrators(cdc):
     with pytest.raises(HTTPException) as exc:
         cdc.cdc.replay_event("no-such-event", user=ADMIN)
     assert exc.value.status_code == 404
+    tick(cdc)
     retail = next(s for s in cdc.cdc.cdc_status(user=ADMIN)["sources"] if s["source"] == "retail")
-    assert retail["per_table"] and retail["tables_tracked"] == 8
+    assert (retail["capture"], retail["tables"]) == ("native", 8) and retail["polled_at"]
     assert retail["events"] == {"accepted": 1}
     assert cdc.cdc.reset_cdc("retail", user=ADMIN)["job_id"]
-    assert cdc.cdc.offsets("retail")[0] is None and discoveries(cdc) == ["cdc_reset"]
+    assert cdc.cdc.offsets("retail", "native")[0] is None and discoveries(cdc) == ["cdc_reset"]
+
+
+# ── Any connector: only the contract every connector meets ───────────────
+
+class BareSource:
+    """A connector offering nothing beyond what every connector must: a
+    listing and one table's columns — no bulk metadata, no change tokens, no
+    source-wide signal. Any database, API or file store looks like this."""
+    dialect = "sqlite"
+    name = "bare"
+
+    def __init__(self, path):
+        self.path, self.probes, self.delay = path, [], 0.0
+
+    def configured(self):
+        return True
+
+    def list_tables(self):
+        with sqlite3.connect(self.path) as c:
+            return [r[0] for r in c.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table','view') ORDER BY name")]
+
+    def get_schema(self, table):
+        self.probes.append(table)
+        time.sleep(self.delay)
+        with sqlite3.connect(self.path) as c:
+            return [{"name": r[1], "type": r[2]}
+                    for r in c.execute(f'PRAGMA table_info("{table}")')]
+
+    def qualifiers(self):
+        return frozenset()
+
+
+@pytest.fixture()
+def bare(cdc):
+    from app import connectors
+    source = BareSource(cdc.warehouse)
+    cdc.mp.setitem(connectors._REGISTRY, "bare", source)
+    cdc.mg.discover("bare", "test")
+    source.probes.clear()
+    cdc.bare = source
+    return cdc
+
+
+def bare_events(env):
+    with env.db.connect() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM meta_events WHERE source='bare' ORDER BY received_at").fetchall()]
+
+
+def bare_tick(env):
+    env.bare.probes.clear()
+    return env.mg.tick_once()["queued"].get("bare")
+
+
+def test_a_bare_connector_is_captured_table_by_table(bare):
+    warehouse(bare, "CREATE TABLE retail_promotions (promo_id INTEGER)",
+              "DROP TABLE retail_returns",
+              "ALTER TABLE retail_stores ADD COLUMN opened_on TEXT")
+    assert bare_tick(bare) is None                         # no whole-source rediscovery
+    assert {(e["asset"], e["event_type"]) for e in bare_events(bare)} == {
+        ("retail_promotions", "asset_created"), ("retail_returns", "asset_dropped"),
+        ("retail_stores", "schema_changed")}
+    drain(bare)
+    names = {r["name"]: r for r in bare.mg.get_source("bare", user=ADMIN)["relations"]}
+    assert "retail_promotions" in names and "retail_returns" not in names
+    assert [c["name"] for c in names["retail_stores"]["columns"]][-1] == "opened_on"
+    status = next(s for s in bare.cdc.cdc_status(user=ADMIN)["sources"] if s["source"] == "bare")
+    assert status["capture"] == "probe"
+    bare_tick(bare)
+    assert len(bare_events(bare)) == 3                     # the record agrees now
+
+
+def test_probes_rotate_within_their_budget(bare):
+    bare.mp.setenv("STUDIO_METAGRAPH_PROBE_TABLES", "3")
+    warehouse(bare, "ALTER TABLE retail_stores ADD COLUMN opened_on TEXT")
+    seen, found_on = set(), None
+    for n in range(1, 4):                                  # 8 objects, 3 a tick
+        bare_tick(bare)
+        assert len(bare.bare.probes) <= 3
+        seen |= set(bare.bare.probes)
+        if bare_events(bare) and found_on is None:
+            found_on = n
+    assert len(seen) == 8 and found_on is not None        # every table came round
+
+
+def test_probes_stop_at_their_time_budget(bare):
+    bare.mp.setenv("STUDIO_METAGRAPH_PROBE_SECONDS", "1")
+    bare.bare.delay = 0.4
+    bare_tick(bare)
+    assert 1 <= len(bare.bare.probes) <= 4
+
+
+def test_creates_and_drops_need_no_probes_at_all(bare):
+    bare.mp.setenv("STUDIO_METAGRAPH_PROBE_TABLES", "0")
+    warehouse(bare, "CREATE TABLE retail_promotions (promo_id INTEGER)",
+              "DROP TABLE retail_returns")
+    bare_tick(bare)
+    assert bare.bare.probes == []                          # the listing alone told us
+    assert {e["event_type"] for e in bare_events(bare)} == {"asset_created", "asset_dropped"}
+
+
+def test_a_bare_connector_listing_nothing_is_held_not_emptied(bare):
+    bare.bare.list_tables = lambda: []
+    assert bare_tick(bare) == "large_change" and bare_events(bare) == []
+    drain(bare)
+    assert bare.mg._state("bare")["status"] == "held"
+    assert len(bare.mg.get_source("bare", user=ADMIN)["relations"]) == 8
+
+
+def test_a_re_read_that_finds_nothing_new_is_not_repeated(bare):
+    """Should a connector's comparison read ever disagree with its re-read,
+    the event that changed nothing is not sent again tick after tick."""
+    real = bare.bare.get_schema
+    bare.bare.get_schema = lambda t: real(t) + ([{"name": "ghost", "type": "TEXT"}]
+                                                if t == "retail_stores" and bare.flip else [])
+    bare.flip = True                                      # the probe sees a ghost column
+    bare_tick(bare)
+    assert [e["asset"] for e in bare_events(bare)] == ["retail_stores"]
+    bare.flip = False                                     # the re-read does not
+    drain(bare)
+    bare.flip = True
+    bare_tick(bare), bare_tick(bare)
+    assert len(bare_events(bare)) == 1                    # a duplicate, not a loop

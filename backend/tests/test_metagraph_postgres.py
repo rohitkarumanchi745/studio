@@ -228,3 +228,49 @@ def test_change_capture_end_to_end_on_postgres(pg_app):
     assert len(settled) == 4
     assert env.cdc.prune(time.time() + 365 * 86400) == 4 and events() == []
     assert env.mg._purge_tombstones(time.time() + 365 * 86400) == 1
+
+
+class _OnlyTheContract:
+    """A real Postgres source seen through nothing but the contract every
+    connector meets — what any other database looks like to change capture."""
+    dialect = "postgres"
+
+    def __init__(self, inner, name):
+        self.inner, self.name = inner, name
+
+    def configured(self):
+        return True
+
+    def list_tables(self):
+        return self.inner.list_tables()
+
+    def get_schema(self, table):
+        return self.inner.get_schema(table)
+
+    def qualifiers(self):
+        return self.inner.qualifiers()
+
+
+def test_change_capture_needs_only_the_connector_contract(pg_app, monkeypatch):
+    from app import connectors
+    env = pg_app
+    bare = _OnlyTheContract(connectors._REGISTRY["pg-test"], "pg-bare")
+    monkeypatch.setitem(connectors._REGISTRY, "pg-bare", bare)
+    env.mg.discover("pg-bare", "test")
+    env.run("ALTER TABLE {s}.retail_customers ADD COLUMN region text")
+    env.run("CREATE TABLE {s}.retail_coupons (coupon_id int)")
+    assert env.mg.tick_once()["queued"].get("pg-bare") is None
+    with env.db.connect() as c:
+        got = {(r["asset"], r["event_type"]) for r in c.execute(
+            "SELECT * FROM meta_events WHERE source='pg-bare'").fetchall()}
+    assert got == {("retail_customers", "schema_changed"), ("retail_coupons", "asset_created")}
+    handler = env.jobs.handlers()["metagraph_event"]
+    with env.db.connect() as c:
+        rows = c.execute("SELECT * FROM background_jobs WHERE kind='metagraph_event' AND "
+                         "status='queued'").fetchall()
+    for row in rows:
+        handler(json.loads(row["payload"]), {**dict(row), "attempts": 1})
+    rels = {r["name"]: r for r in env.mg.get_source("pg-bare", user=ADMIN)["relations"]}
+    assert [c["name"] for c in rels["retail_customers"]["columns"]][-1] == "region"
+    assert "retail_coupons" in rels
+    assert env.cdc.status("pg-bare")["capture"] == "probe"

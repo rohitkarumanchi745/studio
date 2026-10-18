@@ -25,17 +25,17 @@ linked to its table and the columns it reads, checked against the record
 (valid / broken / unchecked), and versioned from the applied YAML documents.
 
 It then stays current with no one asking (tick_once, the "metagraph_sync"
-scheduler). Where the source reports a change token per table
-(Connector.table_signals), every few minutes the tables whose token moved
-become change events (metacdc.py), and each event re-reads just that table
-(discover_asset) — then the relationships, metric baselines and mirror are
-refreshed once for the source (refresh). Elsewhere the source's one cheap
-change signal (Connector.change_signal) is compared with the one its last
-discovery saw, and a source whose signal moved is rediscovered. Either way a
-full rediscovery still runs when the last one is too old: the reconciliation
-for any change no event reported. Events also come from a connection saved or
-reconnected, a supervised write against a source, and a signed webhook
-(/metagraph/events).
+scheduler), for ANY source: every few minutes each source is compared with the
+graph's record through the contract every connector meets (list_tables,
+get_schema), and each table found created, altered or dropped becomes a change
+event (metacdc.py) that re-reads just that table (discover_asset) — then the
+relationships, metric baselines and mirror are refreshed once for the source
+(refresh_now). Bulk metadata or a connector's own per-table tokens only make
+that cheaper. Where a source cannot be listed, its one cheap change signal
+(Connector.change_signal) is compared instead. A full rediscovery still runs
+when the last one is too old: the reconciliation for any change no event
+reported. Events also come from a connection saved or reconnected, a
+supervised write against a source, and a signed webhook (/metagraph/events).
 
 Design:
 - STUDIO'S DATABASE IS THE SYSTEM OF RECORD. Snapshots, objects and columns
@@ -344,24 +344,25 @@ def _read_source(source):
     cap = _max_objects()
     complete = len(names) <= cap and not getattr(connector, "tables_truncated", False)
     names = names[:cap]
-    try:
-        described = connector.describe_relations() or {}
-    except Exception:
-        log.warning("metagraph: bulk describe failed for %s", source, exc_info=True)
-        described = {}
+    described = {}
+    if getattr(connector, "describe_relations", None) is not None:
+        try:
+            described = connector.describe_relations() or {}
+        except Exception:
+            log.warning("metagraph: bulk describe failed for %s", source, exc_info=True)
     objects = []
     for name in names:
         info = described.get(name)
         if info is not None:
             kind, columns = info.get("kind") or "other", info.get("columns") or []
         else:
-            kind = "unknown"
             try:
-                columns = connector.get_schema(name)
+                info = _describe_one(connector, name, None, bulk=False)
+                kind, columns = info.get("kind") or "unknown", info.get("columns") or []
             except Exception:
                 log.warning("metagraph: could not read columns of %s.%s", source, name,
                             exc_info=True)
-                columns, complete = None, False
+                kind, columns, complete = "unknown", None, False
         objects.append({"name": str(name)[:512], "kind": kind,
                         "namespace": _namespace_of(name, info),
                         "columns": None if columns is None else _clean_columns(columns)})
@@ -586,17 +587,44 @@ def match_asset(asset, names):
     return hits[0] if len(hits) == 1 else None
 
 
-def _describe_one(connector, name, row):
-    """Kind, namespace and columns of one object: Connector.describe_relation
-    when the source offers it, else get_schema() with the kind and namespace
-    already known (unknown for a new object until the next full discovery)."""
-    fn = getattr(connector, "describe_relation", None)
-    if fn is not None:
+def listing(connector):
+    """(names, complete): the source's objects as discovery takes them — the
+    first STUDIO_METAGRAPH_MAX_OBJECTS of list_tables() — and whether that is
+    all of them (only a complete listing can prove a removal)."""
+    names = list(connector.list_tables())
+    cap = _max_objects()
+    complete = len(names) <= cap and not getattr(connector, "tables_truncated", False)
+    return [str(n)[:512] for n in names[:cap]], complete
+
+
+def recorded(source):
+    """{name: what the record holds for it} — every stored object, tombstones
+    included: fingerprint, kind, namespace, last_seen_at, changed_at,
+    removed_at."""
+    with db.connect() as c:
+        return {r["name"]: dict(r) for r in c.execute(
+            "SELECT name, fingerprint, kind, namespace, last_seen_at, changed_at, removed_at "
+            "FROM meta_objects WHERE source=?", (source,)).fetchall()}
+
+
+def _describe_one(connector, name, row, *, bulk=True):
+    """Kind, namespace and columns of one object, read the way discovery reads
+    it — so a re-read and a comparison never disagree over how a reader spells
+    a type: Connector.describe_relation when offered; else (with `bulk`) the
+    object's entry in describe_relations(); else get_schema(), with the kind
+    and namespace already known (unknown for a new object)."""
+    for method, args in (("describe_relation", (name,)),
+                         ("describe_relations", ()) if bulk else (None, None)):
+        fn = getattr(connector, method, None) if method else None
+        if fn is None:
+            continue
         try:
-            info = fn(name)
+            info = fn(*args)
         except Exception:
-            log.warning("metagraph: describe_relation of %s failed", name, exc_info=True)
-            info = None
+            log.warning("metagraph: %s of %s failed", method, name, exc_info=True)
+            continue
+        if method == "describe_relations":
+            info = info.get(name) if isinstance(info, dict) else None
         if info is not None:
             return info
     return {"kind": (row or {}).get("kind") or "unknown",
@@ -623,14 +651,8 @@ def discover_asset(source, asset, trigger="event"):
     if not connector.configured():
         raise RuntimeError(f"source '{source}' is not configured")
     read_at = time.time()
-    listed = list(connector.list_tables())
-    cap = _max_objects()
-    complete = len(listed) <= cap and not getattr(connector, "tables_truncated", False)
-    listed = [str(n)[:512] for n in listed[:cap]]
-    with db.connect() as c:
-        existing = {r["name"]: dict(r) for r in c.execute(
-            "SELECT id, name, kind, namespace, removed_at FROM meta_objects WHERE source=?",
-            (source,)).fetchall()}
+    listed, complete = listing(connector)
+    existing = recorded(source)
     name = match_asset(asset, listed)
     if name is None:
         gone = match_asset(asset, [n for n, r in existing.items() if r["removed_at"] is None])
@@ -1180,11 +1202,11 @@ def _due(state, signal, now):
 
 
 def _check(source, now):
-    """Turn the tables whose per-table tokens moved into change events
-    (metacdc.poll); where a source has no such tokens, compare its one change
-    signal with what its last discovery saw. Queue a rediscovery when that
-    moved, when the change is too big for per-table events, or when one is due
-    anyway. Returns the reason queued, or None."""
+    """Turn the tables that changed since the graph read them into change
+    events (metacdc.poll); where the source cannot be listed now, compare its
+    one change signal with what its last discovery saw. Queue a rediscovery
+    when that moved, when the change is too big for per-table events, or when
+    one is due anyway. Returns the reason queued, or None."""
     from .connectors import get_connector
     state = _state(source)
     if state and state["status"] in ("queued", "running") \

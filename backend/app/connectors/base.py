@@ -265,13 +265,15 @@ class Connector:
         return None
 
     def table_signals(self):
-        """{table: token} for the tables list_tables() returns, each token
-        changing whenever THAT table's columns or kind change — so a change can
-        be turned into one event for one table instead of a whole-source
-        rediscovery (metacdc.poll). Metadata only, one cheap query.
+        """{table: token} for the relations in this source's scope, each token
+        changing whenever THAT relation's columns or kind change. OPTIONAL:
+        change capture (metacdc.poll) works for every connector without it —
+        it compares list_tables()/get_schema() (or describe_relations()) with
+        the metadata graph's record. A token only makes that cheaper: the
+        tables whose token moved are re-read and no others are probed.
+        Metadata only, one cheap query.
 
-        Default: None, meaning "not supported" — the source-wide
-        change_signal() and the full-sync cadence are used instead.
+        Default: None — change capture then reads the columns itself.
         """
         return None
 

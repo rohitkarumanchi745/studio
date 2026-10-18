@@ -11,10 +11,11 @@ One normalized event contract for every way a change can be noticed:
    "occurred_at": "2026-10-17T18:00:00Z",   # optional, ISO-8601 or epoch
    "tenant_id": "studio"}            # optional; must be this deployment's
 
-Where events come from: the per-table poller on the scheduler (poll — tables
-whose change token moved since the checkpoint), the signed webhook
-(POST /api/metagraph/events — Debezium, Snowflake Tasks, a Databricks job, a
-deployment pipeline), and Studio itself (an approved write against a source).
+Where events come from: the poller on the scheduler (poll — any connector,
+through the list_tables()/get_schema() contract every connector meets, see the
+polling section), the signed webhook (POST /api/metagraph/events — anything
+that knows a change happened: a CDC tool, a warehouse task, a deployment
+pipeline), and Studio itself (an approved write against a source).
 
 What happens to one:
   1. INTAKE. Validated, recorded in meta_events under its event_id (a repeat
@@ -37,12 +38,13 @@ What happens to one:
      queue; after its last attempt it is "dead", listed for administrators,
      and can be replayed.
 
-Snapshot handoff: a full discovery reads the per-table tokens BEFORE listing,
-records them as the poller's checkpoint and marks every table read as of the
-snapshot's start. A change made during the snapshot moves a token past the
-checkpoint and arrives as an event; an event that arrived before the snapshot
-started is superseded by it. The periodic full sync stays, as the
-reconciliation for any event that never arrived.
+Snapshot handoff: the poller compares the source with the graph's own
+record, so whatever a full discovery missed while it ran differs from the
+record and arrives as an event. (A connector's own per-table tokens are read
+BEFORE the snapshot lists, and saved as their checkpoint, for the same
+effect.) Every table is marked read as of the snapshot's start, so an event
+that arrived before it started is superseded by it. The periodic full sync
+stays, as the reconciliation for any event that never arrived.
 """
 import hashlib
 import json
@@ -380,17 +382,45 @@ def replay(event_id):
     return jid
 
 
-# ── Polling: per-table tokens into events, with a checkpoint ─────────────
+# ── Polling: any source, compared with the graph's own record ────────────
+#
+# Change capture rests on the contract EVERY connector already meets —
+# list_tables() and get_schema() — so any database, warehouse, API or file
+# store a connector reaches is covered with no code of its own:
+#
+#   created / dropped  the listing against the graph's record, every tick;
+#   altered            fresh column fingerprints against the recorded ones:
+#                      all tables at once where the connector offers bulk
+#                      metadata (describe_relations), else the next tables in
+#                      rotation within STUDIO_METAGRAPH_PROBE_TABLES and
+#                      STUDIO_METAGRAPH_PROBE_SECONDS per tick.
+#
+# A connector MAY also report a change token per table (table_signals) — a
+# catalog's last-altered time, say. That only makes it cheaper: the tables
+# whose token moved are re-read and nothing else is probed. Whatever the
+# connector offers, the graph's record is the reference, so the snapshot
+# handoff is exact and nothing a connector reports is trusted beyond "look
+# at this table".
 
-def offsets(source, adapter="tables"):
-    """(checkpoint, saved at): the per-table tokens last turned into events."""
+def _probe_budget():
+    return max(0, _env_int("STUDIO_METAGRAPH_PROBE_TABLES", 100))
+
+
+def _probe_seconds():
+    return max(1, _env_int("STUDIO_METAGRAPH_PROBE_SECONDS", 20))
+
+
+def offsets(source, adapter="native"):
+    """(saved value, saved at) for one of a source's capture checkpoints:
+    "native" (the connector's per-table tokens), "probe" (the rotation's
+    place), "poll" (what the last poll did)."""
     with db.connect() as c:
         row = c.execute("SELECT value, updated_at FROM meta_cdc_offsets WHERE source=? AND "
                         "adapter=?", (source, adapter)).fetchone()
     return (json.loads(row["value"]), row["updated_at"]) if row else (None, None)
 
 
-def save_offsets(source, value, adapter="tables"):
+def save_offsets(source, value, adapter="native"):
     with db.connect() as c:
         c.execute("DELETE FROM meta_cdc_offsets WHERE source=? AND adapter=?", (source, adapter))
         c.execute("INSERT INTO meta_cdc_offsets (source, adapter, value, updated_at) "
@@ -405,7 +435,7 @@ def reset_offsets(source):
 
 
 def read_table_signals(connector):
-    """The connector's {table: token}, or None when it has none to give."""
+    """The connector's {table: token}, or None when it offers none."""
     fn = getattr(connector, "table_signals", None)
     if fn is None:
         return None
@@ -419,57 +449,119 @@ def read_table_signals(connector):
     return {str(k)[:512]: str(v)[:512] for k, v in out.items() if str(k).strip()}
 
 
-def event_id(source, asset, token):
-    """The same change always gets the same id, so re-emitting it after a
-    crash (or from two schedulers) is a duplicate, not a second event."""
-    return "poll:" + hashlib.sha256(f"{source}\x00{asset}\x00{token}".encode()).hexdigest()[:40]
+def event_id(source, asset, basis):
+    """A change seen again — re-sent after a crash, or by two schedulers — gets
+    the same id and is a duplicate. `basis` names the change against what it
+    was compared with (the record's fingerprint and last change, or the token
+    checkpoint's time), so a table that changes back and forth gets a new id
+    each time."""
+    return "poll:" + hashlib.sha256(f"{source}\x00{asset}\x00{basis}".encode()).hexdigest()[:40]
+
+
+def _examine(source, connector, names, record):
+    """{table: fresh fingerprint} for some of `names`, and how they were read:
+    "bulk" (all at once), "probe" (the next ones in rotation, within the
+    budget). A table that cannot be read now is skipped; it comes round again."""
+    from . import metagraph
+    out = {}
+    fn = getattr(connector, "describe_relations", None)
+    bulk = None
+    if fn is not None:
+        try:
+            bulk = fn()
+        except Exception:
+            log.warning("metagraph: bulk describe of %s failed", source, exc_info=True)
+    if isinstance(bulk, dict):
+        for name in names:
+            info = bulk.get(name)
+            if info is not None:
+                out[name] = metagraph._fingerprint(
+                    info.get("kind") or "other", metagraph._clean_columns(info.get("columns")))
+    rest = sorted(n for n in names if n not in out)
+    if not rest:
+        return out, "bulk"
+    (saved, _at) = offsets(source, "probe")
+    start = (saved or {}).get("cursor", 0) % len(rest)
+    order, began, probed = rest[start:] + rest[:start], time.monotonic(), 0
+    for name in order[:_probe_budget()]:
+        if time.monotonic() - began > _probe_seconds():
+            break
+        probed += 1
+        try:
+            info = metagraph._describe_one(connector, name, record[name], bulk=False)
+        except Exception:
+            log.debug("metagraph: probe of %s.%s failed", source, name, exc_info=True)
+            continue
+        out[name] = metagraph._fingerprint(info.get("kind") or record[name]["kind"],
+                                           metagraph._clean_columns(info.get("columns")))
+    save_offsets(source, {"cursor": (start + probed) % len(rest)}, "probe")
+    return out, ("bulk" if isinstance(bulk, dict) else "probe")
 
 
 def poll(source, connector, state, now):
-    """Turn the tables whose tokens moved since the checkpoint into events.
-    Returns what the caller does with the source-wide change signal:
+    """Find the tables that changed since the graph last read them and turn
+    each into an event (see the section comment). Returns what the caller
+    does with the source-wide change signal:
       "per_table"  — handled here: skip it;
-      "fallback"   — no per-table tokens (or no checkpoint yet): compare it;
+      "fallback"   — the source cannot be listed now, or was never
+                     discovered: compare it (and the first discovery);
       "rediscover" — a change too big for events: rediscover the source. A
                      removal as large as the hold rule's goes this way, so the
                      hold applies; so do more changed tables than
                      STUDIO_METAGRAPH_MAX_TABLE_EVENTS.
-    The checkpoint moves only after the events are durably accepted; a crash
-    in between re-emits the same event ids, which dedupe."""
+    Token checkpoints move only after the events are accepted."""
     from . import metagraph
-    if not state or not state.get("ok_at"):
-        return "fallback"                   # the first discovery records the checkpoint
-    current = read_table_signals(connector)
-    if current is None:
+    if not state or not state.get("ok_at") or not connector.configured():
         return "fallback"
-    seen, _at = offsets(source)
-    if seen is None:
-        # Upgraded from source-wide signals: start the checkpoint here, and let
-        # the source-wide signal (read after this) catch anything before it.
-        save_offsets(source, current)
+    try:
+        names, complete = metagraph.listing(connector)
+    except Exception:
+        log.warning("metagraph: listing %s for change capture failed", source, exc_info=True)
         return "fallback"
-    changed = [t for t in current if t in seen and seen[t] != current[t]]
-    created = [t for t in current if t not in seen]
-    dropped = [t for t in seen if t not in current]
-    if not (changed or created or dropped):
-        return "per_table"
+    record = metagraph.recorded(source)
+    live = {n for n, r in record.items() if r["removed_at"] is None}
+    listed = set(names)
+    created = [n for n in names if n not in live]
+    # A removal is taken only from a complete listing, and never while
+    # removals on this source are held (their confirmation settles them).
+    dropped = sorted(live - listed) if complete and not state.get("held_removals") else []
+    tokens = read_table_signals(connector)
+    seen, seen_at = offsets(source, "native") if tokens is not None else (None, None)
+    if seen is not None:
+        how = "native"
+        changed = {t: f"native|{seen_at}|{tokens[t]}" for t in tokens
+                   if seen.get(t) != tokens[t] and t not in created}
+    else:
+        fresh, how = _examine(source, connector, [n for n in names if n in live], record)
+        # Keyed on the record's fingerprint and last change: a re-read that
+        # leaves the record as it was finds the same id next time (a duplicate,
+        # never a loop), and changing back and forth gets a new one each time.
+        changed = {t: f"{record[t]['fingerprint']}|{fp}|{record[t]['changed_at']}"
+                   for t, fp in fresh.items() if fp != record[t]["fingerprint"]}
     minimum, fraction = metagraph._hold_rule()
-    if dropped and len(dropped) >= minimum and len(dropped) >= fraction * max(1, len(seen)):
+    if dropped and len(dropped) >= minimum and len(dropped) >= fraction * max(1, len(live)):
         return "rediscover"
     if len(changed) + len(created) + len(dropped) > _max_table_events():
         return "rediscover"
-    events = ([{"event_id": event_id(source, t, current[t]), "source": source, "asset": t,
-                "event_type": "schema_changed", "occurred_at": now} for t in changed]
-              + [{"event_id": event_id(source, t, current[t]), "source": source, "asset": t,
-                  "event_type": "asset_created", "occurred_at": now} for t in created]
-              + [{"event_id": event_id(source, t, "dropped:" + seen[t]), "source": source,
-                  "asset": t, "event_type": "asset_dropped", "occurred_at": now}
-                 for t in dropped])
-    out = ingest(events, "poller", live_sources=[source])
-    for r in out["rejected"]:
-        log.warning("metagraph: poll of %s could not record %s: %s", source, r["event_id"],
-                    r["reason"])
-    save_offsets(source, current)
+    day = int(now // 86400)
+    events = ([{"event_id": event_id(source, t, basis), "source": source, "asset": t,
+                "event_type": "schema_changed", "occurred_at": now}
+               for t, basis in sorted(changed.items())]
+              + [{"event_id": event_id(source, t, f"created|{(record.get(t) or {}).get('removed_at')}"
+                                                  f"|{day}"),
+                  "source": source, "asset": t, "event_type": "asset_created",
+                  "occurred_at": now} for t in created]
+              + [{"event_id": event_id(source, t, f"dropped|{record[t]['changed_at']}"),
+                  "source": source, "asset": t, "event_type": "asset_dropped",
+                  "occurred_at": now} for t in dropped])
+    if events:
+        out = ingest(events, "poller", live_sources=[source])
+        for r in out["rejected"]:
+            log.warning("metagraph: poll of %s could not record %s: %s", source,
+                        r["event_id"], r["reason"])
+    if tokens is not None:
+        save_offsets(source, tokens, "native")
+    save_offsets(source, {"how": how, "tables": len(names), "events": len(events)}, "poll")
     return "per_table"
 
 
@@ -477,7 +569,7 @@ def after_snapshot(source, started_at, table_tokens):
     """The snapshot-to-stream handoff (see the module docstring)."""
     from . import metagraph
     if table_tokens is not None:
-        save_offsets(source, table_tokens)
+        save_offsets(source, table_tokens, "native")
     with db.connect() as c:
         metagraph._lock(c, source)
         names = [r["name"] for r in c.execute(
@@ -534,18 +626,20 @@ def prune(now):
 def status(source, now=None):
     """What an administrator needs about one source's change capture."""
     now = now or time.time()
-    seen, at = offsets(source)
+    last, polled_at = offsets(source, "poll")
     with db.connect() as c:
         counts = {r["status"]: r["n"] for r in c.execute(
             "SELECT status, COUNT(*) n FROM meta_events WHERE source=? GROUP BY status",
             (source,)).fetchall()}
         oldest = c.execute("SELECT MIN(received_at) t FROM meta_events WHERE source=? "
                            "AND status='accepted'", (source,)).fetchone()["t"]
-        last = c.execute("SELECT MAX(received_at) t FROM meta_events WHERE source=?",
-                         (source,)).fetchone()["t"]
-    return {"source": source, "per_table": seen is not None,
-            "tables_tracked": len(seen) if seen is not None else 0,
-            "checkpoint_at": at, "last_event_at": last, "events": counts,
+        newest = c.execute("SELECT MAX(received_at) t FROM meta_events WHERE source=?",
+                           (source,)).fetchone()["t"]
+    # How the last poll read the source: "native" (its own per-table tokens),
+    # "bulk" (all columns in one read) or "probe" (tables in rotation).
+    return {"source": source, "capture": (last or {}).get("how"),
+            "tables": (last or {}).get("tables", 0), "polled_at": polled_at,
+            "last_event_at": newest, "events": counts,
             "waiting_seconds": int(now - oldest) if oldest else 0,
             "dead": counts.get("dead", 0)}
 
