@@ -64,6 +64,8 @@ from .connectors.graph_conn import GraphConnector
 from .connectors.postgres_conn import PostgresConnector
 from .connectors.powerbi_conn import PowerBIConnector, PowerBIError
 from .connectors.snowflake_conn import SnowflakeConnector
+from .connectors.cassandra_conn import CassandraConnector
+from .connectors.jira_conn import JiraConnector
 from .connectors.sql_conn import SqlConnector
 from .connectors.sql_conn import check_url as check_sql_url
 
@@ -179,6 +181,16 @@ class _DynSQL(SqlConnector):
         super().__init__(name, (cfg or {}).get("url", ""), (cfg or {}).get("schema", ""))
 
 
+class _DynCassandra(CassandraConnector):
+    def __init__(self, name, cfg):
+        super().__init__(name, cfg)
+
+
+class _DynJira(JiraConnector):
+    def __init__(self, name, cfg):
+        super().__init__(name, cfg)
+
+
 class _DynPowerBI(PowerBIConnector):
     def __init__(self, name, cfg):
         super().__init__()                      # per-connection metadata cache
@@ -283,6 +295,32 @@ def _check_neo4j(cfg):
     cfg = {**cfg, "uri": (cfg.get("uri") or "").strip()}
     problem = http_uri_problem(cfg["uri"])
     return cfg, ({"uri": problem} if problem else {})
+
+
+def _check_cassandra(cfg):
+    """Contact points as host[,host…]; the driver installed."""
+    from .connectors.cassandra_conn import driver_available
+    cfg = {**cfg, "contact_points": ",".join(
+        h.strip() for h in (cfg.get("contact_points") or "").split(",") if h.strip())}
+    problems = {}
+    if not driver_available():
+        problems["contact_points"] = ("The Cassandra driver is not installed here "
+                                      "(pip install cassandra-driver).")
+    port = str(cfg.get("port") or "9042").strip()
+    if not port.isdigit():
+        problems["port"] = "The port is a number, usually 9042."
+    return cfg, problems
+
+
+def _check_jira(cfg):
+    """The site as https://host — a pasted page URL is reduced to it."""
+    raw = (cfg.get("site") or "").strip()
+    parts = urlsplit(raw if "://" in raw else f"https://{raw}")
+    cfg = {**cfg, "site": f"https://{parts.hostname}" if parts.hostname else ""}
+    problems = {}
+    if parts.scheme not in ("https", "") or not parts.hostname:
+        problems["site"] = "Use your Jira site's https address, e.g. https://acme.atlassian.net"
+    return cfg, problems
 
 
 def _check_sql(cfg):
@@ -418,6 +456,39 @@ TYPES = {
             _field("user", "User", required=True),
             _field("password", "Password", required=True, secret=True),
             _field("database", "Database", default="neo4j"),
+        ],
+    },
+    # Apache Cassandra — and the CQL-compatible ScyllaDB and Amazon Keyspaces.
+    "cassandra": {
+        "needs_tables": True,
+        "label": "Apache Cassandra", "dialect": "cql", "build": _DynCassandra,
+        "check": _check_cassandra,
+        "hint_key": "contact_points",
+        "ns": {"schema": "keyspace", "database": ""},
+        "fields": [
+            _field("contact_points", "Contact points", required=True,
+                   placeholder="cass1.example.com,cass2.example.com"),
+            _field("port", "Port", default="9042"),
+            _field("keyspace", "Keyspace", required=True),
+            _field("username", "Username"),
+            _field("password", "Password", secret=True),
+            _field("datacenter", "Local datacenter", placeholder="dc1"),
+            _field("ssl", "TLS", placeholder="true to connect over TLS"),
+        ],
+    },
+    # Atlassian Jira Cloud or Data Center: issues and projects as tables.
+    "jira": {
+        "label": "Atlassian Jira", "dialect": "sqlite", "build": _DynJira,
+        "check": _check_jira,
+        "hint_key": "site",
+        "fields": [
+            _field("site", "Jira site", required=True, placeholder="https://acme.atlassian.net"),
+            _field("email", "Account email", placeholder="Cloud only — blank for a "
+                                                         "Data Center personal token"),
+            _field("api_token", "API token", required=True, secret=True),
+            _field("jql", "JQL scope", placeholder="project = OPS ORDER BY updated DESC "
+                                                   "(blank: every issue you can see)"),
+            _field("max_issues", "Issue limit", default="5000"),
         ],
     },
     # Any other database: one SQLAlchemy URL, any installed driver. Its kind of
@@ -1003,9 +1074,19 @@ def types(user=Depends(current_user)):
     # into — the schema field is "dataset" on BigQuery, the database field is
     # "catalog" on Databricks and lives inside the DSN on Postgres. Declaring
     # it here keeps that mapping in one place instead of in the frontend.
-    return [{"ctype": k, "label": t["label"], "dialect": t["dialect"],
-             "fields": t["fields"], "ns": t.get("ns") or {}}
-            for k, t in TYPES.items()]
+    from .connectors.cassandra_conn import driver_available
+    from .connectors.sql_conn import installed_drivers
+    out = [{"ctype": k, "label": t["label"], "dialect": t["dialect"],
+            "fields": t["fields"], "ns": t.get("ns") or {}}
+           for k, t in TYPES.items()]
+    for entry in out:
+        # What this deployment can actually reach, so the marketplace tells
+        # "connect now" apart from "needs a driver installed first".
+        if entry["ctype"] == "sql":
+            entry["drivers"] = installed_drivers()
+        if entry["ctype"] == "cassandra":
+            entry["available"] = driver_available()
+    return out
 
 
 @router.get("")

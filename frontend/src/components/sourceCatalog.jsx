@@ -15,10 +15,14 @@
 // colour carries the recognition without redistributing their asset.
 
 const CATEGORIES = [
-  { key: "warehouse", label: "Databases and warehouses" },
-  { key: "workspace", label: "Files and workspaces" },
+  { key: "database", label: "Databases" },
+  { key: "warehouse", label: "Data warehouses and lakehouses" },
+  { key: "nosql", label: "NoSQL and graph" },
+  { key: "work", label: "Work management and collaboration" },
+  { key: "bi", label: "BI and semantic models" },
   { key: "storage", label: "Cloud file storage" },
   { key: "marketing", label: "Marketing and analytics" },
+  { key: "apps", label: "Business apps" },
   { key: "other", label: "Other" },
 ];
 
@@ -150,6 +154,55 @@ const MARKS = {
       </g>
     </>
   ),
+  eye: (c) => (
+    <>
+      <path d="M5 20c4.5-7 9.5-10.5 15-10.5S30.5 13 35 20c-4.5 7-9.5 10.5-15 10.5S9.5 27 5 20z"
+        fill={c} opacity=".2" />
+      <path d="M5 20c4.5-7 9.5-10.5 15-10.5S30.5 13 35 20c-4.5 7-9.5 10.5-15 10.5S9.5 27 5 20z"
+        fill="none" stroke={c} strokeWidth="2.4" strokeLinejoin="round" />
+      <circle cx="20" cy="20" r="5.6" fill={c} />
+      <circle cx="22" cy="18" r="1.6" fill="#fff" />
+    </>
+  ),
+  diamond: (c) => (
+    <g fill={c}>
+      <path d="M20 4.5 35.5 20 20 35.5l-5-5L25.5 20 15 9.5z" />
+      <path d="M14 10.5 23.5 20 14 29.5 4.5 20z" opacity=".55" />
+    </g>
+  ),
+  wave: (c) => (
+    <g fill="none" stroke={c} strokeWidth="2.8" strokeLinecap="round">
+      <path d="M6 14c3.5-4 6.5-4 10 0s6.5 4 10 0 5-4 8-1" />
+      <path d="M6 21c3.5-4 6.5-4 10 0s6.5 4 10 0 5-4 8-1" opacity=".7" />
+      <path d="M6 28c3.5-4 6.5-4 10 0s6.5 4 10 0 5-4 8-1" opacity=".45" />
+    </g>
+  ),
+  stack: (c) => (
+    <g fill={c}>
+      <rect x="8" y="7" width="24" height="7" rx="3" />
+      <rect x="8" y="16.5" width="24" height="7" rx="3" opacity=".7" />
+      <rect x="8" y="26" width="24" height="7" rx="3" opacity=".45" />
+    </g>
+  ),
+  oval: (c) => (
+    <ellipse cx="20" cy="20" rx="14" ry="9" fill="none" stroke={c} strokeWidth="5" />
+  ),
+  leaf: (c) => (
+    <>
+      <path d="M20 4c7 7 9 13 9 18a9 9 0 0 1-18 0c0-5 2-11 9-18z" fill={c} />
+      <path d="M20 9v27" stroke="#fff" strokeWidth="1.8" strokeLinecap="round" opacity=".8" />
+    </>
+  ),
+  bolt: (c) => (
+    <path d="M23 4 9 23h9l-2 13 15-20h-9z" fill={c} />
+  ),
+  cloudsq: (c) => (
+    <>
+      <path d="M12 29a6 6 0 0 1-.6-12 8.5 8.5 0 0 1 16.4-2A6.5 6.5 0 0 1 28 29z" fill={c} opacity=".25" />
+      <path d="M12 29a6 6 0 0 1-.6-12 8.5 8.5 0 0 1 16.4-2A6.5 6.5 0 0 1 28 29z" fill="none"
+        stroke={c} strokeWidth="2.4" strokeLinejoin="round" />
+    </>
+  ),
   beaker: (c) => (
     <>
       <path d="M16 6v10L9 29a3 3 0 0 0 2.7 4.4h16.6A3 3 0 0 0 31 29l-7-13V6" fill="none" stroke={c} strokeWidth="2.4" strokeLinejoin="round" />
@@ -165,7 +218,7 @@ const MARKS = {
 
 const META = {
   // Connectable from this screen — the field spec comes from the backend.
-  postgres: { label: "PostgreSQL", color: "#336791", mark: "cylinder", category: "warehouse",
+  postgres: { label: "PostgreSQL", color: "#336791", mark: "cylinder", category: "database",
               blurb: "Any Postgres-wire database — RDS, Cloud SQL, Neon, Supabase, Timescale." },
   snowflake: { label: "Snowflake", color: "#29b5e8", mark: "snowflake", category: "warehouse",
                blurb: "Warehouse, database and schema on a Snowflake account." },
@@ -173,17 +226,17 @@ const META = {
                 blurb: "A SQL warehouse on a Databricks workspace, over Unity Catalog." },
   bigquery: { label: "BigQuery", color: "#4285f4", mark: "hexcloud", category: "warehouse",
               blurb: "A BigQuery dataset, read with a service account." },
-  neo4j: { label: "Neo4j", color: "#018bff", mark: "graph", category: "warehouse",
+  neo4j: { label: "Neo4j", color: "#018bff", mark: "graph", category: "nosql",
            blurb: "A property graph queried with Cypher." },
-  sql: { label: "Any SQL database", color: "#5b6b7a", mark: "cylinder", category: "warehouse",
+  sql: { label: "Any SQL database", color: "#5b6b7a", mark: "cylinder", category: "database",
          blurb: "Anything with a SQLAlchemy driver installed — MySQL, MariaDB, SQL Server, Oracle, and more — from one connection URL." },
-  powerbi: { label: "Power BI", color: "#c8a415", mark: "panel", category: "warehouse",
+  powerbi: { label: "Power BI", color: "#c8a415", mark: "panel", category: "bi",
              blurb: "Semantic models in a Power BI or Fabric workspace, read with a service principal." },
 
   // Connected through their own flow rather than a credential form.
-  m365: { label: "Microsoft 365", color: "#0f6cbd", mark: "tiles", category: "workspace",
+  m365: { label: "Microsoft 365", color: "#0f6cbd", mark: "tiles", category: "work",
           blurb: "OneDrive, SharePoint and Outlook, synced into your private knowledge collection." },
-  github: { label: "GitHub", color: "#24292f", mark: "gitbranch", category: "workspace",
+  github: { label: "GitHub", color: "#24292f", mark: "gitbranch", category: "work",
             blurb: "Register repositories as read-only planning context for pipeline drafts; repository code is not executed." },
 
   // Environment-configured sources. They appear so the grid is the whole map
@@ -214,6 +267,149 @@ const META = {
 
   demo: { label: "Demo data", color: "#79766f", mark: "beaker", category: "other",
           blurb: "The built-in sample warehouse — always available, safe to explore." },
+
+  // Native connectors added with the marketplace.
+  cassandra: { label: "Apache Cassandra", color: "#1287b1", mark: "eye", category: "nosql",
+               blurb: "A keyspace's tables, read with CQL — also ScyllaDB and Amazon Keyspaces." },
+  jira: { label: "Atlassian Jira", color: "#0052cc", mark: "diamond", category: "work",
+          blurb: "Issues and projects from Jira Cloud or Data Center, queryable as tables." },
+
+  // ── The marketplace: integrations that connect through a native type ────
+  mysql: { label: "MySQL", color: "#00758f", mark: "wave", category: "database",
+           blurb: "MySQL 5.7+ and 8 — self-hosted, Amazon RDS, Aurora MySQL, Cloud SQL." },
+  mariadb: { label: "MariaDB", color: "#003545", mark: "wave", category: "database",
+             blurb: "MariaDB Server and SkySQL, over the MySQL protocol." },
+  mssql: { label: "Microsoft SQL Server", color: "#cc2927", mark: "stack", category: "database",
+           blurb: "SQL Server 2014+ — on premises or on a VM." },
+  azure_sql: { label: "Azure SQL Database", color: "#0078d4", mark: "stack", category: "database",
+               blurb: "Azure SQL Database and Managed Instance." },
+  oracle: { label: "Oracle Database", color: "#c74634", mark: "oval", category: "database",
+            blurb: "Oracle 12c+ and Autonomous Database — thin mode, no Oracle client needed." },
+  singlestore: { label: "SingleStore", color: "#aa00ff", mark: "bolt", category: "database",
+                 blurb: "SingleStore (MemSQL), over the MySQL protocol." },
+  tidb: { label: "TiDB", color: "#e30c34", mark: "stack", category: "database",
+          blurb: "TiDB and TiDB Cloud, over the MySQL protocol." },
+  planetscale: { label: "PlanetScale", color: "#222222", mark: "orbit", category: "database",
+                 blurb: "PlanetScale MySQL databases." },
+  supabase: { label: "Supabase", color: "#3ecf8e", mark: "bolt", category: "database",
+              blurb: "A Supabase project's Postgres database." },
+  neon: { label: "Neon", color: "#00b386", mark: "cylinder", category: "database",
+          blurb: "Neon serverless Postgres." },
+  cockroachdb: { label: "CockroachDB", color: "#6933ff", mark: "cylinder", category: "database",
+                 blurb: "CockroachDB, over the Postgres wire protocol." },
+  timescale: { label: "TimescaleDB", color: "#e8a300", mark: "cylinder", category: "database",
+               blurb: "Timescale's time-series Postgres." },
+  yugabyte: { label: "YugabyteDB", color: "#ff6e42", mark: "cylinder", category: "database",
+              blurb: "YugabyteDB YSQL, over the Postgres wire protocol." },
+  aurora_pg: { label: "Amazon Aurora PostgreSQL", color: "#ff9900", mark: "cylinder",
+               category: "database", blurb: "Aurora and RDS for PostgreSQL." },
+  cloudsql_pg: { label: "Google Cloud SQL / AlloyDB", color: "#4285f4", mark: "cylinder",
+                 category: "database", blurb: "Cloud SQL for PostgreSQL and AlloyDB." },
+  redshift: { label: "Amazon Redshift", color: "#8c4fff", mark: "hexcloud", category: "warehouse",
+              blurb: "A Redshift cluster or Serverless workgroup, over the Postgres protocol." },
+  clickhouse: { label: "ClickHouse", color: "#d4b800", mark: "bars", category: "warehouse",
+                blurb: "ClickHouse and ClickHouse Cloud." },
+  trino: { label: "Trino / Starburst", color: "#dd00a1", mark: "orbit", category: "warehouse",
+           blurb: "A Trino or Starburst catalog and schema." },
+  teradata: { label: "Teradata", color: "#f37440", mark: "stack", category: "warehouse",
+              blurb: "Teradata Vantage." },
+  db2: { label: "IBM Db2", color: "#0f62fe", mark: "stack", category: "warehouse",
+         blurb: "Db2 for Linux, UNIX and Windows, and Db2 on Cloud." },
+  hana: { label: "SAP HANA", color: "#0070f2", mark: "hexcloud", category: "warehouse",
+          blurb: "SAP HANA and HANA Cloud." },
+  vertica: { label: "Vertica", color: "#1c3d5a", mark: "chevrons", category: "warehouse",
+             blurb: "Vertica analytic databases." },
+  scylladb: { label: "ScyllaDB", color: "#2bb7d6", mark: "eye", category: "nosql",
+              blurb: "ScyllaDB and Scylla Cloud — Cassandra-compatible CQL." },
+  keyspaces: { label: "Amazon Keyspaces", color: "#ff9900", mark: "eye", category: "nosql",
+               blurb: "Amazon Keyspaces (for Apache Cassandra), over TLS on port 9142." },
+  jira_sm: { label: "Jira Service Management", color: "#2684ff", mark: "diamond", category: "work",
+             blurb: "Service desk requests — the same Jira site and token as Jira." },
+
+  // ── Not available yet: on the map, honestly marked ──────────────────────
+  mongodb: { label: "MongoDB", color: "#47a248", mark: "leaf", category: "nosql",
+             blurb: "Not available yet." },
+  dynamodb: { label: "Amazon DynamoDB", color: "#4053d6", mark: "bolt", category: "nosql",
+              blurb: "Not available yet." },
+  elasticsearch: { label: "Elasticsearch", color: "#00a3a3", mark: "rings", category: "nosql",
+                   blurb: "Not available yet." },
+  salesforce: { label: "Salesforce", color: "#00a1e0", mark: "cloudsq", category: "apps",
+                blurb: "Not available yet." },
+  hubspot: { label: "HubSpot", color: "#ff7a59", mark: "orbit", category: "apps",
+             blurb: "Not available yet." },
+  stripe: { label: "Stripe", color: "#635bff", mark: "stack", category: "apps",
+            blurb: "Not available yet." },
+  zendesk: { label: "Zendesk", color: "#17494d", mark: "diamond", category: "apps",
+             blurb: "Not available yet." },
+  servicenow: { label: "ServiceNow", color: "#3f9a5f", mark: "orbit", category: "apps",
+                blurb: "Not available yet." },
+  shopify: { label: "Shopify", color: "#5e8e3e", mark: "bucket", category: "apps",
+             blurb: "Not available yet." },
+  google_sheets: { label: "Google Sheets", color: "#0f9d58", mark: "panel", category: "apps",
+                   blurb: "Not available yet." },
+  tableau: { label: "Tableau", color: "#e97627", mark: "petals", category: "bi",
+             blurb: "Not available yet." },
+};
+
+/**
+ * How each marketplace integration connects. `ctype` is the native connection
+ * type whose form it opens, `preset` what that form starts with, `dialect` the
+ * SQLAlchemy dialect an Any-SQL tile needs a driver for (and the one its
+ * connections are listed under), `driver` the package that provides it. No
+ * `ctype` means not available yet.
+ */
+export const MARKETPLACE = {
+  mysql: { ctype: "sql", dialect: "mysql", driver: "pymysql",
+           preset: { url: "mysql+pymysql://user:password@host:3306/database" } },
+  mariadb: { ctype: "sql", dialect: "mysql", driver: "pymysql",
+             preset: { url: "mysql+pymysql://user:password@host:3306/database" } },
+  mssql: { ctype: "sql", dialect: "mssql", driver: "pymssql",
+           preset: { url: "mssql+pymssql://user:password@host:1433/database", schema: "dbo" } },
+  azure_sql: { ctype: "sql", dialect: "mssql", driver: "pymssql",
+               preset: { url: "mssql+pymssql://user:password@server.database.windows.net:1433/database",
+                         schema: "dbo" } },
+  oracle: { ctype: "sql", dialect: "oracle", driver: "oracledb",
+            preset: { url: "oracle+oracledb://user:password@host:1521/?service_name=ORCLPDB1" } },
+  singlestore: { ctype: "sql", dialect: "mysql", driver: "pymysql",
+                 preset: { url: "mysql+pymysql://user:password@host:3306/database" } },
+  tidb: { ctype: "sql", dialect: "mysql", driver: "pymysql",
+          preset: { url: "mysql+pymysql://user:password@host:4000/database" } },
+  planetscale: { ctype: "sql", dialect: "mysql", driver: "pymysql",
+                 preset: { url: "mysql+pymysql://user:password@aws.connect.psdb.cloud:3306/database" } },
+  supabase: { ctype: "postgres",
+              preset: { dsn: "postgresql://postgres:password@db.project.supabase.co:5432/postgres" } },
+  neon: { ctype: "postgres",
+          preset: { dsn: "postgresql://user:password@ep-name.region.aws.neon.tech/neondb?sslmode=require" } },
+  cockroachdb: { ctype: "postgres",
+                 preset: { dsn: "postgresql://user:password@host:26257/defaultdb?sslmode=require" } },
+  timescale: { ctype: "postgres",
+               preset: { dsn: "postgresql://tsdbadmin:password@host:5432/tsdb?sslmode=require" } },
+  yugabyte: { ctype: "postgres", preset: { dsn: "postgresql://yugabyte:password@host:5433/yugabyte" } },
+  aurora_pg: { ctype: "postgres",
+               preset: { dsn: "postgresql://user:password@cluster.region.rds.amazonaws.com:5432/postgres" } },
+  cloudsql_pg: { ctype: "postgres", preset: { dsn: "postgresql://user:password@host:5432/postgres" } },
+  redshift: { ctype: "postgres",
+              preset: { dsn: "postgresql://user:password@cluster.region.redshift.amazonaws.com:5439/dev" } },
+  clickhouse: { ctype: "sql", dialect: "clickhouse", driver: "clickhouse-sqlalchemy",
+                preset: { url: "clickhouse+native://user:password@host:9000/default" } },
+  trino: { ctype: "sql", dialect: "trino", driver: "trino",
+           preset: { url: "trino://user@host:443/catalog/schema" } },
+  teradata: { ctype: "sql", dialect: "teradatasql", driver: "teradatasqlalchemy",
+              preset: { url: "teradatasql://user:password@host" } },
+  db2: { ctype: "sql", dialect: "db2", driver: "ibm_db_sa",
+         preset: { url: "db2+ibm_db://user:password@host:50000/database" } },
+  hana: { ctype: "sql", dialect: "hana", driver: "sqlalchemy-hana",
+          preset: { url: "hana://user:password@host:30015" } },
+  vertica: { ctype: "sql", dialect: "vertica", driver: "sqlalchemy-vertica-python",
+             preset: { url: "vertica+vertica_python://user:password@host:5433/database" } },
+  scylladb: { ctype: "cassandra", preset: { port: "9042" } },
+  keyspaces: { ctype: "cassandra",
+               preset: { contact_points: "cassandra.us-east-1.amazonaws.com", port: "9142",
+                         ssl: "true" } },
+  jira_sm: { ctype: "jira",
+             preset: { jql: 'projectType = "service_desk" ORDER BY updated DESC' } },
+  mongodb: {}, dynamodb: {}, elasticsearch: {}, salesforce: {}, hubspot: {}, stripe: {},
+  zendesk: {}, servicenow: {}, shopify: {}, google_sheets: {}, tableau: {},
 };
 
 function humanize(id) {

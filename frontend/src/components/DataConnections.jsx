@@ -21,7 +21,7 @@
 // map of available sources and who to ask.
 import { useEffect, useMemo, useState } from "react";
 import { api, getUser } from "../api";
-import { CATEGORIES, SourceIcon, metaFor } from "./sourceCatalog";
+import { CATEGORIES, MARKETPLACE, SourceIcon, metaFor } from "./sourceCatalog";
 import MetadataLine, { useMetadataStatus } from "./MetadataLine";
 import { backdropClose } from "../backdrop";
 
@@ -66,6 +66,37 @@ export function suggestName(ctype, taken) {
  * Exported because it is the only real logic on this screen, and a pure
  * function is worth testing directly.
  */
+/**
+ * How a marketplace tile connects, given what this deployment offers:
+ *   "ready"  — opens its native type's form, pre-filled;
+ *   "driver" — its type is here but its driver is not installed;
+ *   "admin"  — only an administrator sees connection types (or the type is off);
+ *   "soon"   — not available yet.
+ * Exported for tests.
+ */
+export function marketplaceStatus(via, typeById) {
+  if (!via || !via.ctype) return "soon";
+  const base = typeById.get(via.ctype);
+  if (!base) return "admin";
+  if (via.dialect && !(base.drivers || []).some((d) => d.split("+")[0] === via.dialect)) {
+    return "driver";
+  }
+  if (base.available === false) return "driver";
+  return "ready";
+}
+
+// The Any-SQL tile a connection belongs on, by the engine its URL names.
+const SQL_TILE_BY_DIALECT = {};
+for (const [id, via] of Object.entries(MARKETPLACE)) {
+  if (via.ctype === "sql" && via.dialect && !SQL_TILE_BY_DIALECT[via.dialect]) {
+    SQL_TILE_BY_DIALECT[via.dialect] = id;
+  }
+}
+
+function sqlTile(ctype, dialect) {
+  return ctype === "sql" && SQL_TILE_BY_DIALECT[dialect] ? SQL_TILE_BY_DIALECT[dialect] : ctype;
+}
+
 export function buildTiles({ types = [], conns = [], sources = [], repos = [], envs = [], q = "" }) {
   const byId = new Map();
   const put = (id, extra) => {
@@ -78,6 +109,15 @@ export function buildTiles({ types = [], conns = [], sources = [], repos = [], e
   for (const t of types) put(t.ctype, { connectable: true, fields: t.fields, ns: t.ns || {} });
   put("m365");
   put("github");
+  // The marketplace: every integration on the map, each saying how it connects.
+  const typeById = new Map(types.map((t) => [t.ctype, t]));
+  for (const [id, via] of Object.entries(MARKETPLACE)) {
+    const status = marketplaceStatus(via, typeById);
+    const base = typeById.get(via.ctype);
+    put(id, { via: { ...via, status }, connectable: status === "ready",
+              fields: base ? base.fields : null, ns: base ? base.ns || {} : {},
+              ctype: via.ctype || null });
+  }
 
   for (const repo of repos) {
     put("github").instances.push({
@@ -96,7 +136,7 @@ export function buildTiles({ types = [], conns = [], sources = [], repos = [], e
     const own = connByName.get(s.name);
     // A user connection whose ctype this bundle doesn't know (server ahead of
     // the frontend) still needs a home; put() gives it a fallback tile.
-    const tile = put(own?.ctype || s.ctype || s.name);
+    const tile = put(sqlTile(own?.ctype || s.ctype || s.name, s.dialect));
     tile.instances.push({
       name: s.name,
       configured: !!s.configured,
@@ -117,7 +157,7 @@ export function buildTiles({ types = [], conns = [], sources = [], repos = [], e
   // belongs on its tile, where the admin can reconnect or remove it.
   for (const c of conns) {
     if (c.enabled !== false) continue;
-    put(c.ctype).instances.push({
+    put(sqlTile(c.ctype, (c.hint || "").split(" · ")[0])).instances.push({
       name: c.name,
       configured: false,
       allowed: false,
@@ -132,7 +172,8 @@ export function buildTiles({ types = [], conns = [], sources = [], repos = [], e
   const list = [...byId.values()];
   const needle = q.trim().toLowerCase();
   return needle
-    ? list.filter((t) => (t.meta.label + " " + t.id).toLowerCase().includes(needle))
+    ? list.filter((t) => (t.meta.label + " " + t.id + " " + (t.meta.blurb || ""))
+        .toLowerCase().includes(needle))
     : list;
 }
 
@@ -209,22 +250,22 @@ export default function DataConnections({ onClose }) {
           <div>
             <div className="canvas-title">
               {tile ? (
-                <button className="conn-back" onClick={back}>← Connect to data</button>
+                <button className="conn-back" onClick={back}>← All integrations</button>
               ) : (
-                "Connect to data"
+                "Integrations marketplace"
               )}
             </div>
             <div className="meta">
               {tile
                 ? tile.meta.blurb || `Connect Studio to ${tile.meta.label}.`
-                : "Pick a data source or pipeline planning context. Warehouse connections appear in the chat data picker; GitHub repositories are selected when building a pipeline."}
+                : "Connect a database, warehouse, app or workspace. Connected sources appear in the chat data picker; GitHub repositories are selected when building a pipeline."}
             </div>
           </div>
           <div className="conn-head-right">
             {!tile && (
               <input
                 className="conn-search"
-                placeholder="Search sources…"
+                placeholder="Search integrations…"
                 value={q}
                 onChange={(e) => setQ(e.target.value)}
               />
@@ -253,6 +294,7 @@ export default function DataConnections({ onClose }) {
           ) : tile.connectable && isAdmin ? (
             <ConnectForm
               tile={tile}
+              preset={tile.via?.preset}
               defaultName={suggestName(tile.id, takenNames)}
               takenNames={takenNames}
               onDone={(msg) => { setNote(msg); setPicked(null); load(); }}
@@ -296,6 +338,10 @@ function Grid({ tiles, isAdmin, onPick }) {
   );
 }
 
+const VIA_LABEL = {
+  ready: "Connect", driver: "Driver needed", admin: "Ask an admin", soon: "Coming soon",
+};
+
 function Tile({ tile, isAdmin, onPick }) {
   const live = tile.instances.filter((i) => i.configured);
   const dormant = !live.length && !tile.connectable && !(tile.id === "github" && isAdmin);
@@ -314,7 +360,9 @@ function Tile({ tile, isAdmin, onPick }) {
           ? `${live.length} connected`
           : tile.connectable
             ? "Connect"
-            : "Not configured"}
+            : tile.via
+              ? VIA_LABEL[tile.via.status]
+              : "Not configured"}
       </span>
       {live.length > 0 && <span className="conn-dot" aria-hidden="true" />}
     </button>
@@ -440,12 +488,18 @@ export function connectionReadiness({ fields = [], ns = {}, cfg = {}, chosen = [
 }
 
 /** The connect form for one tile. Exported for testing. */
-export function ConnectForm({ tile, defaultName, takenNames, onDone, onError, onRemoved }) {
+export function ConnectForm({ tile, preset, defaultName, takenNames, onDone, onError,
+                             onRemoved }) {
   const fields = tile.fields || [];
   const ns = tile.ns || {};
+  // A marketplace tile posts as its native type (MySQL → "sql").
+  const ctype = tile.ctype || tile.id;
+  const initial = () => ({
+    ...Object.fromEntries(fields.filter((f) => f.default).map((f) => [f.key, f.default])),
+    ...(preset || {}),
+  });
   const [name, setName] = useState(defaultName);
-  const [cfg, setCfg] = useState(() =>
-    Object.fromEntries(fields.filter((f) => f.default).map((f) => [f.key, f.default])));
+  const [cfg, setCfg] = useState(initial);
   const [test, setTest] = useState(null);       // null | {ok, tables?, sample?, error?}
   const [browse, setBrowse] = useState(null);   // null | {ok, namespaces[], error?}
   const [picked, setPicked] = useState([]);     // "db\u0000schema" keys
@@ -478,13 +532,13 @@ export function ConnectForm({ tile, defaultName, takenNames, onDone, onError, on
         // Discovery itself is the credential probe.  /test lists tables and
         // therefore cannot succeed until a namespace has already been picked.
         const result = await api("/connections/browse", {
-          method: "POST", body: JSON.stringify({ ctype: tile.id, config: cfg }),
+          method: "POST", body: JSON.stringify({ ctype, config: cfg }),
         });
         setBrowse(result);
         if (result.ok) setTest({ ok: true, discovery: true });
       } else {
         setTest(await api("/connections/test", {
-          method: "POST", body: JSON.stringify({ ctype: tile.id, config: cfg }),
+          method: "POST", body: JSON.stringify({ ctype, config: cfg }),
         }));
       }
     } catch (e) {
@@ -534,7 +588,7 @@ export function ConnectForm({ tile, defaultName, takenNames, onDone, onError, on
       try {
         await api("/connections", {
           method: "POST",
-          body: JSON.stringify({ name: p.name, ctype: tile.id, config: p.config }),
+          body: JSON.stringify({ name: p.name, ctype, config: p.config }),
         });
         done.push(p.name);
       } catch (e) {
@@ -598,7 +652,7 @@ export function ConnectForm({ tile, defaultName, takenNames, onDone, onError, on
 
   function startReplacing(sourceName) {
     setReplacing(sourceName);
-    setCfg(Object.fromEntries(fields.filter((f) => f.default).map((f) => [f.key, f.default])));
+    setCfg(initial());
     setTest(null);
     setBrowse(null);
     setPicked([]);
@@ -775,9 +829,12 @@ export function ConnectForm({ tile, defaultName, takenNames, onDone, onError, on
         </button>
       </div>
       <div className="meta">
-        Credentials are encrypted at rest and never displayed again. Each schema becomes
-        its own source, scoped and granted separately — grant them to other roles in
-        Governance.
+        Credentials are encrypted at rest and never displayed again.{" "}
+        {ns.schema
+          ? "Each schema becomes its own source, scoped and granted separately — grant them " +
+            "to other roles in Governance."
+          : "Only administrators reach a new source until it is granted to other roles in " +
+            "Governance."}
       </div>
     </div>
   );
@@ -975,14 +1032,31 @@ function DetailPanel({ tile, isAdmin }) {
   // with the admin role has to set this up. Admins fall through to the env
   // explanation, since the only tiles that reach here are the ones this screen
   // cannot configure; the rows above already show which are live.
+  const via = tile.via;
+  let say;
+  if (via?.status === "soon") {
+    say = `${tile.meta.label} has no connector in Studio yet. Until it does, land its data in a ` +
+      "warehouse Studio reads (Snowflake, BigQuery, Databricks, Postgres…) — for example with " +
+      "Fivetran or Airbyte — and connect that.";
+  } else if (via?.status === "driver") {
+    say = isAdmin
+      ? `${tile.meta.label} connects through ${metaFor(via.ctype).label} once its driver is ` +
+        `installed on the deployment: add the \u201c${via.driver || "cassandra-driver"}\u201d ` +
+        "package to the backend's requirements and redeploy. Then this tile opens the form, " +
+        "pre-filled."
+      : "An administrator has to install this integration's driver and connect it.";
+  } else if (!isAdmin) {
+    say = "An administrator connects sources. Sources your role may use appear in the chat " +
+      "picker automatically — ask an admin to connect this one and grant it to your role.";
+  } else {
+    say = "This source is configured by an operator through environment variables on the " +
+      "deployment (see .env.example), not from this screen. Once its keys are set it appears " +
+      "in the chat picker like any other source.";
+  }
   return (
     <div className="conn-detail">
       <Instances tile={tile} />
-      <div className="meta">
-        {isAdmin
-          ? "This source is configured by an operator through environment variables on the deployment (see .env.example), not from this screen. Once its keys are set it appears in the chat picker like any other source."
-          : "An administrator connects sources. Sources your role may use appear in the chat picker automatically — ask an admin to connect this one and grant it to your role."}
-      </div>
+      <div className="meta">{say}</div>
     </div>
   );
 }

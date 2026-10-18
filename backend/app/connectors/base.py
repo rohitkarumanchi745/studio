@@ -16,6 +16,8 @@ import contextvars
 import datetime
 import decimal
 import functools
+from collections.abc import Mapping
+from collections.abc import Set as AbstractSet
 
 # The execution scope: None outside the gateway, the caller's purpose inside
 # it, "unguarded" under the explicit escape hatch. A ContextVar (not a global)
@@ -154,8 +156,12 @@ def to_jsonable(v):
             return str(v)
     if isinstance(v, (list, tuple)):
         return [to_jsonable(x) for x in v]
-    if isinstance(v, dict):
+    if isinstance(v, (dict, Mapping)):
+        # Any mapping — a driver's own ordered map (Cassandra) included.
         return {str(k): to_jsonable(x) for k, x in v.items()}
+    if isinstance(v, AbstractSet):
+        # A set has no order; sorted, so the same set always reads the same.
+        return sorted((to_jsonable(x) for x in v), key=lambda x: (str(type(x)), str(x)))
     return str(v)
 
 

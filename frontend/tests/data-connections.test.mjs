@@ -1,4 +1,4 @@
-// The "Connect to data" grid: tile model + a real render, no browser.
+// The integrations marketplace grid: tile model + a real render, no browser.
 //
 // The grid is the only place a user picks a source, so the two things worth
 // pinning down are that every source lands on exactly one tile with an honest
@@ -17,9 +17,9 @@ const require = createRequire(import.meta.url);
 let hooks = null;
 const bundle = await build({
   stdin: {
-    contents: `export {default as DataConnections, buildTiles, suggestName, planConnections, connectionReadiness, Namespaces, namespaceKey, namespaceLabel, remainingPickedNamespaces, GithubPanel, githubRegistrationReady, ConnectForm, instanceBadge, envActions, userActions, Instances, planSchemaAdds}
+    contents: `export {default as DataConnections, buildTiles, suggestName, planConnections, connectionReadiness, Namespaces, namespaceKey, namespaceLabel, remainingPickedNamespaces, GithubPanel, githubRegistrationReady, ConnectForm, instanceBadge, envActions, userActions, Instances, planSchemaAdds, marketplaceStatus}
       from "./src/components/DataConnections.jsx";
-      export {metaFor} from "./src/components/sourceCatalog.jsx";`,
+      export {metaFor, MARKETPLACE, CATEGORIES} from "./src/components/sourceCatalog.jsx";`,
     resolveDir: frontend, loader: "jsx",
   },
   bundle: true, write: false, format: "cjs", platform: "node", jsx: "automatic",
@@ -38,6 +38,7 @@ compiled._compile(bundle.outputFiles[0].text, compiled.filename);
 const { DataConnections, buildTiles, suggestName, planConnections, connectionReadiness,
         Namespaces, namespaceKey, namespaceLabel, remainingPickedNamespaces, GithubPanel,
         githubRegistrationReady, metaFor, ConnectForm, instanceBadge, envActions,
+        marketplaceStatus, MARKETPLACE, CATEGORIES,
         userActions, Instances, planSchemaAdds } = compiled.exports;
 
 // What the four endpoints answer on a deployment with Postgres configured from
@@ -92,9 +93,13 @@ test("every source lands on exactly one tile, and user connections fold into the
 
 test("search matches the display name, not just the backend identifier", () => {
   const hit = buildTiles({ types: TYPES, conns: CONNS, sources: SOURCES, q: "postgre" });
-  assert.deepEqual(hit.map((t) => t.id), ["postgres"]);
+  assert.equal(hit[0].id, "postgres");
+  // …and the Postgres-wire integrations of the marketplace, by what they say they are.
+  assert.ok(hit.every((t) => /postgre/i.test(t.meta.label + t.id + t.meta.blurb)));
+  assert.ok(hit.some((t) => t.id === "supabase") && hit.some((t) => t.id === "redshift"));
   // "Microsoft 365" is findable even though its id is "m365".
-  assert.deepEqual(buildTiles({ types: TYPES, sources: [], q: "microsoft" }).map((t) => t.id), ["m365"]);
+  assert.deepEqual(buildTiles({ types: TYPES, sources: [], q: "microsoft" }).map((t) => t.id),
+                   ["m365", "mssql"]);
   assert.deepEqual(buildTiles({ repos: REPOS, q: "github" }).map((t) => t.id), ["github"]);
   assert.equal(buildTiles({ repos: REPOS }).find((t) => t.id === "github").instances[0].name,
                "sales-pipelines");
@@ -109,12 +114,12 @@ test("a new connection never collides with an existing source name", () => {
   assert.equal(suggestName("azure_blob", taken), "azure-blob");
 });
 
-test("Power BI sits on the warehouse shelf as a connectable source", () => {
+test("Power BI sits on the BI shelf as a connectable source", () => {
   // It began as a marketing-shelf placeholder (powerbi_sap) that only ever
   // raised a setup message; the real connector is the `powerbi` ctype.
   const m = metaFor("powerbi");
   assert.equal(m.label, "Power BI");
-  assert.equal(m.category, "warehouse");
+  assert.equal(m.category, "bi");
   const tiles = buildTiles({
     types: [{ ctype: "powerbi", label: "Power BI", dialect: "sqlite", fields: [],
               ns: { schema: "dataset", database: "workspace" } }],
@@ -235,7 +240,9 @@ test("the grid renders a tile per source with an honest status", async () => {
                                          "/api/connections/env", "/api/connections/types",
                                          "/api/m365/status", "/api/settings/repos"]);
       // Section headings, so the grid reads as a map rather than a flat wall.
-      assert.match(html, /Databases and warehouses/);
+      assert.match(html, /Databases/);
+      assert.match(html, /Data warehouses and lakehouses/);
+      assert.match(html, /NoSQL and graph/);
       assert.match(html, /Cloud file storage/);
       // Snowflake has one live source (the user's) out of two instances.
       assert.match(html, /Snowflake<\/span><span class="conn-tile-status">1 connected/);
@@ -1084,4 +1091,82 @@ test("the source's own schema is listed but cannot be picked", () => {
   assert.match(own, /disabled=""/);
   assert.match(own, /this source/);
   assert.doesNotMatch(items.find((i) => i.includes("messy_retail")), /disabled|this source/);
+});
+
+
+// ── The marketplace ─────────────────────────────────────────────────────
+
+const MARKET_TYPES = [
+  { ctype: "postgres", label: "PostgreSQL", fields: [{ key: "dsn", label: "DSN", secret: true },
+                                                     { key: "schema", label: "Schema" }] },
+  { ctype: "sql", label: "Any SQL database", drivers: ["mssql+pymssql", "mysql+pymysql",
+                                                       "oracle+oracledb", "postgresql+psycopg"],
+    fields: [{ key: "url", label: "Connection URL", secret: true }, { key: "schema", label: "Schema" }] },
+  { ctype: "cassandra", label: "Apache Cassandra", available: true,
+    fields: [{ key: "contact_points", label: "Contact points" }, { key: "port", label: "Port",
+              default: "9042" }, { key: "keyspace", label: "Keyspace" }, { key: "ssl", label: "TLS" }] },
+  { ctype: "jira", label: "Atlassian Jira",
+    fields: [{ key: "site", label: "Jira site" }, { key: "api_token", label: "API token",
+              secret: true }, { key: "jql", label: "JQL scope" }] },
+];
+
+test("every integration says honestly how it connects", () => {
+  const tiles = byId(buildTiles({ types: MARKET_TYPES }));
+  for (const id of ["cassandra", "jira", "mysql", "mssql", "oracle", "supabase", "redshift",
+                    "scylladb", "keyspaces", "jira_sm"]) {
+    assert.equal(tiles[id].connectable, true, `${id} should connect`);
+  }
+  assert.equal(tiles.mysql.ctype, "sql");
+  assert.equal(tiles.supabase.ctype, "postgres");
+  assert.equal(tiles.keyspaces.ctype, "cassandra");
+  assert.equal(tiles.clickhouse.via.status, "driver");          // no clickhouse driver here
+  assert.equal(tiles.mongodb.via.status, "soon");
+  assert.equal(tiles.mongodb.connectable, false);
+  // A viewer (who cannot read connection types) is told to ask, never offered a form.
+  assert.equal(byId(buildTiles({})).mysql.via.status, "admin");
+  assert.equal(marketplaceStatus({ ctype: "cassandra" },
+                                 new Map([["cassandra", { ctype: "cassandra", available: false }]])),
+               "driver");
+});
+
+test("a connection made through an integration shows on that integration's tile", () => {
+  const tiles = byId(buildTiles({
+    types: MARKET_TYPES,
+    conns: [{ id: "c9", name: "erp-mysql", ctype: "sql", hint: "mysql · db.example.com" },
+            { id: "c10", name: "any-pg", ctype: "sql", hint: "postgresql · pg.example.com" }],
+    sources: [{ name: "erp-mysql", dialect: "mysql", configured: true },
+              { name: "any-pg", dialect: "postgresql", configured: true }],
+  }));
+  assert.deepEqual(tiles.mysql.instances.map((i) => i.name), ["erp-mysql"]);
+  assert.deepEqual(tiles.sql.instances.map((i) => i.name), ["any-pg"]);   // no tile of its own
+});
+
+test("an integration's form opens pre-filled and posts as its native type", () => {
+  const tile = byId(buildTiles({ types: MARKET_TYPES })).mysql;
+  const html = renderToStaticMarkup(React.createElement(ConnectForm, {
+    tile, preset: tile.via.preset, defaultName: "mysql", takenNames: new Set(),
+    onDone() {}, onError() {}, onRemoved() {},
+  }));
+  assert.match(html, /mysql\+pymysql:\/\/user:password@host:3306\/database/);
+  const ks = byId(buildTiles({ types: MARKET_TYPES })).keyspaces;
+  const ksHtml = renderToStaticMarkup(React.createElement(ConnectForm, {
+    tile: ks, preset: ks.via.preset, defaultName: "keyspaces", takenNames: new Set(),
+    onDone() {}, onError() {}, onRemoved() {},
+  }));
+  assert.match(ksHtml, /value="9142"/);                          // the preset beats the default
+  assert.match(ksHtml, /cassandra\.us-east-1\.amazonaws\.com/);
+});
+
+test("every marketplace entry has a name, an icon and a shelf", () => {
+  const shelves = new Set(CATEGORIES.map((c) => c.key));
+  for (const id of [...Object.keys(MARKETPLACE), "cassandra", "jira"]) {
+    const m = metaFor(id);
+    assert.notEqual(m.mark, null, `${id} has no icon`);
+    assert.ok(shelves.has(m.category), `${id} is on no shelf`);
+    assert.match(m.color, /^#[0-9a-f]{6}$/);
+    assert.ok(m.blurb, `${id} has no description`);
+  }
+  for (const [id, via] of Object.entries(MARKETPLACE)) {
+    if (via.ctype === "sql") assert.ok(via.dialect && via.driver && via.preset?.url, id);
+  }
 });
