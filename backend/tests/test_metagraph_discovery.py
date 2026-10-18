@@ -359,9 +359,9 @@ def test_neo4j_mirror_removes_dropped_objects(env, neo4j):
     with sqlite3.connect(env.warehouse) as c:
         c.execute("DROP TABLE retail_returns")
     run_job(env)
-    params = neo4j.requests[-1]["body"]["statements"][-1]["parameters"]
-    assert "retail_returns" not in params["names"]
-    assert "DETACH DELETE t" in neo4j.requests[-1]["body"]["statements"][-1]["statement"]
+    removal = next(s for s in neo4j.requests[-1]["body"]["statements"]
+                   if "WHERE NOT t.name IN $names DETACH DELETE t" in s["statement"])
+    assert "retail_returns" not in removal["parameters"]["names"]
 
 
 def test_a_neo4j_failure_is_recorded_and_never_fails_discovery(env, neo4j):

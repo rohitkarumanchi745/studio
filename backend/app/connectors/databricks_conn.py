@@ -688,6 +688,116 @@ class DatabricksConnector(Connector):
         except Exception:
             return None
 
+    def _info_scope(self):
+        """(information_schema prefix, table filter, name of a relation from its
+        catalog/schema/table) for this source's scope — the same scoping as
+        describe_relations()."""
+        catalog = (self._cfg()["catalog"] or "").strip()
+        if catalog and not _PLAIN.match(catalog):
+            return None
+        if self.all_schemas:
+            prefix = f"`{catalog}`.information_schema" if catalog else "system.information_schema"
+            skipped = ", ".join(f"'{c}'" for c in sorted(_SKIPPED_CATALOGS))
+            return (prefix, f"table_schema <> 'information_schema' "
+                            f"AND table_catalog NOT IN ({skipped})",
+                    lambda cat, sch, name: f"{cat}.{sch}.{name}")
+        return ("information_schema",
+                "table_catalog = current_catalog() AND table_schema = current_schema()",
+                lambda cat, sch, name: name)
+
+    def describe_constraints(self):
+        """Unity Catalog primary and foreign keys (informational constraints)
+        from information_schema. A foreign key whose referenced table lies
+        outside this source's scope is left out."""
+        scope = self._info_scope()
+        if scope is None:
+            return None
+        prefix, where, key = scope
+
+        def go(con):
+            cur = con.cursor()
+            cur.execute(f"SELECT constraint_name, constraint_type, table_catalog, table_schema, "
+                        f"table_name FROM {prefix}.table_constraints WHERE {where} "
+                        f"AND constraint_type IN ('PRIMARY KEY', 'FOREIGN KEY')")
+            constraints = {r[0]: (r[1], key(r[2], r[3], r[4])) for r in cur.fetchall()}
+            cur.execute(f"SELECT constraint_name, column_name, ordinal_position "
+                        f"FROM {prefix}.key_column_usage WHERE {where} "
+                        f"ORDER BY constraint_name, ordinal_position")
+            columns = {}
+            for name, col, _pos in cur.fetchall():
+                columns.setdefault(name, []).append(col)
+            cur.execute(f"SELECT constraint_name, unique_constraint_name "
+                        f"FROM {prefix}.referential_constraints")
+            refs = dict(cur.fetchall())
+            out = {"primary_keys": {}, "foreign_keys": []}
+            for name, (ctype, table) in constraints.items():
+                if ctype == "PRIMARY KEY" and columns.get(name):
+                    out["primary_keys"][table] = columns[name]
+            for name, (ctype, table) in constraints.items():
+                target = refs.get(name)
+                if ctype != "FOREIGN KEY" or target not in constraints:
+                    continue
+                _t, to_table = constraints[target]
+                if columns.get(name) and columns.get(target):
+                    out["foreign_keys"].append({
+                        "name": name, "from": table, "from_columns": columns[name],
+                        "to": to_table, "to_columns": columns[target]})
+            return out
+        try:
+            return self._execute(go)
+        except Exception:
+            logging.getLogger("studio.connectors").warning(
+                "Databricks describe_constraints failed", exc_info=True)
+            return None
+
+    def view_definitions(self):
+        scope = self._info_scope()
+        if scope is None:
+            return None
+        prefix, where, key = scope
+
+        def go(con):
+            cur = con.cursor()
+            cur.execute(f"SELECT table_catalog, table_schema, table_name, view_definition "
+                        f"FROM {prefix}.views WHERE {where}")
+            return {key(cat, sch, name): sql for cat, sch, name, sql in cur.fetchall() if sql}
+        try:
+            return self._execute(go)
+        except Exception:
+            return None
+
+    def lineage(self):
+        """Table lineage Unity Catalog recorded (system.access.table_lineage) for
+        the last 90 days, between tables in this source's scope. None when the
+        system tables are not readable with this token."""
+        scope = self._info_scope()
+        if scope is None:
+            return None
+        _prefix, _where, key = scope
+        catalog = (self._cfg()["catalog"] or "").strip()
+        if self.all_schemas:
+            filt = (f"target_table_catalog = '{catalog}'" if catalog
+                    else "target_table_catalog <> 'system'")
+        else:
+            filt = ("target_table_catalog = current_catalog() "
+                    "AND target_table_schema = current_schema() "
+                    "AND source_table_catalog = current_catalog() "
+                    "AND source_table_schema = current_schema()")
+
+        def go(con):
+            cur = con.cursor()
+            cur.execute("SELECT DISTINCT source_table_catalog, source_table_schema, "
+                        "source_table_name, target_table_catalog, target_table_schema, "
+                        "target_table_name FROM system.access.table_lineage "
+                        f"WHERE {filt} AND source_table_name IS NOT NULL "
+                        "AND event_time > current_timestamp() - INTERVAL 90 DAYS LIMIT 5000")
+            return [(key(*r[:3]), key(*r[3:])) for r in cur.fetchall()
+                    if all(r) and r[:3] != r[3:]]
+        try:
+            return self._execute(go)
+        except Exception:
+            return None
+
     def change_signal(self):
         """Count and newest last_altered of the relations in scope: a create,
         drop, rename or ALTER moves one of them. None where information_schema

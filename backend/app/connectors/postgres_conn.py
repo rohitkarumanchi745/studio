@@ -216,6 +216,58 @@ class PostgresConnector(Connector):
         except Exception:
             return None
 
+    def describe_constraints(self):
+        """Primary and foreign keys in the pinned schema, from pg_constraint,
+        with columns in key order. A foreign key into another schema names a
+        table outside this source and is left out."""
+        schema = self._schema()
+
+        def cols(rel, keys):
+            return ("ARRAY(SELECT a.attname::text FROM unnest(" + keys + ") WITH ORDINALITY "
+                    "k(num, pos) JOIN pg_catalog.pg_attribute a ON a.attrelid = " + rel +
+                    " AND a.attnum = k.num ORDER BY k.pos)")
+
+        def go(con):
+            with con.cursor() as cur:
+                cur.execute(
+                    "SELECT con.contype::text, con.conname::text, rel.relname::text, "
+                    + cols("con.conrelid", "con.conkey") + ", frel.relname::text, "
+                    "fns.nspname::text, " + cols("con.confrelid", "con.confkey") + " "
+                    "FROM pg_catalog.pg_constraint con "
+                    "JOIN pg_catalog.pg_class rel ON rel.oid = con.conrelid "
+                    "JOIN pg_catalog.pg_namespace ns ON ns.oid = rel.relnamespace "
+                    "LEFT JOIN pg_catalog.pg_class frel ON frel.oid = con.confrelid "
+                    "LEFT JOIN pg_catalog.pg_namespace fns ON fns.oid = frel.relnamespace "
+                    "WHERE ns.nspname = %s AND con.contype IN ('p', 'f')", (schema,))
+                out = {"primary_keys": {}, "foreign_keys": []}
+                for ctype, name, table, columns, ftable, fschema, fcolumns in cur.fetchall():
+                    if ctype == "p":
+                        out["primary_keys"][table] = list(columns)
+                    elif ftable and fschema == schema:
+                        out["foreign_keys"].append({
+                            "name": name, "from": table, "from_columns": list(columns),
+                            "to": ftable, "to_columns": list(fcolumns)})
+                return out
+        try:
+            return self._execute(go)
+        except Exception:
+            logging.getLogger("studio.connectors").warning(
+                "Postgres describe_constraints failed", exc_info=True)
+            return None
+
+    def view_definitions(self):
+        schema = self._schema()
+
+        def go(con):
+            with con.cursor() as cur:
+                cur.execute("SELECT table_name, view_definition FROM information_schema.views "
+                            "WHERE table_schema = %s", (schema,))
+                return {name: sql for name, sql in cur.fetchall() if sql}
+        try:
+            return self._execute(go)
+        except Exception:
+            return None
+
     def change_signal(self):
         """A hash of every relation in the pinned schema with its kind and its
         columns' names and types, from pg_catalog in one query — any DDL that

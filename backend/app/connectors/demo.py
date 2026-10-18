@@ -362,6 +362,36 @@ class DemoConnector(Connector):
         c.close()
         return [{"name": r[1], "type": r[2]} for r in rows]
 
+    def describe_constraints(self):
+        """Primary keys and foreign keys SQLite records for each table."""
+        c = self._conn()
+        try:
+            out = {"primary_keys": {}, "foreign_keys": []}
+            for (name,) in c.execute("SELECT name FROM sqlite_master WHERE type='table'"):
+                quoted = name.replace('"', '""')
+                pk = sorted((r[5], r[1]) for r in c.execute(f'PRAGMA table_info("{quoted}")')
+                            if r[5])
+                if pk:
+                    out["primary_keys"][name] = [col for _, col in pk]
+                fks = {}
+                for r in c.execute(f'PRAGMA foreign_key_list("{quoted}")'):
+                    fks.setdefault(r[0], {"name": f"{name}_fk{r[0]}", "from": name,
+                                          "from_columns": [], "to": r[2], "to_columns": []})
+                    fks[r[0]]["from_columns"].append(r[3])
+                    fks[r[0]]["to_columns"].append(r[4])
+                out["foreign_keys"] += [fk for fk in fks.values() if all(fk["to_columns"])]
+            return out
+        finally:
+            c.close()
+
+    def view_definitions(self):
+        c = self._conn()
+        try:
+            return {name: sql for name, sql in c.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type='view'") if sql}
+        finally:
+            c.close()
+
     def change_signal(self):
         """A hash of the schema text SQLite keeps for every table and view."""
         import hashlib

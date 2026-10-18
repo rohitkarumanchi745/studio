@@ -120,6 +120,50 @@ def test_the_change_signal_is_one_cheap_metadata_query():
     assert conn.change_signal() is None              # no signal: full-sync cadence instead
 
 
+def test_declared_keys_come_from_three_information_schema_queries():
+    conn, cur = _connector([
+        ("table_constraints", [("orders_pk", "PRIMARY KEY", "studio_dev", "retail_qa",
+                                "retail_orders"),
+                               ("cust_pk", "PRIMARY KEY", "studio_dev", "retail_qa",
+                                "retail_customers"),
+                               ("orders_cust_fk", "FOREIGN KEY", "studio_dev", "retail_qa",
+                                "retail_orders"),
+                               ("orders_ext_fk", "FOREIGN KEY", "studio_dev", "retail_qa",
+                                "retail_orders")]),
+        ("key_column_usage", [("cust_pk", "customer_id", 1), ("orders_cust_fk", "customer_id", 1),
+                              ("orders_ext_fk", "region_id", 1), ("orders_pk", "order_id", 1)]),
+        ("referential_constraints", [("orders_cust_fk", "cust_pk"),
+                                     ("orders_ext_fk", "regions_pk_elsewhere")]),
+    ])
+    out = conn.describe_constraints()
+    assert out["primary_keys"] == {"retail_orders": ["order_id"],
+                                   "retail_customers": ["customer_id"]}
+    assert out["foreign_keys"] == [{"name": "orders_cust_fk", "from": "retail_orders",
+                                    "from_columns": ["customer_id"], "to": "retail_customers",
+                                    "to_columns": ["customer_id"]}]     # out-of-scope target dropped
+    assert all("current_schema()" in sql for sql in cur.sql[:2])
+
+
+def test_view_definitions_and_engine_lineage():
+    conn, cur = _connector([
+        ("information_schema.views", [("studio_dev", "retail_qa", VIEW,
+                                       "SELECT * FROM retail_orders o JOIN retail_order_items i "
+                                       "ON i.order_id = o.order_id")]),
+        ("system.access.table_lineage", [
+            ("studio_dev", "retail_qa", "retail_orders", "studio_dev", "retail_qa",
+             "retail_daily"),
+            ("studio_dev", "retail_qa", "retail_daily", "studio_dev", "retail_qa",
+             "retail_daily")])])
+    assert conn.view_definitions()[VIEW].startswith("SELECT")
+    assert conn.lineage() == [("retail_orders", "retail_daily")]        # self-lineage dropped
+    assert "INTERVAL 90 DAYS" in cur.sql[-1] and "current_schema()" in cur.sql[-1]
+
+
+def test_unreadable_system_tables_mean_no_lineage():
+    conn, _ = _connector([("system.access", RuntimeError("PERMISSION_DENIED"))])
+    assert conn.lineage() is None
+
+
 def test_discovering_the_retail_schema_end_to_end(tmp_path, monkeypatch):
     """Connect studio_dev.retail_qa → discovery finds seven tables plus the view."""
     monkeypatch.setenv("STUDIO_DB_PATH", str(tmp_path / "e2e.db"))

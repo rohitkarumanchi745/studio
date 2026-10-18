@@ -26,6 +26,9 @@ def pg():
         admin.execute(f"CREATE VIEW {schema}.retail_sales AS SELECT o.order_id, c.segment "
                       f"FROM {schema}.retail_orders o JOIN {schema}.retail_customers c "
                       f"USING (customer_id)")
+        admin.execute(f"CREATE TABLE {schema}.retail_stores (store_id int PRIMARY KEY)")
+        admin.execute(f"CREATE TABLE {schema}.retail_visits (visit_id int, "
+                      f"store_ref int REFERENCES {schema}.retail_stores(store_id))")
         conn = connections._DynPostgres("pg-test", {"dsn": DSN, "schema": schema})
 
         def run(sql):
@@ -63,3 +66,22 @@ def test_the_change_signal_moves_with_every_kind_of_ddl(pg):
         previous = signal
     # It is a function of the schema: back where it started, the signal is too.
     assert previous == base
+
+
+def test_declared_keys_and_view_joins_on_postgres(pg):
+    from app import metarelations as mr
+    conn, _ = pg
+    keys = conn.describe_constraints()
+    assert keys["primary_keys"] == {"retail_stores": ["store_id"]}
+    assert keys["foreign_keys"][0]["from"] == "retail_visits"
+    assert keys["foreign_keys"][0]["from_columns"] == ["store_ref"]
+    views = conn.view_definitions()
+    objects = {name: {"kind": info["kind"], "columns": info["columns"]}
+               for name, info in conn.describe_relations().items()}
+    rels = mr.build(objects, constraints=keys, views=views)
+    declared = rels[("join", "retail_visits", ("store_ref",), "retail_stores", ("store_id",),
+                     True)]
+    assert declared["state"] == "declared"
+    # Postgres stores the view's USING join rewritten; it is still read as one.
+    observed = [k for k, v in rels.items() if k[0] == "join" and v["state"] == "observed"]
+    assert observed and {observed[0][1], observed[0][3]} == {"retail_orders", "retail_customers"}

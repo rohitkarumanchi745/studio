@@ -230,6 +230,29 @@ class Connector:
         """
         return None
 
+    def describe_constraints(self):
+        """Declared keys in this source's scope, keyed as list_tables() names
+        tables: {"primary_keys": {table: [col, ...]},
+                 "foreign_keys": [{"name", "from", "from_columns", "to",
+                                   "to_columns"}, ...]}.
+        Metadata only. Many warehouses declare none (or only informational
+        ones); the metadata graph then infers candidates instead.
+
+        Default: None, meaning "not supported".
+        """
+        return None
+
+    def view_definitions(self):
+        """{view name: its SQL} for the views in scope — the joins a view
+        performs are evidence of how its tables relate, and the tables it reads
+        are its lineage. Metadata only. Default: None (not supported)."""
+        return None
+
+    def lineage(self):
+        """[(upstream, downstream)] table-level lineage the engine itself
+        recorded, both named as list_tables() names them. Default: None."""
+        return None
+
     def change_signal(self):
         """A cheap token that changes whenever a table or view in this source's
         scope is created, altered or dropped — or None when the engine offers
