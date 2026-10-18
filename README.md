@@ -1348,6 +1348,37 @@ Studio's own RBAC and governance are this source's access boundary.
 
 ---
 
+## Metadata graph — what every source contains, discovered automatically
+
+Saving a connection (or reconnecting one) queues a **discovery** job in the
+same transaction as the connection row (`metagraph.py`). The job lists the
+source's tables and views — exactly the set the catalog, RBAC and the agent
+already see — reads their columns, fingerprints each object (kind plus ordered
+column names and types), and records a **snapshot**: what was added, changed
+and removed since the last one. Connections saved before this existed are
+queued once on upgrade (migration 17); an administrator can rediscover any
+source from its row in Data connections.
+
+- **Bulk where the engine allows.** Databricks reads kind and columns from
+  `information_schema` in two queries (`describe_relations`), scoped by the
+  session's own catalog and schema rather than interpolated names; Postgres
+  and the demo warehouse do the same. Other connectors fall back to one
+  `get_schema` per table, with the kind recorded as unknown.
+- **Studio's database is the system of record.** Snapshots, objects and
+  columns live in `meta_snapshots`, `meta_objects` and `meta_columns`, so
+  discovery needs no Neo4j. When `METAGRAPH_NEO4J_*` is set, each successful
+  snapshot is mirrored to Neo4j as `StudioSource → StudioObject → StudioColumn`
+  in one transaction, with every name passed as a Cypher parameter. The mirror
+  refuses the database agents query as the `neo4j` source, where its labels
+  would surface as tables.
+- **Metadata only, per role.** Names, kinds and column types — never a row.
+  `/api/metagraph` shows a source only to a role that may use it and an object
+  only to a role allowed to read it; counts are computed over what the caller
+  can see.
+- **Safe.** A failed listing changes nothing. An object is marked removed only
+  by a complete snapshot — never by a truncated listing
+  (`STUDIO_METAGRAPH_MAX_OBJECTS`) or one where columns could not be read.
+
 ## Adversarial model benchmark — choose attackers with evidence
 
 The admin-only **Red team benchmark** turns attacker-model selection into a

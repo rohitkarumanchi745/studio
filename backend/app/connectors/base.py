@@ -212,6 +212,24 @@ class Connector:
         """
         return []
 
+    def describe_relations(self):
+        """Bulk metadata for discovery: {name: {"kind", "namespace", "columns"}}
+        for the relations list_tables() returns, keyed exactly as it names
+        them. `kind` is "table", "view" or "other"; `columns` is
+        [{"name", "type"}, ...] in ordinal order.
+
+        Metadata only — names and types, never a row. It answers "what is
+        here" for the metadata graph (metagraph.py), in a query or two where
+        the engine has an information schema, instead of one get_schema()
+        round trip per table. It is NOT a widening: list_tables() stays the
+        authoritative object set, and anything returned here that it does not
+        list is ignored.
+
+        Default: None, meaning "not supported" — discovery then falls back to
+        get_schema() per table and records the kind as unknown.
+        """
+        return None
+
     def relation_kind(self, namespace, table):
         """Metadata-only lookup outside the connector's readable namespace.
 

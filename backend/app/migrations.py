@@ -386,6 +386,22 @@ def _m16_kag_graph_provenance(c, is_pg):
         jobs.enqueue("kag_graph_rebuild", {}, job_id=job_id, conn=c)
 
 
+def _m17_metagraph_backfill(c, is_pg):
+    # Sources saved before automatic discovery existed have never been
+    # discovered. Queue one discovery per enabled saved connection, so the
+    # metadata graph covers them without anyone re-saving a connection.
+    if not (_table_exists(c, "data_connections", is_pg)
+            and _table_exists(c, "background_jobs", is_pg)):
+        return
+    from . import jobs
+    for row in c.execute("SELECT name FROM data_connections WHERE enabled=1 "
+                         "ORDER BY name").fetchall():
+        job_id = f"metagraph-backfill-{row['name']}"
+        if not c.execute("SELECT 1 FROM background_jobs WHERE id=?", (job_id,)).fetchone():
+            jobs.enqueue("metagraph_discover", {"source": row["name"], "trigger": "backfill"},
+                         job_id=job_id, max_attempts=3, conn=c)
+
+
 MIGRATIONS = [
     (1, "users.verified", _m1_users_verified),
     (2, "conversations.folder_id", _m2_conversations_folder_id),
@@ -403,6 +419,7 @@ MIGRATIONS = [
     (14, "agent_traces.scrub_private_graph_context", _m14_scrub_private_graph_trace_context),
     (15, "user_memory.embedding+updated_at", _m15_user_memory_rank_columns),
     (16, "kag graph per-chunk provenance + rebuild", _m16_kag_graph_provenance),
+    (17, "metagraph discovery backfill", _m17_metagraph_backfill),
 ]
 
 

@@ -625,6 +625,68 @@ class DatabricksConnector(Connector):
             return out
         return self._execute(go)
 
+    #: information_schema.tables.table_type spellings, by kind.
+    _TABLE_TYPES = {"MANAGED", "EXTERNAL", "BASE TABLE", "STREAMING_TABLE", "FOREIGN"}
+    _VIEW_TYPES = {"VIEW", "MATERIALIZED_VIEW", "MATERIALIZED VIEW", "METRIC_VIEW"}
+
+    def describe_relations(self):
+        """Kind and columns for every relation in this source's scope, from
+        information_schema in two queries rather than a DESCRIBE per table.
+        Keyed as list_tables() names them: bare names when pinned to a schema
+        (current_catalog()/current_schema() are the pinned ones, so nothing is
+        interpolated), catalog.schema.table when the source spans schemas.
+        None where information_schema is unavailable (the Hive metastore) —
+        discovery then DESCRIBEs table by table."""
+        catalog = (self._cfg()["catalog"] or "").strip()
+        if catalog and not _PLAIN.match(catalog):
+            return None
+        if self.all_schemas:
+            prefix = f"`{catalog}`.information_schema" if catalog else "system.information_schema"
+            skipped = ", ".join(f"'{c}'" for c in sorted(_SKIPPED_CATALOGS))
+            where = (f"WHERE table_schema <> 'information_schema' "
+                     f"AND table_catalog NOT IN ({skipped})")
+
+            def key(cat, sch, name):
+                return f"{cat}.{sch}.{name}"
+        else:
+            prefix = "information_schema"
+            where = "WHERE table_catalog = current_catalog() AND table_schema = current_schema()"
+
+            def key(cat, sch, name):
+                return name
+
+        def go(con):
+            cur = con.cursor()
+            cur.execute(f"SELECT table_catalog, table_schema, table_name, table_type "
+                        f"FROM {prefix}.tables {where}")
+            out = {}
+            for cat, sch, name, ttype in cur.fetchall():
+                kind = str(ttype or "").upper()
+                kind = ("view" if kind in self._VIEW_TYPES
+                        else "table" if kind in self._TABLE_TYPES else "other")
+                out[key(cat, sch, name)] = {"kind": kind, "namespace": f"{cat}.{sch}",
+                                            "columns": []}
+            for type_col in ("full_data_type", "data_type"):
+                try:
+                    cur.execute(f"SELECT table_catalog, table_schema, table_name, column_name, "
+                                f"{type_col} FROM {prefix}.columns {where} "
+                                f"ORDER BY table_catalog, table_schema, table_name, "
+                                f"ordinal_position")
+                    rows = cur.fetchall()
+                    break
+                except Exception:
+                    if type_col == "data_type":
+                        raise
+            for cat, sch, name, col, ctype in rows:
+                entry = out.get(key(cat, sch, name))
+                if entry is not None:
+                    entry["columns"].append({"name": col, "type": ctype})
+            return out
+        try:
+            return self._execute(go)
+        except Exception:
+            return None
+
     def relation_kind(self, namespace, table):
         """Classify an output relation from metadata without reading its data.
 
