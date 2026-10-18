@@ -255,8 +255,8 @@ def test_a_disconnected_source_is_hidden_and_leaves_neo4j(sync, neo4j):
     tick(sync), run_queued(sync)
     sync.mg._on_source_event("retail", "disconnected")
     assert sync.mg._state("retail")["status"] == "disconnected"
-    assert "MATCH (s:StudioSource {name: $source}) DETACH DELETE s" in json.dumps(
-        neo4j.requests[-1]["body"])
+    assert "MATCH (s:StudioSource {tenant: $tenant, name: $source}) DETACH DELETE s" in \
+        json.dumps(neo4j.requests[-1]["body"])
     from app import connectors
     sync.mp.delitem(connectors._REGISTRY, "retail")              # gone from the catalog
     from fastapi import HTTPException

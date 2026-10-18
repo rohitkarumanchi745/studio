@@ -404,6 +404,19 @@ def plan_graph(prompt, sources, user, model=None):
     roles = _PLANNER_ROLES[:independent_planner_count()]
     roster_json = json.dumps(_roster_digest(sources, prompt=prompt), ensure_ascii=False,
                              default=str)
+    # Verified canonical keys between these databases (metaentities), only
+    # where the user may read both ends — how a dependent node carries ids
+    # from one database to another. Live planners only: the learned graph
+    # policy's input contract is exactly {prompt, sources}.
+    try:
+        from . import metaentities
+        keys = metaentities.bridge_lines(user, [s["connector"].name for s in sources])
+    except Exception:
+        keys = []
+    if keys:
+        roster_json += ("\n\nKnown cross-database keys (verified; use them in a dependent "
+                        "node's task to carry ids from one database to another):\n"
+                        + "\n".join(keys))
     can_delegate = _workers_can_delegate(requested_spec)
     capability = (
         "Workers MAY request bounded follow-up agents after seeing data; keep "

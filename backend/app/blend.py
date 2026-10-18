@@ -140,6 +140,35 @@ def default_combine(parts):
     return f"SELECT {', '.join(sel)} FROM {frm}"
 
 
+def entity_combine(parts, user):
+    """INNER JOIN the parts on the key columns of ONE verified canonical entity
+    (metaentities.join_columns) — crm's customers.id with retail's
+    orders.customer_id — or None. Only verified mappings, and only members of
+    tables the parts read, are ever used."""
+    try:
+        from . import metaentities
+        found = metaentities.join_columns(parts, user)
+    except Exception:
+        return None
+    if not found:
+        return None
+    entity, keys = found
+    first = parts[0]
+    sel, frm = [], _quote(first["name"])
+    colsets = [p["columns"] for p in parts]
+    for p in parts:
+        for c in p["columns"]:
+            out = c if sum(c in cs for cs in colsets) == 1 else f"{p['name']}_{c}"
+            sel.append(f"{_quote(p['name'])}.{_quote(c)} AS {_quote(out)}")
+    for p in parts[1:]:
+        frm += (f" INNER JOIN {_quote(p['name'])} ON "
+                f"{_quote(first['name'])}.{_quote(keys[first['name']])} = "
+                f"{_quote(p['name'])}.{_quote(keys[p['name']])}")
+    note = " = ".join(f"{p['source']}.{p['name']}.{keys[p['name']]}" for p in parts)
+    return {"sql": f"SELECT {', '.join(sel)} FROM {frm}",
+            "label": f"joined on the verified {entity} key ({note})"}
+
+
 def _materialize(con, part):
     """Create one part as a typed DuckDB table and insert its rows."""
     cols = part["columns"]
@@ -231,6 +260,12 @@ def blend(user, parts, combine_sql=None):
         _harden(con)
 
         sql = (combine_sql or "").strip() or default_combine(fetched)
+        entity_join = None
+        if not sql:
+            # No shared column — but a VERIFIED entity mapping may say which
+            # differently named keys carry the same thing across these sources.
+            entity_join = entity_combine(fetched, user)
+            sql = entity_join["sql"] if entity_join else None
         if not sql:
             shapes = "; ".join(f"{f['name']}({', '.join(f['columns'][:6])})" for f in fetched)
             raise HTTPException(
@@ -276,6 +311,8 @@ def blend(user, parts, combine_sql=None):
         "parts": [{k: f[k] for k in ("name", "source", "table", "columns", "row_count")}
                   for f in fetched],
         "lineage": lineage(fetched),
+        # Why parts with no shared column could be joined at all (or None).
+        "join_basis": entity_join["label"] if entity_join else None,
         # Server-minted from the post-verification parts. Never copy this from
         # a client canvas payload: stored reads trust the envelope only because
         # every SQL string here is the cleaned statement the gateway ran.

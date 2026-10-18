@@ -60,6 +60,10 @@ test("every other state says what happened", () => {
                /^Metadata: 8 tables · discovered just now · 6 removals waiting to be confirmed$/);
   assert.match(metadataText({ status: "held", kinds: { table: 2 }, discovered_at: NOW }, NOW),
                /removals waiting to be confirmed$/);   // a non-admin sees no count
+  assert.match(metadataText({ status: "ok", kinds: { table: 2 }, discovered_at: NOW - 3 * 86400,
+                              freshness: "stale" }, NOW), / · out of date$/);
+  assert.match(metadataText({ status: "ok", kinds: { table: 2 }, discovered_at: NOW,
+                              freshness: "failing" }, NOW), / · needs attention$/);
 });
 
 test("Rediscover appears only where the caller may run discovery", () => {
