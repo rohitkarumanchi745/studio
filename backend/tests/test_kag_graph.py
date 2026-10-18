@@ -56,7 +56,7 @@ def test_deterministic_extraction_finds_entities_and_edges(env):
     ents, edges = env.kg._extract_deterministic(TEXT)
     assert "snowflake" in ents and "warehouse" in ents and "revenue" in ents
     assert "finance team" in ents          # leading "The" stripped
-    assert "acme" not in ents              # stopword-filtered
+    assert "acme" in ents                  # a company is an entity, not a stopword
     # co-occurrence edge inside a sentence (order-normalized)
     assert any({e[0], e[1]} == {"snowflake", "warehouse"} for e in edges)
 

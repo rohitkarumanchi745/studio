@@ -34,17 +34,28 @@ LEARN_THRESHOLD = float(os.getenv("STUDIO_BITNET_MATCH", "0.6"))
 MIN_SEEN = int(os.getenv("STUDIO_BITNET_MIN_SEEN", "2"))
 MIN_REWARD = float(os.getenv("STUDIO_BITNET_MIN_REWARD", "0.6"))
 
-# Stopwords include query filler AND ranking words (top / most / highest / best):
-# those map to the same stored SQL plan (whose ORDER BY already encodes the
-# ranking), so dropping them groups "top products by revenue" with "which
-# products made the most revenue" onto one entry. Measure words (count, sum,
-# total, average) are deliberately NOT stopped — they change the plan.
+# Stopwords are query filler. Measure words (count, sum, total, average) are
+# deliberately NOT stopped — they change the plan.
 _STOP = {"the", "a", "an", "of", "for", "and", "to", "in", "on", "by", "with",
          "from", "our", "show", "me", "what", "which", "how", "is", "are", "was",
          "give", "get", "list", "find", "please", "can", "you", "all", "that",
          "this", "do", "does", "did", "my", "we", "their", "over", "per", "each",
-         "top", "most", "highest", "lowest", "best", "worst", "many", "much",
+         "many", "much",
          "made", "make", "have", "has", "had", "be", "been", "will", "would"}
+
+# Ranking words are a DIRECTION, never filler: "highest" and "lowest" ask
+# opposite questions, and a plan's ORDER BY answers only one of them. Words of
+# one direction share a token, so "top products by revenue" and "products that
+# made the most revenue" still meet on one plan; best/worst keep their own
+# (which way is better depends on the measure). The tokens start with "~",
+# which a prompt's words never do.
+_DIRECTION = {
+    **dict.fromkeys(("top", "most", "highest", "largest", "biggest", "greatest",
+                     "max", "maximum"), "~high"),
+    **dict.fromkeys(("bottom", "least", "lowest", "smallest", "fewest", "min",
+                     "minimum"), "~low"),
+    "best": "~best", "worst": "~worst",
+}
 
 
 def init_tables():
@@ -86,9 +97,21 @@ def _stem(t):
 
 
 def _sig(prompt):
-    toks = [_stem(t) for t in re.split(r"[^a-z0-9]+", (prompt or "").lower())
-            if t and t not in _STOP and len(t) > 1]
+    toks = []
+    for t in re.split(r"[^a-z0-9]+", (prompt or "").lower()):
+        if t in _DIRECTION:
+            toks.append(_DIRECTION[t])
+        elif t and t not in _STOP and len(t) > 1:
+            toks.append(_stem(t))
     return sorted(set(t for t in toks if t not in _STOP))
+
+
+def _direction(prompt):
+    """The ranking direction(s) a prompt asks for — compared exactly before
+    any reuse, whatever the similarity score (an embedding can find "highest"
+    and "lowest" near-identical). Read from the stored PROMPT, so an entry
+    saved before directions were kept is judged correctly too."""
+    return frozenset(t for t in _sig(prompt) if t.startswith("~"))
 
 
 def _jaccard(a, b):
@@ -149,7 +172,10 @@ def lookup(user, source, table_scope, prompt):
             "AND avg_reward >= ?",
             (user["role"], source, table_scope, MIN_REWARD)).fetchall()
     best, best_score = None, 0.0
+    direction = _direction(prompt)
     for r in rows:
+        if _direction(r["prompt"]) != direction:
+            continue                        # the opposite question: never its plan
         e_vec = json.loads(r["embedding"]) if r["embedding"] else None
         score = _sim(q_vec, sig, e_vec, json.loads(r["signature"]))
         if score > best_score:
@@ -258,7 +284,10 @@ def learned(source, table_scope, prompt):
             "HAVING SUM(seen) >= ? AND AVG(avg_reward) >= ?",
             (source, table_scope, MIN_SEEN, MIN_REWARD)).fetchall()
     best, score = None, 0.0
+    direction = _direction(prompt)
     for r in rows:
+        if _direction(r["prompt"]) != direction:
+            continue
         e_vec = json.loads(r["embedding"]) if r["embedding"] else None
         s = _sim(q_vec, sig, e_vec, json.loads(r["signature"]))
         if s > score:
