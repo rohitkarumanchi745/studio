@@ -110,7 +110,7 @@ _STOP = {
     "when", "while", "for", "to", "of", "in", "on", "at", "by", "as", "is", "are",
     "was", "were", "be", "we", "you", "it", "they", "he", "she", "our", "your",
     "their", "his", "her", "its", "i", "each", "all", "any", "no", "not", "must",
-    "may", "can", "will", "shall", "should", "acme",
+    "may", "can", "will", "shall", "should",
 }
 _MAX_ENTITIES = 40
 _MAX_EDGES = 60

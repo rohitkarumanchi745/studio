@@ -563,21 +563,19 @@ def _agg_sql(metric, dialect="ansi"):
     if agg == "count" and expr == "*":
         base = "*" if not filt else f"CASE WHEN {filt} THEN 1 END"
         return f"COUNT({base})"
+    if agg == "median" and dialect not in _MEDIAN_DIALECTS:
+        raise ValueError(f"median is not supported on the {dialect} dialect")
     if filt:
-        # A per-metric filter only composes cleanly for additive/count aggregates;
-        # for others fall back to an unfiltered agg (validated at author time is
-        # future work — for now the common revenue/count cases are covered).
+        # EVERY aggregate takes its filter. Outside the filter the CASE yields
+        # NULL, which every aggregate skips — so AVG/MIN/MAX/MEDIAN are over the
+        # filtered rows only, never silently over all of them. SUM keeps ELSE 0
+        # (an empty filter sums to 0, as it always has).
         if agg == "sum":
             return f"SUM(CASE WHEN {filt} THEN {expr} ELSE 0 END)"
-        if agg == "count":
-            return f"COUNT(CASE WHEN {filt} THEN {expr} END)"
-        if agg == "count_distinct":
-            return f"COUNT(DISTINCT CASE WHEN {filt} THEN {expr} END)"
+        expr = f"CASE WHEN {filt} THEN {expr} END"
     if agg == "count_distinct":
         return f"COUNT(DISTINCT {expr})"
     if agg == "median":
-        if dialect not in _MEDIAN_DIALECTS:
-            raise ValueError(f"median is not supported on the {dialect} dialect")
         return f"PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY {expr})"
     fn = {"sum": "SUM", "avg": "AVG", "min": "MIN", "max": "MAX", "count": "COUNT"}[agg]
     return f"{fn}({expr})"
