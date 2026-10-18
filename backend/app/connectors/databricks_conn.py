@@ -688,6 +688,47 @@ class DatabricksConnector(Connector):
         except Exception:
             return None
 
+    def describe_relation(self, name):
+        """describe_relations() for one relation: information_schema filtered
+        to it, the name checked as plain identifiers before it is quoted. None
+        where information_schema is unavailable or the name is not plain."""
+        scope = self._info_scope()
+        if scope is None:
+            return None
+        prefix, where, _key = scope
+        parts = str(name).split(".")
+        if len(parts) != (3 if self.all_schemas else 1) \
+                or not all(_PLAIN.match(p) for p in parts):
+            return None
+        if self.all_schemas:
+            where += (f" AND table_catalog = '{parts[0]}' AND table_schema = '{parts[1]}' "
+                      f"AND table_name = '{parts[2]}'")
+        else:
+            where += f" AND table_name = '{parts[0]}'"
+
+        def go(con):
+            cur = con.cursor()
+            cur.execute(f"SELECT table_catalog, table_schema, table_type FROM {prefix}.tables "
+                        f"WHERE {where}")
+            row = cur.fetchone()
+            if row is None:
+                return None
+            kind = str(row[2] or "").upper()
+            kind = ("view" if kind in self._VIEW_TYPES
+                    else "table" if kind in self._TABLE_TYPES else "other")
+            for type_col in ("full_data_type", "data_type"):
+                try:
+                    cur.execute(f"SELECT column_name, {type_col} FROM {prefix}.columns "
+                                f"WHERE {where} ORDER BY ordinal_position")
+                    rows = cur.fetchall()
+                    break
+                except Exception:
+                    if type_col == "data_type":
+                        raise
+            return {"kind": kind, "namespace": f"{row[0]}.{row[1]}",
+                    "columns": [{"name": r[0], "type": r[1]} for r in rows]}
+        return self._execute(go)
+
     def _info_scope(self):
         """(information_schema prefix, table filter, name of a relation from its
         catalog/schema/table) for this source's scope — the same scoping as
@@ -796,6 +837,29 @@ class DatabricksConnector(Connector):
         try:
             return self._execute(go)
         except Exception:
+            return None
+
+    def table_signals(self):
+        """{relation: "type|last_altered"} per relation in scope, from
+        information_schema.tables in one query, named as list_tables() names
+        them. None where last_altered is not available."""
+        scope = self._info_scope()
+        if scope is None:
+            return None
+        prefix, where, key = scope
+
+        def go(con):
+            cur = con.cursor()
+            cur.execute(f"SELECT table_catalog, table_schema, table_name, table_type, "
+                        f"last_altered FROM {prefix}.tables WHERE {where}")
+            return {key(cat, sch, name): f"{ttype}|{altered}"
+                    for cat, sch, name, ttype, altered in cur.fetchall()}
+        try:
+            return self._execute(go)
+        except Exception:
+            logging.getLogger("studio.connectors").warning(
+                "Databricks table_signals failed; falling back to the source signal",
+                exc_info=True)
             return None
 
     def change_signal(self):

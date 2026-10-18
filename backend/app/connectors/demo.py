@@ -392,6 +392,19 @@ class DemoConnector(Connector):
         finally:
             c.close()
 
+    def table_signals(self):
+        """{relation: hash of its kind and schema text} for every table and
+        view — the same relations change_signal() covers."""
+        import hashlib
+        c = self._conn()
+        try:
+            rows = c.execute("SELECT name, type, sql FROM sqlite_master "
+                             "WHERE type IN ('table', 'view')").fetchall()
+        finally:
+            c.close()
+        return {name: hashlib.sha256(f"{kind}|{sql or ''}".encode()).hexdigest()[:16]
+                for name, kind, sql in rows}
+
     def change_signal(self):
         """A hash of the schema text SQLite keeps for every table and view."""
         import hashlib
@@ -402,6 +415,21 @@ class DemoConnector(Connector):
         finally:
             c.close()
         return hashlib.sha256(repr(rows).encode()).hexdigest()
+
+    def describe_relation(self, name):
+        """Kind and columns of one table or view in the demo warehouse."""
+        c = self._conn()
+        try:
+            row = c.execute("SELECT type FROM sqlite_master WHERE name = ? "
+                            "AND type IN ('table', 'view')", (name,)).fetchone()
+            if row is None:
+                return None
+            quoted = name.replace('"', '""')
+            cols = c.execute(f'PRAGMA table_info("{quoted}")').fetchall()
+            return {"kind": row[0], "namespace": None,
+                    "columns": [{"name": r[1], "type": r[2]} for r in cols]}
+        finally:
+            c.close()
 
     def describe_relations(self):
         """Kind and columns for every table and view in the demo warehouse."""

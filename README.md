@@ -1482,18 +1482,106 @@ shows it: *grounded in the metadata graph: … (joined through …)*.
   kept apart: every mirrored node and edge carries `STUDIO_METAGRAPH_TENANT`
   and every statement is scoped by it.
 
-**It stays current with no one asking.** The `metagraph_sync` scheduler (every
-`STUDIO_METAGRAPH_TICK_SECONDS`, 300 by default) reads each live source's
-*change signal* — one cheap catalog query: Postgres hashes every relation's
-kind and column names and types, Databricks takes the count and newest
-`last_altered` of `information_schema.tables`, the demo warehouse hashes its
-schema text — and rediscovers only a source whose signal moved since its last
-discovery, or whose last full discovery is older than
-`STUDIO_METAGRAPH_FULL_SYNC_SECONDS` (6 h; the only cadence for a connector
-with no signal). Events queue a rediscovery too: a supervised write against a
-source (an approved SQL job, a successful Airflow DAG), a reconnect, or a
-signed webhook (`POST /api/metagraph/events`, HMAC-SHA256 over the body with
-`STUDIO_METAGRAPH_WEBHOOK_SECRET`; absent secret, absent endpoint).
+**It stays current with no one asking, whatever the source.** Change capture
+needs nothing from a database beyond what every Studio connector already
+provides: a table listing (`list_tables`) and a table's columns
+(`get_schema`). Any warehouse, database, API or file store a connector
+reaches is covered, with no code of its own.
+
+Every `STUDIO_METAGRAPH_TICK_SECONDS` (300 by default), the `metagraph_sync`
+scheduler compares each live source with the **graph's own record**:
+- **Created and dropped tables:** the listing against the record, on every
+  tick.
+- **Altered tables:** fresh column fingerprints against the recorded ones.
+  - A connector that offers bulk metadata (`describe_relations`) is checked
+    in one read.
+  - Any other connector is probed table by table, in rotation, up to
+    `STUDIO_METAGRAPH_PROBE_TABLES` (100) tables and
+    `STUDIO_METAGRAPH_PROBE_SECONDS` (20) per tick. Every table comes round
+    in turn.
+- **Optional speed-up:** a connector *may* report its own per-table change
+  tokens (`table_signals`, such as a catalog's last-altered time). Then only
+  the tables whose token moved are re-read and nothing is probed. Postgres,
+  Databricks and the demo warehouse do this today; it is never required.
+
+Every table found changed becomes a **change event** (`metacdc.py`), and
+that event re-reads **just that table**. Because the record is the
+reference, nothing a connector reports is trusted beyond "look at this
+table". A source that can't be listed at the moment falls back to its
+source-wide *change signal*, if it has one. A source whose last full
+discovery is older than `STUDIO_METAGRAPH_FULL_SYNC_SECONDS` (6 h) is
+rediscovered whole, to reconcile anything no event reported. A reconnect
+still queues a rediscovery.
+
+**Change events** follow one contract, whoever sends them:
+
+```json
+{"event_id": "evt-123", "source": "databricks-3", "asset": "retail_order_items",
+ "event_type": "schema_changed", "source_version": 42,
+ "occurred_at": "2026-10-17T18:00:00Z", "tenant_id": "studio"}
+```
+
+`event_type` is one of `schema_changed`, `asset_created`, `asset_dropped`,
+`data_changed` or `source_changed`. An event with no `asset` is about the
+whole source. Events come from:
+- the per-table poller;
+- a supervised write against a source (an approved SQL job, a successful
+  Airflow DAG), keyed by the job's id;
+- a signed webhook: `POST /api/metagraph/events` takes one event, or
+  `{"events": [...]}` with up to 500 events. The signature is HMAC-SHA256 over
+  the body with `STUDIO_METAGRAPH_WEBHOOK_SECRET`. With no secret set, the
+  endpoint does not exist. The older `{"source": ...}` form still queues a
+  rediscovery.
+
+How events are handled:
+- **Accepted once, durably.** An event is recorded in the event log and its job
+  queued in one commit before the sender is told "accepted". The same
+  `event_id` again is reported as a duplicate and dropped. A malformed event,
+  one for an unknown source, or one whose `tenant_id` is another deployment's
+  is rejected with the reason.
+- **Never rolls the graph back.** An event carries no schema. The worker
+  re-reads the table's current state from the source, so a late, repeated or
+  reordered event cannot undo a newer one. Ordering only saves work. An event
+  is skipped as *superseded* when its table was read after the event arrived.
+  It is also skipped when an event from the same origin, with a later
+  `source_version` (or `occurred_at`), was already applied to that table.
+  Clocks and counters from different origins are never compared.
+- **One table at a time.** A schema event re-reads one table, and the listing
+  stays the authority on what exists. The relationships, metric baselines and
+  Neo4j mirror that depend on it are then refreshed once per source per
+  `STUDIO_METAGRAPH_REFRESH_SECONDS` (30), however many tables changed. A
+  certified metric whose column was dropped turns *broken* as soon as its
+  table is re-read.
+- **Big changes go the safe way.** Some changes go to a full rediscovery
+  instead of per-table events, and that is where the hold on large removals
+  applies:
+  - a removal as large as the hold rule's;
+  - more changed tables than `STUDIO_METAGRAPH_MAX_TABLE_EVENTS` (50).
+
+  A single-table removal is never taken from a truncated listing, or while
+  removals are held.
+- **Rows, not schema.** A `data_changed` event never touches the graph. It
+  records only when that table's data last changed (`data_changed_at` on the
+  table), and never moves that time backwards.
+- **Checkpoints and the snapshot handoff.**
+  - **Duplicates:** a change seen again (re-sent after a crash, or found by
+    two schedulers) gets the same event id and is a duplicate. A table that
+    changes and changes back gets a new id each time.
+  - **During a full discovery:** anything a full discovery missed while it
+    ran still differs from the record, so it arrives as an event. A
+    connector's own tokens are read before the snapshot lists, and saved as
+    their checkpoint, for the same effect.
+  - **Race guard:** an older single-table read never overwrites a newer one,
+    or the other way round.
+- **Retry, then dead letter.** A failing event is retried with backoff, four
+  attempts in all. After that it is *dead*, metadata health turns *stale* for
+  that source, and an admin can replay it. The event log
+  (`GET /api/metagraph/events?source=&status=`) and per-source capture status
+  (`GET /api/metagraph/cdc`: checkpoint, last event, counts by status, oldest
+  wait) are for admins. So are `POST /api/metagraph/events/{id}/replay` and
+  `POST /api/metagraph/sources/{source}/cdc/reset`, which drops the checkpoint
+  and rediscovers the source. Settled events are pruned after
+  `STUDIO_METAGRAPH_EVENTS_KEEP_DAYS` (30); dead ones stay until replayed.
 
 - **One discovery at a time per source**; a queued or running one older than
   `STUDIO_METAGRAPH_STALE_SECONDS` is presumed lost and replaced. A failing

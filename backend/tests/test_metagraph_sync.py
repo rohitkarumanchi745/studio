@@ -1,8 +1,8 @@
 """Metadata graph, phase 02: continuous synchronization.
 
 Acceptance: create, alter or remove a test table and the graph updates
-without manual intervention — the scheduler's tick sees the source's change
-signal move and queues the rediscovery itself.
+without manual intervention — the scheduler's tick finds the table changed
+against the graph's record and queues a change event for it (metacdc).
 
 Also locked in: fingerprints (signals) that have not moved queue nothing;
 events (a connection's lifecycle, a supervised write, a signed webhook) queue a
@@ -54,22 +54,24 @@ def queued(env, source="retail"):
 
 
 def run_queued(env):
-    """What the worker does: run every queued discovery, then mark it done."""
-    handler = env.jobs.handlers()["metagraph_discover"]
-    with env.db.connect() as c:
-        rows = c.execute("SELECT id, payload FROM background_jobs WHERE "
-                         "kind='metagraph_discover' AND status='queued'").fetchall()
-    out = []
-    for row in rows:
+    """What the worker does: run every queued discovery, change event and
+    refresh, then mark it done."""
+    handlers, out = env.jobs.handlers(), []
+    while True:
+        with env.db.connect() as c:
+            row = c.execute("SELECT * FROM background_jobs WHERE status='queued' AND kind IN "
+                            "('metagraph_discover', 'metagraph_event', 'metagraph_refresh') "
+                            "ORDER BY created_at, id LIMIT 1").fetchone()
+        if row is None:
+            return out
         try:
-            out.append(handler(json.loads(row["payload"]), None))
+            out.append(handlers[row["kind"]](json.loads(row["payload"]), None))
             status = "done"
         except Exception:
             status = "failed"
         with env.db.connect() as c:
             c.execute("UPDATE background_jobs SET status=? WHERE id=?", (status, row["id"]))
             c.commit()
-    return out
 
 
 def tick(env, source="retail"):
@@ -109,19 +111,20 @@ def test_create_alter_and_remove_reach_the_graph_without_anyone_asking(sync):
     assert tick(sync) == {}                                  # nothing moved: nothing queued
 
     warehouse(sync, "CREATE TABLE retail_promotions (promo_id INTEGER, name TEXT)")
-    assert tick(sync) == {"retail": "change_detected"}
+    assert tick(sync) == {}                     # one table's event, not a whole rediscovery
+    assert queued(sync) == []
     run_queued(sync)
     assert "retail_promotions" in live_names(sync)
 
     warehouse(sync, "ALTER TABLE retail_promotions ADD COLUMN starts_on TEXT")
-    assert tick(sync) == {"retail": "change_detected"}
+    assert tick(sync) == {}
     run_queued(sync)
     promo = next(r for r in sync.mg.get_source("retail", user=ADMIN)["relations"]
                  if r["name"] == "retail_promotions")
     assert [c["name"] for c in promo["columns"]] == ["promo_id", "name", "starts_on"]
 
     warehouse(sync, "DROP TABLE retail_promotions")
-    assert tick(sync) == {"retail": "change_detected"}
+    assert tick(sync) == {}
     run_queued(sync)
     detail = sync.mg.get_source("retail", user=ADMIN)
     assert "retail_promotions" not in {r["name"] for r in detail["relations"]}
@@ -136,10 +139,26 @@ def test_a_source_without_a_signal_is_rediscovered_on_the_full_sync_cadence(env)
     assert tick(env) == {"retail": "scheduled"}
 
 
-def test_a_moved_signal_is_followed_even_by_a_quiet_source(sync):
+def test_a_change_is_followed_even_by_a_quiet_source(sync):
     tick(sync), run_queued(sync)
     age(sync, ok_at=60)
     warehouse(sync, "CREATE TABLE retail_gift_cards (card_id INTEGER)")
+    tick(sync), run_queued(sync)
+    assert "retail_gift_cards" in live_names(sync)
+
+
+def test_a_source_that_cannot_be_listed_falls_back_to_its_change_signal(sync):
+    tick(sync), run_queued(sync)
+    warehouse(sync, "CREATE TABLE retail_gift_cards (card_id INTEGER)")
+    real = sync.retail.list_tables
+    calls = []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("listing timed out")
+        return real()
+    sync.retail.list_tables = flaky
     assert tick(sync) == {"retail": "change_detected"}
 
 
@@ -281,15 +300,24 @@ def test_reconnecting_queues_a_rediscovery(sync):
 def test_a_supervised_write_queues_one_rediscovery(sync):
     tick(sync), run_queued(sync)
     from app import supervisor
+
+    def events():
+        with sync.db.connect() as c:
+            return [(r["event_id"], r["event_type"], r["origin"]) for r in c.execute(
+                "SELECT * FROM meta_events ORDER BY received_at").fetchall()]
+
     job = {"id": "job-1", "kind": supervisor.SQL_KIND, "target": "retail", "script": "x"}
     supervisor._notify_metadata(job)
-    run_queued(sync)
     supervisor._notify_metadata(job)                              # a polled status, again
-    assert queued(sync) == []
+    assert events() == [("job-job-1", "source_changed", "studio")]
+    warehouse(sync, "CREATE TABLE retail_promotions (promo_id INTEGER)")
+    handler = sync.jobs.handlers()["metagraph_event"]
+    assert handler({"event_id": "job-job-1"}, None) == {"status": "applied"}
+    assert "retail_promotions" in live_names(sync)               # the source was rediscovered
     dag = {"id": "dag-1", "kind": supervisor.DAG_KIND, "target": "airflow",
            "script": json.dumps({"plan": {"source": "retail"}})}
     supervisor._notify_metadata(dag)
-    assert queued(sync) == ["supervised_write"]
+    assert events()[-1] == ("job-dag-1", "source_changed", "studio")
 
 
 def _signed(body, secret="hook-secret"):

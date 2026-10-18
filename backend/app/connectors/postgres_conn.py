@@ -216,6 +216,26 @@ class PostgresConnector(Connector):
         except Exception:
             return None
 
+    def describe_relation(self, name):
+        """Kind and columns of one relation in the pinned schema."""
+        schema = self._schema()
+
+        def go(con):
+            with con.cursor() as cur:
+                cur.execute("SELECT table_type FROM information_schema.tables "
+                            "WHERE table_schema = %s AND table_name = %s", (schema, name))
+                row = cur.fetchone()
+                if row is None:
+                    return None
+                cur.execute("SELECT column_name, data_type FROM information_schema.columns "
+                            "WHERE table_schema = %s AND table_name = %s "
+                            "ORDER BY ordinal_position", (schema, name))
+                return {"kind": "table" if row[0] == "BASE TABLE"
+                        else "view" if row[0] == "VIEW" else "other",
+                        "namespace": schema,
+                        "columns": [{"name": r[0], "type": r[1]} for r in cur.fetchall()]}
+        return self._execute(go)
+
     def describe_constraints(self):
         """Primary and foreign keys in the pinned schema, from pg_constraint,
         with columns in key order. A foreign key into another schema names a
@@ -266,6 +286,36 @@ class PostgresConnector(Connector):
         try:
             return self._execute(go)
         except Exception:
+            return None
+
+    def table_signals(self):
+        """{relation: md5 of its kind and its columns' names and types}, from
+        pg_catalog in one query — over the same relations and attributes as
+        change_signal(), so whatever moves that moves one of these. Views are
+        included: list_tables() leaves them out, but their changes still
+        matter to relationships and lineage."""
+        schema = self._schema()
+
+        def go(con):
+            with con.cursor() as cur:
+                cur.execute(
+                    "SELECT c.relname::text, md5(c.relkind::text || '|' || coalesce(string_agg("
+                    "coalesce(a.attname::text, '') || ':' "
+                    "|| coalesce(format_type(a.atttypid, a.atttypmod), ''), ',' "
+                    "ORDER BY a.attnum), '')) "
+                    "FROM pg_catalog.pg_class c "
+                    "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+                    "LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid "
+                    "AND a.attnum > 0 AND NOT a.attisdropped "
+                    "WHERE n.nspname = %s AND c.relkind IN ('r', 'p', 'v', 'm', 'f') "
+                    "GROUP BY c.relname, c.relkind", (schema,))
+                return {name: token for name, token in cur.fetchall()}
+        try:
+            return self._execute(go)
+        except Exception:
+            logging.getLogger("studio.connectors").warning(
+                "Postgres table_signals failed; falling back to the source signal",
+                exc_info=True)
             return None
 
     def change_signal(self):

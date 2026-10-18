@@ -532,7 +532,8 @@ def _insert(job, *, deduplicate=False):
 def _notify_metadata(job):
     """A supervised write against a source finished: the tables it created or
     altered should reach the metadata graph without waiting for the next
-    signal check. Keyed by job id, so repeated status polls queue it once."""
+    signal check. It goes in as a change event (metacdc) whose id is the job's,
+    so repeated status polls record it once."""
     try:
         if job["kind"] == SQL_KIND:
             source = job.get("target")
@@ -541,8 +542,12 @@ def _notify_metadata(job):
         else:
             return
         if source and source != "*":
-            from . import metagraph
-            metagraph.notify_changed(source, "supervised_write", key=f"job-{job['id']}")
+            from . import metacdc
+            out = metacdc.ingest([{"event_id": f"job-{job['id']}", "source": source,
+                                   "event_type": "source_changed"}], "studio")
+            for r in out["rejected"]:
+                log.info("Job %s: no metadata event for %s (%s)", job.get("id"), source,
+                         r["reason"])
     except Exception:
         log.warning("Could not notify the metadata graph about job %s", job.get("id"),
                     exc_info=True)
