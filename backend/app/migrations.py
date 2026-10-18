@@ -424,6 +424,16 @@ def _m20_metagraph_freshness(c, is_pg):
     _add_column(c, "meta_sources", "freshness", "TEXT", is_pg)
 
 
+def _m21_query_cache_user_id(c, is_pg):
+    # Private query plans: a cached plan belongs to the user who asked it.
+    # Rows from before have no owner and are never replayed; their seen /
+    # reward counts still feed the learned-pattern statistics.
+    _add_column(c, "query_cache", "user_id", "TEXT", is_pg)
+    if db._has_column(c, "query_cache", "user_id"):        # skipped with a missing table
+        c.execute("CREATE INDEX IF NOT EXISTS idx_qcache_user "
+                  "ON query_cache(user_id, source, table_scope)")
+
+
 MIGRATIONS = [
     (1, "users.verified", _m1_users_verified),
     (2, "conversations.folder_id", _m2_conversations_folder_id),
@@ -445,6 +455,7 @@ MIGRATIONS = [
     (18, "meta_sources sync columns", _m18_metagraph_sync_columns),
     (19, "meta_sources relate columns", _m19_metagraph_relate_columns),
     (20, "meta_sources freshness", _m20_metagraph_freshness),
+    (21, "query_cache.user_id", _m21_query_cache_user_id),
 ]
 
 

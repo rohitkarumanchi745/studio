@@ -37,7 +37,7 @@ EXPECTED = {
     "conversations": ["folder_id"],
     "chat_tasks": ["steps", "user_message_id"],
     "mcp_servers": ["owner_id"],
-    "query_cache": ["seen", "avg_reward", "embedding"],
+    "query_cache": ["seen", "avg_reward", "embedding", "user_id"],
     "messages": ["reply_to"],
     "redteam_benchmarks": ["model_revision"],
     "training_adapters": ["sha256"],

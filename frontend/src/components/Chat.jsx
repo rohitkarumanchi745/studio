@@ -988,8 +988,10 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
               );
             })()}
             {m.cached && (
-              <span title={`reused the plan for: "${m.cached.from_prompt}"`}>
-                {" · "}reused plan{m.cached.similarity < 1 ? ` (${Math.round(m.cached.similarity * 100)}% match)` : ""} · fresh data
+              <span title={m.cached.shared
+                ? `reused the shared query “${m.cached.template?.title || ""}”`
+                : `reused your earlier plan for: "${m.cached.from_prompt || ""}"`}>
+                {" · "}{m.cached.shared ? "reused shared query" : "reused plan"}{m.cached.similarity < 1 ? ` (${Math.round(m.cached.similarity * 100)}% match)` : ""} · fresh data
               </span>
             )}
           </span>
