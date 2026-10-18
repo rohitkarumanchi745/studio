@@ -1379,6 +1379,28 @@ source from its row in Data connections.
   by a complete snapshot — never by a truncated listing
   (`STUDIO_METAGRAPH_MAX_OBJECTS`) or one where columns could not be read.
 
+**How the tables relate** (`metarelations.py`). After every snapshot the
+source's relationships are recomputed — how its tables join, and what each view
+is derived from — each with a **state**, a **confidence** and the **evidence**
+behind it, in words:
+
+| State | Evidence | Confidence |
+|---|---|---|
+| declared | a primary/foreign key in the catalog (`describe_constraints`: Postgres `pg_constraint`, Unity Catalog `information_schema`, SQLite) | 1.0 |
+| observed | the join in a view definition (`view_definitions`), or in Studio's own successful queries against the source (`audit_log`) | 0.9 · 0.75–0.9 by count |
+| inferred | a naming pattern: `retail_orders.customer_id` points at `retail_customers`, typed alike | up to 0.85 |
+| verified / rejected | an administrator's review (`POST …/relationships/{id}/review`), which outlives recomputation | 1.0 / hidden |
+
+Views also get *derived-from* edges to the tables they read, and Databricks
+adds the table lineage Unity Catalog records (`system.access.table_lineage`,
+when the token may read it). Joins are read from SQL with the query guard's
+tokenizer — a comment or a string literal cannot forge one — and no value is
+ever sampled from a table. `GET /api/metagraph/sources/{name}/relationships`
+lists them; `…/paths?tables=a,b,c` returns the cheapest join tree connecting
+the tables (fewer and surer joins win). Both show only relationships whose two
+tables the caller may read, and the Neo4j mirror carries them as `RELATES`
+edges.
+
 **It stays current with no one asking.** The `metagraph_sync` scheduler (every
 `STUDIO_METAGRAPH_TICK_SECONDS`, 300 by default) reads each live source's
 *change signal* — one cheap catalog query: Postgres hashes every relation's

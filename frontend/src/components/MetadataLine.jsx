@@ -33,6 +33,9 @@ export function metadataText(summary, now = Date.now() / 1000) {
     .filter(([kind]) => !KIND_WORDS[kind]).reduce((n, [, v]) => n + v, 0);
   if (other) parts.push(`${other} ${other === 1 ? "object" : "objects"}`);
   if (!parts.length) parts.push("nothing found");
+  if (summary.relationships) {
+    parts.push(`${summary.relationships} ${summary.relationships === 1 ? "relationship" : "relationships"}`);
+  }
   let text = `Metadata: ${parts.join(" · ")}`;
   if (summary.discovered_at) text += ` · discovered ${ago(summary.discovered_at, now)}`;
   if (busy) text += " · rediscovering…";

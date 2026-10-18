@@ -7,6 +7,10 @@ the source's tables and views, reads their columns, fingerprints each object,
 and records a snapshot: what was added, changed and removed since the last
 one. The result is a graph — source → namespace → table/view → column —
 readable through /api/metagraph and mirrored to Neo4j when one is configured.
+After each snapshot its relationships are recomputed (metarelations.py): how
+the tables join — declared keys, joins seen in views and in Studio's own
+queries, naming patterns — and what each view is derived from, every edge with
+its evidence, state and confidence.
 
 It then stays current with no one asking (tick_once, the "metagraph_sync"
 scheduler): every few minutes each source's cheap change signal
@@ -49,7 +53,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from . import connections, db, jobs, rbac
+from . import connections, db, jobs, metarelations, rbac
 from .auth import current_user
 
 log = logging.getLogger("studio.metagraph")
@@ -175,10 +179,13 @@ def init_tables():
             synced_signal TEXT,
             checked_at REAL,
             held_removals TEXT,
-            held_at REAL
+            held_at REAL,
+            related_at REAL,
+            relate_error TEXT
         );
         """)
         c.commit()
+    metarelations.init_tables()
 
 
 # ── Discovery ────────────────────────────────────────────────────────────
@@ -462,10 +469,27 @@ def discover(source, trigger="manual"):
         log.warning("metagraph: discovery of %s failed", source, exc_info=True)
         _fail(source, snapshot_id, _safe_error(exc))
         raise
+    relationships = _relate(source)
     mirror(source)
     return {"source": source, "snapshot_id": snapshot_id, "objects": len(objects),
             "added": added, "changed": changed, "removed": removed, "held": held,
-            "complete": complete}
+            "complete": complete, "relationships": relationships}
+
+
+def _relate(source):
+    """Recompute relationships after a snapshot. A failure is recorded on the
+    source and never undoes the snapshot."""
+    try:
+        out = metarelations.relate(source, lock=_lock)
+        error = None
+    except Exception as exc:
+        log.warning("metagraph: relationships of %s failed", source, exc_info=True)
+        out, error = None, _safe_error(exc)
+    with db.connect() as c:
+        c.execute("UPDATE meta_sources SET related_at=?, relate_error=? WHERE source=?",
+                  (time.time() if error is None else None, error, source))
+        c.commit()
+    return out
 
 
 @jobs.handler(JOB_KIND)
@@ -530,13 +554,16 @@ def _summary(user, source, objects=None):
     kinds = {}
     for o in objects:
         kinds[o["kind"]] = kinds.get(o["kind"], 0) + 1
+    names = {o["name"] for o in objects}
+    joins = [r for r in metarelations.current(source, names) if r["kind"] == "join"]
     out = {"source": source, "status": state.get("status"), "discovered_at": state.get("ok_at"),
-           "objects": len(objects), "kinds": kinds}
+           "objects": len(objects), "kinds": kinds, "relationships": len(joins)}
     if user["role"] == "admin":
         held = json.loads(state["held_removals"]) if state.get("held_removals") else []
         out.update({"error": state.get("error"), "mirror_status": state.get("mirror_status"),
                     "mirror_error": state.get("mirror_error"), "held": len(held),
-                    "checked_at": state.get("checked_at")})
+                    "checked_at": state.get("checked_at"),
+                    "relate_error": state.get("relate_error")})
     return out
 
 
@@ -592,6 +619,55 @@ def source_graph(source: str, user=Depends(current_user)):
                           "data_type": col["type"]})
             edges.append({"from": obj_id, "to": col_id, "type": "HAS_COLUMN"})
     return {"source": source, "nodes": nodes, "edges": edges}
+
+
+@router.get("/sources/{source}/relationships")
+def source_relationships(source: str, min_confidence: float = 0.0,
+                         user=Depends(current_user)):
+    """How this source's tables join, and what each view is derived from —
+    every edge with its state, confidence and evidence. Only edges whose two
+    tables this user may read; rejected ones only for administrators."""
+    _visible_source(user, source)
+    visible = {o["name"] for o in visible_objects(user, source, with_columns=False)}
+    rels = metarelations.current(source, visible, include_rejected=user["role"] == "admin")
+    return {"source": source,
+            "relationships": [r for r in rels if r["confidence"] >= min_confidence
+                              or r["state"] == "rejected"]}
+
+
+@router.get("/sources/{source}/paths")
+def source_paths(source: str, tables: str, min_confidence: float = 0.6,
+                 user=Depends(current_user)):
+    """The join path connecting `tables` (comma-separated), over relationships
+    this user may see, preferring fewer and surer joins."""
+    _visible_source(user, source)
+    wanted = [t.strip() for t in tables.split(",") if t.strip()][:20]
+    visible = {o["name"] for o in visible_objects(user, source, with_columns=False)}
+    unknown = [t for t in wanted if t not in visible]
+    joins, missing = metarelations.join_path(
+        metarelations.current(source, visible), [t for t in wanted if t in visible],
+        min_confidence)
+    return {"source": source, "tables": wanted, "joins": joins,
+            "connected": not missing and not unknown, "unreachable": missing,
+            "unknown": unknown}
+
+
+@router.post("/sources/{source}/relationships/{rel_id}/review")
+def review_relationship(source: str, rel_id: str, body: dict, user=Depends(current_user)):
+    """An administrator confirms or rejects a relationship ({"decision":
+    "verified" | "rejected" | "clear"}). The review outlives recomputation."""
+    if user["role"] != "admin":
+        raise HTTPException(403, "Only administrators can review relationships")
+    _visible_source(user, source)
+    try:
+        found = metarelations.review(source, rel_id, (body or {}).get("decision"), user)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    if not found:
+        raise HTTPException(404, "Not found")
+    db.log_activity(user, "metagraph_review", prompt=f"{rel_id}: {body.get('decision')}",
+                    source=source)
+    return {"id": rel_id, "decision": body.get("decision")}
 
 
 @router.post("/sources/{source}/discover", status_code=202)
@@ -803,9 +879,18 @@ def mirror(source):
         _mirror_state(source, "off", None)
         return False
     objects, columns = _projection(source)
+    rels = [{"kind": r["kind"], "from": r["from_object"], "to": r["to_object"],
+             "from_columns": json.dumps(r["from_columns"]),
+             "to_columns": json.dumps(r["to_columns"]), "state": r["state"],
+             "confidence": r["confidence"], "evidence": json.dumps(r["evidence"])}
+            for r in metarelations.current(source, {o["name"] for o in objects},
+                                           include_rejected=True)]
     params = {"source": source, "now": time.time(), "objects": objects, "columns": columns,
               "names": [o["name"] for o in objects],
-              "pairs": [[col["object"], col["name"]] for col in columns]}
+              "pairs": [[col["object"], col["name"]] for col in columns],
+              "relationships": rels,
+              "rel_keys": [[r["kind"], r["from"], r["from_columns"], r["to"], r["to_columns"]]
+                           for r in rels]}
     statements = [
         {"statement": "MERGE (s:StudioSource {name: $source}) SET s.synced_at = $now",
          "parameters": params},
@@ -826,6 +911,18 @@ def mirror(source):
          "parameters": params},
         {"statement": "MATCH (t:StudioObject {source: $source}) "
                       "WHERE NOT t.name IN $names DETACH DELETE t",
+         "parameters": params},
+        {"statement": "UNWIND $relationships AS r "
+                      "MATCH (a:StudioObject {source: $source, name: r.from}) "
+                      "MATCH (b:StudioObject {source: $source, name: r.to}) "
+                      "MERGE (a)-[e:RELATES {kind: r.kind, from_columns: r.from_columns, "
+                      "to_columns: r.to_columns}]->(b) "
+                      "SET e.state = r.state, e.confidence = r.confidence, "
+                      "e.evidence = r.evidence",
+         "parameters": params},
+        {"statement": "MATCH (a:StudioObject {source: $source})-[e:RELATES]->(b:StudioObject) "
+                      "WHERE NOT [e.kind, a.name, e.from_columns, b.name, e.to_columns] "
+                      "IN $rel_keys DELETE e",
          "parameters": params},
     ]
     try:

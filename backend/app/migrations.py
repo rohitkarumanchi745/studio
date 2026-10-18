@@ -411,6 +411,13 @@ def _m18_metagraph_sync_columns(c, is_pg):
         _add_column(c, "meta_sources", column, ctype, is_pg)
 
 
+def _m19_metagraph_relate_columns(c, is_pg):
+    # Relationship discovery: when relationships were last recomputed, and why
+    # the last attempt failed.
+    _add_column(c, "meta_sources", "related_at", "REAL", is_pg)
+    _add_column(c, "meta_sources", "relate_error", "TEXT", is_pg)
+
+
 MIGRATIONS = [
     (1, "users.verified", _m1_users_verified),
     (2, "conversations.folder_id", _m2_conversations_folder_id),
@@ -430,6 +437,7 @@ MIGRATIONS = [
     (16, "kag graph per-chunk provenance + rebuild", _m16_kag_graph_provenance),
     (17, "metagraph discovery backfill", _m17_metagraph_backfill),
     (18, "meta_sources sync columns", _m18_metagraph_sync_columns),
+    (19, "meta_sources relate columns", _m19_metagraph_relate_columns),
 ]
 
 

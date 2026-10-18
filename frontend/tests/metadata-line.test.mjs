@@ -37,6 +37,9 @@ test("a discovered source reads as tables, views and when", () => {
                "Metadata: 8 objects · discovered 2 h ago");
   assert.equal(metadataText({ status: "ok", kinds: {}, discovered_at: NOW }, NOW),
                "Metadata: nothing found · discovered just now");
+  assert.equal(metadataText({ status: "ok", kinds: { table: 7, view: 1 }, relationships: 9,
+                              discovered_at: NOW - 60 }, NOW),
+               "Metadata: 7 tables · 1 view · 9 relationships · discovered 1 min ago");
 });
 
 test("every other state says what happened", () => {
