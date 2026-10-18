@@ -194,6 +194,29 @@ def _norm_terms(*values):
     return {t for t in out if t}
 
 
+def _stewardship(entry):
+    """({owner, certified, version}, problem) — optional fields saying who
+    answers for a definition, whether it is approved, and its version label."""
+    owner, version, certified = entry.get("owner"), entry.get("version"), entry.get("certified")
+    if owner is not None and (not isinstance(owner, str) or len(owner) > 120):
+        return {}, "owner must be a short string (an email or a team)"
+    if version is not None and (not isinstance(version, (str, int, float))
+                                or len(str(version)) > 40):
+        return {}, "version must be a short label"
+    if certified is not None and not isinstance(certified, bool):
+        return {}, "certified must be true or false"
+    return {"owner": owner, "certified": bool(certified),
+            "version": None if version is None else str(version)}, None
+
+
+def all_models():
+    """Every model of the active document (refreshed if another replica applied
+    a newer one)."""
+    _refresh_if_stale()
+    doc = _STATE["doc"]
+    return list(doc["models"]) if doc else []
+
+
 def validate(text):
     """(ok, errors, doc). Parse and structurally check a semantic YAML document.
 
@@ -211,6 +234,9 @@ def validate(text):
               synonyms: [sales, turnover]
               format: currency                  # optional display hint
               description: Total sales revenue
+              owner: finance@acme.com           # optional: who answers for it
+              certified: true                   # optional: approved for answers
+              version: "2"                      # optional: your own version label
           dimensions:
             - name: region
               expr: region
@@ -263,11 +289,17 @@ def validate(text):
             if name.lower() in metrics:
                 errors.append(f"{where}.metric '{name}': duplicate metric name")
                 continue
+            stewardship, problem = _stewardship(met)
+            if problem:
+                errors.append(f"{where}.metric '{name}': {problem}")
+                continue
             metrics[name.lower()] = {
                 "name": name, "agg": agg, "expr": expr,
                 "filter": (met.get("filter") or "").strip() or None,
                 "format": met.get("format"), "description": met.get("description", ""),
                 "terms": _norm_terms(name, name.replace("_", " "), met.get("synonyms")),
+                "synonyms": [str(x) for x in (met.get("synonyms") or [])],
+                **stewardship,
             }
         for j, dim in enumerate(m.get("dimensions") or []):
             if not isinstance(dim, dict) or not dim.get("name"):
@@ -288,11 +320,17 @@ def validate(text):
             if name.lower() in dims:
                 errors.append(f"{where}.dimension '{name}': duplicate dimension name")
                 continue
+            stewardship, problem = _stewardship(dim)
+            if problem:
+                errors.append(f"{where}.dimension '{name}': {problem}")
+                continue
             dims[name.lower()] = {
                 "name": name, "expr": expr,
                 "grain": str(grain).lower() if grain else None,
                 "description": dim.get("description", ""),
                 "terms": _norm_terms(name, name.replace("_", " "), dim.get("synonyms")),
+                "synonyms": [str(x) for x in (dim.get("synonyms") or [])],
+                **stewardship,
             }
         if not metrics:
             errors.append(f"{where} ({source}.{table}) defines no valid metrics")
@@ -606,6 +644,22 @@ def answer(user, source, prompt, table=None):
         return None
 
     model = match["model"]
+    # A definition the metadata graph shows broken (its table or a column is
+    # gone) is never answered from: decline, say why, and let the agent try.
+    try:
+        from . import metametrics, progress
+        for kind, picked in (("metric", match["metrics"]), ("dimension", match["dimensions"])):
+            for d in picked:
+                result = metametrics.check({
+                    "kind": kind, "source": source, "table": model["table"], "name": d["name"],
+                    "expr": d["expr"], "filter": d.get("filter"),
+                    "model_filter": model.get("filter")})
+                if result["status"] == "broken":
+                    progress.emit(f"the semantic {kind} {d['name']} is broken "
+                                  f"({'; '.join(result['reasons'])}) — not answering from it")
+                    return None
+    except Exception:
+        pass
     from .connectors import get_connector
     try:
         dialect = get_connector(source).dialect

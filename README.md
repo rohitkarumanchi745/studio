@@ -1412,6 +1412,23 @@ the tables (fewer and surer joins win). Both show only relationships whose two
 tables the caller may read, and the Neo4j mirror carries them as `RELATES`
 edges.
 
+**Certified metrics live in it** (`metametrics.py`). The semantic YAML stays
+the source of truth for what a metric means; the graph says whether the
+warehouse still holds what it reads. Every metric and dimension is linked to
+its table and to the columns its expression and filters reference (read with
+the query guard's tokenizer, so a function, a qualifier, a type or a SQL
+keyword is never taken for a column, and quoted `"UnitPrice"` and bare
+`unit_price` both resolve) and checked against the current record: *valid*,
+*broken* (its table or a column is gone — with the reason) or *unchecked*
+(its source has not been discovered). A broken definition is never answered
+from: the semantic layer declines it and says why, the source's metadata
+health turns *failing*, and grounding ignores it. Each definition has a
+version history from the applied YAML documents (a new version only when its
+calculation changes), and may carry `owner`, `certified` and `version` fields.
+`GET /api/metagraph/metrics` and `…/metrics/{source}/{name}` show them to roles
+that may read their tables; the graph view draws them (`MEASURES`, `USES`), and
+the Neo4j mirror carries them as `StudioMetric` nodes.
+
 **Questions are grounded in it** (`metaground.py`). Before the SQL agent
 runs, the question is matched against the graph — every table's name and
 columns, rare words weighted over words every table shares — so "which
@@ -1420,7 +1437,9 @@ tables holding `segment`, `net_sales` and the store's `region` without any of
 them being named. The cheapest join tree then adds the tables needed to
 connect them (`retail_orders`), and the agent gets their governed columns plus
 the join conditions with their state and confidence; a matching view is
-offered too, since it may answer with no join at all. It costs no warehouse
+offered too, since it may answer with no join at all. A certified metric's
+name and synonyms point at its table ("turnover" finds the revenue table), and
+the agent is handed its exact definition to use. It costs no warehouse
 call and never looks past the tables the turn may read; a source not yet
 discovered falls back to name matching. The multi-source planners see each
 source's relevant tables first instead of whichever twelve come first, and

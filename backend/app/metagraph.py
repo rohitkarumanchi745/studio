@@ -20,6 +20,10 @@ a permission-aware search over all of it. The Neo4j mirror is tenant-scoped
 (STUDIO_METAGRAPH_TENANT), so deployments sharing one Neo4j never see or
 overwrite each other's graph.
 
+Certified metrics (metametrics.py): every semantic-YAML metric and dimension is
+linked to its table and the columns it reads, checked against the record
+(valid / broken / unchecked), and versioned from the applied YAML documents.
+
 It then stays current with no one asking (tick_once, the "metagraph_sync"
 scheduler): every few minutes each source's cheap change signal
 (Connector.change_signal) is compared with the one its last discovery saw, and
@@ -61,7 +65,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from . import connections, db, jobs, metaentities, metarelations, rbac
+from . import connections, db, jobs, metaentities, metametrics, metarelations, rbac
 from .auth import current_user
 
 log = logging.getLogger("studio.metagraph")
@@ -620,6 +624,11 @@ def get_source(source: str, user=Depends(current_user)):
         obj["domain"] = (own.get(obj["name"]) or {}).get("domain") or \
             (own.get("") or {}).get("domain")
         obj["owner"] = names.get(entry.get("owner_id"))
+    defs = metametrics.for_source(source, {o["name"] for o in objects})
+    for obj in objects:
+        obj["metrics"] = [{"name": d["name"], "kind": d["kind"], "status": d["status"],
+                           "certified": d["certified"]}
+                          for d in defs if d["object"] == obj["name"]]
     out = {**_summary(user, source, objects), "relations": objects}
     if user["role"] == "admin":
         out["removed"] = _recently_removed(source)
@@ -649,6 +658,18 @@ def source_graph(source: str, user=Depends(current_user)):
             nodes.append({"id": col_id, "type": "column", "name": col["name"],
                           "data_type": col["type"]})
             edges.append({"from": obj_id, "to": col_id, "type": "HAS_COLUMN"})
+    for d in metametrics.for_source(source, {o["name"] for o in visible_objects(
+            user, source, with_columns=False)}):
+        if not d["object"]:
+            continue
+        mid = f"{d['kind']}:{source}:{d['object']}:{d['name']}"
+        nodes.append({"id": mid, "type": d["kind"], "name": d["name"], "status": d["status"],
+                      "certified": d["certified"]})
+        edges.append({"from": mid, "to": f"object:{source}:{d['object']}",
+                      "type": "MEASURES" if d["kind"] == "metric" else "SLICES"})
+        for col in d["columns"]:
+            edges.append({"from": mid, "to": f"column:{source}:{d['object']}:{col}",
+                          "type": "USES"})
     return {"source": source, "nodes": nodes, "edges": edges}
 
 
@@ -706,6 +727,54 @@ def review_relationship(source: str, rel_id: str, body: dict, user=Depends(curre
     db.log_activity(user, "metagraph_review", prompt=f"{rel_id}: {body.get('decision')}",
                     source=source)
     return {"id": rel_id, "decision": body.get("decision")}
+
+
+def _metric_view(d, user, *, detail=False):
+    out = {k: d[k] for k in ("kind", "source", "table", "name", "agg", "expr", "filter",
+                             "model_filter", "grain", "description", "synonyms", "owner",
+                             "certified", "declared_version", "status", "columns")}
+    out["object"] = d["object"]
+    if user["role"] == "admin" or detail:
+        out["reasons"] = d["reasons"]
+    hist = metametrics.history(d["source"], d["table"], d["name"], d["kind"])
+    current = [v for v in hist if not v.get("removed")]
+    out["version"] = current[-1]["version"] if current else None
+    if detail:
+        names = _user_names({v.get("applied_by") for v in hist})
+        out["history"] = [{**v, "applied_by": names.get(v.get("applied_by"), v.get("applied_by"))}
+                          for v in hist]
+    return out
+
+
+def _metrics_for(user, source):
+    """Definitions on `source` this user may see: an admin all of them (a
+    broken one may name a table that is gone); others those on tables they
+    may read."""
+    if user["role"] == "admin":
+        return metametrics.for_source(source)
+    return metametrics.for_source(source, {o["name"] for o in visible_objects(
+        user, source, with_columns=False)})
+
+
+@router.get("/metrics")
+def list_metrics(user=Depends(current_user)):
+    """Every semantic-layer metric and dimension this user may see, linked to
+    its table and columns, with its check (valid / broken / unchecked), owner,
+    certification and version."""
+    live = set(_live_sources()) & set(rbac.allowed_sources(user["role"]))
+    return {"metrics": [_metric_view(d, user) for source in sorted(live)
+                        for d in _metrics_for(user, source)]}
+
+
+@router.get("/metrics/{source}/{name}")
+def get_metric(source: str, name: str, kind: str = "metric", user=Depends(current_user)):
+    """One definition with its version history from the applied YAML."""
+    _visible_source(user, source)
+    d = next((d for d in _metrics_for(user, source)
+              if d["name"].lower() == name.lower() and d["kind"] == kind), None)
+    if d is None:
+        raise HTTPException(404, "Not found")
+    return _metric_view(d, user, detail=True)
 
 
 @router.get("/entities")
@@ -799,7 +868,12 @@ def metadata_health(user=Depends(current_user)):
     for source in _live_sources():
         fresh, reasons = metaentities.freshness(_state(source), now, tick_s=_TICK_SECONDS,
                                                 full_s=_full_sync_seconds())
-        rows.append({"source": source, "freshness": fresh, "reasons": reasons})
+        broken = [f"{d['kind']} {d['name']}: {'; '.join(d['reasons'])}"
+                  for d in metametrics.for_source(source) if d["status"] == "broken"]
+        if broken and fresh == "fresh":
+            fresh = "failing"
+        rows.append({"source": source, "freshness": fresh, "reasons": reasons + broken,
+                     "broken_metrics": len(broken)})
     worst = next((f for f in ("failing", "stale", "unknown")
                   if any(r["freshness"] == f for r in rows)), "fresh")
     return {"status": worst, "sources": rows}
@@ -1083,6 +1157,12 @@ def mirror(source):
               "relationships": rels,
               "rel_keys": [[r["kind"], r["from"], r["from_columns"], r["to"], r["to_columns"]]
                            for r in rels]}
+    defs = [d for d in metametrics.for_source(source) if d["object"]]
+    params["metrics"] = [{"kind": d["kind"], "name": d["name"], "object": d["object"],
+                          "agg": d.get("agg"), "expr": d["expr"], "status": d["status"],
+                          "certified": d["certified"], "owner": d.get("owner"),
+                          "columns": d["columns"]} for d in defs]
+    params["metric_keys"] = [[d["kind"], d["name"]] for d in defs]
     statements = [
         {"statement": "MERGE (s:StudioSource {tenant: $tenant, name: $source}) SET s.synced_at = $now",
          "parameters": params},
@@ -1115,6 +1195,20 @@ def mirror(source):
         {"statement": "MATCH (a:StudioObject {tenant: $tenant, source: $source})-[e:RELATES]->(b:StudioObject) "
                       "WHERE NOT [e.kind, a.name, e.from_columns, b.name, e.to_columns] "
                       "IN $rel_keys DELETE e",
+         "parameters": params},
+        {"statement": "UNWIND $metrics AS m "
+                      "MATCH (t:StudioObject {tenant: $tenant, source: $source, name: m.object}) "
+                      "MERGE (x:StudioMetric {tenant: $tenant, source: $source, kind: m.kind, "
+                      "name: m.name}) "
+                      "SET x.agg = m.agg, x.expr = m.expr, x.status = m.status, "
+                      "x.certified = m.certified, x.owner = m.owner "
+                      "MERGE (x)-[:MEASURES]->(t) "
+                      "WITH x, m UNWIND m.columns AS col "
+                      "MATCH (c:StudioColumn {tenant: $tenant, source: $source, object: m.object, "
+                      "name: col}) MERGE (x)-[:USES]->(c)",
+         "parameters": params},
+        {"statement": "MATCH (x:StudioMetric {tenant: $tenant, source: $source}) "
+                      "WHERE NOT [x.kind, x.name] IN $metric_keys DETACH DELETE x",
          "parameters": params},
     ]
     try:

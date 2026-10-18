@@ -582,7 +582,8 @@ def _grounding(ctx, user, prompt):
         loaded = set(ctx["schemas"])
         schemas = {t: cols for t, cols in grounded["schemas"].items()
                    if t not in loaded and rbac.can_access(user["role"], ctx["source"], t)}
-        hints = metaground.join_hint_lines(grounded["joins"], grounded["views"])
+        hints = metaground.join_hint_lines(grounded["joins"], grounded["views"],
+                                           grounded["metrics"])
         named = ", ".join([t for t in grounded["tables"] if t in grounded["matched"]][:6])
         bridges = f" (joined through {', '.join(grounded['bridges'])})" \
             if grounded["bridges"] else ""

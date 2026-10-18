@@ -92,10 +92,21 @@ def _vocabulary(objects):
     return vocab
 
 
-def score(prompt, objects):
-    """[(table, score, why)] best first, for tables the question touches."""
+def score(prompt, objects, definitions=()):
+    """[(table, score, why)] best first, for tables the question touches.
+    `definitions` (semantic-layer metrics and dimensions) lend their names and
+    synonyms to their table, weighted like the table's own name: "turnover",
+    a synonym of a certified revenue metric, points at the revenue table."""
     singles, pairs = _terms(prompt)
     vocab = _vocabulary(objects)
+    for d in definitions:
+        if d.get("object") in vocab:
+            name_words, col_words, col_names = vocab[d["object"]]
+            for phrase in [d["name"]] + list(d.get("synonyms") or []):
+                parts = [w for w in identifiers.words(phrase) if len(w) >= 2]
+                name_words = name_words | set(parts) - _GENERIC_NAME
+                col_names = col_names | {"_".join(parts)}
+            vocab[d["object"]] = (name_words, col_words, col_names)
     n = max(1, len(vocab))
 
     def idf(term, field):
@@ -143,7 +154,8 @@ def ground(source, prompt, allowed, *, limit=6, min_confidence=0.6, cutoff=0.35)
     objects = _objects(source, allowed)
     if not objects:
         return None
-    ranked = score(prompt, objects)
+    defs = _definitions(source, objects)
+    ranked = score(prompt, objects, defs)
     if not ranked:
         return None
     top = ranked[0][1]
@@ -177,13 +189,33 @@ def ground(source, prompt, allowed, *, limit=6, min_confidence=0.6, cutoff=0.35)
     bridges = [t for t in tables if t not in matched]
     schemas = {t: governance.governed_schema(source, t, objects[t]["columns"])
                for t in tables}
+    # The certified definitions on the grounded tables whose name or synonym
+    # the question uses: the agent is told how the measure is computed.
+    asked = set(_words(prompt))
+    metrics = [d for d in defs if d["object"] in tables and asked & {
+        w for phrase in [d["name"]] + list(d.get("synonyms") or [])
+        for w in identifiers.words(phrase)}]
     return {"tables": tables, "matched": matched, "bridges": bridges, "joins": joins,
-            "views": views, "schemas": {t: cols for t, cols in schemas.items() if cols}}
+            "views": views, "metrics": metrics,
+            "schemas": {t: cols for t, cols in schemas.items() if cols}}
 
 
-def join_hint_lines(joins, views=None):
+def _definitions(source, objects):
+    """Valid or unchecked semantic definitions on these tables — a broken one
+    never steers grounding or the agent."""
+    try:
+        from . import metametrics
+        return [d for d in metametrics.for_source(source, set(objects))
+                if d["status"] != "broken" and d.get("object") in objects]
+    except Exception:
+        return []
+
+
+def join_hint_lines(joins, views=None, metrics=None):
     """The join conditions as the agent reads them, with why each is believed,
-    then any matching view and the tables it already joins."""
+    then any matching view and the tables it already joins, then the certified
+    definitions the question asks for."""
+    from . import metametrics
     lines = []
     for rel in joins:
         on = " AND ".join(f"{rel['from_object']}.{a} = {rel['to_object']}.{b}"
@@ -193,6 +225,8 @@ def join_hint_lines(joins, views=None):
         if reads:
             lines.append(f"{view} is a view over {', '.join(reads)} — it may answer this "
                          f"without joins")
+    for d in metrics or []:
+        lines.append(metametrics.describe(d) + " — use this definition")
     return lines
 
 
@@ -208,4 +242,4 @@ def worker_context(source, question, allowed, loaded=()):
         return {}, []
     loaded = set(loaded or ())
     return ({t: c for t, c in grounded["schemas"].items() if t not in loaded},
-            join_hint_lines(grounded["joins"], grounded["views"]))
+            join_hint_lines(grounded["joins"], grounded["views"], grounded["metrics"]))
