@@ -564,6 +564,36 @@ def _focus_schemas(ctx, user, prompt):
             for t, c in zip(picks, cols) if c and rbac.can_access(user["role"], ctx["source"], t)}
 
 
+def _grounding(ctx, user, prompt):
+    """(focus schemas, join hints) for this question. The metadata graph first
+    (metaground.ground): the tables whose names or columns the question
+    touches, the tables needed to join them, and how they join — from the
+    record, with no warehouse call, and only within ctx["allowed"]. Then the
+    name-based picks (_focus_schemas), which also keep a follow-up's tables
+    from this conversation's earlier SQL. Never raises."""
+    from . import metaground
+    schemas, hints = {}, []
+    try:
+        grounded = metaground.ground(ctx["source"], prompt, ctx["allowed"])
+    except Exception:
+        log.warning("metadata grounding failed for %s", ctx.get("source"), exc_info=True)
+        grounded = None
+    if grounded:
+        loaded = set(ctx["schemas"])
+        schemas = {t: cols for t, cols in grounded["schemas"].items()
+                   if t not in loaded and rbac.can_access(user["role"], ctx["source"], t)}
+        hints = metaground.join_hint_lines(grounded["joins"], grounded["views"])
+        named = ", ".join([t for t in grounded["tables"] if t in grounded["matched"]][:6])
+        bridges = f" (joined through {', '.join(grounded['bridges'])})" \
+            if grounded["bridges"] else ""
+        progress.emit(f"grounded in the metadata graph: {named}{bridges}")
+    try:
+        extra = _focus_schemas({**ctx, "schemas": {**ctx["schemas"], **schemas}}, user, prompt)
+    except Exception:
+        extra = {}
+    return {**schemas, **extra}, hints
+
+
 def _answer(ctx, result):
     """Append the turn's assistant message. A BACKGROUND turn stamps the id of
     the user message it answers (ctx["reply_to"]) so a retry can recognise its
@@ -948,14 +978,15 @@ def _run_turn(ctx, user):
         # hit), and once per turn however many models are tried.
         if "schemas" not in focus:
             try:
-                focus["schemas"] = _focus_schemas(ctx, user, prompt)
+                focus["schemas"], focus["joins"] = _grounding(ctx, user, prompt)
             except Exception:
-                focus["schemas"] = {}
+                focus["schemas"], focus["joins"] = {}, []
         return agent.run_agent(
             prompt=prompt, connector=connector, table=ctx["table_param"],
             allowed_tables=ctx["allowed"], schemas=ctx["schemas"], history=ctx["history"],
             user=user, model=spec, skill_md=skill_md, kag_first=kag_first,
-            visual_mode=visual, conversation_id=cid, focus_schemas=focus["schemas"])
+            visual_mode=visual, conversation_id=cid, focus_schemas=focus["schemas"],
+            join_hints=focus["joins"])
 
     if ctx.get("visual"):
         # The D3 & artifacts window goes straight to the frontier agent: the

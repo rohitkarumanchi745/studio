@@ -148,18 +148,31 @@ Rules:
 - "combine": "table" when the answer is ONE table joining the parts; "reason" when the answer is a comparison or summary across them."""
 
 
-def _roster_digest(sources, max_tables=12):
+def _roster_digest(sources, max_tables=12, prompt=None):
     """What the planner is allowed to choose from: the RBAC-filtered roster
-    only. Tables are listed so it can tell which database holds what."""
+    only. Tables are listed so it can tell which database holds what — with a
+    prompt, each source's tables the question touches FIRST (metaground.rank:
+    names and columns from the metadata graph), so a wide source shows the
+    planner its relevant tables instead of whichever twelve come first."""
+    def tables(s):
+        allowed = list(s.get("allowed") or [])
+        if prompt:
+            try:
+                from . import metaground
+                allowed = metaground.rank(s["connector"].name, prompt, allowed)
+            except Exception:
+                pass
+        return allowed[:max_tables]
     return [{"source": s["connector"].name,
              "dialect": getattr(s["connector"], "dialect", ""),
-             "tables": (s.get("allowed") or [])[:max_tables]}
+             "tables": tables(s)}
             for s in sources]
 
 
 def trajectory_input(prompt, sources):
-    """Canonical raw input for graph-policy inference and later capture."""
-    return {"prompt": str(prompt or ""), "sources": _roster_digest(sources)}
+    """Canonical raw input for graph-policy inference and later capture — the
+    same digest the planners are served, so train == serve."""
+    return {"prompt": str(prompt or ""), "sources": _roster_digest(sources, prompt=prompt)}
 
 
 def trajectory_target(plan):
@@ -389,7 +402,8 @@ def plan_graph(prompt, sources, user, model=None):
         return flat_plan(sources, prompt)
 
     roles = _PLANNER_ROLES[:independent_planner_count()]
-    roster_json = json.dumps(_roster_digest(sources), ensure_ascii=False, default=str)
+    roster_json = json.dumps(_roster_digest(sources, prompt=prompt), ensure_ascii=False,
+                             default=str)
     can_delegate = _workers_can_delegate(requested_spec)
     capability = (
         "Workers MAY request bounded follow-up agents after seeing data; keep "
@@ -1013,6 +1027,16 @@ def run_node(node, source_entry, prompt, user, model, results, ask=None, inbox=N
     # email, mutate durable memory, or invoke arbitrary MCP side effects. Those
     # effects need a separately authorized terminal action, not fan-out.
     extra["tool_profile"] = "graph_worker"
+    # The node's own question, grounded in the metadata graph like a chat turn:
+    # the tables it touches, the ones joining them, and how they join.
+    from . import metaground
+    focus, hints = metaground.worker_context(
+        conn.name, node.get("task") or prompt, source_entry["allowed"],
+        loaded=source_entry.get("schemas") or {})
+    if focus:
+        extra["focus_schemas"] = focus
+    if hints:
+        extra["join_hints"] = hints
     worker_history = [] if node.get("dynamic") else (history or [])
     sub = agent.run_agent(ask, conn, "*", source_entry["allowed"],
                           source_entry["schemas"], worker_history, user, model=model,

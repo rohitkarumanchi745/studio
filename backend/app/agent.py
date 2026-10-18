@@ -629,7 +629,8 @@ def describe_for(user, connector, allowed_tables, table):
 
 def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, model=None,
               skill_md=None, kag_first=False, delegation=None, tool_profile="full",
-              visual_mode=False, conversation_id=None, focus_schemas=None):
+              visual_mode=False, conversation_id=None, focus_schemas=None,
+              join_hints=None):
     """One analytics turn.
 
     schemas: {table_name: [{"name","type"}, ...]} — one entry for single-table
@@ -647,7 +648,10 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
     conversation_id: the chat this turn belongs to; recall_past_work skips it,
     since its turns are already in `history`.
     focus_schemas: {table: columns} of tables this question looks likely to
-    need beyond `schemas` (chat picks them by name, matching.focus_tables).
+    need beyond `schemas` (chat grounds them in the metadata graph,
+    metaground.ground, else picks them by name, matching.focus_tables).
+    join_hints: ["a.x = b.y  (state, confidence N)", ...] — how those tables
+    join, from the metadata graph's relationships.
     They go in the volatile half of the prompt, so the cached prefix — the
     skill file — stays the same from one question to the next. Any other
     table's columns are one describe_table call away.
@@ -972,7 +976,7 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
     memory_notes = memory.notes_for_prompt(user["id"], prompt)
     # Stable half (cached prefix) + volatile half (below the breakpoint).
     system, volatile = _system_blocks(connector, table, allowed_tables, schemas,
-                                      memory_notes, skill_md, focus_schemas)
+                                      memory_notes, skill_md, focus_schemas, join_hints)
     if delegation is not None:
         available = json.dumps(delegation.source_catalog, ensure_ascii=False)
         delegation_note = (
@@ -1150,7 +1154,7 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
 
 
 def _system_blocks(connector, table, allowed_tables, schemas, memory_notes, skill_md=None,
-                   focus_schemas=None):
+                   focus_schemas=None, join_hints=None):
     """(stable, volatile) halves of the system prompt.
 
     stable: role, scope, the skill file, learned rules, platform notes, rules —
@@ -1268,6 +1272,11 @@ Recent failures on this source (avoid repeating them):
         volatile += ("\n\nColumns of more tables that look relevant to this question "
                      "(your briefing lists them without columns; these need no "
                      f"describe_table call):\n{lines}")
+    if join_hints:
+        volatile += ("\n\nHow these tables join (from the metadata graph — declared keys, "
+                     "joins seen in views and past queries, naming patterns; prefer these "
+                     "conditions, and check an inferred one if the result looks wrong):\n"
+                     + "\n".join(f"  {line}" for line in join_hints))
     return stable, volatile
 
 
