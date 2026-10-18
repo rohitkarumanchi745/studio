@@ -1507,6 +1507,34 @@ source's relevant tables first instead of whichever twelve come first, and
 every planned node's worker is grounded the same way. The turn's activity
 shows it: *grounded in the metadata graph: … (joined through …)*.
 
+**Descriptions, and search by meaning.**
+- **Descriptions are read where the catalog keeps them:** Postgres
+  `COMMENT ON`, Databricks comments, and any SQL database through SQLAlchemy's
+  comment reflection.
+- **Where they go:** each source's detail, the graph view, search
+  (`/api/metagraph/search`) and the Neo4j mirror.
+- **Fingerprints:** descriptions are part of an object's fingerprint, so a
+  changed description is a change, and change capture picks it up like a
+  column change. An object without descriptions keeps the fingerprint it
+  always had.
+- **Grounding:** a question word that only a description uses still counts,
+  more weakly than a name.
+- **With Harrier** (`HARRIER_EMBED_URL`):
+  - Each object's name, description and columns are embedded as it is
+    discovered, and on the scheduler tick for a large source. That is at most
+    `STUDIO_METAGRAPH_EMBED_BATCH` (100) per pass, and only objects whose
+    fingerprint changed.
+  - A question is then matched by meaning as well: "how much do clients
+    spend" finds the customers table.
+  - Retrieval stays verified. Only the turn's own tables are considered, and
+    only a vector of the object as it is now. A table found by meaning alone
+    must reach `STUDIO_METAGRAPH_MEANING_ONLY_MIN` (0.65), against
+    `STUDIO_METAGRAPH_MEANING_MIN` (0.5) for one that also matches by words.
+    It is labelled `≈meaning`, so the agent checks its columns before relying
+    on it.
+  - With Harrier unset or unreachable, nothing is embedded and words alone
+    decide, as before.
+
 **Across sources, for a whole organization** (`metaentities.py`).
 
 - **Canonical entities.** The keys that carry one business thing between

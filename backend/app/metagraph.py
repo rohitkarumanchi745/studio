@@ -181,16 +181,26 @@ def init_tables():
             last_seen_at REAL NOT NULL,
             changed_at REAL NOT NULL,
             removed_at REAL,
-            snapshot_id TEXT
+            snapshot_id TEXT,
+            description TEXT
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_meta_obj_key ON meta_objects(source, name);
         CREATE TABLE IF NOT EXISTS meta_columns (
             object_id TEXT NOT NULL,
             ordinal INTEGER NOT NULL,
             name TEXT NOT NULL,
-            type TEXT
+            type TEXT,
+            description TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_meta_col_obj ON meta_columns(object_id);
+        CREATE TABLE IF NOT EXISTS meta_embeddings (
+            source TEXT NOT NULL,
+            object TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            vector TEXT NOT NULL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (source, object)
+        );
         CREATE TABLE IF NOT EXISTS meta_sources (
             source TEXT PRIMARY KEY,
             status TEXT NOT NULL,
@@ -290,10 +300,21 @@ def notify_changed(source, reason, *, key=None):
         return None
 
 
-def _fingerprint(kind, columns):
-    """Changes when the object's kind or any column's name, type or order does."""
+def _fingerprint(kind, columns, description=None):
+    """Changes when the object's kind, any column's name, type or order — or
+    its description or a column's — does. An object that carries no
+    descriptions keeps exactly the fingerprint it always had."""
     text = kind + "\n" + "\n".join(f"{c['name']}:{c.get('type') or ''}" for c in columns)
+    if description or any(c.get("description") for c in columns):
+        text += "\n#" + (description or "") + "\n" + "\n".join(
+            f"{c['name']}:{c.get('description') or ''}" for c in columns)
     return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _description(text):
+    """A catalog's description (a COMMENT), tidied; None when there is none."""
+    text = " ".join(str(text or "").split())
+    return text[:2000] or None
 
 
 def _namespace_of(name, described):
@@ -308,7 +329,11 @@ def _clean_columns(columns):
     for col in (columns or [])[:_max_columns()]:
         name = str(col.get("name") or "")[:256]
         if name:
-            out.append({"name": name, "type": str(col.get("type") or "")[:128]})
+            entry = {"name": name, "type": str(col.get("type") or "")[:128]}
+            note = _description(col.get("description"))
+            if note:
+                entry["description"] = note[:1000]
+            out.append(entry)
     return out
 
 
@@ -365,6 +390,7 @@ def _read_source(source):
                 kind, columns, complete = "unknown", None, False
         objects.append({"name": str(name)[:512], "kind": kind,
                         "namespace": _namespace_of(name, info),
+                        "description": _description((info or {}).get("description")),
                         "columns": None if columns is None else _clean_columns(columns)})
     return objects, complete, signal, tokens
 
@@ -455,23 +481,25 @@ def _upsert_object(c, source, row, obj, now, snapshot_id):
                   (now, snapshot_id, row["id"]))
         return "unchanged"
     columns = columns or []
-    fp = _fingerprint(obj["kind"], columns)
+    description = obj.get("description")
+    fp = _fingerprint(obj["kind"], columns, description)
     if row is None:
         oid = str(uuid.uuid4())
         c.execute(
             "INSERT INTO meta_objects (id, source, name, namespace, kind, fingerprint, "
             "column_count, first_seen_at, last_seen_at, changed_at, removed_at, "
-            "snapshot_id) VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?)",
+            "snapshot_id, description) VALUES (?,?,?,?,?,?,?,?,?,?,NULL,?,?)",
             (oid, source, obj["name"], obj["namespace"], obj["kind"], fp, len(columns),
-             now, now, now, snapshot_id))
+             now, now, now, snapshot_id, description))
         _put_columns(c, oid, columns)
         return "added"
     if row["fingerprint"] != fp or row["removed_at"] is not None:
         c.execute(
             "UPDATE meta_objects SET namespace=?, kind=?, fingerprint=?, column_count=?, "
-            "last_seen_at=?, changed_at=?, removed_at=NULL, snapshot_id=? WHERE id=?",
+            "last_seen_at=?, changed_at=?, removed_at=NULL, snapshot_id=?, description=? "
+            "WHERE id=?",
             (obj["namespace"], obj["kind"], fp, len(columns), now, now, snapshot_id,
-             row["id"]))
+             description, row["id"]))
         c.execute("DELETE FROM meta_columns WHERE object_id=?", (row["id"],))
         _put_columns(c, row["id"], columns)
         return "added" if row["removed_at"] is not None else "changed"
@@ -482,8 +510,9 @@ def _upsert_object(c, source, row, obj, now, snapshot_id):
 
 def _put_columns(c, object_id, columns):
     for i, col in enumerate(columns):
-        c.execute("INSERT INTO meta_columns (object_id, ordinal, name, type) VALUES (?,?,?,?)",
-                  (object_id, i, col["name"], col["type"]))
+        c.execute("INSERT INTO meta_columns (object_id, ordinal, name, type, description) "
+                  "VALUES (?,?,?,?,?)",
+                  (object_id, i, col["name"], col["type"], col.get("description")))
 
 
 def _start(source, snapshot_id, trigger, now):
@@ -536,6 +565,7 @@ def discover(source, trigger="manual"):
     except Exception:
         log.warning("metagraph: metric baselines for %s failed", source, exc_info=True)
     mirror(source)
+    _index(source)
     return {"source": source, "snapshot_id": snapshot_id, "objects": len(objects),
             "added": added, "changed": changed, "removed": removed, "held": held,
             "complete": complete, "relationships": relationships}
@@ -676,6 +706,7 @@ def discover_asset(source, asset, trigger="event"):
         info = _describe_one(connector, name, existing.get(name))
         obj = {"name": name, "kind": info.get("kind") or "other",
                "namespace": _namespace_of(name, info),
+               "description": _description(info.get("description")),
                "columns": _clean_columns(info.get("columns"))}
     with db.connect() as c:
         _lock(c, source)
@@ -711,7 +742,19 @@ def refresh_now(source):
     except Exception:
         log.warning("metagraph: metric baselines for %s failed", source, exc_info=True)
     mirror(source)
+    _index(source)
     return {"source": source, "relationships": relationships}
+
+
+def _index(source, budget=None):
+    """Keep the source's Harrier index current (metaground.index) — only when
+    Harrier is configured, and never failing the caller."""
+    try:
+        from . import metaground
+        return metaground.index(source, budget)
+    except Exception:
+        log.warning("metagraph: indexing %s for search failed", source, exc_info=True)
+        return 0
 
 
 def refresh_soon(source, *, conn):
@@ -753,8 +796,8 @@ def visible_objects(user, source, *, with_columns=True):
     """The current objects of `source` this user may read, with their columns."""
     with db.connect() as c:
         rows = [dict(r) for r in c.execute(
-            "SELECT id, name, namespace, kind, column_count, first_seen_at, changed_at "
-            "FROM meta_objects WHERE source=? AND removed_at IS NULL ORDER BY name",
+            "SELECT id, name, namespace, kind, column_count, first_seen_at, changed_at, "
+            "description FROM meta_objects WHERE source=? AND removed_at IS NULL ORDER BY name",
             (source,)).fetchall()]
         allowed = set(rbac.allowed_tables(user["role"], source, [r["name"] for r in rows]))
         rows = [r for r in rows if r["name"] in allowed]
@@ -765,14 +808,19 @@ def visible_objects(user, source, *, with_columns=True):
                 batch = ids[i:i + 400]
                 ph = ",".join("?" for _ in batch)
                 for col in c.execute(
-                        f"SELECT object_id, name, type FROM meta_columns WHERE object_id IN ({ph}) "
-                        f"ORDER BY object_id, ordinal", tuple(batch)).fetchall():
-                    cols.setdefault(col["object_id"], []).append(
-                        {"name": col["name"], "type": col["type"]})
+                        f"SELECT object_id, name, type, description FROM meta_columns "
+                        f"WHERE object_id IN ({ph}) ORDER BY object_id, ordinal",
+                        tuple(batch)).fetchall():
+                    entry = {"name": col["name"], "type": col["type"]}
+                    if col["description"]:
+                        entry["description"] = col["description"]
+                    cols.setdefault(col["object_id"], []).append(entry)
             for r in rows:
                 r["columns"] = cols.get(r["id"], [])
     for r in rows:
         r.pop("id", None)
+        if not r.get("description"):
+            r.pop("description", None)
     return rows
 
 
@@ -882,12 +930,15 @@ def source_graph(source: str, user=Depends(current_user)):
                 edges.append({"from": parent, "to": ns_id, "type": "CONTAINS"})
             parent = ns_id
         obj_id = f"object:{source}:{obj['name']}"
-        nodes.append({"id": obj_id, "type": obj["kind"], "name": obj["name"]})
+        nodes.append({"id": obj_id, "type": obj["kind"], "name": obj["name"],
+                      **({"description": obj["description"]} if obj.get("description") else {})})
         edges.append({"from": parent, "to": obj_id, "type": "CONTAINS"})
         for col in obj["columns"]:
             col_id = f"column:{source}:{obj['name']}:{col['name']}"
             nodes.append({"id": col_id, "type": "column", "name": col["name"],
-                          "data_type": col["type"]})
+                          "data_type": col["type"],
+                          **({"description": col["description"]}
+                             if col.get("description") else {})})
             edges.append({"from": obj_id, "to": col_id, "type": "HAS_COLUMN"})
     for d in metametrics.for_source(source, {o["name"] for o in visible_objects(
             user, source, with_columns=False)}):
@@ -1152,12 +1203,16 @@ def search(q: str, user=Depends(current_user)):
     hits = []
     for source in sorted(live & set(rbac.allowed_sources(user["role"]))):
         for obj in visible_objects(user, source):
-            if term in obj["name"].lower():
-                hits.append({"type": obj["kind"], "source": source, "object": obj["name"]})
+            if term in obj["name"].lower() or term in (obj.get("description") or "").lower():
+                hits.append({"type": obj["kind"], "source": source, "object": obj["name"],
+                             **({"description": obj["description"]}
+                                if obj.get("description") else {})})
             for col in obj["columns"]:
-                if term in col["name"].lower():
+                if term in col["name"].lower() or term in (col.get("description") or "").lower():
                     hits.append({"type": "column", "source": source, "object": obj["name"],
-                                 "column": col["name"], "data_type": col["type"]})
+                                 "column": col["name"], "data_type": col["type"],
+                                 **({"description": col["description"]}
+                                    if col.get("description") else {})})
             if len(hits) >= 100:
                 break
     for ent in metaentities.visible(user, live):
@@ -1235,6 +1290,9 @@ def _purge_tombstones(now):
     with db.connect() as c:
         c.execute("DELETE FROM meta_columns WHERE object_id IN (SELECT id FROM meta_objects "
                   "WHERE removed_at IS NOT NULL AND removed_at < ?)", (cutoff,))
+        c.execute("DELETE FROM meta_embeddings WHERE EXISTS (SELECT 1 FROM meta_objects o "
+                  "WHERE o.source = meta_embeddings.source AND o.name = meta_embeddings.object "
+                  "AND o.removed_at IS NOT NULL AND o.removed_at < ?)", (cutoff,))
         c.execute("DELETE FROM meta_asset_versions WHERE EXISTS (SELECT 1 FROM meta_objects o "
                   "WHERE o.source = meta_asset_versions.source "
                   "AND o.name = meta_asset_versions.asset "
@@ -1290,6 +1348,8 @@ def tick_once():
         metametrics.ensure_baselines()
     except Exception:
         log.warning("metagraph: metric baselines failed", exc_info=True)
+    for source in live:
+        _index(source)                      # catches up a large source a batch a tick
     _watch_freshness(live, now)
     return {"queued": queued, "purged": purged}
 
@@ -1407,20 +1467,26 @@ def _projection(source):
     the mirror is a projection of it, not a second source of truth."""
     with db.connect() as c:
         objects = [dict(r) for r in c.execute(
-            "SELECT id, name, namespace, kind, fingerprint, column_count FROM meta_objects "
-            "WHERE source=? AND removed_at IS NULL", (source,)).fetchall()]
+            "SELECT id, name, namespace, kind, fingerprint, column_count, description "
+            "FROM meta_objects WHERE source=? AND removed_at IS NULL", (source,)).fetchall()]
         names = {o["id"]: o["name"] for o in objects}
         columns = []
         ids = list(names)
         for i in range(0, len(ids), 400):
             batch = ids[i:i + 400]
             ph = ",".join("?" for _ in batch)
-            for col in c.execute(f"SELECT object_id, ordinal, name, type FROM meta_columns "
-                                 f"WHERE object_id IN ({ph})", tuple(batch)).fetchall():
-                columns.append({"object": names[col["object_id"]], "name": col["name"],
-                                "type": col["type"], "ordinal": col["ordinal"]})
+            for col in c.execute(f"SELECT object_id, ordinal, name, type, description "
+                                 f"FROM meta_columns WHERE object_id IN ({ph})",
+                                 tuple(batch)).fetchall():
+                entry = {"object": names[col["object_id"]], "name": col["name"],
+                         "type": col["type"], "ordinal": col["ordinal"]}
+                if col["description"]:
+                    entry["description"] = col["description"]
+                columns.append(entry)
     for o in objects:
         o.pop("id", None)
+        if not o.get("description"):
+            o.pop("description", None)       # Cypher reads a missing key as null
     return objects, columns
 
 
@@ -1462,13 +1528,15 @@ def mirror(source):
         {"statement": "UNWIND $objects AS o "
                       "MERGE (t:StudioObject {tenant: $tenant, source: $source, name: o.name}) "
                       "SET t.kind = o.kind, t.namespace = o.namespace, "
+                      "t.description = o.description, "
                       "t.fingerprint = o.fingerprint, t.column_count = o.column_count "
                       "WITH t MATCH (s:StudioSource {tenant: $tenant, name: $source}) MERGE (s)-[:CONTAINS]->(t)",
          "parameters": params},
         {"statement": "UNWIND $columns AS col "
                       "MATCH (t:StudioObject {tenant: $tenant, source: $source, name: col.object}) "
                       "MERGE (c:StudioColumn {tenant: $tenant, source: $source, object: col.object, name: col.name}) "
-                      "SET c.type = col.type, c.ordinal = col.ordinal "
+                      "SET c.type = col.type, c.ordinal = col.ordinal, "
+                      "c.description = col.description "
                       "MERGE (t)-[:HAS_COLUMN]->(c)",
          "parameters": params},
         {"statement": "MATCH (c:StudioColumn {tenant: $tenant, source: $source}) "

@@ -345,3 +345,32 @@ def test_the_metadata_graph_over_any_sql_database(pg_app, monkeypatch):
                   if r["name"] == f"{schema}.retail_stores")
     assert [c["name"] for c in stores["columns"]][-1] == "region"
     assert env.cdc.status("pg-any")["capture"] == "bulk"
+
+
+# ── Descriptions: COMMENT ON, read by both connectors ────────────────────
+
+def test_comments_are_read_as_descriptions_and_move_the_token(pg):
+    from app.connectors import sql_conn
+    conn, run = pg
+    before = conn.table_signals()
+    run("COMMENT ON TABLE {s}.retail_orders IS 'One row per order as placed'")
+    run("COMMENT ON COLUMN {s}.retail_orders.status IS 'placed, shipped or cancelled'")
+    after = conn.table_signals()
+    assert [t for t in before if before[t] != after[t]] == ["retail_orders"]
+    bulk = conn.describe_relations()["retail_orders"]
+    one = conn.describe_relation("retail_orders")
+    for got in (bulk, one):
+        assert got["description"] == "One row per order as placed"
+        status = next(c for c in got["columns"] if c["name"] == "status")
+        assert status["description"] == "placed, shipped or cancelled"
+    assert "description" not in conn.describe_relations()["retail_customers"]
+    sql_conn._LEARNED.clear()
+    generic = sql_conn.SqlConnector("pg-any", DSN.replace("postgresql://",
+                                                          "postgresql+psycopg://", 1),
+                                    schema=conn._schema())
+    name = f"{conn._schema()}.retail_orders"
+    assert generic.describe_relations()[name]["description"] == "One row per order as placed"
+    assert generic.describe_relation(name)["description"] == "One row per order as placed"
+    status = next(c for c in generic.get_schema(name) if c["name"] == "status")
+    assert status["description"] == "placed, shipped or cancelled"
+    generic.close()

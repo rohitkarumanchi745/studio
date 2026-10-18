@@ -434,6 +434,12 @@ def _m21_query_cache_user_id(c, is_pg):
                   "ON query_cache(user_id, source, table_scope)")
 
 
+def _m22_metagraph_descriptions(c, is_pg):
+    # Table and column descriptions (catalog COMMENTs) in the metadata graph.
+    _add_column(c, "meta_objects", "description", "TEXT", is_pg)
+    _add_column(c, "meta_columns", "description", "TEXT", is_pg)
+
+
 MIGRATIONS = [
     (1, "users.verified", _m1_users_verified),
     (2, "conversations.folder_id", _m2_conversations_folder_id),
@@ -456,6 +462,7 @@ MIGRATIONS = [
     (19, "meta_sources relate columns", _m19_metagraph_relate_columns),
     (20, "meta_sources freshness", _m20_metagraph_freshness),
     (21, "query_cache.user_id", _m21_query_cache_user_id),
+    (22, "meta_objects/meta_columns description", _m22_metagraph_descriptions),
 ]
 
 

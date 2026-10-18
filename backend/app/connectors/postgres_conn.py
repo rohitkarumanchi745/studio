@@ -191,9 +191,39 @@ class PostgresConnector(Connector):
                 return [{"name": r[0], "type": r[1]} for r in cur.fetchall()]
         return self._execute(go)
 
+    @staticmethod
+    def _comments(cur, schema, name=None):
+        """({relation: description}, {(relation, column): description}) — the
+        COMMENTs in the pinned schema (or on one relation), from pg_catalog.
+        Read last and fail soft: a relation is described without them rather
+        than not at all."""
+        try:
+            cur.execute(
+                "SELECT c.relname::text, a.attname::text, d.description "
+                "FROM pg_catalog.pg_description d "
+                "JOIN pg_catalog.pg_class c ON c.oid = d.objoid "
+                "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+                "LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid "
+                "AND a.attnum = d.objsubid "
+                "WHERE d.classoid = 'pg_catalog.pg_class'::regclass AND n.nspname = %s"
+                + (" AND c.relname = %s" if name is not None else ""),
+                (schema,) if name is None else (schema, name))
+            rows = cur.fetchall()
+        except Exception:
+            logging.getLogger("studio.connectors").warning(
+                "Postgres comments could not be read", exc_info=True)
+            return {}, {}
+        tables, columns = {}, {}
+        for rel, col, text in rows:
+            if col is None:
+                tables[rel] = text
+            else:
+                columns[(rel, col)] = text
+        return tables, columns
+
     def describe_relations(self):
-        """Kind and columns for every relation in the pinned schema, in two
-        information_schema queries."""
+        """Kind, columns and descriptions (COMMENTs) for every relation in the
+        pinned schema, in three catalog queries."""
         schema = self._schema()
 
         def go(con):
@@ -210,6 +240,13 @@ class PostgresConnector(Connector):
                 for name, col, ctype in cur.fetchall():
                     if name in out:
                         out[name]["columns"].append({"name": col, "type": ctype})
+                tables, columns = self._comments(cur, schema)
+                for name, entry in out.items():
+                    if tables.get(name):
+                        entry["description"] = tables[name]
+                    for col in entry["columns"]:
+                        if columns.get((name, col["name"])):
+                            col["description"] = columns[(name, col["name"])]
                 return out
         try:
             return self._execute(go)
@@ -230,10 +267,17 @@ class PostgresConnector(Connector):
                 cur.execute("SELECT column_name, data_type FROM information_schema.columns "
                             "WHERE table_schema = %s AND table_name = %s "
                             "ORDER BY ordinal_position", (schema, name))
-                return {"kind": "table" if row[0] == "BASE TABLE"
-                        else "view" if row[0] == "VIEW" else "other",
-                        "namespace": schema,
-                        "columns": [{"name": r[0], "type": r[1]} for r in cur.fetchall()]}
+                cols = [{"name": r[0], "type": r[1]} for r in cur.fetchall()]
+                tables, columns = self._comments(cur, schema, name)
+                for col in cols:
+                    if columns.get((name, col["name"])):
+                        col["description"] = columns[(name, col["name"])]
+                out = {"kind": "table" if row[0] == "BASE TABLE"
+                       else "view" if row[0] == "VIEW" else "other",
+                       "namespace": schema, "columns": cols}
+                if tables.get(name):
+                    out["description"] = tables[name]
+                return out
         return self._execute(go)
 
     def describe_constraints(self):
@@ -299,16 +343,21 @@ class PostgresConnector(Connector):
         def go(con):
             with con.cursor() as cur:
                 cur.execute(
-                    "SELECT c.relname::text, md5(c.relkind::text || '|' || coalesce(string_agg("
+                    # Kind, columns and every COMMENT: a changed description
+                    # is a change, as the metadata graph's fingerprint has it.
+                    "SELECT c.relname::text, md5(c.relkind::text || '|' "
+                    "|| coalesce(obj_description(c.oid, 'pg_class'), '') || '|' "
+                    "|| coalesce(string_agg("
                     "coalesce(a.attname::text, '') || ':' "
-                    "|| coalesce(format_type(a.atttypid, a.atttypmod), ''), ',' "
+                    "|| coalesce(format_type(a.atttypid, a.atttypmod), '') || ':' "
+                    "|| coalesce(col_description(c.oid, a.attnum), ''), ',' "
                     "ORDER BY a.attnum), '')) "
                     "FROM pg_catalog.pg_class c "
                     "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
                     "LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid "
                     "AND a.attnum > 0 AND NOT a.attisdropped "
                     "WHERE n.nspname = %s AND c.relkind IN ('r', 'p', 'v', 'm', 'f') "
-                    "GROUP BY c.relname, c.relkind", (schema,))
+                    "GROUP BY c.oid, c.relname, c.relkind", (schema,))
                 return {name: token for name, token in cur.fetchall()}
         try:
             return self._execute(go)

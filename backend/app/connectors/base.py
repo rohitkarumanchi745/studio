@@ -216,7 +216,10 @@ class Connector:
         """Bulk metadata for discovery: {name: {"kind", "namespace", "columns"}}
         for the relations list_tables() returns, keyed exactly as it names
         them. `kind` is "table", "view" or "other"; `columns` is
-        [{"name", "type"}, ...] in ordinal order.
+        [{"name", "type"}, ...] in ordinal order. Where the catalog keeps
+        descriptions (COMMENTs), a relation may carry "description" and a
+        column "description" too — they reach grounding and search, and a
+        changed one is a change.
 
         Metadata only — names and types, never a row. It answers "what is
         here" for the metadata graph (metagraph.py), in a query or two where

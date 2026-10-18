@@ -32,16 +32,18 @@ def available():
     return bool(os.getenv("HARRIER_EMBED_URL", "").strip())
 
 
-def embed(text, kind="query"):
+def embed(text, kind="query", instruct=None):
     """Embed one string via the Harrier endpoint (OpenAI-compatible /embeddings).
-    kind='query' prepends the required instruction; kind='document' sends plain
-    text. Returns a 1024-dim vector, or None on any failure (→ lexical fallback)."""
+    kind='query' prepends the required instruction (`instruct`, else
+    HARRIER_EMBED_INSTRUCT, else the query-cache task); kind='document' sends
+    plain text. Returns a 1024-dim vector, or None on any failure (→ lexical
+    fallback)."""
     url = os.getenv("HARRIER_EMBED_URL", "").strip()
     if not url or not (text or "").strip():
         return None
     text = text[:8000]
     if kind == "query":
-        instruct = os.getenv("HARRIER_EMBED_INSTRUCT", _DEFAULT_INSTRUCT)
+        instruct = instruct or os.getenv("HARRIER_EMBED_INSTRUCT", _DEFAULT_INSTRUCT)
         text = f"Instruct: {instruct}\nQuery: {text}"
     model = os.getenv("HARRIER_EMBED_MODEL", "microsoft/harrier-oss-v1-0.6b")
     key = os.getenv("HARRIER_EMBED_KEY", "")
