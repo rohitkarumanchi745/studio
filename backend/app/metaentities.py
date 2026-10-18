@@ -26,8 +26,8 @@ import logging
 import time
 import uuid
 
-from . import db, rbac
-from .metarelations import _family, _named_for, _stem
+from . import db, identifiers, rbac
+from .metarelations import _family, _named_for, _stem, _vocab
 
 log = logging.getLogger("studio.metagraph")
 
@@ -81,7 +81,7 @@ def init_tables():
 # ── Proposals ────────────────────────────────────────────────────────────
 
 def _display(stem):
-    return stem.replace("_", " ").capitalize()
+    return identifiers.entity_name(stem.split("_") if isinstance(stem, str) else stem)
 
 
 def _live_objects(sources):
@@ -109,28 +109,32 @@ def _live_objects(sources):
 
 
 def candidates(objects):
-    """{stem: [member]} — key columns that name an entity, across sources.
-    A `<stem>_id` column is the HOME of the key in a table named for the stem
-    (customers.customer_id) and a REFERENCE anywhere else
-    (orders.customer_id); a table named for the stem and keyed by a bare `id`
-    is a home too (crm.customers.id). Proposed only when the stem spans at
+    """{stem: [member]} — key columns that name an entity, across sources and
+    across naming conventions (CustomerID in one source, cust_no in another,
+    customer_sk in a third all name a customer). A key column is the HOME of
+    its subject in the table that is home to it (Customer.CustomerID,
+    dim_customer.customer_sk) and a REFERENCE anywhere else; a home table
+    keyed by a bare `id` is a home too. Proposed only when a subject spans at
     least two sources and has a home; members whose type family differs from
-    the home's (a text key against a number key) are left out."""
+    the home's (a text key against a number key) are left out. `stem` is the
+    subject's words joined by "_"."""
+    vocab = _vocab({f"{s}.{o}": info for (s, o), info in objects.items()})
     found = {}
     for (source, obj), info in objects.items():
         if info["kind"] == "view":
             continue
         bare = obj.split(".")[-1]
         for col in info["columns"]:
-            stem = _stem(col["name"])
+            stem = _stem(col["name"], vocab)
             if not stem:
                 continue
-            home = _named_for(obj, stem)
+            home = _named_for(obj, stem, vocab)
+            subject = " ".join(stem)
             found.setdefault(stem, []).append({
                 "source": source, "object": obj, "column": col["name"],
                 "role": "home" if home else "reference", "type": col.get("type"),
-                "evidence": [f"table {bare} is named for {stem}" if home
-                             else f"column {bare}.{col['name']} names {stem}"]})
+                "evidence": [f"table {bare} is named for {subject}" if home
+                             else f"column {bare}.{col['name']} names {subject}"]})
     for (source, obj), info in objects.items():
         if info["kind"] == "view":
             continue
@@ -140,11 +144,11 @@ def candidates(objects):
         for stem in list(found):
             has_home = any(m["source"] == source and m["object"] == obj and m["role"] == "home"
                            for m in found[stem])
-            if _named_for(obj, stem) and not has_home:
+            if _named_for(obj, stem, vocab) and not has_home:
                 found[stem].append({
                     "source": source, "object": obj, "column": bare_id["name"],
                     "role": "home", "type": bare_id.get("type"),
-                    "evidence": [f"table {obj.split('.')[-1]} is named for {stem} "
+                    "evidence": [f"table {obj.split('.')[-1]} is named for {' '.join(stem)} "
                                  f"and keyed by id"]})
     out = {}
     for stem, members in found.items():
@@ -157,9 +161,9 @@ def candidates(objects):
         sources = {m["source"] for m in kept}
         if len(sources) < 2:
             continue
-        out[stem] = [{**m, "confidence": 0.75 if m["role"] == "home" else 0.6,
-                      "evidence": m["evidence"] + [f"found in {len(sources)} sources"]}
-                     for m in kept]
+        out["_".join(stem)] = [{**m, "confidence": 0.75 if m["role"] == "home" else 0.6,
+                                "evidence": m["evidence"] + [f"found in {len(sources)} sources"]}
+                               for m in kept]
     return out
 
 

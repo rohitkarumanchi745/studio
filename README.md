@@ -1388,8 +1388,19 @@ behind it, in words:
 |---|---|---|
 | declared | a primary/foreign key in the catalog (`describe_constraints`: Postgres `pg_constraint`, Unity Catalog `information_schema`, SQLite) | 1.0 |
 | observed | the join in a view definition (`view_definitions`), or in Studio's own successful queries against the source (`audit_log`) | 0.9 · 0.75–0.9 by count |
-| inferred | a naming pattern: `retail_orders.customer_id` points at `retail_customers`, typed alike | up to 0.85 |
+| inferred | a naming pattern, in any convention — `orders.customer_id` → `customers`, `SalesOrderDetail.SalesOrderID` → `SalesOrderHeader`, `fact_sales.customer_sk` → `dim_customer`, `users.fk_account` → `accounts.id`, `ord.cust_no` → `cust` — typed alike | up to 0.85 |
 | verified / rejected | an administrator's review (`POST …/relationships/{id}/review`), which outlives recomputation | 1.0 / hidden |
+
+Names are read as words whatever the convention (`identifiers.py`):
+snake_case, PascalCase and camelCase are split, singular and plural read
+alike, key markers are found at either end (`_id`, `_sk`, `_key`, `_no`,
+`_code`, `fk_`, `_ref` …), table classifiers are ignored (`dim_`, `fact_`,
+`tbl`, `vw_`), a header table is home to its key while a detail/line/item
+table never is, and abbreviations resolve from a short list of standard
+data-modelling forms (`qty`, `cust`, `desc` …) or from a word the same schema
+spells out — never a guess between two. When several tables could equally hold
+a key, every candidate is kept below the join-path threshold, labelled as one
+of several. No table name is special-cased anywhere.
 
 Views also get *derived-from* edges to the tables they read, and Databricks
 adds the table lineage Unity Catalog records (`system.access.table_lineage`,
