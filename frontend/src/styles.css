@@ -1267,8 +1267,31 @@ input:focus, select:focus, .composer-pill:focus-within { box-shadow: 0 0 0 1px v
 }
 .conn-connected-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .conn-connected-head .chip { text-transform: none; letter-spacing: 0; font-weight: 500; }
-.conn-connected-note { margin: -4px 0 8px 2px; }
-.dbconn-row .conn-connected-open { margin-left: auto; }
+/* Connected: one compact line per sign-in (ConnectedSources). */
+.conn-connected-list {
+  border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface);
+  overflow: hidden;
+}
+.conn-connected-row { padding: 7px 12px; border-top: 1px solid var(--line); }
+.conn-connected-row:first-child { border-top: none; }
+.conn-connected-row.conn-connected-dup { background: var(--accent-soft); }
+.conn-connected-line, .conn-connected-sub {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0;
+}
+.conn-connected-line b, .conn-connected-sub b { font-size: 13px; }
+.conn-connected-where { font-size: 12px; min-width: 0; overflow-wrap: anywhere; }
+.conn-connected-line > .conn-connected-where, .conn-connected-sub > .conn-connected-where {
+  margin-right: auto;
+}
+.conn-connected-line .metadata-line, .conn-connected-sub .metadata-line {
+  flex-basis: auto; margin: 0; padding-left: 0; gap: 6px; font-size: 12px;
+}
+.conn-connected-line .chip, .conn-connected-sub .chip { padding: 2px 9px; font-size: 12px; }
+.conn-connected-why { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin: 4px 0 2px 26px; }
+.conn-connected-sub { padding: 3px 0 0 26px; }
+.conn-combine { font-weight: 600; }
+.conn-already { margin: 8px 0; }
 .conn-grid {
   display: grid; gap: 10px;
   grid-template-columns: repeat(auto-fill, minmax(146px, 1fr));

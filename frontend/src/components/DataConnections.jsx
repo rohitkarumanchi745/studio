@@ -113,7 +113,9 @@ export function buildTiles({ types = [], conns = [], sources = [], repos = [], e
     return Object.assign(byId.get(id), extra || {});
   };
 
-  for (const t of types) put(t.ctype, { connectable: true, fields: t.fields, ns: t.ns || {} });
+  for (const t of types) {
+    put(t.ctype, { connectable: true, fields: t.fields, ns: t.ns || {}, spans: !!t.spans });
+  }
   put("m365");
   put("github");
   put("teams");
@@ -127,7 +129,7 @@ export function buildTiles({ types = [], conns = [], sources = [], repos = [], e
     const base = typeById.get(via.ctype);
     put(id, { via: { ...via, status }, connectable: status === "ready",
               fields: base ? base.fields : null, ns: base ? base.ns || {} : {},
-              ctype: via.ctype || null });
+              spans: !!base?.spans, ctype: via.ctype || null });
   }
 
   for (const repo of repos) {
@@ -163,6 +165,11 @@ export function buildTiles({ types = [], conns = [], sources = [], repos = [], e
       kind: own || s.ctype ? "user" : "env",
       connId: own?.id,
       hint: own?.hint || envByName.get(s.name)?.hint || "",
+      // Which sign-in it uses (a fingerprint, no credential), what it reads,
+      // and whether that is everything the sign-in can see.
+      account: own?.account || envByName.get(s.name)?.account || "",
+      namespace: own?.namespace || envByName.get(s.name)?.namespace || "",
+      everything: !!own?.everything,
       // How an admin set a built-in source on this screen (/connections/env):
       // "environment" | "replaced" | "disconnected". Absent for user
       // connections — and for everyone but admins, who alone can change it.
@@ -183,6 +190,9 @@ export function buildTiles({ types = [], conns = [], sources = [], repos = [], e
       kind: "user",
       connId: c.id,
       hint: c.hint || "",
+      account: c.account || "",
+      namespace: c.namespace || "",
+      everything: !!c.everything,
       disconnected: true,
     });
   }
@@ -214,6 +224,7 @@ export default function DataConnections({ onClose }) {
   // sources panel (administrators), and the names being queued for a rescan.
   const scans = useMetadataStatus(isAdmin);
   const [rescanning, setRescanning] = useState([]);
+  const [combining, setCombining] = useState("");  // the sign-in group being combined
 
   async function rediscover(names) {
     setRescanning((now) => [...now, ...names]);
@@ -227,6 +238,26 @@ export default function DataConnections({ onClose }) {
     } finally {
       await scans.reload();          // queued now: the status keeps itself current
       setRescanning((now) => now.filter((n) => !names.includes(n)));
+    }
+  }
+
+  // “Combine into one”: the source that already reads everything — else the
+  // first by name — reads everything, and the others with its sign-in go.
+  async function combine(group) {
+    const keep = keeperOf(group);
+    const others = group.sources.filter((s) => s !== keep).map((s) => s.name);
+    if (!confirm(everythingQuestion(keep.name, others))) return;
+    setCombining(group.key);
+    setError("");
+    setNote("");
+    try {
+      setNote(combinedNote(await api(`/connections/${keep.connId}/everything`, { method: "POST" })));
+      load();
+      await scans.reload();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setCombining("");
     }
   }
 
@@ -321,7 +352,7 @@ export default function DataConnections({ onClose }) {
             <>
               {isAdmin && !q.trim() && (
                 <ConnectedSources tiles={tiles} scans={scans.byName} rescanning={rescanning}
-                  onRediscover={rediscover}
+                  onRediscover={rediscover} onCombine={combine} combining={combining}
                   onPick={(id) => { setPicked(id); setError(""); setNote(""); }} />
               )}
               <Grid tiles={tiles} isAdmin={isAdmin} featured={!q.trim()}
@@ -367,57 +398,128 @@ export function needsScan(summary) {
   return summary.status === "failed";
 }
 
+/** What a source reads, for a listing: "all catalogs" for one that reads
+ * everything its sign-in can see (the server's own word for it). */
+export function scopeText(inst) {
+  return inst.everything ? "all catalogs" : inst.namespace || "";
+}
+
 /**
- * Every connected source in one place, for administrators: what Studio has
- * scanned from it (the metadata Auto routes questions with) and a Rediscover
- * button — the line each integration shows under its connection, without
- * having to know which tile a source was connected through. Stateless: the
- * scan status and the rescans in flight belong to the marketplace.
+ * Connected sources grouped by sign-in — one entry per account. A source whose
+ * sign-in Studio does not know (demo; a built-in one not set up here) is its
+ * own entry. Exported for tests.
  */
-export function ConnectedSources({ tiles, scans, rescanning, onRediscover, onPick }) {
-  const rows = tiles.flatMap((tile) => tile.id === "github" || tile.id === "m365"
-    || SEND_TO.includes(tile.id) ? []
-    : tile.instances.filter((i) => i.configured && !i.disconnected).map((inst) => ({ tile, inst })))
-    .sort((a, b) => a.inst.name.localeCompare(b.inst.name));
-  if (!rows.length) return null;
+export function signInGroups(tiles) {
+  const groups = new Map();
+  for (const tile of tiles) {
+    if (tile.id === "github" || tile.id === "m365" || SEND_TO.includes(tile.id)) continue;
+    for (const inst of tile.instances) {
+      if (!inst.configured || inst.disconnected) continue;
+      const key = inst.account ? `${tile.id}\u0000${inst.account}` : `\u0000${inst.name}`;
+      if (!groups.has(key)) groups.set(key, { key, tile, sources: [] });
+      groups.get(key).sources.push(inst);
+    }
+  }
+  return [...groups.values()]
+    .map((g) => ({ ...g, sources: [...g.sources].sort((a, b) => a.name.localeCompare(b.name)) }))
+    .sort((a, b) => a.sources[0].name.localeCompare(b.sources[0].name));
+}
+
+/** Which source “Combine into one” keeps: one that already reads everything,
+ * else the first by name. */
+export function keeperOf(group) {
+  return group.sources.find((s) => s.everything) || group.sources[0];
+}
+
+/** A group that is one sign-in connected several times where one source could
+ * read all of it: “Combine into one” applies (connections made here only). */
+export function combinable(group) {
+  return group.sources.length > 1 && !!group.tile.spans
+    && group.sources.every((s) => s.kind === "user" && s.connId);
+}
+
+/**
+ * Every connected source in one place, for administrators: one compact line
+ * per sign-in — what it reads, what Studio has scanned from it (the metadata
+ * Auto routes questions with) and a Rediscover button. One sign-in connected
+ * several times shows as one entry, with “Combine into one” where a single
+ * source can read it all. Stateless: the scan status, the rescans and the
+ * combine in flight belong to the marketplace.
+ */
+export function ConnectedSources({ tiles, scans, rescanning, onRediscover, onPick,
+                                   onCombine = null, combining = "" }) {
+  const groups = signInGroups(tiles);
+  if (!groups.length) return null;
+  const names = groups.flatMap((g) => g.sources.map((s) => s.name));
   const running = (name) => rescanning.includes(name)
     || ["queued", "running"].includes(scans[name]?.status);
-  const waiting = rows.map(({ inst }) => inst.name)
-    .filter((name) => needsScan(scans[name]) && !running(name));
+  const waiting = names.filter((name) => needsScan(scans[name]) && !running(name));
+  const scanned = (inst) => (
+    <span className="metadata-line meta"
+          title={scans[inst.name]?.error || scans[inst.name]?.mirror_error || ""}>
+      <span>{metadataText(scans[inst.name]).replace(/^Metadata: /, "")}</span>
+      <button className="chip" onClick={() => onRediscover([inst.name])}
+              disabled={running(inst.name)} title={`Read ${inst.name}'s tables and columns again`}>
+        {running(inst.name) ? "discovering…" : "↻ Rediscover"}
+      </button>
+    </span>
+  );
 
   return (
     <section className="conn-group conn-connected" aria-label="Connected sources">
       <div className="conn-group-title conn-connected-head">
-        <span>Connected sources</span>
+        <span>Connected · {groups.length}</span>
         {waiting.length > 0 && (
           <button className="chip" onClick={() => onRediscover(waiting)}>
             ↻ Rediscover {waiting.length} not scanned
           </button>
         )}
       </div>
-      <div className="meta conn-connected-note">
-        What Studio has read from each source — its tables, columns and keys. Auto picks the
-        source for a question from this.
-      </div>
-      <div className="conn-instances">
-        {rows.map(({ tile, inst }) => (
-          <div key={inst.name} className="dbconn-row">
-            <SourceIcon id={tile.id} size={20} />
-            <b>{inst.name}</b>
-            <span className="meta">{tile.meta.label}{inst.hint ? ` · ${inst.hint}` : ""}</span>
-            <button className="chip conn-connected-open" onClick={() => onPick(tile.id)}>
-              Manage
-            </button>
-            <div className="metadata-line meta"
-                 title={scans[inst.name]?.error || scans[inst.name]?.mirror_error || ""}>
-              <span>{metadataText(scans[inst.name])}</span>
-              <button className="chip" onClick={() => onRediscover([inst.name])}
-                      disabled={running(inst.name)}>
-                {running(inst.name) ? "discovering…" : "↻ Rediscover"}
-              </button>
+      <div className="conn-connected-list">
+        {groups.map((g) => {
+          const many = g.sources.length > 1;
+          const first = g.sources[0];
+          const where = many ? [g.tile.meta.label, first.hint]
+            : [g.tile.meta.label, first.hint, scopeText(first)];
+          return (
+            <div key={g.key} className={`conn-connected-row${combinable(g) ? " conn-connected-dup" : ""}`}>
+              <div className="conn-connected-line">
+                <SourceIcon id={g.tile.id} size={18} />
+                <b>{many ? g.tile.meta.label : first.name}</b>
+                <span className="meta conn-connected-where">
+                  {where.filter(Boolean).slice(many ? 1 : 0).join(" · ")}
+                </span>
+                {!many && scanned(first)}
+                <button className="chip conn-connected-open" onClick={() => onPick(g.tile.id)}>
+                  Manage
+                </button>
+              </div>
+              {many && (
+                <>
+                  <div className="meta conn-connected-why">
+                    {combinable(g)
+                      ? `One sign-in connected ${g.sources.length} times — each reads part of the `
+                        + "same data. One source can read all of it."
+                      : `${g.sources.length} schemas through one sign-in.`}
+                    {combinable(g) && onCombine && (
+                      <button className="chip conn-combine" onClick={() => onCombine(g)}
+                              disabled={!!combining}>
+                        {combining === g.key ? "combining…" : "⧉ Combine into one"}
+                      </button>
+                    )}
+                  </div>
+                  {g.sources.map((inst) => (
+                    <div key={inst.name} className="conn-connected-sub">
+                      <b>{inst.name}</b>
+                      <span className="meta conn-connected-where">{scopeText(inst)}</span>
+                      {scanned(inst)}
+                    </div>
+                  ))}
+                </>
+              )}
             </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
     </section>
   );
@@ -495,72 +597,57 @@ function Tile({ tile, isAdmin, onPick }) {
 
 // ── Connect: credentials, then which schemas to bind ─────────────────────
 //
-// Tableau's shape: sign in to the server, then choose what to work with. The
-// second step is the one that needs care. A Studio source is pinned to ONE
-// namespace — qualifiers() refuses every other one, and allowed_tables()
-// matches BARE table names, so a source spanning two schemas would let a grant
-// for `orders` admit the other schema's `orders` as well. So picking three
-// schemas creates three sources, each pinned, each independently grantable in
-// Governance. Browsing only decides what to bind; it never widens a binding.
+// Tableau's shape: sign in to the server, then choose what to work with — and
+// one sign-in is one source. Where the connector can read everything from one
+// source (Databricks: schema "*", every table named catalog.schema.table, so a
+// grant for one `orders` never admits another schema's), that is the default.
+// Where a source reads one schema (Postgres, Snowflake…), the pick says which.
+// The server refuses a second connection with a sign-in already here when it
+// would read any of the same data (connections._refuse_duplicate).
 
-/**
- * Allocate an opaque sibling name (sales-pg-1, sales-pg-2, ...).
- *
- * Source names are visible in the disabled picker even when the caller cannot
- * access their catalog.  Putting a schema name into this public identifier
- * would undo the backend's namespace redaction, so the authorized UI shows the
- * namespace separately and the stored source name stays opaque.
- */
-function nameForNamespace(base, taken) {
-  for (let i = 1; i < 10000; i++) {
-    const suffix = `-${i}`;
-    // Reserve room for the suffix. Appending and then slicing would erase it
-    // when base is already at the server's 31-character limit.
-    const stem = base.slice(0, 31 - suffix.length).replace(/[-_]$/, "");
-    const next = `${stem}${suffix}`;
-    if (!taken.has(next)) return next;
-  }
-  throw new Error("Could not generate a unique source name");
+/** The config to POST: the form as typed, pinned to the namespace picked. */
+export function pinnedConfig({ cfg, ns, chosen = null }) {
+  if (!chosen) return cfg;
+  return {
+    ...cfg,
+    [ns.schema]: chosen.schema,
+    ...(ns.database && chosen.database ? { [ns.database]: chosen.database } : {}),
+    // "Everything the credential can see" spans catalogs: no catalog pin,
+    // whatever was typed in that field.
+    ...(ns.database && chosen.schema === ALL && !chosen.database ? { [ns.database]: "" } : {}),
+  };
 }
 
-/**
- * What to POST for the schemas the admin picked: one source per namespace,
- * each carrying the same credential but pinned to its own database/schema.
- *
- * Picking nothing (or a connector with no namespaces, like Neo4j) plans the
- * single source the form already describes. Exported for testing — this is
- * where "three schemas" becomes "three independently governed sources".
- */
-export function planConnections({ cfg, ns, name, chosen = [], takenNames = new Set() }) {
-  const base = String(name || "").trim();
-  const plan = chosen.length
-    ? chosen.map((n) => ({
-        ns: n,
-        config: {
-          ...cfg,
-          [ns.schema]: n.schema,
-          ...(ns.database && n.database ? { [ns.database]: n.database } : {}),
-          // "Everything the credential can see" spans catalogs: no catalog pin,
-          // whatever was typed in that field.
-          ...(ns.database && n.schema === ALL && !n.database ? { [ns.database]: "" } : {}),
-        },
-      }))
-    : [{ ns: null, config: cfg }];
+/** Whether two {database, schema} scopes read any of the same data — the
+ * server's rule (connections._overlaps), to mark picks already connected. */
+export function overlaps(a, b) {
+  const same = (a.database || "") === (b.database || "") && a.schema === b.schema;
+  const covers = (x, y) => x.schema === ALL && (!x.database || x.database === (y.database || ""));
+  return same || covers(a, b) || covers(b, a);
+}
 
-  // Names are reserved as we go, so two picked schemas cannot collide with
-  // each other any more than with a source that already exists.
-  const taken = new Set(takenNames);
-  return plan.map((p) => {
-    // One selected namespace normally keeps the typed name.  If that name is
-    // already used, it still needs the same namespace suffixing path as a
-    // multi-selection; the form deliberately allows a taken prefix once a
-    // namespace is selected.
-    const sourceName = plan.length === 1 && (!p.ns || !taken.has(base))
-      ? base
-      : nameForNamespace(base, taken);
-    taken.add(sourceName);
-    return { ...p, name: sourceName };
-  });
+/** "a", "a and b", "a, b and c". */
+export function listNames(names) {
+  return names.length > 1 ? `${names.slice(0, -1).join(", ")} and ${names.at(-1)}` : names[0] || "";
+}
+
+/** What “Read everything” / “Combine into one” asks before it acts. */
+export function everythingQuestion(name, others = []) {
+  return `Make “${name}” read everything this sign-in can see?`
+    + (others.length
+      ? ` ${listNames(others.map((o) => `“${o}”`))} ${others.length > 1 ? "use" : "uses"} the same `
+        + `sign-in and will be removed — chats and grants that name ${others.length > 1 ? "them" : "it"} `
+        + "stop working."
+      : "")
+    + " Its tables will be named catalog.schema.table, so roles need them granted again in "
+    + "Governance.";
+}
+
+/** What to say once a source reads everything (POST …/everything). */
+export function combinedNote(out) {
+  return `“${out.name}” now reads everything this sign-in can see`
+    + (out.removed?.length ? ` — removed ${listNames(out.removed.map((n) => `“${n}”`))}` : "")
+    + ". Its tables are being rediscovered.";
 }
 
 /** A schema value meaning every schema (Databricks: as one source, tables
@@ -576,20 +663,12 @@ export function namespaceLabel(n) {
 /** What the picker shows for a namespace. */
 export function schemaLabel(n) {
   if (n?.schema !== ALL) return n?.schema;
-  return n.database ? "✳ all schemas — one source" : "✳ everything this credential can see — one source";
+  return n.database ? "✳ all schemas — one source"
+    : "✳ everything this credential can see — one source (recommended)";
 }
 
 export function namespaceKey(n) {
   return `${n?.database || ""}\u0000${n?.schema || ""}`;
-}
-
-/** Remove only namespaces whose POSTs actually succeeded after a partial run. */
-export function remainingPickedNamespaces(picked, named, completedNames) {
-  const completed = new Set(completedNames);
-  const landedKeys = new Set(named
-    .filter((p) => p.ns && completed.has(p.name))
-    .map((p) => namespaceKey(p.ns)));
-  return picked.filter((key) => !landedKeys.has(key));
 }
 
 /** Which actions the current credential/scope values can safely enable. */
@@ -626,10 +705,8 @@ export function ConnectForm({ tile, preset, defaultName, takenNames, onDone, onE
   const [cfg, setCfg] = useState(initial);
   const [test, setTest] = useState(null);       // null | {ok, tables?, sample?, error?}
   const [browse, setBrowse] = useState(null);   // null | {ok, namespaces[], error?}
-  const [picked, setPicked] = useState([]);     // "db\u0000schema" keys
-  const [landedNames, setLandedNames] = useState([]); // successes from a partial batch
+  const [picked, setPicked] = useState([]);     // the one "db\u0000schema" key picked, or none
   const [busy, setBusy] = useState("");
-  const [progress, setProgress] = useState("");
   // A built-in source being re-pointed with this form (its name), or "".
   const [replacing, setReplacing] = useState("");
   const [rowBusy, setRowBusy] = useState("");
@@ -646,6 +723,11 @@ export function ConnectForm({ tile, preset, defaultName, takenNames, onDone, onE
   // (Neo4j does not) and the type says which fields a pick writes into.
   const canBrowse = !!ns.schema;
   const key = namespaceKey;
+  // One source can read everything this sign-in sees (Databricks): the default.
+  const spans = !!tile.spans;
+  // Sources this sign-in is already connected as that read (some of) `n`.
+  const takenBy = (result, n) => (result?.connected_as || [])
+    .filter((c) => overlaps(c, n)).map((c) => c.name);
 
   async function runTest() {
     setBusy(canBrowse ? "browse" : "test");
@@ -659,7 +741,11 @@ export function ConnectForm({ tile, preset, defaultName, takenNames, onDone, onE
           method: "POST", body: JSON.stringify({ ctype, config: cfg }),
         });
         setBrowse(result);
-        if (result.ok) setTest({ ok: true, discovery: true });
+        if (result.ok) {
+          setTest({ ok: true, discovery: true });
+          const every = spans && (result.namespaces || []).find((n) => n.schema === ALL && !n.database);
+          if (every && !takenBy(result, every).length) setPicked([key(every)]);
+        }
       } else {
         setTest(await api("/connections/test", {
           method: "POST", body: JSON.stringify({ ctype, config: cfg }),
@@ -699,59 +785,22 @@ export function ConnectForm({ tile, preset, defaultName, takenNames, onDone, onE
     if (replacing) return saveReplacement();
     setBusy("save");
     onError("");
-    const effectiveTaken = new Set([...takenNames, ...landedNames]);
-    const named = planConnections({ cfg, ns, name, chosen, takenNames: effectiveTaken });
-
-    // Sequential, not parallel: each POST re-probes the warehouse, and a
-    // partial failure has to name the source that failed and keep the ones
-    // that already landed rather than leaving an indeterminate set.
-    const done = [];
-    const skipped = [];   // picked schemas that signed in but hold nothing readable
-    for (const [i, p] of named.entries()) {
-      setProgress(`connecting ${p.name} (${i + 1} of ${named.length})…`);
-      try {
-        await api("/connections", {
-          method: "POST",
-          body: JSON.stringify({ name: p.name, ctype, config: p.config }),
-        });
-        done.push(p.name);
-      } catch (e) {
-        if (named.length > 1 && p.ns && e.detail?.stage === "signed_in"
-            && e.detail?.fields?.[ns.schema]) {
-          skipped.push(namespaceLabel(p.ns));   // keep going with the others
-          continue;
-        }
-        setBusy("");
-        setProgress("");
-        if (!done.length && refusedSave(e)) return;
-        onError(done.length
-          ? `Connected ${done.join(", ")}, then “${p.name}” failed: ${e.message}`
-          : e.message);
-        if (done.length) {
-          // A retry must target only the namespaces that did not land. Keep a
-          // local name reservation too: the parent's reload is asynchronous,
-          // so a fast second click must not plan a colliding source name.
-          setPicked((current) => remainingPickedNamespaces(current, named, done));
-          setLandedNames((current) => [...new Set([...current, ...done])]);
-          onRemoved();                  // reload so the landed sources show
-        }
-        return;
-      }
+    try {
+      const made = await api("/connections", {
+        method: "POST",
+        body: JSON.stringify({ name: trimmed, ctype,
+                               config: pinnedConfig({ cfg, ns, chosen: chosen[0] || null }) }),
+      });
+      onDone(made?.everything
+        ? `Connected — “${trimmed}” reads everything this sign-in can see, and is in the chat `
+          + "picker now (open a new chat or refresh to see it)."
+        : `Connected — “${trimmed}” is now a source in the chat picker (open a new chat or `
+          + "refresh to see it).");
+    } catch (e) {
+      if (!refusedSave(e)) onError(e.message);
+    } finally {
+      setBusy("");
     }
-    setBusy("");
-    setProgress("");
-    const skippedNote = skipped.length
-      ? ` Skipped ${skipped.join(", ")} — no tables this token can see.` : "";
-    if (!done.length) {
-      onError(`None of the picked schemas has tables this token can see (${skipped.join(", ")}). `
-        + "Pick schemas that show a table count, or grant the token USE CATALOG, USE SCHEMA "
-        + "and SELECT.");
-      return;
-    }
-    onDone((done.length === 1
-      ? `Connected — “${done[0]}” is now a source in the chat picker (open a new chat or refresh to see it).`
-      : `Connected ${done.length} sources — ${done.join(", ")} — each scoped to its own schema.`)
-      + skippedNote);
   }
 
   // Re-point a built-in source. ONE namespace: it stays one source with one
@@ -759,8 +808,7 @@ export function ConnectForm({ tile, preset, defaultName, takenNames, onDone, onE
   async function saveReplacement() {
     setBusy("save");
     onError("");
-    const config = chosen.length === 1
-      ? planConnections({ cfg, ns, name: replacing, chosen })[0].config : cfg;
+    const config = chosen.length === 1 ? pinnedConfig({ cfg, ns, chosen: chosen[0] }) : cfg;
     try {
       await api(`/connections/env/${encodeURIComponent(replacing)}`, {
         method: "PUT", body: JSON.stringify({ config }),
@@ -821,6 +869,21 @@ export function ConnectForm({ tile, preset, defaultName, takenNames, onDone, onE
       setAdding((a) => (a === inst.name ? "" : inst.name));
       return;
     }
+    if (verb === "everything") {
+      const others = tile.instances.filter((o) => o !== inst && o.kind === "user" && o.account
+        && o.account === inst.account).map((o) => o.name);
+      if (!confirm(everythingQuestion(inst.name, others))) return;
+      setRowBusy(`everything:${inst.name}`);
+      onError("");
+      try {
+        onDone(combinedNote(await api(`/connections/${inst.connId}/everything`, { method: "POST" })));
+      } catch (e) {
+        onError(e.message);
+      } finally {
+        setRowBusy("");
+      }
+      return;
+    }
     const ask = {
       disconnect: `Disconnect “${inst.name}”? It leaves the chat picker and queries against it stop, `
         + "but the credential is kept so you can reconnect without re-entering it.",
@@ -842,12 +905,12 @@ export function ConnectForm({ tile, preset, defaultName, takenNames, onDone, onE
   }
 
   const trimmed = name.trim();
-  const effectiveTakenNames = new Set([...takenNames, ...landedNames]);
-  const nameOk = NAME_RE.test(trimmed) && !effectiveTakenNames.has(trimmed);
+  const nameUsable = NAME_RE.test(trimmed) && !takenNames.has(trimmed);
   const { credentialsFilled, saveFilled } = connectionReadiness({ fields, ns, cfg, chosen });
-  // With schemas picked the name is a PREFIX, so a collision on the bare name
-  // is fine — nameForNamespace suffixes each one and dodges what is taken.
-  const nameUsable = chosen.length ? NAME_RE.test(trimmed) : nameOk;
+  // What this sign-in is already connected as (after signing in), and the one
+  // that already reads everything, when there is one: nothing left to connect.
+  const connectedAs = browse?.ok ? browse.connected_as || [] : [];
+  const whole = connectedAs.find((c) => c.everything);
 
   return (
     <div className="conn-detail">
@@ -893,22 +956,16 @@ export function ConnectForm({ tile, preset, defaultName, takenNames, onDone, onE
         ))}
         {!replacing && (
           <label className="conn-field">
-            <span className="conn-label">
-              {chosen.length > 1 ? "Name these in Studio (prefix)" : "Name it in Studio"}
-            </span>
+            <span className="conn-label">Name it in Studio</span>
             <input value={name} onChange={(e) => setName(e.target.value)}
                    disabled={!!busy} {...NO_AUTOFILL} autoComplete="off" />
           </label>
         )}
       </div>
 
-      {replacing && chosen.length > 1 && (
-        <div className="meta conn-warn">Pick one — “{replacing}” reads exactly one schema.</div>
-      )}
-
       {!replacing && trimmed && !nameUsable && (
         <div className="meta conn-warn">
-          {effectiveTakenNames.has(trimmed) && !chosen.length
+          {takenNames.has(trimmed)
             ? `A source named “${trimmed}” already exists — pick another name.`
             : "Name must be 2–31 characters: lowercase letters, digits, - or _."}
         </div>
@@ -937,8 +994,22 @@ export function ConnectForm({ tile, preset, defaultName, takenNames, onDone, onE
           Signing in to the workspace — up to a minute if the SQL warehouse is starting.
         </div>
       )}
-      {browse && !formRefused && <Namespaces
-        browse={browse} picked={picked} setPicked={setPicked} keyOf={key} />}
+      {connectedAs.length > 0 && !replacing && (
+        <div className="meta conn-warn conn-already" role="status">
+          {whole ? (
+            <>This sign-in is already connected as <b>{whole.name}</b>, which reads everything it
+              can see — there is nothing more to connect. Use {whole.name}.</>
+          ) : (
+            <>This sign-in is already connected as{" "}
+              {listNames(connectedAs.map((c) => `${c.name} (${c.namespace || "default"})`))}.{" "}
+              {spans ? "To read everything with one source, use Combine into one under Connected."
+                : "Pick another schema, or use that source."}</>
+          )}
+        </div>
+      )}
+      {browse && !formRefused && !whole && <Namespaces single
+        browse={browse} picked={picked} setPicked={setPicked} keyOf={key}
+        takenBy={(n) => takenBy(browse, n)} />}
 
       <div className="m365-actions">
         <button className="chip" onClick={runTest} disabled={!!busy || !credentialsFilled}>
@@ -946,17 +1017,19 @@ export function ConnectForm({ tile, preset, defaultName, takenNames, onDone, onE
             : canBrowse ? "⚡ Sign in and list schemas" : "⚡ Test connection"}
         </button>
         <button className="primary" onClick={save}
-          disabled={!!busy || !saveFilled || (replacing ? chosen.length > 1 : !nameUsable)}>
-          {busy === "save" ? (progress || "connecting…")
-            : replacing ? `✓ Use for “${replacing}”`
-            : chosen.length > 1 ? `✓ Connect ${chosen.length} schemas` : "✓ Connect"}
+          disabled={!!busy || !saveFilled || (!replacing && (!nameUsable || !!whole))}>
+          {busy === "save" ? "connecting…"
+            : replacing ? `✓ Use for “${replacing}”` : "✓ Connect"}
         </button>
       </div>
       <div className="meta">
-        Credentials are encrypted at rest and never displayed again.{" "}
-        {ns.schema
-          ? "Each schema becomes its own source, scoped and granted separately — grant them " +
-            "to other roles in Governance."
+        Credentials are encrypted at rest and never displayed again. One sign-in is connected
+        once.{" "}
+        {spans
+          ? "One source reads every catalog and schema this credential can see — grant its " +
+            "tables to other roles in Governance."
+          : ns.schema
+          ? "The source reads the schema you pick — grant it to other roles in Governance."
           : "Only administrators reach a new source until it is granted to other roles in " +
             "Governance."}
       </div>
@@ -1069,7 +1142,8 @@ function AddSchemas({ source, takenNames, onDone, onError, onPartial, onCancel }
 }
 
 /** The picked-schema checklist, grouped by database / catalog / project. */
-export function Namespaces({ browse, picked, setPicked, keyOf, current = null,
+export function Namespaces({ browse, picked, setPicked, keyOf, current = null, single = false,
+                             takenBy = null,
                              failHint = "Type the schema in the field above and connect — this only affects the picker, not the connection.",
                              emptyHint = "No schemas visible to this account — type one above." }) {
   if (!browse.ok) {
@@ -1098,16 +1172,18 @@ export function Namespaces({ browse, picked, setPicked, keyOf, current = null,
   }
 
   function toggle(k) {
-    setPicked((p) => p.includes(k) ? p.filter((x) => x !== k) : [...p, k]);
+    if (single) setPicked((p) => (p.includes(k) ? [] : [k]));
+    else setPicked((p) => p.includes(k) ? p.filter((x) => x !== k) : [...p, k]);
   }
 
   return (
     <div className="conn-ns">
       <div className="conn-ns-head">
         <span className="conn-label">
-          Schemas this account can see — pick the ones to add as sources
+          {single ? "What this source reads — pick one"
+            : "Schemas this account can see — pick the ones to add as sources"}
         </span>
-        <span className="meta">{picked.length} selected</span>
+        {!single && <span className="meta">{picked.length} selected</span>}
       </div>
       {groups.map((g) => (
         <div key={g.db} className="conn-ns-group">
@@ -1117,13 +1193,16 @@ export function Namespaces({ browse, picked, setPicked, keyOf, current = null,
               const k = keyOf(n);
               const here = isCurrent(n);
               const empty = n.tables === 0;
+              const owners = takenBy ? takenBy(n) : [];
               return (
                 <label key={k} title={empty ? "No tables this credential can see" : undefined}
                        className={`conn-ns-item${picked.includes(k) ? " conn-ns-on" : ""}${empty ? " conn-ns-empty" : ""}`}>
-                  <input type="checkbox" checked={here || picked.includes(k)}
-                         disabled={here || (empty && !picked.includes(k))} onChange={() => toggle(k)} />
+                  <input type={single ? "radio" : "checkbox"} checked={here || picked.includes(k)}
+                         disabled={here || owners.length > 0 || (empty && !picked.includes(k))}
+                         onChange={() => toggle(k)} />
                   <span>{schemaLabel(n)}</span>
                   {here && <span className="meta"> (this source)</span>}
+                  {owners.length > 0 && <span className="meta"> (connected as {owners.join(", ")})</span>}
                   {typeof n.tables === "number" && (
                     <span className="meta">{empty ? "empty" : `${n.tables} table${n.tables === 1 ? "" : "s"}`}</span>
                   )}
@@ -1236,20 +1315,32 @@ export function Instances({ tile, onAct, onManage, busy = "" }) {
   // Any live source of a type with schemas can bind more of them — the
   // env-configured one included, since that reuses its credential and changes
   // nothing about the source itself.
-  const canAdd = (i) => !!tile.ns?.schema && i.configured && !i.disconnected;
+  const canAdd = (i) => !!tile.ns?.schema && !tile.spans && i.configured && !i.disconnected;
+  // Where one source can read everything (Databricks), a row that reads part
+  // of it widens instead — and takes the other copies of its sign-in with it.
+  const canWiden = (i) => !!tile.spans && i.kind === "user" && i.configured && !i.disconnected
+    && !i.everything;
   return (
     <div className="conn-instances">
       {tile.instances.map((i) => (
         <div key={i.name} className={`dbconn-row${i.disconnected ? " dbconn-row-off" : ""}`}>
           <SourceIcon id={tile.id} size={20} />
           <b>{i.name}</b>
-          {i.hint && <span className="meta">{i.hint}</span>}
+          {(i.hint || i.namespace || i.everything) && (
+            <span className="meta">{[i.hint, scopeText(i)].filter(Boolean).join(" · ")}</span>
+          )}
           <span className={`m365-badge${i.configured ? " m365-badge-on" : " m365-badge-off"}`}>
             {instanceBadge(i)}
           </span>
           {onAct && canAdd(i) && (
             <button className="chip" onClick={() => onAct(i, "schemas")} disabled={!!busy}>
               ＋ Add schemas
+            </button>
+          )}
+          {onAct && canWiden(i) && (
+            <button className="chip" onClick={() => onAct(i, "everything")} disabled={!!busy}
+                    title="One source for every catalog and schema this sign-in can see">
+              {is("everything", i) ? "working…" : "✳ Read everything"}
             </button>
           )}
           {onManage && envActions(i).map((verb) => (

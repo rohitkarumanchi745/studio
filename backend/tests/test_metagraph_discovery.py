@@ -147,7 +147,7 @@ def test_discovers_all_seven_retail_tables_plus_the_view(env, bulk):
 
 
 def test_saving_a_connection_queues_discovery_with_the_row(env):
-    env.mp.setattr(env.connections, "_probe", lambda ctype, cfg: {"ok": True})
+    env.mp.setattr(env.connections, "_probe", lambda ctype, cfg, *checks: {"ok": True})
     env.mp.setattr(env.connections, "_require_pin", lambda *a, **k: None)
     env.connections._create(ADMIN, "retail-qa", "postgres",
                             {"host": "h", "database": "d", "user": "u", "password": "p",
@@ -162,7 +162,7 @@ def test_saving_a_connection_queues_discovery_with_the_row(env):
 
 
 def test_a_failed_save_queues_nothing(env):
-    env.mp.setattr(env.connections, "_probe", lambda ctype, cfg: {"ok": False, "error": "no"})
+    env.mp.setattr(env.connections, "_probe", lambda ctype, cfg, *checks: {"ok": False, "error": "no"})
     env.mp.setattr(env.connections, "_require_pin", lambda *a, **k: None)
     with pytest.raises(Exception):
         env.connections._create(ADMIN, "retail-qa", "postgres", {"host": "h"}, {"host": "h"})
