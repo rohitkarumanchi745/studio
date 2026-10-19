@@ -14,6 +14,7 @@ import { applyFormat } from "./renderers/format";
 import PlotlyView, { PLOTLY_TYPES } from "./renderers/PlotlyView";
 import VegaView, { VEGA_TYPES } from "./renderers/VegaView";
 import ArtifactView, { downloadArtifact } from "./renderers/ArtifactView";
+import { base64Text, downloadPng } from "../exporting";
 import VisualControls from "./VisualControls";
 import VizFrame from "./VizFrame";
 import { EMPTY_STATE, applyControls, detectControls } from "./visualFilters";
@@ -145,6 +146,37 @@ export function computeFit(columns, rows, spec) {
   return fit;
 }
 
+/**
+ * A chart as an SVG data URL, drawn by ECharts with no screen at all (its
+ * server-side renderer) — what a report embeds, so a chart is in the report
+ * even when it is not open anywhere. null for a table, a KPI card, a type
+ * the data does not fit, or one only D3 draws.
+ */
+export function chartImage(columns, rows, chart, { width = 900, height = 420 } = {}) {
+  if (!chart || !columns?.length || !rows?.length) return null;
+  const type = chart.type || "table";
+  const spec = { ...chart, type };
+  if (computeFit(columns, rows, spec)[type]?.ok === false) return null;
+  let option;
+  try {
+    option = buildOption(columns, rows, spec);
+    if (!option) return null;
+    const res = applyFormat(option, spec, { columns, rows });
+    option = res?.option || res || option;
+  } catch {
+    return null;
+  }
+  const inst = echarts.init(null, null, { renderer: "svg", ssr: true, width, height });
+  try {
+    inst.setOption({ ...option, animation: false, backgroundColor: "#ffffff" });
+    return `data:image/svg+xml;base64,${base64Text(inst.renderToSVGString())}`;
+  } catch {
+    return null;
+  } finally {
+    inst.dispose();
+  }
+}
+
 export default function ChartView({
   columns, rows, chart, tall, plain,
   // A custom visual the agent wrote as code (backend app/visuals.py): shown
@@ -175,6 +207,7 @@ export default function ChartView({
   const [showVisual, setShowVisual] = useState(true);
   const [showCode, setShowCode] = useState(false);
   const [saveError, setSaveError] = useState("");
+  const bodyRef = useRef(null);         // the drawn chart, for ⬇ PNG
   useEffect(() => { setShowVisual(true); setShowCode(false); setSaveError(""); }, [visual?.code]);
 
   // The D3 & artifacts window puts a filter bar over every visual — a date
@@ -296,6 +329,13 @@ export default function ChartView({
           ))}
         </select>
         )}
+        {plottable && !(typeOk && type === "kpi" && !d3Only) && (
+          <button className="chip" title="Save this chart as a PNG image"
+            onClick={() => downloadPng(bodyRef.current, chart?.title || LABELS[type])
+              .catch((e) => setSaveError(String(e?.message || e)))}>
+            ⬇ PNG
+          </button>
+        )}
         <select className="type-select" value={type} onChange={(e) => setType(e.target.value)}>
           {(d3Only ? D3_GROUPS : TYPE_GROUPS).map(([g, ts]) => (
             <optgroup key={g} label={g}>
@@ -311,6 +351,7 @@ export default function ChartView({
       </div>
       )}
       {filterBar}
+      {saveError && <div className="chart-note">Could not save the image: {saveError}</div>}
       {!typeOk && (
         <div className="chart-note">
           {LABELS[type]} doesn’t fit this data — {fit[type]?.reason}.
@@ -324,6 +365,7 @@ export default function ChartView({
           with ECharts instead.
         </div>
       )}
+      <div className="chart-body" ref={bodyRef}>
       {typeOk && type === "kpi" && spec && !d3Only ? (
         <KpiCard columns={columns} rows={rows} spec={spec} />
       ) : plottable && drawEngine === "plotly" ? (
@@ -343,6 +385,7 @@ export default function ChartView({
       ) : (
         <DataTable columns={columns} rows={rows} />
       )}
+      </div>
     </div>
   );
 }

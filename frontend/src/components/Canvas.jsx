@@ -4,8 +4,31 @@
 // here is a LOCAL copy — source tables are never modified.
 import { useMemo, useState } from "react";
 import { api } from "../api";
-import ChartView, { LABELS, computeFit } from "./ChartView";
+import ChartView, { LABELS, chartImage, computeFit } from "./ChartView";
 import EncodingShelf, { deriveRenderData } from "./EncodingShelf";
+import { downloadReport, downloadTable } from "../exporting";
+
+/** The canvas as a report: every view's chart (as edited), data and SQL. */
+export function canvasReport(state, title) {
+  const panels = state.panels || [];
+  return {
+    title,
+    subtitle: state.source && state.source !== "*" ? state.source : undefined,
+    sections: panels.map((p, i) => {
+      // One view draws through the encoding shelf (a Color channel may pivot it).
+      const rd = panels.length === 1 && p.chart ? deriveRenderData(p.columns, p.rows, p.chart)
+        : { columns: p.columns, rows: p.rows, spec: p.chart };
+      return {
+        title: p.chart?.title || (panels.length > 1 ? `View ${i + 1}` : "Result"),
+        image: chartImage(rd.columns, rd.rows, rd.spec),
+        columns: p.columns || [],
+        rows: p.rows || [],
+        sql: p.sql || null,
+        source: state.source && state.source !== "*" ? state.source : null,
+      };
+    }),
+  };
+}
 
 export default function Canvas({ state, setState, onClose, chatOpen, onToggleChat, conversationId, tableLabel, onNewVersion, onOpenDashboard }) {
   const { panels, selected, note, original } = state;
@@ -130,6 +153,20 @@ export default function Canvas({ state, setState, onClose, chatOpen, onToggleCha
     }
   }
 
+  async function save(kind) {
+    const title = cur?.chart?.title || "Canvas";
+    setState((s) => ({ ...s, note: kind === "report" ? "Building the report…" : "Preparing the file…" }));
+    try {
+      const name = kind === "report"
+        ? await downloadReport(canvasReport(state, panels.length > 1 ? `${panels.length} views` : title))
+        : await downloadTable(kind, { title, columns: cur.columns, rows: cur.rows, sql: cur.sql,
+                                      source: state.source });
+      setState((s) => ({ ...s, note: `Saved ${name}.` }));
+    } catch (e) {
+      setState((s) => ({ ...s, note: `Download failed: ${e.message}` }));
+    }
+  }
+
   function reset() {
     setState({
       ...state,
@@ -164,6 +201,18 @@ export default function Canvas({ state, setState, onClose, chatOpen, onToggleCha
           <button className="chip" onClick={pin} disabled={busy} title="Pin this chart to a dashboard">
             📌 pin
           </button>
+          {cur?.rows?.length > 0 && (
+            <>
+              <button className="chip" onClick={() => save("csv")}
+                      title="Download this view's data, edits included, as CSV">⬇ CSV</button>
+              <button className="chip" onClick={() => save("xlsx")}
+                      title="Download this view's data, edits included, as an Excel workbook">⬇ Excel</button>
+              <button className="chip" onClick={() => save("report")}
+                      title="Download every view — charts, data and SQL — as one HTML page (print it to PDF)">
+                ⬇ Report
+              </button>
+            </>
+          )}
           <button className="chip" onClick={reset}>reset edits</button>
           {onToggleChat && (
             <button className="chip" onClick={onToggleChat}>
