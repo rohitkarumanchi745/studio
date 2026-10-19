@@ -17,7 +17,7 @@ const require = createRequire(import.meta.url);
 let hooks = null;
 const bundle = await build({
   stdin: {
-    contents: `export {default as DataConnections, buildTiles, suggestName, planConnections, connectionReadiness, Namespaces, namespaceKey, namespaceLabel, remainingPickedNamespaces, GithubPanel, githubRegistrationReady, ConnectForm, instanceBadge, envActions, userActions, Instances, planSchemaAdds, marketplaceStatus}
+    contents: `export {default as DataConnections, buildTiles, suggestName, pinnedConfig, overlaps, signInGroups, combinable, keeperOf, everythingQuestion, combinedNote, listNames, scopeText, ConnectedSources, connectionReadiness, Namespaces, namespaceKey, namespaceLabel, GithubPanel, githubRegistrationReady, ConnectForm, instanceBadge, envActions, userActions, Instances, planSchemaAdds, marketplaceStatus}
       from "./src/components/DataConnections.jsx";
       export {metaFor, MARKETPLACE, CATEGORIES, FEATURED} from "./src/components/sourceCatalog.jsx";`,
     resolveDir: frontend, loader: "jsx",
@@ -37,8 +37,9 @@ compiled.require = (id) => id === "react" ? {
   useCallback: (...args) => hooks ? hooks.useCallback(...args) : React.useCallback(...args),
 } : require(id);
 compiled._compile(bundle.outputFiles[0].text, compiled.filename);
-const { DataConnections, buildTiles, suggestName, planConnections, connectionReadiness,
-        Namespaces, namespaceKey, namespaceLabel, remainingPickedNamespaces, GithubPanel,
+const { DataConnections, buildTiles, suggestName, pinnedConfig, overlaps, signInGroups, combinable, keeperOf,
+        everythingQuestion, combinedNote, listNames, scopeText, ConnectedSources, connectionReadiness,
+        Namespaces, namespaceKey, namespaceLabel, GithubPanel,
         githubRegistrationReady, metaFor, ConnectForm, instanceBadge, envActions,
         marketplaceStatus, MARKETPLACE, CATEGORIES, FEATURED,
         userActions, Instances, planSchemaAdds } = compiled.exports;
@@ -434,139 +435,54 @@ test("non-admin GitHub panel has no registration or removal mutation controls", 
 
 
 // ── The schema step ─────────────────────────────────────────────────────
-// A Studio source is pinned to ONE namespace: qualifiers() refuses any other,
-// and allowed_tables() matches bare table names, so a source spanning two
-// schemas would let a grant for `orders` admit the other schema's `orders`.
-// Picking N schemas therefore has to produce N sources, not one wide one.
+// One sign-in is one source. The pick says what it reads: everything, where
+// the connector can (Databricks — full catalog.schema.table names, so a grant
+// for one `orders` never admits another), else one schema.
 
 const SF_NS = { schema: "schema", database: "database" };
 const FOUND = [{ database: "acme", schema: "public" },
                 { database: "acme", schema: "analytics" },
                 { database: "warehouse", schema: "raw" }];
 
-test("picking three schemas plans three sources, each pinned to one namespace", () => {
-  const plan = planConnections({
-    cfg: { account: "acme-prod", password: "pw", schema: "public" },
-    ns: SF_NS, name: "sales-sf", chosen: FOUND, takenNames: new Set(["demo"]),
-  });
-
-  assert.deepEqual(plan.map((p) => [p.name, p.config.database, p.config.schema]), [
-    ["sales-sf-1", "acme", "public"],
-    ["sales-sf-2", "acme", "analytics"],
-    ["sales-sf-3", "warehouse", "raw"],
-  ]);
-  // Source names are catalog-visible even to roles without access. They must
-  // not repeat namespace names that the API deliberately redacts.
-  assert.ok(plan.every((p) => !p.name.includes(p.config.schema.toLowerCase())));
-  // The credential rides along unchanged; only the namespace differs.
-  assert.ok(plan.every((p) => p.config.account === "acme-prod" && p.config.password === "pw"));
-  // No plan is a superset of another — that is the whole safety property.
-  assert.equal(new Set(plan.map((p) => p.config.schema)).size, 3);
+test("the pick pins the one source; the credential rides along unchanged", () => {
+  const cfg = { account: "acme-prod", password: "pw", database: "typed", schema: "public" };
+  assert.deepEqual(pinnedConfig({ cfg, ns: SF_NS, chosen: FOUND[2] }),
+                   { account: "acme-prod", password: "pw", database: "warehouse", schema: "raw" });
+  // Nothing picked: the form as typed.
+  assert.equal(pinnedConfig({ cfg, ns: SF_NS }), cfg);
 });
 
 test("BigQuery's namespace lands on dataset/project, not schema/database", () => {
-  const plan = planConnections({
+  const config = pinnedConfig({
     cfg: { project: "old-proj", dataset: "old", credentials_json: "{}" },
-    ns: { schema: "dataset", database: "project" }, name: "bq",
-    chosen: [{ database: "analytics-prod", schema: "Events" }],
+    ns: { schema: "dataset", database: "project" },
+    chosen: { database: "analytics-prod", schema: "Events" },
   });
-  assert.equal(plan.length, 1);
-  assert.equal(plan[0].config.dataset, "Events");   // case preserved — BigQuery is case-sensitive
-  assert.equal(plan[0].config.project, "analytics-prod");
-  assert.equal(plan[0].config.schema, undefined);
+  assert.equal(config.dataset, "Events");   // case preserved — BigQuery is case-sensitive
+  assert.equal(config.project, "analytics-prod");
+  assert.equal(config.schema, undefined);
 });
 
 test("Postgres keeps its database in the DSN and only rewrites the schema", () => {
-  const plan = planConnections({
+  const config = pinnedConfig({
     cfg: { dsn: "postgresql://u:p@h:5432/acme", schema: "public" },
-    ns: { schema: "schema", database: "" }, name: "pg",
-    chosen: [{ database: "acme", schema: "analytics" }],
+    ns: { schema: "schema", database: "" }, chosen: { database: "acme", schema: "analytics" },
   });
-  assert.equal(plan[0].config.schema, "analytics");
-  assert.equal(plan[0].config.dsn, "postgresql://u:p@h:5432/acme");
-  assert.equal(plan[0].config[""], undefined);      // no empty-string key written
+  assert.equal(config.schema, "analytics");
+  assert.equal(config.dsn, "postgresql://u:p@h:5432/acme");
+  assert.equal(config[""], undefined);      // no empty-string key written
 });
 
-test("planned names dodge existing sources and each other", () => {
-  const plan = planConnections({
-    cfg: {}, ns: SF_NS, name: "sf", chosen: FOUND,
-    takenNames: new Set(["sf-1", "sf-2"]),
-  });
-  assert.deepEqual(plan.map((p) => p.name), ["sf-3", "sf-4", "sf-5"]);
-  assert.equal(new Set(plan.map((p) => p.name)).size, 3);
-  // Source names are [a-z0-9_-] and at most 31 characters, server-side.
-  for (const p of plan) assert.match(p.name, /^[a-z0-9][a-z0-9_-]{1,30}$/);
-});
-
-test("one picked namespace dodges a collision on the typed base name", () => {
-  const plan = planConnections({
-    cfg: {}, ns: SF_NS, name: "warehouse",
-    chosen: [{ database: "acme", schema: "analytics" }],
-    takenNames: new Set(["warehouse", "warehouse-1"]),
-  });
-  assert.equal(plan[0].name, "warehouse-2");
-  assert.equal(plan[0].config.database, "acme");
-  assert.equal(plan[0].config.schema, "analytics");
-});
-
-test("long generated names retain their uniqueness suffix", () => {
-  const base = "warehouse-connection-prefix";
-  const first = planConnections({
-    cfg: {}, ns: SF_NS, name: base,
-    chosen: [{ database: "acme", schema: "schema-name-one" },
-             { database: "acme", schema: "schema-name-two" }],
-  });
-  assert.ok(first[0].name.length <= 31);
-  assert.ok(first[1].name.length <= 31);
-  assert.notEqual(first[0].name, first[1].name);
-  assert.match(first[0].name, /-1$/);
-  assert.match(first[1].name, /-2$/);
-
-  const again = planConnections({
-    cfg: {}, ns: SF_NS, name: base,
-    chosen: [{ database: "acme", schema: "schema-name-one" }],
-    takenNames: new Set([base, first[0].name, first[1].name]),
-  });
-  assert.match(again[0].name, /-3$/);
-  assert.ok(again[0].name.length <= 31);
-});
-
-test("schema spelling never enters a public generated source name", () => {
-  const plan = planConnections({
-    cfg: {}, ns: SF_NS, name: "dw",
-    chosen: [{ database: "d", schema: "Raw.Events_2024" },
-             { database: "d", schema: "a-very-long-schema-name-that-will-be-cut-off" }],
-  });
-  for (const p of plan) assert.match(p.name, /^[a-z0-9][a-z0-9_-]{1,30}$/);
-  assert.deepEqual(plan.map((p) => p.name), ["dw-1", "dw-2"]);
-  assert.ok(plan.every((p) => !p.name.includes("raw") && !p.name.includes("schema")));
-});
-
-test("partial batch retry drops successful namespaces and reserves their names", () => {
-  const named = planConnections({
-    cfg: {}, ns: SF_NS, name: "dw", chosen: FOUND,
-  });
-  assert.deepEqual(named.map((p) => p.name), ["dw-1", "dw-2", "dw-3"]);
-
-  const initiallyPicked = FOUND.map(namespaceKey);
-  const remaining = remainingPickedNamespaces(initiallyPicked, named, ["dw-1"]);
-  assert.deepEqual(remaining, FOUND.slice(1).map(namespaceKey));
-
-  const retry = planConnections({
-    cfg: {}, ns: SF_NS, name: "dw", chosen: FOUND.slice(1),
-    takenNames: new Set(["dw-1"]),
-  });
-  assert.deepEqual(retry.map((p) => p.name), ["dw-2", "dw-3"]);
-  assert.ok(!retry.some((p) => p.config.schema === "public"));
-});
-
-test("picking nothing plans the single source the form already describes", () => {
-  const plan = planConnections({
-    cfg: { dsn: "postgresql://…", schema: "public" },
-    ns: { schema: "schema", database: "" }, name: "sales-pg", chosen: [],
-  });
-  assert.deepEqual(plan, [{ ns: null, name: "sales-pg",
-                            config: { dsn: "postgresql://…", schema: "public" } }]);
+test("scopes overlap as the server says: the same one, or everything that covers it", () => {
+  const every = { database: "", schema: "*" };
+  const main = { database: "main", schema: "*" };
+  const sales = { database: "main", schema: "sales" };
+  assert.ok(overlaps(sales, { database: "main", schema: "sales" }));
+  assert.ok(overlaps(every, sales) && overlaps(sales, every));
+  assert.ok(overlaps(main, sales) && overlaps(sales, main) && overlaps(every, main));
+  assert.ok(!overlaps(sales, { database: "main", schema: "finance" }));
+  assert.ok(!overlaps(main, { database: "hive", schema: "sales" }));
+  assert.ok(!overlaps({ database: "hive", schema: "*" }, main));
 });
 
 test("credentials can browse before required namespace fields are selected", () => {
@@ -891,24 +807,32 @@ test("the picker shows table counts and will not pick an empty schema", () => {
                       /conn-ns-empty|disabled=""/);
 });
 
-async function saveTwo(emptyNames) {
+// Databricks, as /connections/types serves it: one source can read everything.
+const DBX_SPANS = { ...DBX, spans: true };
+const EVERY = { ok: true, truncated: false, namespaces: [
+  { database: "", schema: "*", tables: 6 },
+  { database: "main", schema: "*", tables: 4 },
+  { database: "main", schema: "sales", tables: 3 },
+  { database: "main", schema: "ops", tables: 1 },
+] };
+
+/** The Databricks form, signed in, handed to `work(panel)`: `browse` is what
+ * /connections/browse says, `answer(body)` what POST /connections answers. */
+async function signedIn(browse, work,
+                        answer = (b) => [201, { name: b.name, everything: b.config.schema === "*" }]) {
   const posts = [], done = [], errors = [];
-  await withApi({ __user: ADMIN, "/connections/browse": LISTED }, async () => {
+  await withApi({ __user: ADMIN, "/connections/browse": browse }, async () => {
     const original = globalThis.fetch;
     globalThis.fetch = async (url, options = {}) => {
       if (url === "/api/connections" && options.method === "POST") {
         const body = JSON.parse(options.body);
-        posts.push(body.config.schema);
-        if (emptyNames.includes(body.config.schema)) {
-          const said = "Signed in, but this schema has no tables the credential can see.";
-          return { status: 400, ok: false, json: async () => ({ detail: {
-            error: `connection test failed: ${said}`, fields: { schema: said }, stage: "signed_in" } }) };
-        }
-        return { status: 201, ok: true, json: async () => ({ name: body.name }) };
+        posts.push(body);
+        const [status, json] = answer(body);
+        return { status, ok: status < 400, json: async () => json };
       }
       return original(url, options);
     };
-    const tile = byId(buildTiles({ types: [DBX], sources: [], envs: [] })).databricks;
+    const tile = byId(buildTiles({ types: [DBX_SPANS], sources: [], envs: [] })).databricks;
     const panel = harness(ConnectForm, { tile, defaultName: "databricks-2", takenNames: new Set(),
       onDone: (m) => done.push(m), onError: (m) => errors.push(m), onRemoved() {} });
     const type = (key, value) => findNode(panel.tree(),
@@ -918,28 +842,85 @@ async function saveTwo(emptyNames) {
     type("access_token", "dapi-token");
     await findNode(panel.tree(), (n) => n.type === "button"
       && String(n.props.children).includes("Sign in and list schemas")).props.onClick();
-    // Tick sales and ops (the picker would not let "default" be ticked).
-    const ns = findNode(panel.tree(), (n) => n.type?.name === "Namespaces");
-    ns.props.setPicked([namespaceKey(LISTED.namespaces[1]), namespaceKey(LISTED.namespaces[2])]);
-    await findNode(panel.tree(), (n) => n.type === "button" && n.props.className === "primary").props.onClick();
+    panel.connect = () => findNode(panel.tree(), (n) => n.type === "button"
+      && n.props.className === "primary");
+    // The picker is its own component: render it from the props it was given.
+    panel.picker = () => {
+      const el = findNode(panel.tree(), (n) => n.type?.name === "Namespaces");
+      return el && el.type(el.props);
+    };
+    panel.radio = (label) => findNode(panel.picker(), (n) => n.type === "label"
+      && findNode(n.props.children, (c) => c.type === "span" && c.props.children === label))
+      .props.children.find((c) => c?.type === "input");
+    panel.html = () => panel.render();
+    await work(panel);
   });
   return { posts, done, errors };
 }
 
-test("saving several schemas skips an empty one and connects the rest", async () => {
-  const { posts, done, errors } = await saveTwo(["ops"]);
-  assert.deepEqual(posts, ["sales", "ops"]);
-  assert.equal(done.length, 1);
-  assert.match(done[0], /“databricks-2-1” is now a source/);
-  assert.match(done[0], /Skipped main\.ops — no tables this token can see\./);
-  assert.ok(errors.every((e) => e === ""), errors.join(" | "));
+test("signing in to Databricks picks everything, and Connect makes one source", async () => {
+  const { posts, done } = await signedIn(EVERY, async (panel) => {
+    const html = panel.html();
+    assert.match(html, /What this source reads — pick one/);
+    assert.equal((html.match(/type="radio"/g) || []).length, 4);     // one choice, not a checklist
+    assert.doesNotMatch(html, /type="checkbox"|selected<\/span>/);
+    assert.match(html, /conn-ns-on[^>]*><input type="radio" checked=""[^>]*\/><span>✳ everything this credential can see — one source \(recommended\)/);
+    assert.match(html, />✓ Connect<\/button>/);
+    assert.match(html, /One source reads every catalog and schema this credential can see/);
+    await panel.connect().props.onClick();
+  });
+  assert.equal(posts.length, 1);
+  assert.deepEqual([posts[0].name, posts[0].config.schema, posts[0].config.catalog],
+                   ["databricks-2", "*", ""]);
+  assert.match(done[0], /“databricks-2” reads everything this sign-in can see/);
 });
 
-test("when every picked schema is empty, it says which and what to grant", async () => {
-  const { done, errors } = await saveTwo(["sales", "ops"]);
+test("picking one schema instead makes one source pinned to it — one at a time", async () => {
+  const { posts, done } = await signedIn(EVERY, async (panel) => {
+    panel.radio("sales").props.onChange();
+    panel.radio("ops").props.onChange();                              // replaces, never adds
+    assert.equal((panel.html().match(/conn-ns-on/g) || []).length, 1);
+    await panel.connect().props.onClick();
+  });
+  assert.deepEqual(posts.map((b) => [b.config.catalog, b.config.schema]), [["main", "ops"]]);
+  assert.match(done[0], /“databricks-2” is now a source in the chat picker/);
+});
+
+test("a sign-in that already reads everything has nothing more to connect", async () => {
+  await signedIn({ ...EVERY, connected_as: [
+    { name: "lake", database: "", schema: "*", namespace: "all catalogs", everything: true,
+      disconnected: false, env: false }] }, async (panel) => {
+    const html = panel.html();
+    assert.match(html, /This sign-in is already connected as <b>lake<\/b>, which reads everything it\s+can see — there is nothing more to connect/);
+    assert.doesNotMatch(html, /What this source reads/);
+    assert.equal(panel.connect().props.disabled, true);
+  });
+});
+
+test("a sign-in connected to one schema marks it, and does not pick everything over it", async () => {
+  await signedIn({ ...EVERY, connected_as: [
+    { name: "lake-sales", database: "main", schema: "sales", namespace: "main.sales",
+      everything: false, disconnected: false, env: false }] }, async (panel) => {
+    const html = panel.html();
+    assert.match(html, /already connected as\s+lake-sales \(main\.sales\)\. To read everything with one source, use Combine into one under Connected\./);
+    assert.doesNotMatch(html, /conn-ns-on/);                          // nothing picked for you
+    for (const label of ["✳ everything this credential can see — one source (recommended)",
+                         "✳ all schemas — one source", "sales"]) {
+      assert.equal(panel.radio(label).props.disabled, true, label);
+    }
+    assert.equal(panel.radio("ops").props.disabled, false);
+    assert.match(html, /<span>sales<\/span><span class="meta"> \(connected as lake-sales\)/);
+  });
+});
+
+test("the server's refusal of a duplicate is shown as it said it", async () => {
+  const said = "This sign-in already reads main.ops as “ops” — use that source.";
+  const { errors, done } = await signedIn(EVERY, async (panel) => {
+    panel.radio("ops").props.onChange();
+    await panel.connect().props.onClick();
+  }, () => [409, { detail: { error: said, existing: "ops", stage: "duplicate" } }]);
+  assert.equal(errors.at(-1), said);
   assert.equal(done.length, 0);
-  assert.match(errors.at(-1), /None of the picked schemas has tables this token can see \(main\.sales, main\.ops\)/);
-  assert.match(errors.at(-1), /USE CATALOG, USE SCHEMA and SELECT/);
 });
 
 // ── Everything as one source (Databricks: schema "*") ───────────────────
@@ -951,7 +932,7 @@ test("the picker offers all schemas of a catalog, and everything, as one source"
     { database: "main", schema: "sales", tables: 3 },
   ] };
   const html = harness(Namespaces, { browse, picked: [], setPicked() {}, keyOf: namespaceKey }).render();
-  assert.match(html, /✳ everything this credential can see — one source<\/span><span class="meta">6 tables/);
+  assert.match(html, /✳ everything this credential can see — one source \(recommended\)<\/span><span class="meta">6 tables/);
   assert.match(html, /✳ all schemas — one source<\/span><span class="meta">4 tables/);
   assert.equal(namespaceLabel({ database: "", schema: "*" }), "all catalogs");
   assert.equal(namespaceLabel({ database: "main", schema: "*" }), "main (all schemas)");
@@ -960,15 +941,14 @@ test("the picker offers all schemas of a catalog, and everything, as one source"
 test("everything clears a typed catalog; a whole catalog pins it", () => {
   const cfg = { server_hostname: "h", http_path: "/sql/x", access_token: "t", catalog: "typed", schema: "default" };
   const ns = { schema: "schema", database: "catalog" };
-  const [everything, wholeMain] = planConnections({ cfg, ns, name: "dbx", chosen: [
-    { database: "", schema: "*" }, { database: "main", schema: "*" }] });
-  assert.equal(everything.config.catalog, "");
-  assert.equal(everything.config.schema, "*");
-  assert.equal(wholeMain.config.catalog, "main");
-  assert.equal(wholeMain.config.schema, "*");
+  const everything = pinnedConfig({ cfg, ns, chosen: { database: "", schema: "*" } });
+  const wholeMain = pinnedConfig({ cfg, ns, chosen: { database: "main", schema: "*" } });
+  assert.equal(everything.catalog, "");
+  assert.equal(everything.schema, "*");
+  assert.equal(wholeMain.catalog, "main");
+  assert.equal(wholeMain.schema, "*");
   // An ordinary schema without a catalog keeps what was typed (unchanged).
-  const [plain] = planConnections({ cfg, ns, name: "dbx", chosen: [{ database: "", schema: "sales" }] });
-  assert.equal(plain.config.catalog, "typed");
+  assert.equal(pinnedConfig({ cfg, ns, chosen: { database: "", schema: "sales" } }).catalog, "typed");
 });
 
 // ── Disconnect / reconnect / remove ─────────────────────────────────────
@@ -1267,9 +1247,12 @@ test("Connected sources lists every connected source with what was scanned from 
       // Connected ones only (not the unconfigured Snowflake or S3), by name.
       const names = [...section.matchAll(/<b>([^<]+)<\/b>/g)].map((m) => m[1]);
       assert.deepEqual(names, ["demo", "postgres", "sales-sf"]);
-      assert.match(section, /Metadata: 4 tables · 2 relationships · discovered 2 min ago/);
-      assert.match(section, /Metadata: not discovered yet/);
-      assert.match(section, /title="permission denied for schema acme"[^>]*><span>Metadata: discovery failed/);
+      assert.match(section, /<span>4 tables · 2 relationships · discovered 2 min ago<\/span>/);
+      assert.match(section, /<span>not discovered yet<\/span>/);
+      assert.match(section, /title="permission denied for schema acme"[^>]*><span>discovery failed/);
+      // Compact: one line each, saying what it is and where.
+      assert.match(section, /Connected · 3/);
+      assert.match(section, /<b>sales-sf<\/b><span class="meta conn-connected-where">Snowflake · acme-prod<\/span>/);
       assert.equal(section.match(/↻ Rediscover<\/button>/g)?.length, 3);
       assert.match(section, /↻ Rediscover 2 not scanned/);
 
@@ -1288,7 +1271,7 @@ test("Connected sources lists every connected source with what was scanned from 
                                 "/api/metagraph/sources/sales-sf/discover"]);
       assert.ok(calls.filter((c) => c.url === "/api/metagraph/sources").length >= 2);  // reloaded
       // One row's own button rescans that source alone.
-      const demoRow = findNode(shown(), (n) => n.props?.className === "dbconn-row"
+      const demoRow = findNode(shown(), (n) => n.props?.className === "conn-connected-row"
         && findNode(n.props.children, (c) => c.type === "b" && c.props.children === "demo"));
       const own = findNode(demoRow, (n) => n.type === "button" && n.props.children === "↻ Rediscover");
       await own.props.onClick();
@@ -1313,8 +1296,8 @@ test("a scan in flight is not offered again", async () => {
       await flush();
       const html = panel.render();
       assert.doesNotMatch(html, /not scanned/);
-      assert.equal(html.match(/<button class="chip" disabled="">discovering…<\/button>/g)?.length, 2);
-      assert.match(html, /Metadata: discovery queued…/);
+      assert.equal(html.match(/<button class="chip" disabled=""[^>]*>discovering…<\/button>/g)?.length, 2);
+      assert.match(html, /<span>discovery queued…<\/span>/);
     });
 });
 
@@ -1342,5 +1325,137 @@ test("only administrators get Connected sources, and a search hides it", async (
         && n.props.className === "conn-search");
       search.props.onChange({ target: { value: "post" } });
       assert.doesNotMatch(panel.render(), /aria-label="Connected sources"/);
+    });
+});
+
+// ── One sign-in, one source ─────────────────────────────────────────────
+// What production had: one Databricks sign-in connected three times, a schema
+// each, and a second workspace. Connected groups them by sign-in; "Combine
+// into one" leaves one source reading everything.
+
+const SIGN_IN = "a1b2c3d4e5f6a7b8c9d0";
+const DBX_CONNS = [
+  { id: "d1", name: "databricks-2-1", ctype: "databricks", hint: "dbc-1.cloud.databricks.com",
+    namespace: "main.sales", account: SIGN_IN, everything: false, configured: true },
+  { id: "d2", name: "databricks-2-2", ctype: "databricks", hint: "dbc-1.cloud.databricks.com",
+    namespace: "main.finance", account: SIGN_IN, everything: false, configured: true },
+  { id: "d3", name: "databricks-3", ctype: "databricks", hint: "dbc-1.cloud.databricks.com",
+    namespace: "main.sales", account: SIGN_IN, everything: false, configured: true },
+  { id: "d4", name: "ops-lake", ctype: "databricks", hint: "dbc-2.cloud.databricks.com",
+    namespace: "all catalogs", account: "ffffffffffffffffffff", everything: true, configured: true },
+];
+const DBX_SOURCES = [
+  { name: "demo", dialect: "sqlite", configured: true, allowed: true },
+  ...DBX_CONNS.map((c) => ({ name: c.name, dialect: "databricks", ctype: "databricks",
+                             configured: true, allowed: true })),
+];
+
+test("connected sources group by sign-in: one entry per account", () => {
+  const tiles = buildTiles({ types: [DBX_SPANS], conns: DBX_CONNS, sources: DBX_SOURCES });
+  const groups = signInGroups(tiles);
+  assert.deepEqual(groups.map((g) => g.sources.map((s) => s.name)),
+                   [["databricks-2-1", "databricks-2-2", "databricks-3"], ["demo"], ["ops-lake"]]);
+  assert.deepEqual(groups.map(combinable), [true, false, false]);
+  // A type that reads one schema per source groups, but is not a duplicate.
+  const pg = { ...groups[0], tile: { ...groups[0].tile, spans: false } };
+  assert.equal(combinable(pg), false);
+  // Built-in copies cannot be combined from here.
+  assert.equal(combinable({ ...groups[0], sources: [...groups[0].sources,
+    { name: "databricks", kind: "env", account: SIGN_IN }] }), false);
+  assert.equal(keeperOf(groups[0]).name, "databricks-2-1");            // first by name…
+  const one = { ...groups[0], sources: groups[0].sources.map((x) => (
+    x.name === "databricks-3" ? { ...x, everything: true } : x)) };
+  assert.equal(keeperOf(one).name, "databricks-3");                    // …unless one reads it all
+  assert.equal(scopeText(groups[2].sources[0]), "all catalogs");
+  assert.equal(scopeText(groups[0].sources[0]), "main.sales");
+
+  const combined = [];
+  const el = React.createElement(ConnectedSources, { tiles, scans: {}, rescanning: [],
+    onRediscover() {}, onPick() {}, onCombine: (g) => combined.push(g) });
+  const html = renderToStaticMarkup(el);
+  assert.match(html, /Connected · 3/);
+  // The three copies are one entry: the account, then each source under it.
+  assert.match(html, /conn-connected-row conn-connected-dup"><div class="conn-connected-line">.*?<b>Databricks SQL<\/b><span class="meta conn-connected-where">dbc-1\.cloud\.databricks\.com<\/span>/s);
+  assert.match(html, /One sign-in connected 3 times — each reads part of the same data\. One source can read all of it\./);
+  for (const [name, scope] of [["databricks-2-1", "main.sales"], ["databricks-2-2", "main.finance"],
+                               ["databricks-3", "main.sales"]]) {
+    assert.match(html, new RegExp(`conn-connected-sub"><b>${name}</b><span class="meta conn-connected-where">${scope.replace(".", "\\.")}</span>`));
+  }
+  // One that reads everything is one line.
+  assert.match(html, /<b>ops-lake<\/b><span class="meta conn-connected-where">Databricks SQL · dbc-2\.cloud\.databricks\.com · all catalogs<\/span>/);
+  assert.equal((html.match(/Combine into one/g) || []).length, 1);
+  findNode(el.type(el.props), (n) => n.type === "button"
+    && String(n.props.children).includes("Combine into one")).props.onClick();
+  assert.deepEqual(combined[0].sources.map((s) => s.name), ["databricks-2-1", "databricks-2-2", "databricks-3"]);
+});
+
+test("Combine into one asks first, keeps one source and says what went", async () => {
+  const asked = [];
+  await withApi({ __user: ADMIN, "/catalog/sources": DBX_SOURCES, "/connections/types": [DBX_SPANS],
+                  "/connections": DBX_CONNS, "/m365/status": { configured: false },
+                  "/settings/repos": { repos: [] }, "/metagraph/sources": { sources: [] },
+                  "/connections/d1/everything": { ...DBX_CONNS[0], everything: true,
+                                                  removed: ["databricks-2-2", "databricks-3"] } },
+    async ({ calls, flush }) => {
+      globalThis.confirm = (q) => { asked.push(q); return asked.length > 1; };  // no, then yes
+      const panel = harness(DataConnections, { onClose() {} });
+      panel.render();
+      panel.start();
+      await flush();
+      const combine = () => {
+        const el = findNode(panel.tree(), (n) => n.type?.name === "ConnectedSources");
+        return findNode(el.type(el.props), (n) => n.type === "button"
+          && String(n.props.children).includes("Combine into one")).props.onClick();
+      };
+      await combine();                                    // declined: nothing sent
+      assert.ok(!calls.some((c) => c.method === "POST"));
+      assert.equal(asked[0], "Make “databricks-2-1” read everything this sign-in can see? "
+        + "“databricks-2-2” and “databricks-3” use the same sign-in and will be removed — chats "
+        + "and grants that name them stop working. Its tables will be named catalog.schema.table, "
+        + "so roles need them granted again in Governance.");
+      await combine();
+      await flush();
+      assert.deepEqual(calls.filter((c) => c.method === "POST").map((c) => c.url),
+                       ["/api/connections/d1/everything"]);
+      assert.match(panel.render(), /“databricks-2-1” now reads everything this sign-in can see — removed “databricks-2-2” and “databricks-3”\. Its tables are being rediscovered\./);
+      assert.ok(calls.filter((c) => c.url === "/api/connections").length >= 2);   // reloaded
+    });
+});
+
+test("on a Databricks row, Read everything replaces Add schemas", () => {
+  const tile = byId(buildTiles({ types: [DBX_SPANS], conns: DBX_CONNS, sources: DBX_SOURCES })).databricks;
+  const html = renderToStaticMarkup(React.createElement(Instances, { tile, onAct() {} }));
+  const rows = html.split('class="dbconn-row').slice(1);
+  const row = (name) => rows.find((r) => r.includes(`<b>${name}</b>`));
+  assert.doesNotMatch(html, /Add schemas/);
+  assert.match(row("databricks-2-1"), /✳ Read everything/);
+  assert.match(row("databricks-2-1"), /dbc-1\.cloud\.databricks\.com · main\.sales/);
+  assert.doesNotMatch(row("ops-lake"), /Read everything/);            // already does
+  assert.match(row("ops-lake"), /dbc-2\.cloud\.databricks\.com · all catalogs/);
+  assert.equal(everythingQuestion("solo"), "Make “solo” read everything this sign-in can see? Its "
+    + "tables will be named catalog.schema.table, so roles need them granted again in Governance.");
+  assert.equal(combinedNote({ name: "solo", removed: [] }),
+               "“solo” now reads everything this sign-in can see. Its tables are being rediscovered.");
+  assert.equal(listNames(["a", "b", "c"]), "a, b and c");
+});
+
+test("Read everything on a row asks, then widens that connection", async () => {
+  const done = [], asked = [];
+  await withApi({ __user: ADMIN, "/connections/d2/everything": { name: "databricks-2-2", removed: ["databricks-2-1", "databricks-3"] } },
+    async ({ calls, flush }) => {
+      globalThis.confirm = (q) => { asked.push(q); return true; };
+      const tile = byId(buildTiles({ types: [DBX_SPANS], conns: DBX_CONNS, sources: DBX_SOURCES })).databricks;
+      const panel = harness(ConnectForm, { tile, defaultName: "databricks-4", takenNames: new Set(),
+        onDone: (m) => done.push(m), onError() {}, onRemoved() {} });
+      const rows = findNode(panel.tree(), (n) => n.type?.name === "Instances");
+      const tree = harness(Instances, rows.props).tree();      // its own hooks
+      const row = findNode(tree, (n) => n.props?.className === "dbconn-row"
+        && findNode(n.props.children, (c) => c.type === "b" && c.props.children === "databricks-2-2"));
+      await findNode(row, (n) => n.type === "button" && n.props.children === "✳ Read everything").props.onClick();
+      await flush();
+      assert.match(asked[0], /^Make “databricks-2-2” read everything this sign-in can see\? “databricks-2-1” and “databricks-3” use the same sign-in/);
+      assert.deepEqual(calls.filter((c) => c.method === "POST").map((c) => c.url),
+                       ["/api/connections/d2/everything"]);
+      assert.match(done[0], /“databricks-2-2” now reads everything this sign-in can see — removed/);
     });
 });

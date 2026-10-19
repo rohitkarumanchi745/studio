@@ -1339,17 +1339,47 @@ skill files all apply to it unchanged.
   host/account/project hint. A rotated `STUDIO_SECRET` fails closed: the row stops
   decrypting, the source shows unconfigured, and an admin reconnects.
 - **Saved only after a live probe.** Namespace discovery validates the submitted
-  credentials but does not save them. Each selected or typed namespace is then
-  persisted only after its own `list_tables()` probe succeeds, so one credential
-  can create several separately scoped sources without saving a broken scope. A
+  credentials but does not save them. The source is then persisted only after
+  a `list_tables()` probe of what it will read succeeds, so a broken scope is
+  never saved. A
   SQL warehouse schema that signs in but shows **no tables** is refused too, with
   the schema field marked (and a note when no catalog/database was set, so the
   default one was used): saved, every question would fail. A source that is
   empty anyway says so — "has no tables to read" — instead of "no access",
   which is kept for a role that is filtered down to nothing.
-- **Everything as one source (Databricks).** The schema picker also offers
-  **✳ all schemas** of a catalog and **✳ everything this credential can see**
-  (schema `*`, no catalog). Such a source lists every table by its full name —
+- **One sign-in, one source.** Connecting makes exactly one source. A sign-in
+  is *where* it signs in and *as whom*:
+  - Databricks: host and token;
+  - Snowflake: account and user;
+  - Postgres: host, port, database and user (not the password).
+
+  The schema a source reads, the warehouse it runs on and a rotated password
+  don't make a different sign-in. A second connection with a sign-in that's
+  already here is refused (409) if it would read any of the same data:
+  - the same schema, or anything one that reads everything already covers;
+  - this applies to connections made here, disconnected ones and the
+    deployment's own built-in source;
+  - the check runs after the form's own checks and before anything signs in.
+
+  Signing in on the connect form says at once what that sign-in is already
+  connected as. A pick that's already connected is marked and can't be chosen.
+  Where a type reads one schema per source (Postgres, Snowflake, BigQuery), a
+  *different* schema is not a duplicate. Listings carry a fingerprint of the
+  sign-in (`account`): an HMAC keyed with the deployment's secret, so it groups
+  sources without revealing or confirming any credential.
+- **Everything as one source (Databricks).** Signing in picks **✳ everything
+  this credential can see** (schema `*`, no catalog) by default, so one
+  connection reads every catalog and schema. The picker can instead limit the
+  source to **✳ all schemas** of one catalog, or to one schema. A source that
+  reads only part of a sign-in gets **✳ Read everything** on its row.
+
+  **Combine into one** (`POST /api/connections/{id}/everything`) fixes a
+  sign-in connected several times:
+  - one source, which keeps its name, reads everything;
+  - the others with that sign-in are removed;
+  - it signs in first and changes nothing if that fails;
+  - its record is rediscovered, because its tables are now named
+    `catalog.schema.table` and roles need them granted again in Governance. Such a source lists every table by its full name —
   `catalog.schema.table`, from one `information_schema` query (a `SHOW` walk
   where that is unreadable), capped by `STUDIO_DATABRICKS_MAX_TABLES` (1000) and
   never including the `system` catalog of audit and billing logs. With no single
@@ -1594,11 +1624,14 @@ queued once on upgrade (migration 17). A source set up through environment
 variables, rather than saved here, is scanned by the scheduler's first pass,
 one full tick (`STUDIO_METAGRAPH_TICK_SECONDS`, 300 s) after the server starts.
 
-**Connected sources**, at the top of **Tools & settings → Integrations**
-(administrators), shows every connected source in one place:
-- what has been scanned from it, for example "Metadata: 15 tables · 2
-  relationships · discovered 5 min ago". It also says whether the scan is
-  queued, running or failed; hover over the line to see the error.
+**Connected**, at the top of **Tools & settings → Integrations**
+(administrators), lists connected sources compactly, one line per sign-in. A
+sign-in connected several times (one schema each) is one entry, with its
+sources listed under it and **⧉ Combine into one** where a single source can
+read all of it. Each line shows:
+- what has been scanned from it, for example "15 tables · 2 relationships ·
+  discovered 5 min ago". It also says whether the scan is queued, running or
+  failed; hover over the line to see the error.
 - a **↻ Rediscover** button for each source;
 - **↻ Rediscover N not scanned** for every source never scanned or whose scan
   failed.

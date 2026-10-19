@@ -37,6 +37,7 @@ Security model:
 """
 import base64
 import hashlib
+import hmac
 import json
 import re
 import socket
@@ -496,6 +497,9 @@ TYPES = {
     },
     "databricks": {
         "needs_tables": True,
+        # One source can read every catalog and schema the token can see
+        # (schema "*", no catalog): what connecting does by default.
+        "spans": True,
         "label": "Databricks SQL", "dialect": "databricks", "build": _DynDatabricks,
         "check": _check_databricks, "explain": describe_databricks_error,
         "classify": classify_databricks_error,
@@ -1009,15 +1013,185 @@ def _public(row):
             "type_label": t.get("label", row["ctype"]), "label": row.get("label") or "",
             "hint": _hint(row["ctype"], cfg) if cfg else "",
             "namespace": _namespace(row["ctype"], cfg) if cfg else "",
+            "account": account_key(row["ctype"], cfg) if cfg else "",
+            "everything": bool(cfg) and _everything(_scope(row["ctype"], cfg)),
             "configured": cfg is not None, "enabled": bool(row.get("enabled", 1)),
             "created_at": row.get("created_at")}
 
 
+# ── The same sign-in ─────────────────────────────────────────────────────
+#
+# One account is connected once. Two connections are the same sign-in when
+# they sign in to the same place as the same identity; the namespace each
+# reads is its scope, and tuning (the warehouse it runs on, a row cap, a JQL
+# filter) is neither. A second connection whose sign-in matches one already
+# here and whose scope overlaps it is refused: it would only read the same
+# data under a second name. A different schema of a type that cannot read
+# every schema from one source (Postgres, say) is not a duplicate.
+
+#: The fields that say who signs in where, per type. A secret stands in for
+#: the "who" only where the type has no user field (a Databricks token).
+_SIGN_IN = {
+    "snowflake": ("account", "user"),
+    "databricks": ("server_hostname", "access_token"),
+    "neo4j": ("uri", "user", "database"),
+    "cassandra": ("contact_points", "port", "username"),
+    "lancedb": ("uri", "region", "host_override", "api_key"),
+    "jira": ("site", "email"),
+    "servicenow": ("instance", "username"),
+    "n8n": ("url", "api_key"),
+    "powerbi": ("tenant_id", "client_id"),
+}
+#: When the "who" field is blank, the credential itself is the identity.
+_SIGN_IN_SECRET = {"jira": ("email", "api_token"), "servicenow": ("username", "token")}
+_CASELESS = {"server_hostname", "account", "user", "uri", "site", "instance", "url",
+             "contact_points", "tenant_id", "client_id", "region", "host_override"}
+
+
+def _url_sign_in(raw):
+    """Where and as whom a DSN / SQLAlchemy URL signs in — not its password."""
+    try:
+        from sqlalchemy.engine import make_url
+        u = make_url(raw)
+        return [u.get_backend_name(), (u.host or "").lower(), u.port or "", u.database or "",
+                u.username or ""]
+    except Exception:
+        try:
+            u = urlsplit(raw)
+            return [u.scheme, (u.hostname or "").lower(), u.port or "", u.path.strip("/"),
+                    u.username or ""]
+        except ValueError:
+            return [raw]
+
+
+def _sign_in(ctype, cfg):
+    """The sign-in part of a config as a list, compared whole."""
+    cfg = cfg or {}
+    val = lambda k: (str(cfg.get(k) or "").strip().lower() if k in _CASELESS
+                     else str(cfg.get(k) or "").strip())
+    if ctype == "postgres":
+        return _url_sign_in(str(cfg.get("dsn") or ""))
+    if ctype == "sql":
+        return _url_sign_in(str(cfg.get("url") or ""))
+    if ctype == "bigquery":
+        creds = str(cfg.get("credentials_json") or "").strip()
+        try:
+            return ["sa", json.loads(creds).get("client_email", "")] if creds else ["adc"]
+        except (ValueError, AttributeError):
+            return ["creds", hashlib.sha256(creds.encode()).hexdigest()]
+    if ctype == "cassandra":
+        points = sorted(p.strip().lower() for p in val("contact_points").split(",") if p.strip())
+        return [points, val("port") or "9042", val("username")]
+    keys = _SIGN_IN.get(ctype)
+    if keys is None:                        # a type this table predates: the whole form
+        ns = (TYPES.get(ctype) or {}).get("ns") or {}
+        keys = tuple(sorted(k for k in cfg if k not in (ns.get("schema"), ns.get("database"))))
+    out = [val(k) for k in keys]
+    who, secret = _SIGN_IN_SECRET.get(ctype, (None, None))
+    if who and not val(who):
+        out.append(hashlib.sha256(val(secret).encode()).hexdigest())
+    return out
+
+
+def account_key(ctype, cfg):
+    """A fingerprint of the sign-in, safe to show: keyed with the deployment's
+    secret, so it groups connections without revealing or confirming any
+    credential. "" when it cannot be computed."""
+    from . import bootstrap
+    secret = bootstrap.jwt_secret() or ""
+    if not cfg or not secret:
+        return ""
+    key = hashlib.sha256(b"studio-sign-in\0" + secret.encode()).digest()
+    payload = json.dumps([ctype, _sign_in(ctype, cfg)], sort_keys=True, default=str)
+    return hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()[:20]
+
+
+EVERYTHING = "*"
+
+
+def _scope(ctype, cfg):
+    """(database, schema) a config reads; ("", "*") is everything the sign-in
+    can see. Types without namespaces read one thing: ("", "")."""
+    ns = (TYPES.get(ctype) or {}).get("ns") or {}
+    if not ns.get("schema"):
+        return ("", "")
+    field = next((f for f in TYPES[ctype]["fields"] if f["key"] == ns["schema"]), {})
+    schema = str((cfg or {}).get(ns["schema"]) or field.get("default") or "").strip()
+    database = str((cfg or {}).get(ns["database"]) or "").strip() if ns.get("database") else ""
+    return (database, schema)
+
+
+def _overlaps(a, b):
+    """Whether two scopes read any of the same data."""
+    if a == b:
+        return True
+    return any(x[1] == EVERYTHING and (not x[0] or x[0] == y[0]) for x, y in ((a, b), (b, a)))
+
+
+def _everything(scope):
+    return scope == ("", EVERYTHING)
+
+
+def same_sign_in(ctype, cfg, *, skip_id=None, skip_env=None):
+    """The sources connected with this sign-in: connections made here (on or
+    off) and the deployment's own. Each {name, scope, namespace, everything,
+    id?, env, enabled}."""
+    key = account_key(ctype, cfg)
+    if not key:
+        return []
+    out = []
+    with db.connect() as c:
+        rows = [dict(r) for r in c.execute(
+            "SELECT * FROM data_connections WHERE ctype=? ORDER BY created_at", (ctype,)).fetchall()]
+    for row in rows:
+        if row["id"] == skip_id:
+            continue
+        other = _config(row)
+        if other is None or account_key(ctype, other) != key:
+            continue
+        scope = _scope(ctype, other)
+        out.append({"name": row["name"], "id": row["id"], "env": False,
+                    "enabled": bool(row["enabled"]), "scope": scope,
+                    "namespace": _namespace(ctype, other), "everything": _everything(scope)})
+    if ctype != skip_env:
+        parent = _env_parent(ctype) if _env_type(ctype) else None
+        if parent and parent[0] == ctype and account_key(ctype, parent[1]) == key:
+            scope = _scope(ctype, parent[1])
+            out.append({"name": ctype, "id": None, "env": True, "enabled": True, "scope": scope,
+                        "namespace": _namespace(ctype, parent[1]),
+                        "everything": _everything(scope)})
+    return out
+
+
+def _refuse_duplicate(ctype, cfg, **skip):
+    """409 when this sign-in already reads (some of) what `cfg` would."""
+    scope = _scope(ctype, cfg)
+    clash = next((s for s in same_sign_in(ctype, cfg, **skip) if _overlaps(scope, s["scope"])),
+                 None)
+    if clash is None:
+        return
+    if clash["everything"]:
+        said = (f"This sign-in is already connected as “{clash['name']}”, which reads "
+                f"everything it can see — use that source.")
+    elif _everything(scope):
+        said = (f"This sign-in is already connected as “{clash['name']}” "
+                f"({clash['namespace']}). To read everything with one source, choose "
+                f"“Combine into one” on it.")
+    else:
+        said = (f"This sign-in already reads {clash['namespace'] or 'this'} as "
+                f"“{clash['name']}” — use that source.")
+    if not clash["enabled"]:
+        said += " (It is disconnected: reconnect it.)"
+    raise HTTPException(409, {"error": said, "existing": clash["name"], "stage": "duplicate"})
+
+
 # ── Probe ────────────────────────────────────────────────────────────────
 
-def _probe(ctype, cfg):
+def _probe(ctype, cfg, before_sign_in=None):
     """Build a throwaway connector and prove it can list tables. Errors come
-    back as data (capped), never a 500 — a wrong password is a normal outcome."""
+    back as data (capped), never a 500 — a wrong password is a normal outcome.
+    `before_sign_in(cfg)` runs once the form's own checks pass and before any
+    sign-in (a duplicate refusal: a typo is named first, nobody is called)."""
     t = TYPES.get(ctype)
     if t is None:
         return {"ok": False, "error": f"unknown connection type '{ctype}'"}
@@ -1027,6 +1201,8 @@ def _probe(ctype, cfg):
     cfg, problems = _preflight(ctype, cfg)
     if problems:
         return _refused(problems)
+    if before_sign_in is not None:
+        before_sign_in(cfg)
     conn = None
     try:
         conn = t["build"]("__probe__", cfg)
@@ -1209,7 +1385,7 @@ def types(user=Depends(current_user)):
     from .connectors.cassandra_conn import driver_available
     from .connectors.sql_conn import installed_drivers
     out = [{"ctype": k, "label": t["label"], "dialect": t["dialect"],
-            "fields": t["fields"], "ns": t.get("ns") or {}}
+            "fields": t["fields"], "ns": t.get("ns") or {}, "spans": bool(t.get("spans"))}
            for k, t in TYPES.items()]
     for entry in out:
         # What this deployment can actually reach, so the marketplace tells
@@ -1241,9 +1417,22 @@ def test_connection(body: TestIn, user=Depends(current_user)):
 @router.post("/browse")
 def browse_connection(body: TestIn, user=Depends(current_user)):
     """Which namespaces could this credential bind a source to? Admin-only for
-    the same reason /test is: it proves what an arbitrary DSN can reach."""
+    the same reason /test is: it proves what an arbitrary DSN can reach. Says,
+    too, what this sign-in is already connected as — only once it has signed
+    in, so it never answers for a credential that does not work."""
     _admin(user)
-    return _browse(body.ctype, {k: str(v) for k, v in (body.config or {}).items()})
+    cfg = {k: str(v) for k, v in (body.config or {}).items()}
+    out = _browse(body.ctype, cfg)
+    if out.get("ok") and body.ctype in TYPES:
+        out["connected_as"] = _connected_as(body.ctype, _normalized(body.ctype, cfg))
+    return out
+
+
+def _connected_as(ctype, cfg, **skip):
+    return [{"name": s["name"], "database": s["scope"][0], "schema": s["scope"][1],
+             "namespace": s["namespace"], "everything": s["everything"],
+             "disconnected": not s["enabled"], "env": s["env"]}
+            for s in same_sign_in(ctype, cfg, **skip)]
 
 
 def _require_pin(ctype, cfg, why):
@@ -1309,7 +1498,7 @@ def _create(user, name, ctype, stored, effective, label=""):
     if "from_env" not in stored:
         stored = _normalized(ctype, stored)
     _require_pin(ctype, effective, "— each one becomes its own source")
-    probe = _probe(ctype, effective)
+    probe = _probe(ctype, effective, lambda c: _refuse_duplicate(ctype, c))
     if not probe["ok"]:
         _refuse_save(probe)
     row = {"id": str(uuid.uuid4()), "name": name, "ctype": ctype,
@@ -1453,7 +1642,8 @@ def reconnect_connection(cid: str, user=Depends(current_user)):
         if cfg is None:
             raise HTTPException(400, "the stored credential can no longer be read "
                                      "(STUDIO_SECRET changed) — remove it and connect again")
-        probe = _probe(row["ctype"], cfg)
+        probe = _probe(row["ctype"], cfg,
+                       lambda c: _refuse_duplicate(row["ctype"], c, skip_id=cid))
         if not probe["ok"]:
             raise HTTPException(400, f"connection test failed: {probe['error']}")
         _set_enabled(cid, True)
@@ -1462,6 +1652,58 @@ def reconnect_connection(cid: str, user=Depends(current_user)):
         db.log_activity(user, "connection_reconnect", prompt=row["name"], source=row["ctype"])
     row["enabled"] = 1
     return _public(row)
+
+
+@router.post("/{cid}/everything")
+def read_everything(cid: str, user=Depends(current_user)):
+    """“Combine into one”: this connection reads everything its sign-in can
+    see, and the other connections made here with the same sign-in — which
+    only read parts of the same data — are removed. Signed in first; nothing
+    changes unless it works. Its name stays, so chats and grants that use it
+    keep it; tables are named catalog.schema.table from now on, so roles need
+    their tables granted again in Governance."""
+    _admin(user)
+    row = _row_by_id(cid)
+    if row is None:
+        raise HTTPException(404, "Not found")
+    ctype = row["ctype"]
+    t = TYPES.get(ctype) or {}
+    if not t.get("spans"):
+        raise HTTPException(400, f"{t.get('label', ctype)} reads one schema per source")
+    if not row["enabled"]:
+        raise HTTPException(400, f"“{row['name']}” is disconnected — reconnect it first")
+    cfg, raw = _config(row), _decrypt(row["config"])
+    if cfg is None or raw is None:
+        raise HTTPException(400, "the stored credential can no longer be read "
+                                 "(STUDIO_SECRET changed) — remove it and connect again")
+    others = same_sign_in(ctype, cfg, skip_id=cid)
+    env = next((s for s in others if s["env"]), None)
+    if env is not None:
+        raise HTTPException(409, {
+            "error": f"The deployment's own source “{env['name']}” signs in the same way — "
+                     f"read everything with that one, then remove “{row['name']}”.",
+            "existing": env["name"], "stage": "duplicate"})
+    ns = t["ns"]
+    wide = {ns["schema"]: EVERYTHING, ns["database"]: ""}
+    probe = _probe(ctype, {**cfg, **wide})
+    if not probe["ok"]:
+        _refuse_save(probe)
+    stored = _fernet().encrypt(json.dumps({**raw, **wide}).encode()).decode()
+    with db.connect() as c:
+        c.execute("UPDATE data_connections SET config=? WHERE id=?", (stored, cid))
+        for s in others:
+            c.execute("DELETE FROM data_connections WHERE id=?", (s["id"],))
+        c.commit()
+    for s in others:
+        _evict_cached(s["name"])
+        _announce(s["name"], "removed")
+        db.log_activity(user, "connection_delete", prompt=s["name"], source=ctype)
+    # Its record starts over: every name it lists changes to catalog.schema.table.
+    _evict_cached(row["name"])
+    _announce(row["name"], "removed")
+    _announce(row["name"], "connection_saved")
+    db.log_activity(user, "connection_read_everything", prompt=row["name"], source=ctype)
+    return {**_public({**row, "config": stored}), "removed": [s["name"] for s in others]}
 
 
 # ── Routes: built-in sources ─────────────────────────────────────────────
@@ -1503,11 +1745,13 @@ def _env_public(name):
     replaced = bool(row and row["config"])
     mode = ("disconnected" if row and row["disabled"]
             else "replaced" if replaced else "environment")
+    live = _env_parent(name) if mode != "disconnected" else None
     return {"name": name, "ctype": name, "type_label": TYPES[name]["label"], "mode": mode,
             "replaced": replaced, "readable": (cfg is not None) if replaced else None,
             "env_configured": bool(connectors._REGISTRY[name].configured()),
             "hint": _hint(name, cfg) if cfg else "",
             "namespace": _namespace(name, cfg) if cfg else "",
+            "account": account_key(name, live[1]) if live else "",
             "updated_at": row["updated_at"] if row else None}
 
 
@@ -1530,7 +1774,7 @@ def replace_env_source(name: str, body: EnvIn, user=Depends(current_user)):
     ctype = _env_or_404(name)
     cfg = _normalized(ctype, {k: str(v) for k, v in (body.config or {}).items()})
     _require_pin(ctype, cfg, f"— '{name}' reads exactly one")
-    probe = _probe(ctype, cfg)
+    probe = _probe(ctype, cfg, lambda c: _refuse_duplicate(ctype, c, skip_env=name))
     if not probe["ok"]:
         _refuse_save(probe)
     _env_write(name, user, config=_fernet().encrypt(json.dumps(cfg).encode()).decode(),
@@ -1564,7 +1808,7 @@ def reconnect_env_source(name: str, user=Depends(current_user)):
             raise HTTPException(400, "the stored credential can no longer be read "
                                      "(STUDIO_SECRET changed) — set the source up again, "
                                      "or switch it back to the environment")
-        probe = _probe(ctype, cfg)
+        probe = _probe(ctype, cfg, lambda c: _refuse_duplicate(ctype, c, skip_env=name))
         if not probe["ok"]:
             raise HTTPException(400, f"connection test failed: {probe['error']}")
         _env_write(name, user, config=row["config"], disabled=False)
