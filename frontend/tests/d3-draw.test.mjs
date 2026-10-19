@@ -19,7 +19,8 @@ const frontend = fileURLToPath(new URL("../", import.meta.url));
 const require = createRequire(import.meta.url);
 const bundle = await build({
   stdin: {
-    contents: `export {draw, D3_TYPES} from "./src/components/renderers/D3View.jsx";`,
+    contents: `export {draw, D3_TYPES} from "./src/components/renderers/D3View.jsx";
+      export {loadGeo, MAP_TYPES} from "./src/components/renderers/geo.js";`,
     resolveDir: frontend, loader: "jsx",
   },
   bundle: true, write: false, format: "cjs", platform: "node", jsx: "automatic",
@@ -30,15 +31,17 @@ compiled.filename = path.join(frontend, "d3-draw-test.cjs");
 compiled.paths = Module._nodeModulePaths(frontend);
 compiled.require = (id) => require(id);
 compiled._compile(bundle.outputFiles[0].text, compiled.filename);
-const { draw, D3_TYPES } = compiled.exports;
+const { draw, D3_TYPES, loadGeo, MAP_TYPES } = compiled.exports;
 const d3 = await import("d3");
+const geo = await loadGeo();          // a map's base map: world countries, US states
 
 const SIZE = { w: 640, h: 320 };
 
 function render(type, columns, rows, spec = {}) {
   const el = document.createElement("div");
   document.body.appendChild(el);
-  const out = draw(d3, el, columns, rows, { type, title: type, ...spec }, SIZE);
+  const out = draw(d3, el, columns, rows, { type, title: type, ...spec }, SIZE,
+                   MAP_TYPES.has(type) ? geo : null);
   if (typeof out === "function") out();                 // stop an animated layout
   return { el, out, count: (sel) => el.querySelectorAll(sel).length };
 }
@@ -128,6 +131,10 @@ test("every type D3 claims draws without throwing", () => {
     beeswarm: [["g", "v"], [["a", 1], ["b", 2]], { x: "g", y: ["v"] }],
     circle_pack: [["g", "v"], [["a", 1], ["b", 2]], { x: "g", y: ["v"] }],
     heatmap: [["a", "b", "v"], [["x", "y", 1]], { x: "a", y: ["b", "v"] }],
+    route_map: [["from_lat", "from_lon", "to_lat", "to_lon", "n"], [[41.9, -87.6, 40.7, -74.0, 3]],
+                { x: "n", y: ["n"] }],
+    point_map: [["lat", "lon", "n"], [[48.85, 2.35, 1]], { x: "n", y: ["n"] }],
+    choropleth: [["country", "n"], [["France", 1], ["Japan", 2]], { x: "country", y: ["n"] }],
     ...MORE,
   };
   for (const type of D3_TYPES) {

@@ -1,8 +1,10 @@
 // D3 renderer — hand-built SVG for the whole chart catalog, so a screen can
 // draw every type with D3 alone (the D3 & artifacts window does), plus the
 // chart types only D3 draws here: a force-directed network, a beeswarm, a
-// calendar heatmap and circle packing (D3_ONLY). Same validated palette as
-// every other engine.
+// calendar heatmap, circle packing and three maps — routes between places
+// (transit, shipments, trips), places as dots, and shaded countries or US
+// states (D3_ONLY; what each map reads is in geo.js). Same validated palette
+// as every other engine.
 //
 // d3 is loaded on demand (dynamic import) so the main bundle stays light. The
 // data builders (networkData, beeswarmData, …, sankeyData) are pure — rows in,
@@ -15,9 +17,12 @@ import {
   firstNumericIndex, isNumericCol, resolveSpec,
 } from "./common";
 import { animate, captureBars } from "./motion";
+import { MAP_LIMITS, MAP_TYPES, choroplethData, featureKey, loadGeo, pointMapData,
+         routeMapData } from "./geo";
 
 /** Chart types no other engine draws: these always render with D3. */
-export const D3_ONLY = new Set(["network", "beeswarm", "calendar", "circle_pack"]);
+export const D3_ONLY = new Set(["network", "beeswarm", "calendar", "circle_pack",
+                                "route_map", "point_map", "choropleth"]);
 export const D3_TYPES = new Set([
   "bar", "hbar", "stacked_bar", "combo", "line", "area", "stacked_area",
   "pie", "donut", "scatter", "bubble", "heatmap",
@@ -34,7 +39,8 @@ export const d3Type = (t) => (D3_TYPES.has(t) ? t : "bar");
 export const LIMITS = { networkNodes: 300, networkLinks: 2000, beeswarm: 2000,
                         calendarDays: 1100, packLeaves: 400, sankeyNodes: 30,
                         boxGroups: 20, waterfallSteps: 20, funnelStages: 10,
-                        radarAxes: 12, tableRows: 200 };
+                        radarAxes: 12, tableRows: 200,
+                        mapPoints: MAP_LIMITS.points, mapRoutes: MAP_LIMITS.routes };
 
 let _d3 = null;
 function getD3() {
@@ -71,8 +77,9 @@ export default function D3View({ columns, rows, spec, tall, motion = false, fill
     if (!el || !size || size.w < 60 || size.h < 60) return undefined;
     let dead = false;
     let stop = null;
-    getD3()
-      .then((d3) => {
+    // A map needs its base map (countries / US states) as well as d3.
+    Promise.all([getD3(), MAP_TYPES.has(spec?.type) ? loadGeo() : null])
+      .then(([d3, geo]) => {
         if (dead) return;
         const last = drawn.current;
         const changed = !last || last.rows !== rows || last.columns !== columns
@@ -80,7 +87,7 @@ export default function D3View({ columns, rows, spec, tall, motion = false, fill
         const before = motion && changed ? captureBars(el) : null;
         el.replaceChildren();
         try {
-          stop = draw(d3, el, columns, rows, spec, size);
+          stop = draw(d3, el, columns, rows, spec, size, geo);
           if (stop === false) setErr("This data cannot be drawn as this chart type in D3.");
           else if (before) animate(d3, el, spec, last?.spec?.type === spec?.type ? before : new Map());
           drawn.current = { columns, rows, spec };
@@ -404,9 +411,13 @@ function gridY(d3, g, y, width) {
 }
 
 /** Draw one chart into `el`. Returns false when the data does not fit, a stop
- *  function for an animated layout, or null. Exported for tests. */
-export function draw(d3, el, columns, rows, spec, size) {
+ *  function for an animated layout, or null. A map also takes `geo`, its base
+ *  map (geo.loadGeo). Exported for tests. */
+export function draw(d3, el, columns, rows, spec, size, geo = null) {
   switch (spec.type) {
+    case "route_map": return drawRouteMap(d3, el, columns, rows, spec, size, geo);
+    case "point_map": return drawPointMap(d3, el, columns, rows, spec, size, geo);
+    case "choropleth": return drawChoropleth(d3, el, columns, rows, spec, size, geo);
     case "bar": case "hbar": case "stacked_bar": return drawBars(d3, el, columns, rows, spec, size);
     case "line": case "area": case "stacked_area": return drawLines(d3, el, columns, rows, spec, size);
     case "pie": case "donut": return drawPie(d3, el, columns, rows, spec, size);
@@ -1138,3 +1149,261 @@ function drawTable(d3, el, columns, rows) {
   return null;
 }
 
+
+// ── Maps ────────────────────────────────────────────────────────────────
+
+const LAND = "#efedea";       // the base map: quiet, so the data reads first
+const NO_DATA = "#f6f5f3";
+
+/** The base map for a kind: US states (Albers USA, Alaska and Hawaii inset)
+ *  or world countries (Natural Earth). */
+function baseMap(d3, geo, kind) {
+  const { topojson } = geo;
+  if (kind === "us") {
+    const states = topojson.feature(geo.us, geo.us.objects.states);
+    return { kind, features: states.features, outline: states, projection: d3.geoAlbersUsa() };
+  }
+  const countries = topojson.feature(geo.world, geo.world.objects.countries);
+  return { kind, features: countries.features, outline: { type: "Sphere" },
+           projection: d3.geoNaturalEarth1() };
+}
+
+/** A region's centre, on its largest piece: France's is in Europe, not in
+ *  French Guiana; the US's is in the lower 48. Exported for tests. */
+export function mainCentroid(d3, feature) {
+  const g = feature.geometry;
+  if (g?.type !== "MultiPolygon") return d3.geoCentroid(feature);
+  let best = null, area = -1;
+  for (const coordinates of g.coordinates) {
+    const poly = { type: "Polygon", coordinates };
+    const a = d3.geoArea(poly);
+    if (a > area) { area = a; best = poly; }
+  }
+  return d3.geoCentroid(best);
+}
+
+/** Fit the projection to where the data is. A city or a region (under
+ *  ~25° across — a transit network, a delivery area) gets a Mercator close-up
+ *  of just that area; wider than that, the whole US, the whole world, or the
+ *  part of the world the places are in (at least 30° × 18°). */
+export function fitMap(d3, base, coords, box) {
+  const lons = coords.map((c) => c[0]), lats = coords.map((c) => c[1]);
+  const w0 = Math.min(...lons), e0 = Math.max(...lons), s0 = Math.min(...lats), n0 = Math.max(...lats);
+  const clamp = (v, m) => Math.max(-m, Math.min(m, v));
+  if (coords.length && Math.max(e0 - w0, n0 - s0) < 25) {
+    const dx = Math.max(e0 - w0, 0.2) * 0.6, dy = Math.max(n0 - s0, 0.12) * 0.6;
+    const cx = (w0 + e0) / 2, cy = (s0 + n0) / 2;
+    base.projection = d3.geoMercator().fitExtent(box, { type: "MultiPoint", coordinates: [
+      [clamp(cx - dx, 180), clamp(cy - dy, 85)], [clamp(cx + dx, 180), clamp(cy + dy, 85)]] });
+    base.closeUp = true;
+    return base.projection;
+  }
+  const p = base.projection;
+  if (base.kind === "us" || !coords.length || e0 - w0 > 200) {
+    p.fitExtent(box, base.outline);
+    return p;
+  }
+  const cx = (w0 + e0) / 2, cy = (s0 + n0) / 2;
+  const dx = (Math.max(e0 - w0, 30) / 2) * 1.15, dy = (Math.max(n0 - s0, 18) / 2) * 1.15;
+  p.fitExtent(box, { type: "MultiPoint", coordinates: [
+    [clamp(cx - dx, 180), clamp(cy - dy, 85)], [clamp(cx + dx, 180), clamp(cy + dy, 85)]] });
+  return p;
+}
+
+/** The svg, a zoomable layer with the base map in it, and the path generator.
+ *  Scroll or pinch to zoom, drag to pan; dots keep their size. */
+function mapFrame(d3, el, { w, h }, spec, base, coords, fill) {
+  const svg = svgFor(d3, el, { w, h }, spec.title);
+  const box = [[8, 8], [w - 8, h - 30]];
+  const projection = fitMap(d3, base, coords, box);
+  const path = d3.geoPath(projection);
+  const layer = svg.append("g").attr("class", "map-layer");
+  if (base.kind === "world" && !base.closeUp) {
+    layer.append("path").datum({ type: "Sphere" }).attr("d", path)
+      .attr("fill", "none").attr("stroke", GRID_LINE);
+  }
+  const regions = layer.append("g").selectAll("path").data(base.features).join("path")
+    .attr("class", "map-region").attr("d", path)
+    .attr("fill", fill || LAND).attr("stroke", AXIS_LINE).attr("stroke-width", 0.6)
+    .attr("vector-effect", "non-scaling-stroke");
+  const zoom = d3.zoom().scaleExtent([1, 12]).on("zoom", (event) => {
+    layer.attr("transform", event.transform);
+    const k = event.transform.k;
+    layer.selectAll("circle[data-r]").attr("r", function () { return this.getAttribute("data-r") / k; });
+    layer.selectAll("text.map-label").attr("font-size", 11 / k).attr("dx", 7 / k).attr("stroke-width", 3 / k);
+  });
+  svg.call(zoom).style("cursor", "grab");
+  return { svg, layer, regions, path, projection };
+}
+
+/** Where a place is: its coordinates, or its region's centre. */
+function placesOn(d3, base) {
+  const centre = new Map(base.features.map((f) => [featureKey(f), mainCentroid(d3, f)]));
+  return (p) => (p.id ? centre.get(p.id) || null : [p.lon, p.lat]);
+}
+
+/** Name the places on the map itself when there are few enough to read. */
+function placeLabels(layer, places, projection, limit = 15) {
+  const named = places.filter((p) => p.label !== null && p.label !== undefined && p.label !== "");
+  if (!named.length || named.length > limit) return;
+  layer.append("g").selectAll("text").data(named).join("text").attr("class", "map-label")
+    .attr("x", (p) => projection(p.at)[0]).attr("y", (p) => projection(p.at)[1])
+    .attr("dx", 7).attr("dy", "0.32em").attr("font-size", 11).attr("fill", INK.primary)
+    .attr("stroke", SURFACE).attr("stroke-width", 3).attr("paint-order", "stroke")
+    .attr("stroke-linejoin", "round").text((p) => String(p.label).slice(0, 28));
+}
+
+/** Places a result names that the base map has no shape for — too small at
+ *  this scale (Singapore) — reported with the ones not found at all. */
+function lostPlaces(data, labels) {
+  return [...new Set([...(data.unmatched || []), ...labels.filter((l) => l !== null && l !== undefined)
+    .map(String)])];
+}
+
+const placeName = (label, at) => (label !== null && label !== undefined && label !== ""
+  ? String(label) : at ? `${at[1].toFixed(3)}, ${at[0].toFixed(3)}` : "");
+
+/** "Not on the map: a, b and 3 more" — places the gazetteer could not find. */
+function unmatchedNote(svg, data, { w, h }) {
+  if (!data.unmatched?.length) return;
+  const shown = data.unmatched.slice(0, 3).map((u) => String(u).slice(0, 24));
+  const more = data.unmatched.length - shown.length;
+  svg.append("text").attr("class", "map-note").attr("x", w - 8).attr("y", h - 8)
+    .attr("text-anchor", "end").attr("fill", INK.muted)
+    .text(`Not on the map: ${shown.join(", ")}${more > 0 ? ` and ${more} more` : ""}`);
+}
+
+function keyLegend(svg, items, h) {
+  const g = svg.append("g").attr("class", "map-legend").attr("transform", `translate(10,${h - 16})`);
+  let x = 0;
+  for (const [color, text] of items) {
+    if (color) {
+      g.append("circle").attr("cx", x + 4).attr("cy", 0).attr("r", 4).attr("fill", color);
+      x += 12;
+    }
+    const t = g.append("text").attr("x", x).attr("y", 4).attr("fill", INK.secondary).text(text);
+    x += 14 + (t.node().getComputedTextLength?.() || text.length * 6);
+  }
+}
+
+function drawRouteMap(d3, el, columns, rows, spec, size, geo) {
+  const data = routeMapData(columns, rows, spec);
+  if (!data || !geo) return false;
+  const base = baseMap(d3, geo, data.kind);
+  const where = placesOn(d3, base);
+  const placed = data.routes.map((r) => ({ ...r, a: where(r.from), b: where(r.to) }));
+  const routes = placed.filter((r) => r.a && r.b);
+  if (!routes.length) return false;
+  const lost = lostPlaces(data, placed.flatMap((r) => [r.a ? null : r.fromLabel, r.b ? null : r.toLabel]));
+  const { svg, layer, path, projection } = mapFrame(d3, el, size, spec, base,
+                                                    routes.flatMap((r) => [r.a, r.b]));
+  const tip = tooltip(el);
+  const width = d3.scaleSqrt().domain([0, d3.max(routes, (r) => r.value) || 1]).range([0.8, 7]);
+  // Busiest last, so they sit on top.
+  const ordered = routes.slice().sort((x, y) => x.value - y.value);
+  const line = layer.append("g").attr("fill", "none").selectAll("path").data(ordered).join("path")
+    .attr("class", "map-route")
+    .attr("d", (r) => path({ type: "LineString", coordinates: [r.a, r.b] }))
+    .attr("stroke", SERIES[0]).attr("stroke-opacity", 0.6).attr("stroke-linecap", "round")
+    .attr("stroke-width", (r) => width(r.value)).attr("vector-effect", "non-scaling-stroke");
+  // Moving dashes show which way the traffic runs (styles.css animates them;
+  // reduced motion keeps them still). Too many would only flicker.
+  if (ordered.length <= 400) line.attr("stroke-dasharray", "6 5").classed("map-flow", true);
+  hover(line, tip, (r) => [`${placeName(r.fromLabel, r.a)} → ${placeName(r.toLabel, r.b)}`,
+                           `${data.valueName}: ${fmtNum(r.value)}`]);
+  const ends = (pick, label, kind) => {
+    const seen = new Map();
+    for (const r of routes) {
+      const at = pick(r);
+      const key = at.join(",");
+      const hit = seen.get(key) || { at, label: label(r), value: 0, kind };
+      hit.value += r.value;
+      seen.set(key, hit);
+    }
+    return [...seen.values()].filter((e) => projection(e.at));
+  };
+  const stops = [...ends((r) => r.a, (r) => r.fromLabel, "origin"),
+                 ...ends((r) => r.b, (r) => r.toLabel, "dest")];
+  const dot = layer.append("g").selectAll("circle").data(stops).join("circle")
+    .attr("class", "map-stop")
+    .attr("cx", (e) => projection(e.at)[0]).attr("cy", (e) => projection(e.at)[1])
+    .attr("r", 3.5).attr("data-r", 3.5)
+    .attr("fill", (e) => (e.kind === "origin" ? SERIES[0] : SERIES[1]))
+    .attr("stroke", SURFACE).attr("stroke-width", 1).attr("vector-effect", "non-scaling-stroke");
+  hover(dot, tip, (e) => [placeName(e.label, e.at), `${e.kind === "origin" ? "from here" : "to here"}: ${fmtNum(e.value)} ${data.valueName}`]);
+  // A stop that is both an origin and a destination is named once.
+  const named = new Map(stops.map((e) => [e.at.join(","), e]));
+  placeLabels(layer, [...named.values()], projection);
+  keyLegend(svg, [[SERIES[0], "origin"], [SERIES[1], "destination"],
+                  [null, data.total > data.routes.length
+                    ? `busiest ${data.routes.length} of ${data.total} routes · width = ${data.valueName}`
+                    : `width = ${data.valueName}`]], size.h);
+  unmatchedNote(svg, { unmatched: lost }, size);
+  return null;
+}
+
+function drawPointMap(d3, el, columns, rows, spec, size, geo) {
+  const data = pointMapData(columns, rows, spec);
+  if (!data || !geo) return false;
+  const base = baseMap(d3, geo, data.kind);
+  const where = placesOn(d3, base);
+  const placedPoints = data.points.map((p) => ({ ...p, at: where(p) }));
+  const points = placedPoints.filter((p) => p.at);
+  if (!points.length) return false;
+  const lost = lostPlaces(data, placedPoints.filter((p) => !p.at).map((p) => p.label));
+  const { svg, layer, projection } = mapFrame(d3, el, size, spec, base, points.map((p) => p.at));
+  const tip = tooltip(el);
+  const shown = points.filter((p) => projection(p.at));
+  const max = d3.max(shown, (p) => Math.abs(p.value ?? 0)) || 0;
+  const radius = data.measured && max > 0
+    ? d3.scaleSqrt().domain([0, max]).range([2, shown.length > 300 ? 10 : 18])
+    : () => (shown.length > 500 ? 2.5 : 4);
+  // Largest first, so the small ones stay clickable on top.
+  const dot = layer.append("g").selectAll("circle")
+    .data(shown.slice().sort((a, b) => Math.abs(b.value ?? 0) - Math.abs(a.value ?? 0)))
+    .join("circle").attr("class", "map-point")
+    .attr("cx", (p) => projection(p.at)[0]).attr("cy", (p) => projection(p.at)[1])
+    .attr("r", (p) => radius(Math.abs(p.value ?? 0))).attr("data-r", (p) => radius(Math.abs(p.value ?? 0)))
+    .attr("fill", SERIES[0]).attr("fill-opacity", 0.7)
+    .attr("stroke", SURFACE).attr("stroke-width", 0.8).attr("vector-effect", "non-scaling-stroke");
+  hover(dot, tip, (p) => [placeName(p.label, p.at),
+                          ...(p.value !== null && data.valueName ? [`${data.valueName}: ${fmtNum(p.value)}`] : [])]);
+  placeLabels(layer, shown, projection);
+  keyLegend(svg, [[SERIES[0], data.measured ? `size = ${data.valueName}` : `${shown.length} places`]], size.h);
+  unmatchedNote(svg, { unmatched: lost }, size);
+  return null;
+}
+
+function drawChoropleth(d3, el, columns, rows, spec, size, geo) {
+  const data = choroplethData(columns, rows, spec);
+  if (!data || !geo) return false;
+  const base = baseMap(d3, geo, data.kind);
+  const byId = new Map(data.regions.map((r) => [r.id, r]));
+  const [lo, hi] = d3.extent(data.regions, (r) => r.value);
+  const color = d3.scaleQuantize().domain(lo === hi ? [Math.min(0, lo), hi || 1] : [lo, hi]).range(SEQ);
+  const { svg, regions } = mapFrame(d3, el, size, spec, base, [],
+    (f) => (byId.has(featureKey(f)) ? color(byId.get(featureKey(f)).value) : NO_DATA));
+  const tip = tooltip(el);
+  regions.filter((f) => byId.has(featureKey(f))).attr("class", "map-region map-shaded");
+  const drawn = new Set(base.features.map(featureKey));
+  const lost = lostPlaces(data, data.regions.filter((r) => !drawn.has(r.id)).map((r) => r.label));
+  hover(regions, tip, (f) => {
+    const r = byId.get(featureKey(f));
+    return r ? [String(r.label), `${data.valueName}: ${fmtNum(r.value)}`]
+      : [f.properties?.name || "", "no data"];
+  });
+  // The scale: five steps of the blue ramp, low to high, and "no data".
+  const step = 30;
+  const compact = (v) => d3.format("~s")(v).replace("G", "B");
+  const g = svg.append("g").attr("class", "map-legend").attr("transform", `translate(10,${size.h - 24})`);
+  SEQ.forEach((c, i) => g.append("rect").attr("x", i * step).attr("width", step).attr("height", 8).attr("fill", c));
+  g.append("text").attr("x", 0).attr("y", 20).attr("fill", INK.muted).text(compact(color.domain()[0]));
+  g.append("text").attr("x", SEQ.length * step).attr("y", 20).attr("text-anchor", "end")
+    .attr("fill", INK.muted).text(compact(color.domain()[1]));
+  g.append("rect").attr("x", SEQ.length * step + 14).attr("width", 12).attr("height", 8)
+    .attr("fill", NO_DATA).attr("stroke", AXIS_LINE);
+  g.append("text").attr("x", SEQ.length * step + 30).attr("y", 8).attr("fill", INK.muted)
+    .text(`no data · shade = ${data.valueName}`);
+  unmatchedNote(svg, { unmatched: lost }, size);
+  return null;
+}

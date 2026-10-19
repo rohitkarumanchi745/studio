@@ -784,6 +784,12 @@ td { color: var(--ink-2); }
   font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre;
 }
 .d3-chart svg text { font-family: inherit; }
+/* Maps (D3View): routes run in the direction of travel; still for reduced motion. */
+.d3-chart .map-flow { animation: map-flow 1.1s linear infinite; }
+@keyframes map-flow { to { stroke-dashoffset: -11; } }
+@media (prefers-reduced-motion: reduce) { .d3-chart .map-flow { animation: none; } }
+.d3-chart .map-region.map-shaded:hover, .d3-chart .map-route:hover { stroke: var(--ink, #1b1a19); }
+.d3-chart svg:active { cursor: grabbing; }
 .d3-tip {
   position: absolute; pointer-events: none; opacity: 0; transition: opacity .12s;
   background: var(--surface, #fff); color: var(--ink-2, #4a4844); border: 1px solid var(--line, #e3e1dd);
