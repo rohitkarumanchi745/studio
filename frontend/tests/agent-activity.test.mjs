@@ -233,7 +233,7 @@ test("a failed task poll keeps recorded steps in an expandable panel above the e
     return [];
   }, async ({requests, timers}) => {
     const chat = chatHarness({conversationId: "conv-live", onConversationCreated() {}});
-    const input = findElement(chat.render().tree, (element) => element.type === "input" && element.props.className === "pill-input");
+    const input = findElement(chat.render().tree, (element) => element.type === "textarea" && element.props.className === "pill-input");
     input.props.onChange({target: {value: "Show sales"}});
     const form = findElement(chat.render().tree, (element) => element.type === "form" && element.props.className === "composer chat-composer");
     await form.props.onSubmit({preventDefault() {}});

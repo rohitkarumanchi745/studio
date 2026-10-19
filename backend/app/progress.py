@@ -59,6 +59,21 @@ def describe(source):
         return {"source": source} if isinstance(source, str) else {}
 
 
+def stop_requested(tid=None):
+    """True when the user pressed Stop on this task (chat_tasks.status
+    'stopped') — `tid`, or the task this thread is bound to. False outside a
+    task, and on any error: a check must never break a turn."""
+    tid = tid or _task.get()
+    if not tid:
+        return False
+    try:
+        with db.connect() as c:
+            r = c.execute("SELECT status FROM chat_tasks WHERE id=?", (tid,)).fetchone()
+        return bool(r) and dict(r)["status"] == "stopped"
+    except Exception:
+        return False
+
+
 def emit(label, agent=None, kind=None, source=None, tables=None):
     """Append one step to the bound task's live feed. No-op when unbound
     (synchronous /chat has no task row and stays silent)."""

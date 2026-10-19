@@ -328,6 +328,25 @@ Copilot response, top to bottom, with no box around it:
 
 While Studio works, the same avatar and name sit above the live steps.
 
+**The composer** works the way ChatGPT's and Copilot's do:
+- **One rounded box.** The message grows as you type, up to about eight
+  lines. Enter sends; Shift+Enter starts a new line.
+- **＋** opens the Airflow option ("Build an approval-gated Airflow DAG from
+  this prompt") and "Run on Airflow / another platform". A chosen DAG build
+  shows as a removable ⚙ chip in the box.
+- **The model** is a small pill, and **send** is a round ↑.
+- **■ Stop.** While an answer is being worked on, send becomes Stop, as in
+  ChatGPT (`POST /api/tasks/{id}/stop`):
+  - The question is answered at once with "You stopped this answer before
+    it finished", which takes its one reply slot, so whatever the agent
+    would still have said is refused when it tries to write.
+  - The task is marked stopped, and nothing later overwrites that.
+  - Queries the turn hasn't run yet are refused at the gateway. A model call
+    already under way finishes and is discarded.
+  - Pressed before the server has returned the task's id, Stop stops it as
+    soon as it has one.
+  - An answer that landed first stays; only the task's owner can stop it.
+
 ### Auto — the question picks its source and tables
 
 The chat toolbar's **Auto** switch is on by default, and each browser

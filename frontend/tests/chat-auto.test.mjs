@@ -134,7 +134,7 @@ async function withChatNetwork(responseFor, run) {
 
 async function ask(chat, text) {
   const input = findElement(chat.render().tree,
-    (el) => el.type === "input" && el.props.className === "pill-input");
+    (el) => el.type === "textarea" && el.props.className === "pill-input");
   input.props.onChange({ target: { value: text } });
   const form = findElement(chat.render().tree,
     (el) => el.type === "form" && el.props.className === "composer chat-composer");

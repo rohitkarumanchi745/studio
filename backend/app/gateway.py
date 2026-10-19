@@ -37,8 +37,8 @@ import threading
 import os
 import time
 
-from . import cypherguard, db, governance, limits, queryguard, rbac, sources
-from .connectors.base import CancelToken, cancel_scope, gateway_scope
+from . import cypherguard, db, governance, limits, progress, queryguard, rbac, sources
+from .connectors.base import CancelToken, QueryCancelled, cancel_scope, gateway_scope
 from .queryguard import QueryRejected
 
 
@@ -263,6 +263,9 @@ def execute(user, source, sql, purpose, *, table_label="*", max_rows=None, audit
     t0 = time.time()
     cleaned = None
     try:
+        if progress.stop_requested():
+            # The user pressed Stop on the chat turn this read belongs to.
+            raise QueryCancelled("Stopped by the user")
         connector, _allowed, cleaned = check(
             user, source, sql, table_label=table_label, max_rows=max_rows,
             allow_explain=allow_explain)
