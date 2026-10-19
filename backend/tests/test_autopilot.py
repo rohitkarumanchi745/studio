@@ -112,17 +112,23 @@ def test_threshold_fires_only_when_crossed(client, monkeypatch):
     assert run1["status"] == "done", run1
 
     # Second evaluation, still above threshold (already latched true): no re-fire.
+    # A poll that does not fire writes no run — what it found is on the agent.
     d = autopilot._get_agent(aid)
     run2 = autopilot._run_agent_now(d, "schedule")
-    assert run2["status"] == "skipped"
+    assert run2["status"] == "checked" and run2["check"] == {"status": "met", "value": 5.0}
 
     # Drop below, then back above -> a fresh cross fires again.
     state["val"] = -1.0
     d = autopilot._get_agent(aid)
-    assert autopilot._run_agent_now(d, "schedule")["status"] == "skipped"
+    assert autopilot._run_agent_now(d, "schedule")["check"]["status"] == "not met"
+    agent = client.get(f"/api/autopilot/{aid}").json()
+    assert agent["last_check"] == {"status": "not met", "value": -1.0}
+    assert agent["last_checked_at"] is not None
     state["val"] = 9.0
     d = autopilot._get_agent(aid)
     assert autopilot._run_agent_now(d, "schedule")["status"] == "done"
+    runs = client.get(f"/api/autopilot/{aid}/runs").json()["runs"]
+    assert [r["status"] for r in runs] == ["done", "done"]          # only the two crossings
 
 
 # ── RBAC: never wider than the owner ─────────────────────────────────────

@@ -573,6 +573,52 @@ panel, and `GET /freshness/{source}`. Honest limit: it reports what's *in* the
 tables — a silently failed pipeline shows up as a freshness value that stops
 advancing, not as a schedule alert.
 
+### Autopilot — agents that act on a trigger
+
+An Autopilot agent has a goal ("summarize revenue by region and flag anything
+unusual"), a scope (a source and optionally its tables) and a trigger. It
+runs as its owner, re-checked on every run, so it never reads more than the
+owner may (`autopilot.py`).
+
+**Triggers**
+- **Schedule:** every N minutes, hours or days.
+- **Threshold:** a certified metric or a SQL value crosses a rule. It fires
+  when the condition becomes true, not again while it stays true.
+- **New data:** a table's newest row moves past the one seen before. The
+  first check only records where to start.
+- **Manual:** on **run now**.
+
+**Answers.** A run answers its goal in the order chat answers a question, so
+a scheduled report and a chat answer agree: a certified metric's definition,
+then an exact verified query, then the agent. A tier's answer counts only
+when its SQL stays inside the agent's tables.
+
+**Writes need approval.** An optional action (a SQL script, Spark job or
+platform run) is proposed to the supervisor and waits for an admin in Jobs.
+It never runs on its own. If the proposal fails, the run says so.
+
+**What you see**
+- **Every card says what its last check found:** "not met (334,200)",
+  "watching for rows newer than 2026-10-16", or, in red, "couldn't check:
+  the threshold SQL reads tables outside this agent's scope". A check that
+  doesn't fire writes no run.
+- **A check that starts failing is one failed run, then a red line.** It is
+  not a new failure every poll.
+- **Every table a SQL reads counts,** comma joins and CTEs included, so an
+  agent's declared tables hold.
+- **Alerts.** A run the agent started itself is an alert until its owner
+  reads it:
+  - the sidebar shows **🔔 N new Autopilot alerts** even with Tools &
+    settings collapsed;
+  - the Autopilot screen opens with the unread ones, and **open** shows the
+    run in full: its text, charts, data (the first 200 rows), SQL, where
+    the answer came from, and any action awaiting approval;
+  - alerts are the owner's own, an admin's included; **run now** is not an
+    alert.
+- **History.** Each agent keeps its newest 200 runs. Changing a trigger or
+  its tables starts the watch over.
+- **Email.** The owner is also emailed when SMTP is configured.
+
 ### Planning context for DAG drafts
 
 An admin can register GitHub repositories from the **GitHub tile in Data

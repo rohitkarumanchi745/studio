@@ -440,6 +440,24 @@ def _m22_metagraph_descriptions(c, is_pg):
     _add_column(c, "meta_columns", "description", "TEXT", is_pg)
 
 
+def _m23_autopilot_checks_and_alerts(c, is_pg):
+    # Autopilot: a poll that does not fire updates the agent's check state
+    # instead of writing a run, and a fired run is an alert until it is seen.
+    _add_column(c, "autopilot_agents", "last_checked_at", "REAL", is_pg)
+    _add_column(c, "autopilot_agents", "last_check", "TEXT", is_pg)
+    _add_column(c, "autopilot_runs", "seen_at", "REAL", is_pg)
+    # The index lives here, not in init_tables: on an existing database
+    # init_tables runs before this migration has added the column.
+    if db._has_column(c, "autopilot_runs", "seen_at"):
+        c.execute("CREATE INDEX IF NOT EXISTS idx_autopilot_runs_unseen "
+                  "ON autopilot_runs(owner_id, seen_at)")
+        # Runs from before alerts existed are history, not news.
+        c.execute("UPDATE autopilot_runs SET seen_at = COALESCE(finished_at, started_at) "
+                  "WHERE seen_at IS NULL")
+        # The 'skipped' rows a non-firing poll used to write are noise.
+        c.execute("DELETE FROM autopilot_runs WHERE status = 'skipped'")
+
+
 MIGRATIONS = [
     (1, "users.verified", _m1_users_verified),
     (2, "conversations.folder_id", _m2_conversations_folder_id),
@@ -463,6 +481,7 @@ MIGRATIONS = [
     (20, "meta_sources freshness", _m20_metagraph_freshness),
     (21, "query_cache.user_id", _m21_query_cache_user_id),
     (22, "meta_objects/meta_columns description", _m22_metagraph_descriptions),
+    (23, "autopilot check state + run alerts", _m23_autopilot_checks_and_alerts),
 ]
 
 

@@ -64,6 +64,7 @@ _MAX_INTERVAL = 2_592_000          # 30 days
 _DEFAULT_POLL = 300                # threshold/event poll cadence
 _CLAIM_STALE = 300                 # a claim older than this is considered dead
 _RESULT_ROW_CAP = 200              # cap rows stored on a run so the table stays lean
+_KEEP_RUNS = 200                   # runs kept per agent, newest first
 _TICK_SECONDS = int(os.getenv("STUDIO_AUTOPILOT_TICK_SECONDS", "60"))
 
 
@@ -89,6 +90,8 @@ def init_tables():
                 claimed_at REAL,
                 last_seen_freshness TEXT,
                 last_threshold_state INTEGER,
+                last_checked_at REAL,
+                last_check TEXT,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
             );
@@ -108,7 +111,8 @@ def init_tables():
                 trace_id TEXT,
                 proposed_job_id TEXT,
                 started_at REAL NOT NULL,
-                finished_at REAL
+                finished_at REAL,
+                seen_at REAL
             );
             CREATE INDEX IF NOT EXISTS idx_autopilot_runs_agent
                 ON autopilot_runs(agent_id, started_at DESC);
@@ -156,12 +160,44 @@ def _build_scope(owner, source, tables):
     return connector, allowed, schemas, table_param
 
 
+def _within(sql, tables):
+    """True when `sql` reads only `tables` (lowercase names) — every table it
+    reads, comma joins and CTEs included (queryguard.base_tables). An agent
+    with no declared tables (`tables` empty) may read any the owner can."""
+    if not tables:
+        return True
+    from .queryguard import base_tables
+    reads = base_tables(sql or "")
+    return bool(reads) and reads <= tables
+
+
 def _run_headless(owner, source, tables, goal, model=None):
-    """Run one analytics turn as the owner, with no chat conversation. Replicates
-    the setup half of chat._prepare/_run_turn and calls agent.run_agent directly
-    — history=[] (an autopilot run is stateless). Dormant-safe: with no LLM key
-    run_agent returns rows via its deterministic fallback."""
+    """Answer the goal as the owner, with no conversation — in the order chat
+    answers a question, so a scheduled report and a chat answer agree:
+    a CERTIFIED metric's definition, then an exact VERIFIED query, then the
+    agent. A tier's answer counts only when its SQL stays inside the agent's
+    declared tables. Dormant-safe: with no LLM key the agent tier returns rows
+    via its deterministic fallback."""
     connector, allowed, schemas, table_param = _build_scope(owner, source, tables)
+    declared = {t.lower() for t in allowed} if [t for t in (tables or []) if t] else set()
+    single = None if table_param == "*" else table_param
+    try:
+        out = semantic.certified_answer(owner, [source], goal, single)
+    except Exception:
+        out = None
+    if out is not None and _within(out.get("sql"), declared):
+        out.setdefault("served_by", "semantic")
+        return out
+    try:
+        from . import verified_sql
+        match = verified_sql.match(owner, source, single or "*", goal)
+        out = verified_sql.answer(owner, source, match) \
+            if match and match["kind"] == "exact" else None
+    except Exception:
+        out = None
+    if out is not None and _within(out.get("sql"), declared):
+        out.setdefault("served_by", "verified_sql")
+        return out
     skill_md = skills.get_skill(connector, owner["role"], allowed, schemas)
     return agent.run_agent(
         prompt=goal, connector=connector, table=table_param, allowed_tables=allowed,
@@ -186,91 +222,107 @@ def _scalar(columns, rows, column=None):
         return None
 
 
+class TriggerError(Exception):
+    """The trigger could not be checked — said in words, so the agent shows
+    why instead of looking like a condition that simply was not met."""
+
+
 def _threshold_metric(owner, agent_def):
     """Evaluate the threshold metric AS THE OWNER. Prefer the deterministic
     semantic layer (no LLM key needed); fall back to a guarded SQL through the
     exact human gate (queries.verify_sql = RBAC + query guard + governance +
-    execution). Returns a float or None."""
+    execution). Returns a float, or raises TriggerError saying why not."""
     cfg = agent_def["trigger_config"]
     source = agent_def["source"]
+    declared = {str(t).lower() for t in (agent_def.get("tables") or []) if t}
+    why = []
     if cfg.get("metric_prompt"):
         try:
             res = semantic.answer(owner, source, cfg["metric_prompt"], "*")
-        except Exception:
-            res = None
-        if res and res.get("rows"):
+        except Exception as e:
+            res, why = None, [f"the metric could not be read ({str(e)[:120]})"]
+        if res and res.get("rows") and _within(res.get("sql"), declared):
             v = _scalar(res.get("columns"), res["rows"], cfg.get("column"))
             if v is not None:
                 return v
+        if not why:
+            why.append(f"no defined metric matches “{cfg['metric_prompt']}” on {source}")
     if cfg.get("sql"):
         # Confine the threshold SQL to the agent's DECLARED tables — an agent
         # scoped to [sales] must not probe [customers] even though the owner
-        # could. (verify_sql still enforces the owner's full RBAC on top.)
-        declared = {str(t).lower() for t in (agent_def.get("tables") or []) if t}
-        if declared:
-            from .queryguard import TABLE_REF
-            refs = {r.strip('"').split(".")[-1].lower()
-                    for r in TABLE_REF.findall(cfg["sql"] or "")}
-            if refs - declared:
-                return None      # references a table outside the declared scope
+        # could; every table the SQL reads counts, comma joins included.
+        # (verify_sql still enforces the owner's full RBAC on top.)
+        if not _within(cfg["sql"], declared):
+            raise TriggerError("the threshold SQL reads tables outside this agent's scope ("
+                               + ", ".join(sorted(declared)) + ")")
         res = queries.verify_sql(owner, source, "*", cfg["sql"], full_rows=True)
-        if res.get("ok") and res.get("rows"):
-            return _scalar(res.get("columns"), res["rows"], cfg.get("column"))
-    return None
+        if not res.get("ok"):
+            raise TriggerError(f"the threshold SQL failed: {str(res.get('error') or '')[:200]}")
+        v = _scalar(res.get("columns"), res.get("rows") or [], cfg.get("column"))
+        if v is None:
+            raise TriggerError("the threshold SQL returned no number")
+        return v
+    raise TriggerError("; ".join(why) or "the threshold has no metric to check")
 
 
 def _threshold_crossed(owner, agent_def):
     cfg = agent_def["trigger_config"]
     val = _threshold_metric(owner, agent_def)
-    if val is None:
-        return False, None
     op = _OPS.get(cfg.get("op"))
     if op is None:
-        return False, val
-    try:
-        return bool(op(val, float(cfg["value"]))), val
-    except (TypeError, ValueError):
-        return False, val
+        raise TriggerError(f"unknown comparison {cfg.get('op')!r}")
+    return bool(op(val, float(cfg["value"]))), val
 
 
 def _event_advanced(owner, agent_def):
-    """New-data check via freshness: the table's newest timestamp advanced past
-    the cursor stored on the agent. Returns (advanced, latest_str)."""
+    """New-data check via freshness: the table's newest timestamp, read as the
+    owner through the gateway (freshness.for_table). Returns the latest value
+    as text; raises TriggerError when it cannot be read."""
     cfg = agent_def["trigger_config"]
     try:
         connector, allowed, _schemas, _tp = _build_scope(
             owner, agent_def["source"], agent_def.get("tables"))
-    except (PermissionError, HTTPException):
-        return False, None
+    except PermissionError as e:
+        raise TriggerError(f"the owner can no longer read this scope: {e}")
     table = cfg.get("table")
     if not table or table not in allowed:
-        return False, None
-    r = freshness.for_table(connector, allowed, table)
-    latest = r.get("latest")
-    if latest is None:
-        return False, None
-    latest = str(latest)
-    advanced = latest != (agent_def.get("last_seen_freshness") or "")
-    return advanced, latest
+        raise TriggerError(f"the owner can no longer read {table}")
+    r = freshness.for_table(owner, agent_def["source"], table, connector=connector)
+    if r.get("error"):
+        raise TriggerError(f"could not read the newest row of {table}: {r['error']}")
+    if r.get("latest") is None:
+        raise TriggerError(r.get("note") and f"{table} has {r['note']}"
+                           or f"{table} has no rows yet")
+    return str(r["latest"])
 
 
 def _should_fire(owner, agent_def, trigger):
-    """Decide whether a due agent fires now, and what agent-state cursor to
-    persist. Returns (fire: bool, field_updates: dict). Manual + schedule always
-    fire; threshold fires only on a false->true CROSS; event fires only when
-    freshness advanced."""
+    """Decide whether a due agent fires now. Returns (fire, field_updates,
+    check): `check` is what this poll found — {"status", "value"?, "detail"?}
+    — kept on the agent so a poll that does not fire is visible without a run.
+    Manual and schedule always fire; a threshold fires on a false->true CROSS;
+    new data fires when the newest row moved past the one seen before (the
+    first poll only records where to start). Raises TriggerError."""
     tt = agent_def["trigger_type"]
     if trigger == "manual" or tt in ("manual", "schedule"):
-        return True, {}
+        return True, {}, {"status": "fired"}
     if tt == "threshold":
-        crossed, _val = _threshold_crossed(owner, agent_def)
+        crossed, val = _threshold_crossed(owner, agent_def)
         prev = bool(agent_def.get("last_threshold_state"))
-        return (crossed and not prev), {"last_threshold_state": 1 if crossed else 0}
+        fire = crossed and not prev
+        status = "fired" if fire else "met" if crossed else "not met"
+        return fire, {"last_threshold_state": 1 if crossed else 0}, \
+            {"status": status, "value": val}
     if tt == "event":
-        advanced, latest = _event_advanced(owner, agent_def)
-        updates = {"last_seen_freshness": latest} if latest is not None else {}
-        return advanced, updates
-    return False, {}
+        latest = _event_advanced(owner, agent_def)
+        seen = agent_def.get("last_seen_freshness")
+        if not seen:
+            return False, {"last_seen_freshness": latest}, \
+                {"status": "watching", "value": latest}
+        fire = latest != seen
+        return fire, {"last_seen_freshness": latest}, \
+            {"status": "fired" if fire else "no new data", "value": latest}
+    return False, {}, {"status": "error", "detail": f"unknown trigger {tt!r}"}
 
 
 # ── The 'act with approval' seam ─────────────────────────────────────────
@@ -280,20 +332,23 @@ def _maybe_gate_action(agent_def, owner):
     PROPOSE it through supervisor.submit — which runs the SAME classify/RBAC gate
     a human hits and returns needs_human for any write/pipeline (an
     awaiting_approval supervised job an admin approves in Jobs). This module
-    NEVER executes the write itself. Returns the proposed job id, or None for a
-    pure read/alert agent. Best-effort: a supervisor failure must not crash the
-    run (the read result + trace still land)."""
+    NEVER executes the write itself. Returns (job id, None), (None, None) for a
+    pure read/alert agent, or (None, why) when the proposal failed — the run
+    still lands, saying so."""
     action = (agent_def.get("trigger_config") or {}).get("action") or {}
     kind = action.get("kind")
     if kind not in _ACTION_KINDS:
-        return None
+        return None, None
     from . import supervisor  # CALL only — never edit supervisor.py
     try:
         job = supervisor.submit(kind, action.get("target") or agent_def["source"],
                                 action.get("script") or "", owner)
-    except Exception:
-        return None
-    return job.get("id") if isinstance(job, dict) else None
+    except Exception as e:
+        detail = getattr(e, "detail", None) or str(e) or type(e).__name__
+        return None, str(detail)[:300]
+    if isinstance(job, dict) and job.get("id"):
+        return job["id"], None
+    return None, "the supervisor returned no job"
 
 
 # ── The run loop ─────────────────────────────────────────────────────────
@@ -303,7 +358,7 @@ def _summarize(result):
     return text[:500] if text else "(no output)"
 
 
-def _capped_result(result, proposed_job_id=None):
+def _capped_result(result, proposed_job_id=None, action_error=None):
     """The JSON stored on a run row: text/sql/chart + capped rows + panels,
     plus a pointer to any gated job so the UI links to Jobs."""
     out = {
@@ -316,10 +371,13 @@ def _capped_result(result, proposed_job_id=None):
                     "rows": (p.get("rows") or [])[:_RESULT_ROW_CAP], "chart": p.get("chart")}
                    for p in (result.get("panels") or [])],
         "mode": result.get("mode"),
+        "served_by": result.get("served_by"),
         "row_count": len(result.get("rows") or []),
     }
     if proposed_job_id:
         out["proposed_job_id"] = proposed_job_id
+    if action_error:
+        out["action_error"] = action_error
     return out
 
 
@@ -342,35 +400,45 @@ def _email_owner(owner, agent_def, result, proposed_job_id):
 
 
 def _run_agent_now(agent_def, trigger):
-    """Execute one run for a (already loaded) agent definition. Resolves the
-    owner + scope fresh, decides whether to fire, runs headless as the owner,
-    gates any risky action through the supervisor, records a run row + a
-    lightning trace, and emails the owner. Returns the run row dict.
+    """One poll of an (already loaded) agent. Resolves the owner fresh, checks
+    the trigger, and — when it fires — answers the goal as the owner, gates
+    any action through the supervisor, and records a run (an alert until the
+    owner sees it), a lightning trace and an email.
 
-    Never raises to its caller (the ticker / the manual endpoint wraps it too):
-    an owner-gone / RBAC-shrunk / agent error becomes a status='failed' run."""
+    A poll that does not fire writes no run: what it found is kept on the
+    agent (last_checked_at / last_check). A check that STARTS failing is one
+    failed run — news once — and then shows on the agent until it recovers.
+    Returns the run row, or {"status": "checked", "check": …} when nothing ran.
+    Never raises to its caller (the ticker / the manual endpoint)."""
     run_id = str(uuid.uuid4())
     started = time.time()
-    owner_id = agent_def["owner_id"]
+    manual = trigger == "manual"
 
     try:
-        owner = _owner_identity(owner_id)
+        owner = _owner_identity(agent_def["owner_id"])
     except Exception as e:
         return _record_run(run_id, agent_def, trigger, "failed", started,
-                           summary=f"owner unavailable: {e}")
+                           summary=f"owner unavailable: {e}", seen=manual)
 
-    # Fire decision (threshold/event may decline); persist any cursor update.
     try:
-        fire, field_updates = _should_fire(owner, agent_def, trigger)
+        fire, field_updates, check = _should_fire(owner, agent_def, trigger)
+    except TriggerError as e:
+        fire, field_updates, check = False, {}, {"status": "error", "detail": str(e)}
     except Exception as e:
-        return _record_run(run_id, agent_def, trigger, "failed", started,
-                           summary=f"trigger evaluation error: {e}")
+        fire, field_updates, check = False, {}, {
+            "status": "error", "detail": f"trigger evaluation error: {str(e)[:300]}"}
+    if not manual:
+        field_updates = {**field_updates, "last_checked_at": time.time(),
+                         "last_check": json.dumps(check, default=str)}
     if field_updates:
         _update_fields(agent_def["id"], field_updates)
 
     if not fire:
-        return _record_run(run_id, agent_def, trigger, "skipped", started,
-                           summary="trigger condition not met")
+        before = agent_def.get("last_check") or {}
+        if check["status"] == "error" and before.get("status") != "error":
+            return _record_run(run_id, agent_def, trigger, "failed", started,
+                               summary=f"the trigger could not be checked: {check['detail']}")
+        return {"id": None, "agent_id": agent_def["id"], "status": "checked", "check": check}
 
     t0 = time.time()
     try:
@@ -380,13 +448,13 @@ def _run_agent_now(agent_def, trigger):
         # The owner's RBAC no longer covers this scope (a demotion). Fail the run
         # — an autopilot agent can never run wider than its current owner.
         return _record_run(run_id, agent_def, trigger, "failed", started,
-                           summary=f"owner RBAC denies this scope: {e}")
+                           summary=f"owner RBAC denies this scope: {e}", seen=manual)
     except Exception as e:
         return _record_run(run_id, agent_def, trigger, "failed", started,
-                           summary=f"agent error: {str(e)[:400]}")
+                           summary=f"agent error: {str(e)[:400]}", seen=manual)
 
     # Act-with-approval: propose any write/pipeline action; never execute it here.
-    proposed_job_id = _maybe_gate_action(agent_def, owner)
+    proposed_job_id, action_error = _maybe_gate_action(agent_def, owner)
 
     # Trace the rollout like every other run (best-effort; swallows its own errors).
     result_for_trace = {**result, "source": agent_def["source"], "table": "*"}
@@ -402,26 +470,39 @@ def _run_agent_now(agent_def, trigger):
     except Exception:
         pass
 
-    return _record_run(run_id, agent_def, trigger, "done", started,
-                       summary=_summarize(result),
-                       result=_capped_result(result, proposed_job_id),
-                       trace_id=trace_id, proposed_job_id=proposed_job_id)
+    summary = _summarize(result)
+    if check.get("status") == "fired" and "value" in check and agent_def["trigger_type"] == "threshold":
+        value = check["value"]
+        shown = f"{value:,.0f}" if float(value).is_integer() else f"{value:,.2f}"
+        summary = f"Threshold crossed (value {shown}). {summary}"[:500]
+    if action_error:
+        summary = f"{summary[:300]} — the governed action could not be proposed: {action_error}"[:500]
+    return _record_run(run_id, agent_def, trigger, "done", started, summary=summary,
+                       result=_capped_result(result, proposed_job_id, action_error),
+                       trace_id=trace_id, proposed_job_id=proposed_job_id, seen=manual)
 
 
 def _record_run(run_id, agent_def, trigger, status, started, summary=None,
-                result=None, trace_id=None, proposed_job_id=None):
+                result=None, trace_id=None, proposed_job_id=None, seen=False):
+    """Write a run — unread (an alert) unless the owner started it — and keep
+    the agent's newest _KEEP_RUNS."""
+    now = time.time()
     row = {
         "id": run_id, "agent_id": agent_def["id"], "owner_id": agent_def["owner_id"],
         "trigger": trigger, "status": status, "summary": summary,
         "result": json.dumps(result, default=str) if result is not None else None,
         "trace_id": trace_id, "proposed_job_id": proposed_job_id,
-        "started_at": started, "finished_at": time.time(),
+        "started_at": started, "finished_at": now, "seen_at": now if seen else None,
     }
     cols = ("id,agent_id,owner_id,trigger,status,summary,result,trace_id,"
-            "proposed_job_id,started_at,finished_at")
+            "proposed_job_id,started_at,finished_at,seen_at")
     with db.connect() as c:
-        c.execute(f"INSERT INTO autopilot_runs ({cols}) VALUES ({','.join('?' * 11)})",
+        c.execute(f"INSERT INTO autopilot_runs ({cols}) VALUES ({','.join('?' * 12)})",
                   tuple(row[k] for k in cols.split(",")))
+        c.execute("DELETE FROM autopilot_runs WHERE agent_id=? AND id NOT IN ("
+                  "SELECT id FROM autopilot_runs WHERE agent_id=? "
+                  "ORDER BY started_at DESC LIMIT ?)",
+                  (agent_def["id"], agent_def["id"], _KEEP_RUNS))
         c.commit()
     return row
 
@@ -434,6 +515,10 @@ def _agent_row(r):
     d["trigger_config"] = json.loads(d["trigger_config"]) if d.get("trigger_config") else {}
     d["tables"] = json.loads(d["tables"]) if d.get("tables") else []
     d["enabled"] = bool(d.get("enabled"))
+    try:
+        d["last_check"] = json.loads(d["last_check"]) if d.get("last_check") else None
+    except (TypeError, ValueError):
+        d["last_check"] = None
     return d
 
 
@@ -480,6 +565,7 @@ def _public_agent(d):
         "source": d["source"], "tables": d["tables"], "model": d.get("model"),
         "enabled": d["enabled"], "next_run_at": d.get("next_run_at"),
         "last_run": _last_run(d["id"]), "created_at": d.get("created_at"),
+        "last_checked_at": d.get("last_checked_at"), "last_check": d.get("last_check"),
     }
 
 
@@ -653,6 +739,57 @@ def create_agent(body: AgentIn, user=Depends(current_user)):
     return _public_agent(_get_agent(aid))
 
 
+class SeenIn(BaseModel):
+    run_ids: Optional[List[str]] = None   # none: every unread alert
+
+
+@router.get("/alerts")
+def list_alerts(user=Depends(current_user)):
+    """The signed-in user's alerts: runs of THEIR agents (an admin's too — an
+    admin sees every agent, but is alerted only about their own), newest first,
+    with how many are unread."""
+    with db.connect() as c:
+        unread = c.execute(
+            "SELECT COUNT(*) AS n FROM autopilot_runs r JOIN autopilot_agents a "
+            "ON a.id = r.agent_id WHERE r.owner_id=? AND r.seen_at IS NULL",
+            (user["id"],)).fetchone()["n"]
+        rows = c.execute(
+            "SELECT r.id, r.agent_id, r.trigger, r.status, r.summary, r.proposed_job_id, "
+            "r.started_at, r.seen_at, a.name AS agent_name FROM autopilot_runs r "
+            "JOIN autopilot_agents a ON a.id = r.agent_id WHERE r.owner_id=? "
+            "ORDER BY r.started_at DESC LIMIT 20", (user["id"],)).fetchall()
+    return {"unread": int(unread or 0), "alerts": [dict(r) for r in rows]}
+
+
+@router.post("/alerts/seen")
+def mark_alerts_seen(body: SeenIn, user=Depends(current_user)):
+    """Mark the user's own alerts read — the ones named, or all of them."""
+    sql = "UPDATE autopilot_runs SET seen_at=? WHERE owner_id=? AND seen_at IS NULL"
+    params = [time.time(), user["id"]]
+    if body.run_ids is not None:
+        ids = [i for i in body.run_ids if i][:500]
+        if not ids:
+            return {"marked": 0}
+        sql += f" AND id IN ({','.join('?' * len(ids))})"
+        params += ids
+    with db.connect() as c:
+        cur = c.execute(sql, params)
+        c.commit()
+    return {"marked": getattr(cur, "rowcount", 0) or 0}
+
+
+@router.get("/runs/{run_id}")
+def get_run(run_id: str, user=Depends(current_user)):
+    """One run in full, for its owner (or an admin)."""
+    with db.connect() as c:
+        r = c.execute("SELECT r.*, a.name AS agent_name FROM autopilot_runs r "
+                      "JOIN autopilot_agents a ON a.id = r.agent_id WHERE r.id=?",
+                      (run_id,)).fetchone()
+    if not r or (r["owner_id"] != user["id"] and user["role"] != "admin"):
+        raise HTTPException(404, "Run not found")
+    return _run_row(r)
+
+
 def _own_or_404(agent_id, user):
     """404 (not 403) for another user's agent id — no existence oracle. An admin
     may manage any agent (platform operator)."""
@@ -694,6 +831,11 @@ def update_agent(agent_id: str, body: AgentPatch, user=Depends(current_user)):
         fields["trigger_config"] = json.dumps(cfg)
         if d["enabled"]:
             fields["next_run_at"] = _schedule_next(d["trigger_type"], cfg)
+    if body.trigger_config is not None or body.tables is not None:
+        # A changed condition or scope starts its watch over: the old crossing,
+        # the newest row seen and the last check describe a different trigger.
+        fields.update({"last_threshold_state": None, "last_seen_freshness": None,
+                       "last_check": None, "last_checked_at": None})
     if fields:
         _update_fields(agent_id, fields)
     return _public_agent(_get_agent(agent_id))
