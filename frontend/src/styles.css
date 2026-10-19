@@ -1472,3 +1472,67 @@ input:focus, select:focus, .composer-pill:focus-within { box-shadow: 0 0 0 1px v
   .assistant-body { margin-left: 0; }
   .result-card { flex-wrap: wrap; }
 }
+
+/* ── The composer, as ChatGPT / Copilot draw it ───────────────────────────
+   One rounded box: a message that grows as you type (Enter sends,
+   Shift+Enter breaks a line), and under it ＋ (Airflow DAG, platform runs),
+   the model as a small pill, and a round send button that turns into ■ Stop
+   while an answer is being worked on. */
+.chat-composer { gap: 6px; padding-top: 8px; }
+.chat-composer .composer-box {
+  display: flex; flex-direction: column; gap: 8px; width: 100%;
+  background: var(--surface); border: 1px solid var(--line); border-radius: 26px;
+  padding: 12px 12px 10px 18px; box-shadow: var(--shadow-2);
+  transition: border-color .15s, box-shadow .15s;
+}
+.chat-composer .composer-box:focus-within {
+  border-color: var(--accent); box-shadow: 0 0 0 3px rgba(15, 108, 189, .12), var(--shadow-2);
+}
+.chat-composer textarea.pill-input {
+  width: 100%; border: none; outline: none; resize: none; background: transparent; box-shadow: none;
+  font: inherit; font-size: 15px; line-height: 1.5; color: var(--ink); padding: 2px 0;
+  min-height: 24px; max-height: 200px; field-sizing: content; overflow-y: auto;
+}
+.chat-composer textarea.pill-input:focus { box-shadow: none; }
+.chat-composer textarea.pill-input::placeholder { color: var(--ink-3); }
+.composer-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.composer-tools { display: flex; align-items: center; gap: 6px; min-width: 0; flex-wrap: wrap; }
+.composer-plus { position: relative; }
+.composer-plus > summary { list-style: none; }
+.composer-plus > summary::-webkit-details-marker { display: none; }
+.composer-plus-btn {
+  width: 32px; height: 32px; border-radius: 50%; border: 1px solid var(--line); background: var(--surface);
+  display: inline-flex; align-items: center; justify-content: center; font-size: 17px; color: var(--ink-2);
+  cursor: pointer;
+}
+.composer-plus-btn:hover, .composer-plus[open] > .composer-plus-btn { background: var(--surface-3); color: var(--ink); }
+.composer-menu {
+  position: absolute; z-index: 40; bottom: calc(100% + 8px); left: 0; min-width: 300px; padding: 4px;
+  background: var(--surface); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--shadow-pop);
+  display: flex; flex-direction: column;
+}
+.composer-menu .composer-pipeline-option { font-size: 13px; color: var(--ink); cursor: pointer; }
+.chat-composer .composer-menu .composer-pipeline-option input { accent-color: var(--accent); }
+.composer-chip {
+  display: inline-flex; align-items: center; gap: 4px; padding: 3px 4px 3px 10px; border-radius: 999px;
+  background: var(--accent-soft); color: var(--accent-2); font-size: 12px; font-weight: 500;
+}
+.composer-chip button {
+  border: none; background: transparent; color: inherit; cursor: pointer; padding: 0 4px; font-size: 11px;
+}
+.chat-composer .model-mini {
+  border: 1px solid var(--line); background: var(--surface-2); color: var(--ink-2);
+  border-radius: 999px; padding: 5px 10px; font-size: 12px; max-width: 220px;
+}
+.chat-composer .send-btn {
+  flex: none; width: 36px; height: 36px; border-radius: 50%; border: none; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--ink); color: #fff; font-size: 18px; font-weight: 600; cursor: pointer;
+}
+.chat-composer .send-btn:disabled { background: var(--surface-3); color: var(--ink-3); cursor: default; }
+.chat-composer .stop-btn { background: var(--ink); }
+.chat-composer .stop-btn:hover { background: #000; }
+.stop-square { width: 12px; height: 12px; border-radius: 2px; background: #fff; }
+.composer-note { text-align: center; color: var(--ink-3); font-size: 11px; }
+/* A stopped answer: a quiet line, not an answer. */
+.assistant.copilot .answer-stopped { color: var(--ink-3); font-size: 13px; margin: 4px 0 6px; }

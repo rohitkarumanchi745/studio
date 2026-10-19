@@ -230,7 +230,7 @@ async function withChatNetwork(responseFor, run) {
 
 async function ask(chat, text) {
   const input = findElement(chat.render().tree,
-    (el) => el.type === "input" && el.props.className === "pill-input");
+    (el) => el.type === "textarea" && el.props.className === "pill-input");
   input.props.onChange({ target: { value: text } });
   const form = findElement(chat.render().tree,
     (el) => el.type === "form" && el.props.className === "composer chat-composer");
@@ -265,7 +265,7 @@ test("the window opens as a prompt for a visual, without the pipeline controls",
   // Read-only SQL pipelines were removed: only the Airflow DAG build remains.
   assert.match(ordinary, /Build an approval-gated Airflow DAG from this prompt/);
   assert.doesNotMatch(ordinary, /read-only pipeline/);
-  assert.equal(ordinary.match(/class="composer-pipeline-option"/g)?.length, 1);
+  assert.equal(ordinary.match(/class="composer-pipeline-option[" ]/g)?.length, 1);
 });
 
 test("a read-only pipeline saved before the removal shows its SQL as a record, with no Run button", () => {

@@ -1368,9 +1368,11 @@ def _already_answered(cid, tid):
 
 
 def _finish_task(tid, status, error=None):
+    """Record a task's outcome — never over a Stop the user pressed."""
     try:
         with db.connect() as c:
-            c.execute("UPDATE chat_tasks SET status=?, error=?, finished_at=? WHERE id=?",
+            c.execute("UPDATE chat_tasks SET status=?, error=?, finished_at=? "
+                      "WHERE id=? AND status != 'stopped'",
                       (status, error, time.time(), tid))
             c.commit()
     except Exception:
@@ -1412,8 +1414,14 @@ def _chat_turn_job(payload, job):
         # checks again immediately before it writes, which is the one that
         # actually has to hold.
         jobs.check_claim()
+        if progress.stop_requested(tid):
+            return {"status": "stopped", "task_id": tid}
         _run_turn(ctx, user)
     except jobs.ClaimLost:
+        if progress.stop_requested(tid):
+            # Not another worker: the user pressed Stop, whose reply took the
+            # slot this answer was for. The job is done; the answer is dropped.
+            return {"status": "stopped", "task_id": tid}
         # Another worker owns this job — and therefore this task — now. Leave
         # chat_tasks exactly as it is: the owner will finish it, and marking
         # it failed here would overwrite an answer that is on its way.
@@ -1448,6 +1456,43 @@ def task_status(tid: str, user=Depends(current_user)):
     except (TypeError, ValueError):
         d["steps"] = []
     return d
+
+
+@router.post("/tasks/{tid}/stop")
+def stop_task(tid: str, user=Depends(current_user)):
+    """Stop a running chat turn, as Stop does in ChatGPT. The turn's reply slot
+    is taken at once by a "Stopped" message — the user message's reply_to is
+    UNIQUE, so the answer the worker may still produce is refused when it
+    tries to write (see _answer) — and the task is marked stopped, which no
+    later outcome overwrites. Reads the worker has not made yet are refused
+    at the gateway (progress.stop_requested); a model call already under way
+    finishes, and its answer is discarded. Idempotent; an answer that already
+    landed stays, and the task reads done."""
+    with db.connect() as c:
+        r = c.execute("SELECT id, conversation_id, user_id, status, user_message_id "
+                      "FROM chat_tasks WHERE id=?", (tid,)).fetchone()
+    if r is None or dict(r)["user_id"] != user["id"]:
+        raise HTTPException(404, "Task not found")
+    task = dict(r)
+    if task["status"] != "running":
+        return {"status": task["status"], "task_id": tid}
+    content = {"text": "You stopped this answer before it finished.", "mode": "stopped",
+               "sql": None, "columns": [], "rows": [], "chart": None, "panels": [],
+               "errors": [], "activity_task_id": tid, "author_role": user["role"]}
+    if task["user_message_id"]:
+        if db.add_message(task["conversation_id"], "assistant", content,
+                          reply_to=task["user_message_id"]) is None:
+            # The answer got there first: nothing to stop.
+            _finish_task(tid, "done")
+            return {"status": "done", "task_id": tid}
+    else:
+        db.add_message(task["conversation_id"], "assistant", content)
+    with db.connect() as c:
+        c.execute("UPDATE chat_tasks SET status='stopped', finished_at=?, seen=1 "
+                  "WHERE id=? AND status='running'", (time.time(), tid))
+        c.commit()
+    db.log_activity(user, "chat_stop", prompt=tid)
+    return {"status": "stopped", "task_id": tid}
 
 
 @router.get("/conversations/{cid}/task")

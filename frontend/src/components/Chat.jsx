@@ -614,6 +614,28 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
     setBusy(false);
   }
 
+  // ■ Stop, as in ChatGPT: the server answers the turn with a "stopped" reply
+  // and drops whatever the agent would have said. Pressed before the task's
+  // id is back, it stops the task the moment it starts.
+  const stopAsap = useRef(false);
+  async function stop() {
+    const tid = pollingRef.current;
+    if (!tid) {
+      stopAsap.current = true;
+      return;
+    }
+    pollingRef.current = null;                       // no more polling for this turn
+    try {
+      await api(`/tasks/${tid}/stop`, { method: "POST" });
+    } catch (e) {
+      setError(`Could not stop: ${e.message}`);
+    }
+    setBusy(false);
+    setLiveSteps([]);
+    setActiveStartedAt(null);
+    refreshMessages();
+  }
+
   // A run an agent posted here (Autopilot from chat) shows without a reload.
   function refreshMessages() {
     if (!conversationId) return;
@@ -625,6 +647,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
     const q = (typeof text === "string" ? text : prompt).trim();
     if (!q || busy) return;
     taskViewEpochRef.current++;
+    stopAsap.current = false;
     setPrompt("");
     setError("");
     setFailedActivity(null);
@@ -659,6 +682,10 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
       setBuildAirflow(false);
       if (!conversationId) onConversationCreated(data.conversation_id);
       pollFor(data.task_id, data.conversation_id);
+      if (stopAsap.current) {
+        stopAsap.current = false;
+        stop();
+      }
     } catch (err) {
       await sendFailed(err, q);
     }
@@ -1057,14 +1084,24 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
       </div>
 
       <form className="composer chat-composer" onSubmit={send}>
-        <div className="composer-pill">
-          <input
+        <div className="composer-box">
+          <textarea
             className="pill-input"
+            rows={1}
+            aria-label="Message Studio"
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
+            onKeyDown={(e) => {
+              // Enter sends; Shift+Enter starts a new line (and an IME
+              // composition's Enter is the IME's).
+              if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent?.isComposing) {
+                e.preventDefault();
+                send(e);
+              }
+            }}
             placeholder={
               visualMode
-                ? "Describe the visualization — e.g. “revenue by region as circle packing” or “a custom radial timeline of orders”…"
+                ? "Describe the visualization — e.g. “revenue by region as circle packing”…"
                 : auto
                 ? "Ask about your data — Studio finds the source and tables…"
                 : orchestrated
@@ -1073,37 +1110,69 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
             }
             disabled={busy}
           />
-          <select
-            className="model-mini"
-            value={model}
-            onChange={(e) => setModel(e.target.value)}
-            title="Which AI model answers"
-          >
-            {models.map((m) => (
-              <option key={m.spec} value={m.spec} disabled={!m.available}>
-                {m.label || m.name}{!m.available ? (m.note ? ` — ${m.note}` : " — no key") : ""}
-              </option>
-            ))}
-          </select>
-          <button className="primary send-btn" aria-label={buildAirflow ? "Build Airflow DAG" : "Send message"} disabled={busy || !prompt.trim()}>
-            ➤
-          </button>
+          <div className="composer-row">
+            <div className="composer-tools">
+              {!visualMode && (
+                <details className="composer-plus">
+                  <summary className="composer-plus-btn" aria-label="More options"
+                           title="Build an Airflow DAG, or run on a platform">＋</summary>
+                  <div className="composer-menu" role="menu">
+                    <label className="composer-pipeline-option menu-item">
+                      <input type="checkbox" checked={buildAirflow} disabled={busy}
+                        onChange={(e) => setBuildAirflow(e.target.checked)} />
+                      Build an approval-gated Airflow DAG from this prompt
+                    </label>
+                    <button type="button" className="menu-item" disabled={busy}
+                            onClick={() => setShowPlatform((v) => !v)}>
+                      Run on Airflow / another platform
+                    </button>
+                  </div>
+                </details>
+              )}
+              {buildAirflow && !visualMode && (
+                <span className="composer-chip">
+                  ⚙ Airflow DAG
+                  <button type="button" aria-label="Don't build a DAG" title="Don't build a DAG"
+                          onClick={() => setBuildAirflow(false)}>✕</button>
+                </span>
+              )}
+              <select
+                className="model-mini"
+                value={model}
+                onChange={(e) => setModel(e.target.value)}
+                title="Which AI model answers"
+                aria-label="Model"
+              >
+                {models.map((m) => (
+                  <option key={m.spec} value={m.spec} disabled={!m.available}>
+                    {m.label || m.name}{!m.available ? (m.note ? ` — ${m.note}` : " — no key") : ""}
+                  </option>
+                ))}
+              </select>
+            </div>
+            {busy ? (
+              <button type="button" className="send-btn stop-btn" aria-label="Stop"
+                      title="Stop this answer" onClick={stop}>
+                <span className="stop-square" aria-hidden="true" />
+              </button>
+            ) : (
+              <button className="send-btn" aria-label={buildAirflow ? "Build Airflow DAG" : "Send message"}
+                      disabled={!prompt.trim()}>
+                ↑
+              </button>
+            )}
+          </div>
         </div>
-        {!visualMode && (<>
-        <label className="composer-pipeline-option">
-          <input type="checkbox" checked={buildAirflow} disabled={busy}
-            onChange={(e) => setBuildAirflow(e.target.checked)} />
-          Build an approval-gated Airflow DAG from this prompt
-        </label>
-        {buildAirflow && (
+        {!visualMode && buildAirflow && (
           <PlanningContextPicker {...planningCatalog}
             repositoryId={repositoryId} confluencePageIds={confluencePageIds}
             onRepositoryChange={setRepositoryId} onConfluenceChange={setConfluencePageIds}
             disabled={busy} />
         )}
-        <button type="button" className="chip" disabled={busy} onClick={() => setShowPlatform((v) => !v)}>Run on Airflow / another platform</button>
-        {showPlatform && <PlatformComposer busy={busy} onSubmit={platformAction} onClose={() => setShowPlatform(false)} />}
-        </>)}
+        {!visualMode && showPlatform && (
+          <PlatformComposer busy={busy} onSubmit={platformAction} onClose={() => setShowPlatform(false)} />
+        )}
+        <div className="composer-note">Studio can make mistakes. Check the SQL and sources.</div>
       </form>
       </main>
     </div>
@@ -1291,6 +1360,7 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
         <div className="assistant-head">
           <span className="assistant-avatar" aria-hidden="true">◆</span>
           <span className="assistant-name">Studio</span>
+          {m.mode !== "stopped" && (
           <span className="meta assistant-meta">
             {served}
             {" · "}{m.source_meta
@@ -1322,6 +1392,7 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
               </span>
             )}
           </span>
+          )}
         </div>
         <div className="assistant-body">
           {m.activity_task_id && <AgentActivity key={m.activity_task_id} taskId={m.activity_task_id} steps={activitySteps || []} graph={m.graph} agents={m.agents} />}
@@ -1333,7 +1404,9 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
               {" "}<a className="chip" href="/autopilot">manage</a>
             </div>
           )}
-          {m.text && <Markdown className="answer" text={m.text} />}
+          {m.mode === "stopped"
+            ? <div className="answer-stopped" role="note">⏹ {m.text}</div>
+            : m.text && <Markdown className="answer" text={m.text} />}
           {m.autopilot_draft && (
             <AutopilotDraft draft={m.autopilot_draft} conversationId={conversationId}
                             onCreated={onAutopilotCreated} />
@@ -1450,7 +1523,7 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
               </div>
             </div>
           )}
-          {(m.trace_id || m.sql || m.text) && (
+          {(m.trace_id || m.sql || m.text) && m.mode !== "stopped" && (
             <div className="response-actions" role="toolbar" aria-label="Answer actions">
               {m.trace_id && (
                 <>
@@ -1516,7 +1589,7 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
               {status && <span className="meta action-status"> {status}</span>}
             </div>
           )}
-          {(m.sql || m.text) && !m.autopilot_draft && (
+          {(m.sql || m.text) && !m.autopilot_draft && m.mode !== "stopped" && (
             <div className="ai-note">AI-generated — check the SQL and sources before you rely on it.</div>
           )}
           {automate && (

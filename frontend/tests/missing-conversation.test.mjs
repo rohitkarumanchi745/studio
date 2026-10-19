@@ -154,7 +154,7 @@ async function withServer(routes, run) {
 
 // Type and send; settle() then lets the send (and anything after it) answer.
 async function ask(chat, text) {
-  const input = findElement(chat.tree(), (el) => el.type === "input" && el.props.className === "pill-input");
+  const input = findElement(chat.tree(), (el) => el.type === "textarea" && el.props.className === "pill-input");
   input.props.onChange({ target: { value: text } });
   const form = findElement(chat.tree(), (el) => el.type === "form" && el.props.className === "composer chat-composer");
   form.props.onSubmit({ preventDefault() {} });
@@ -175,7 +175,7 @@ test("opening a conversation that is gone moves to a new chat and says why", asy
       assert.match(markup, /class="chat-notice" role="status">That conversation isn&#x27;t available any more/);
       assert.match(markup, /What you asked is in the box below/);
       assert.doesNotMatch(markup, /class="error"/);
-      const input = findElement(tree, (el) => el.type === "input" && el.props.className === "pill-input");
+      const input = findElement(tree, (el) => el.type === "textarea" && el.props.className === "pill-input");
       assert.equal(input.props.value, "revenue by method");     // the draft came along
       assert.equal(store.get("studio_draft:new"), "revenue by method");
       assert.equal(store.has("studio_draft:dead"), false);
@@ -218,7 +218,7 @@ test("a question sent into a conversation that vanished is kept for a new chat",
     const { tree, markup } = await chat.settle();
     assert.match(markup, /chat-notice/);
     assert.doesNotMatch(markup, /class="error"|Conversation not found/);
-    const input = findElement(tree, (el) => el.type === "input" && el.props.className === "pill-input");
+    const input = findElement(tree, (el) => el.type === "textarea" && el.props.className === "pill-input");
     assert.equal(input.props.value, "Top 10 method by amount — bar chart");
     assert.equal(findElement(tree, (el) => el.props?.className === "bubble-user"), null);
   });
