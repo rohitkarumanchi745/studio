@@ -33,12 +33,13 @@ from .queryguard import QueryRejected
 
 # Full Power BI / Tableau-style catalog (rendered with ECharts client-side),
 # plus the types only the D3 engine draws: network, beeswarm, calendar,
-# circle_pack.
+# circle_pack, and the maps — route_map, point_map, choropleth.
 CHART_TYPES = [
     "bar", "hbar", "stacked_bar", "line", "area", "stacked_area", "combo",
     "pie", "donut", "scatter", "bubble", "heatmap", "treemap", "funnel",
     "radar", "gauge", "kpi", "histogram", "boxplot", "waterfall", "sankey",
     "network", "beeswarm", "calendar", "circle_pack",
+    "route_map", "point_map", "choropleth",
     "table",
 ]
 
@@ -49,6 +50,7 @@ D3_CHART_TYPES = (
     "scatter", "bubble", "heatmap", "treemap", "funnel", "radar", "gauge", "kpi",
     "histogram", "boxplot", "waterfall", "sankey", "table",
     "network", "beeswarm", "calendar", "circle_pack",
+    "route_map", "point_map", "choropleth",
 )
 # The D3 & artifacts window draws every one of them, plus custom visuals.
 
@@ -86,6 +88,14 @@ _CHART_PHRASES = [
     ("calendar chart", "calendar"), ("calendar view", "calendar"),
     ("circle pack", "circle_pack"), ("packed circle", "circle_pack"),
     ("packed bubble", "circle_pack"),
+    # Maps, by unmistakable names only: "heat map" is a heatmap, and "map the
+    # columns" or "roadmap" are not maps.
+    ("route map", "route_map"), ("flow map", "route_map"), ("transit map", "route_map"),
+    ("routes on a map", "route_map"), ("choropleth", "choropleth"),
+    ("filled map", "choropleth"), ("shaded map", "choropleth"),
+    ("point map", "point_map"), ("dot map", "point_map"), ("bubble map", "point_map"),
+    # Just "a map": whichever map the columns are for (geo_columns.map_for_columns).
+    ("on a map", "map"), ("as a map", "map"), ("world map", "map"), ("map view", "map"),
     ("stacked bar", "stacked_bar"), ("stacked column", "stacked_bar"),
     ("stacked area", "stacked_area"), ("horizontal bar", "hbar"),
     ("box plot", "boxplot"), ("donut", "donut"), ("treemap", "treemap"),
@@ -733,7 +743,15 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
                 numeric, one dot per row; x a category to split rows),
                 calendar (x a date, y[0] daily value — up to 3 years),
                 circle_pack (x category, y=[size] or [size, parent
-                category]), table.
+                category]), route_map (movement between places — transit,
+                shipments, trips, flights: origin/destination latitude and
+                longitude columns such as from_lat/from_lon/to_lat/to_lon are
+                found by name, x names the origin, y=[value]; or x origin
+                country/US state, y=[destination, value]), point_map (places
+                as dots: a lat/lon column pair found by name, x the label,
+                y=[size]; or x a country/US state, y=[value]), choropleth
+                (x a country or US state — name or ISO/USPS code — y=[value]),
+                table.
             title: Short human-readable chart title.
             x: Column for the x axis / category / label / source dimension.
             y: Numeric column(s) to plot; special shapes noted per type above.
@@ -1239,7 +1257,12 @@ Rules:
   scatter/bubble, matrices → heatmap, distributions → histogram/boxplot (or
   beeswarm to show every point), bridges → waterfall, flows → sankey,
   connections between entities → network, daily patterns → calendar, many
-  small shares → circle_pack, single headline number → kpi/gauge.
+  small shares → circle_pack, single headline number → kpi/gauge, movement
+  between places (transit, shipments, trips, flights) → route_map, places
+  with coordinates → point_map, values per country or US state → choropleth.
+  For a map, SELECT the coordinate columns with lat/lon in their names
+  (origin_lat, origin_lon, dest_lat, dest_lon) — a city name alone cannot be
+  placed.
 - Multiple views: when the user asks for several breakdowns at once (e.g. day
   level AND month level AND year level), produce one chart per view — repeat
   run_sql then render_chart for each granularity. Each render_chart captures
@@ -1454,6 +1477,10 @@ def _fallback_granularity_panels(user, connector, target, grans):
 def _auto_chart(columns, rows, table):
     if not rows:
         return None
+    from .geo_columns import suggest_map
+    place = suggest_map(columns, rows)          # coordinates, routes or regions: a map
+    if place:
+        return place
     first = rows[0]
     numeric = [c for c, v in zip(columns, first) if isinstance(v, (int, float))]
     texty = [c for c, v in zip(columns, first) if isinstance(v, str)]
@@ -1682,6 +1709,9 @@ def _canvas_fallback(instruction, columns, chart):
     note_parts = []
     for phrase, t in _CHART_PHRASES:
         if phrase in low:
+            if t == "map":
+                from .geo_columns import map_for_columns
+                t = map_for_columns(columns)
             if new_chart:
                 new_chart["type"] = t
                 note_parts.append(f"chart type → {t}")

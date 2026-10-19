@@ -1,6 +1,7 @@
 // ECharts renderer covering the Power BI / Tableau-style catalog (22 types),
-// plus the D3-only types (network, beeswarm, calendar, circle packing), which
-// always draw with D3 because no other engine here can.
+// plus the D3-only types (network, beeswarm, calendar, circle packing, and
+// the maps — routes, places, shaded regions), which always draw with D3
+// because no other engine here can.
 // with a grouped type picker per chart. Palette + mark rules follow the
 // validated dark-surface reference palette: fixed categorical order, 2px lines,
 // rounded bar data-ends, ink-colored text, recessive grid, tooltips on.
@@ -22,6 +23,7 @@ import D3View, {
   D3_ONLY, D3_TYPES, LIMITS as D3_LIMITS, beeswarmData, calendarData, d3Type, networkData,
   packData,
 } from "./renderers/D3View";
+import { choroplethData, pointMapData, routeMapData } from "./renderers/geo";
 
 const ENGINES = [
   ["echarts", "ECharts"],
@@ -37,6 +39,7 @@ const TYPE_GROUPS = [
   ["Distribution", ["histogram", "boxplot", "beeswarm"]],
   ["Relationship", ["scatter", "bubble", "heatmap", "radar", "network"]],
   ["Flow & bridge", ["waterfall", "sankey"]],
+  ["Maps", ["route_map", "point_map", "choropleth"]],
   ["KPI", ["kpi", "gauge"]],
   ["Data", ["table"]],
 ];
@@ -55,6 +58,7 @@ export const LABELS = {
   // Drawn by D3 whichever engine is picked.
   network: "Network (D3)", beeswarm: "Beeswarm (D3)", calendar: "Calendar heatmap (D3)",
   circle_pack: "Circle packing (D3)",
+  route_map: "Route map (D3)", point_map: "Point map (D3)", choropleth: "Choropleth (D3)",
 };
 
 
@@ -142,6 +146,15 @@ export function computeFit(columns, rows, spec) {
                  `needs a date column + numeric value spanning ≤3 years`),
     circle_pack: ok(spec && packData(columns, rows, spec),
                     `needs a category column + positive values (≤${D3_LIMITS.packLeaves})`),
+    // Maps: places by coordinates, or by country / US state name or code.
+    route_map: ok(spec && routeMapData(columns, rows, spec),
+                  "needs where each trip starts and ends — origin and destination latitude/"
+                  + "longitude (from_lat/from_lon → to_lat/to_lon), or origin and destination "
+                  + "countries / US states"),
+    point_map: ok(spec && pointMapData(columns, rows, spec),
+                  "needs latitude/longitude columns, or a column of countries / US states"),
+    choropleth: ok(spec && choroplethData(columns, rows, spec),
+                   "needs a column of countries or US states (and a value to shade by)"),
   };
   return fit;
 }
