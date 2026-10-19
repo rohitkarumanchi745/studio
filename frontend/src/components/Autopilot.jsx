@@ -12,6 +12,9 @@
 // pickers reuse /catalog/sources, /catalog/sources/{s}/tables and /models.
 import { useEffect, useState } from "react";
 import { api } from "../api";
+import ChartView from "./ChartView";
+import Markdown from "./Markdown";
+import { alertsChanged } from "./AlertsBell";
 
 const TRIGGERS = [
   { id: "schedule", label: "Schedule", hint: "Run on a fixed interval." },
@@ -67,6 +70,107 @@ function triggerSummary(a) {
   }
   if (a.trigger_type === "event") return `◆ on new data in ${c.table || "?"}`;
   return "▷ manual only";
+}
+
+/** A number as people read it: 334,200 or 12.35. Other values as they are. */
+function formatValue(v) {
+  if (typeof v !== "number") return String(v);
+  return Number.isInteger(v) ? v.toLocaleString() : v.toLocaleString(undefined, { maximumFractionDigits: 2 });
+}
+
+/**
+ * What this agent's last check found, for a threshold or new-data agent —
+ * so a poll that did not fire is visible without a run. "" for agents that
+ * are not polled (schedule, manual).
+ */
+export function checkText(a) {
+  if (a.trigger_type !== "threshold" && a.trigger_type !== "event") return "";
+  const c = a.last_check;
+  if (!c || !a.last_checked_at) return "not checked yet";
+  const when = whenText(a.last_checked_at);
+  const value = c.value != null ? ` (${formatValue(c.value)})` : "";
+  switch (c.status) {
+    case "error": return `⚠ couldn't check (${when}): ${c.detail}`;
+    case "watching": return `watching for rows newer than ${c.value} · checked ${when}`;
+    case "no new data": return `no new data since ${c.value} · checked ${when}`;
+    case "not met": return `not met${value} · checked ${when}`;
+    case "met": return `still met${value} — fires again once it drops back · checked ${when}`;
+    case "fired": return `fired${value} · ${when}`;
+    default: return `checked ${when}`;
+  }
+}
+
+const SERVED = { semantic: "▣ certified metric", verified_sql: "✓ verified query" };
+
+/** One run in full: what it said, its charts and data, its SQL. */
+export function RunDetail({ run, onOpenJobs }) {
+  const res = run.result || {};
+  const views = res.panels?.length ? res.panels
+    : res.columns?.length ? [{ columns: res.columns, rows: res.rows, chart: res.chart, sql: res.sql }]
+    : [];
+  const shown = (res.rows || []).length;
+  const took = run.finished_at && run.started_at
+    ? `${Math.max(0, Number(run.finished_at) - Number(run.started_at)).toFixed(1)}s` : "";
+  return (
+    <div className="ap-run-body">
+      <div className="inputs-row">
+        {res.served_by && SERVED[res.served_by] && <span className="query-tag">{SERVED[res.served_by]}</span>}
+        <span className="meta">
+          {run.trigger || "run"} · {whenText(run.started_at)}{took && ` · took ${took}`}
+        </span>
+      </div>
+      {run.status === "failed" && <div className="error ap-run-why">{run.summary}</div>}
+      {res.action_error && (
+        <div className="error ap-run-why">The governed action could not be proposed: {res.action_error}</div>
+      )}
+      {run.proposed_job_id && (
+        <div className="ap-run-gate">
+          <span className="query-tag flow-badge-warn">⏳ action pending approval</span>
+          <button className="chip" onClick={onOpenJobs}>→ approve in Jobs</button>
+        </div>
+      )}
+      {res.text && <Markdown className="answer ap-run-text" text={res.text} />}
+      {views.map((v, i) => (
+        <div key={i} className="ap-run-view">
+          <ChartView columns={v.columns || []} rows={v.rows || []} chart={v.chart} />
+        </div>
+      ))}
+      {res.row_count > shown && (
+        <div className="meta">The first {shown.toLocaleString()} of {res.row_count.toLocaleString()} rows
+          are kept with the run.</div>
+      )}
+      {res.sql && (
+        <details className="ap-run-sql">
+          <summary className="meta">SQL</summary>
+          <pre className="flow-json" style={{ marginLeft: 0, whiteSpace: "pre-wrap" }}>{res.sql}</pre>
+        </details>
+      )}
+      {run.trace_id && <div className="meta">trace {String(run.trace_id).slice(0, 8)}</div>}
+    </div>
+  );
+}
+
+/** Unread alerts: fired runs of the user's own agents, newest first. */
+export function AlertsStrip({ alerts, onOpen, onMarkAll }) {
+  const unread = (alerts || []).filter((a) => !a.seen_at);
+  if (!unread.length) return null;
+  return (
+    <div className="ap-alerts" role="status">
+      <div className="ap-alerts-head">
+        <b>🔔 {unread.length} new {unread.length === 1 ? "alert" : "alerts"}</b>
+        <button className="chip" onClick={onMarkAll}>mark all read</button>
+      </div>
+      {unread.map((a) => (
+        <div key={a.id} className="ap-alert">
+          <span className={"query-tag flow-badge-" + (RUN_TONE[a.status] || "warn")}>{a.status}</span>
+          <b>{a.agent_name}</b>
+          <span className="ap-run-summary">{a.summary || "—"}</span>
+          <span className="meta">{whenText(a.started_at)}</span>
+          <button className="chip" onClick={() => onOpen(a)}>open</button>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 // ─────────────────────────────── Create form ───────────────────────────────
@@ -363,10 +467,20 @@ function CreateForm({ sources, models, onCreated }) {
 }
 
 // ─────────────────────────────── Run history ───────────────────────────────
-function RunList({ agentId, refreshKey, onOpenJobs }) {
+function RunList({ agentId, refreshKey, onOpenJobs, focusRunId, onSeen }) {
   const [runs, setRuns] = useState([]);
   const [error, setError] = useState("");
-  const [openRun, setOpenRun] = useState(null);
+  const [openRun, setOpenRun] = useState(focusRunId || null);
+  useEffect(() => { if (focusRunId) setOpenRun(focusRunId); }, [focusRunId]);
+
+  function toggle(r) {
+    const next = openRun === r.id ? null : r.id;
+    setOpenRun(next);
+    if (next && !r.seen_at) {
+      api("/autopilot/alerts/seen", { method: "POST", body: JSON.stringify({ run_ids: [r.id] }) })
+        .then(() => onSeen && onSeen()).catch(() => {});
+    }
+  }
 
   useEffect(() => {
     api(`/autopilot/${agentId}/runs`)
@@ -385,25 +499,19 @@ function RunList({ agentId, refreshKey, onOpenJobs }) {
         const isOpen = openRun === r.id;
         return (
           <div key={r.id} className="ap-run">
-            <div className="ap-run-head" onClick={() => setOpenRun(isOpen ? null : r.id)}>
+            <div className={"ap-run-head" + (r.seen_at ? "" : " ap-run-unread")} onClick={() => toggle(r)}>
               <span className={"query-tag flow-badge-" + tone}>{r.status}</span>
               <span className="meta">{r.trigger || "run"}</span>
               <span className="ap-run-summary">{r.summary || res.text || "—"}</span>
               <span className="meta">{whenText(r.started_at)}</span>
             </div>
-            {r.proposed_job_id && (
+            {r.proposed_job_id && !isOpen && (
               <div className="ap-run-gate">
                 <span className="query-tag flow-badge-warn">⏳ pending approval</span>
                 <button className="chip" onClick={onOpenJobs}>→ approve in Jobs</button>
               </div>
             )}
-            {isOpen && (
-              <div className="ap-run-body">
-                {res.text && <div className="meta ap-run-text">{res.text}</div>}
-                {res.sql && <pre className="flow-json" style={{ marginLeft: 0, whiteSpace: "pre-wrap" }}>{res.sql}</pre>}
-                {r.trace_id && <div className="meta">trace {String(r.trace_id).slice(0, 8)}</div>}
-              </div>
-            )}
+            {isOpen && <RunDetail run={r} onOpenJobs={onOpenJobs} />}
           </div>
         );
       })}
@@ -412,8 +520,9 @@ function RunList({ agentId, refreshKey, onOpenJobs }) {
 }
 
 // ─────────────────────────────── Agent card ────────────────────────────────
-function AgentCard({ agent, isAdmin, onChanged, onOpenJobs }) {
-  const [expanded, setExpanded] = useState(false);
+function AgentCard({ agent, isAdmin, onChanged, onOpenJobs, focusRunId, onSeen }) {
+  const [expanded, setExpanded] = useState(Boolean(focusRunId));
+  useEffect(() => { if (focusRunId) setExpanded(true); }, [focusRunId]);
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [runKey, setRunKey] = useState(0);
@@ -496,8 +605,14 @@ function AgentCard({ agent, isAdmin, onChanged, onOpenJobs }) {
             <span className="meta">next: {whenText(agent.next_run_at)}</span>
           )}
         </div>
+        {checkText(agent) && (
+          <div className={"meta ap-check" + (agent.last_check?.status === "error" ? " ap-check-bad" : "")}>
+            {checkText(agent)}
+          </div>
+        )}
         {error && <div className="error" style={{ marginTop: 6 }}>{error}</div>}
-        {expanded && <RunList agentId={agent.id} refreshKey={runKey} onOpenJobs={onOpenJobs} />}
+        {expanded && <RunList agentId={agent.id} refreshKey={runKey} onOpenJobs={onOpenJobs}
+                              focusRunId={focusRunId} onSeen={onSeen} />}
       </div>
     </div>
   );
@@ -512,6 +627,24 @@ export default function Autopilot({ user, onClose, onOpenJobs }) {
   const [loaded, setLoaded] = useState(false);
   const [unavailable, setUnavailable] = useState(false);
   const [error, setError] = useState("");
+  const [alerts, setAlerts] = useState([]);
+  const [focus, setFocus] = useState(null);         // {agentId, runId} opened from an alert
+
+  function loadAlerts() {
+    api("/autopilot/alerts").then((d) => setAlerts(d.alerts || [])).catch(() => {});
+    alertsChanged();                                // the sidebar count follows
+  }
+
+  function openAlert(a) {
+    setFocus({ agentId: a.agent_id, runId: a.id, at: Date.now() });
+    api("/autopilot/alerts/seen", { method: "POST", body: JSON.stringify({ run_ids: [a.id] }) })
+      .then(loadAlerts).catch(() => {});
+  }
+
+  function markAllRead() {
+    api("/autopilot/alerts/seen", { method: "POST", body: JSON.stringify({}) })
+      .then(loadAlerts).catch((e) => setError(e.message));
+  }
 
   function refresh() {
     api("/autopilot")
@@ -526,6 +659,7 @@ export default function Autopilot({ user, onClose, onOpenJobs }) {
 
   useEffect(() => {
     refresh();
+    loadAlerts();
     api("/catalog/sources").then((s) => setSources(Array.isArray(s) ? s : [])).catch(() => {});
     api("/models").then((m) => setModels(Array.isArray(m) ? m : [])).catch(() => {});
   }, []);
@@ -553,6 +687,8 @@ export default function Autopilot({ user, onClose, onOpenJobs }) {
         </div>
       )}
 
+      {!unavailable && <AlertsStrip alerts={alerts} onOpen={openAlert} onMarkAll={markAllRead} />}
+
       {!unavailable && <CreateForm sources={sources} models={models} onCreated={refresh} />}
 
       {loaded && !unavailable && agents.length === 0 && (
@@ -563,7 +699,8 @@ export default function Autopilot({ user, onClose, onOpenJobs }) {
 
       <div className="query-list ap-list">
         {agents.map((a) => (
-          <AgentCard key={a.id} agent={a} isAdmin={isAdmin} onChanged={refresh} onOpenJobs={onOpenJobs} />
+          <AgentCard key={a.id} agent={a} isAdmin={isAdmin} onChanged={refresh} onOpenJobs={onOpenJobs}
+                     focusRunId={focus?.agentId === a.id ? focus.runId : null} onSeen={loadAlerts} />
         ))}
       </div>
 

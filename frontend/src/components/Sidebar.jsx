@@ -3,6 +3,7 @@ import { api, clearSession, getUser } from "../api";
 import KeySettings from "./KeySettings";
 import DataConnections from "./DataConnections";
 import ShareDialog from "./ShareDialog";
+import AlertsBell, { useAutopilotAlerts } from "./AlertsBell";
 
 export default function Sidebar({
   conversations, activeId, onSelect, onNew, onDelete, onActivity, onCollapse,
@@ -16,6 +17,7 @@ export default function Sidebar({
   const [sharing, setSharing] = useState(null);   // {id, title}
   const [keysOpen, setKeysOpen] = useState(false);
   const [dataConnOpen, setDataConnOpen] = useState(false);
+  const unreadAlerts = useAutopilotAlerts();
   const inputRef = useRef(null);
 
   // Folders: personal chat organization. Collapse state is per-device.
@@ -429,6 +431,7 @@ export default function Sidebar({
       )}
 
       <div className="sidebar-footer">
+        <AlertsBell count={unreadAlerts} onOpen={onAutopilot} />
         <button className="tools-toggle" onClick={toggleTools}>
           {toolsOpen ? "▾" : "▸"} Tools & settings
         </button>
@@ -473,6 +476,7 @@ export default function Sidebar({
         )}
         <button className="logout" onClick={onAutopilot} style={{ marginBottom: 8 }}>
           ✦ Autopilot
+          {unreadAlerts > 0 && <span className="ap-badge">{unreadAlerts}</span>}
         </button>
         <button className="logout" onClick={onSkills} style={{ marginBottom: 8 }}>
           ▤ Skill files
