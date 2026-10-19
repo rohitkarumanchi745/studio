@@ -20,6 +20,7 @@ const CATEGORIES = [
   { key: "nosql", label: "NoSQL, vector and graph" },
   { key: "work", label: "Work management and collaboration" },
   { key: "automation", label: "Automation and workflows" },
+  { key: "messaging", label: "Send answers to" },
   { key: "bi", label: "BI and semantic models" },
   { key: "storage", label: "Cloud file storage" },
   { key: "marketing", label: "Marketing and analytics" },
@@ -213,6 +214,20 @@ const MARKS = {
       <circle cx="29" cy="29" r="3.6" fill={c} opacity=".6" />
     </>
   ),
+  bubble: (c) => (
+    <>
+      <path d="M8 11.5A3.5 3.5 0 0 1 11.5 8h17a3.5 3.5 0 0 1 3.5 3.5v11a3.5 3.5 0 0 1-3.5 3.5H17l-6 5v-5h.5A3.5 3.5 0 0 1 8 22.5z"
+        fill={c} opacity=".22" stroke={c} strokeWidth="2.4" strokeLinejoin="round" />
+      <path d="M14 14h12M20 14v8" stroke={c} strokeWidth="2.6" strokeLinecap="round" />
+    </>
+  ),
+  hash: (c) => (
+    <>
+      <rect x="7" y="7" width="26" height="26" rx="7" fill={c} opacity=".18" />
+      <path d="M17 11l-2.4 18M25.4 11 23 29M11.5 17h18M10.5 23h18" stroke={c} strokeWidth="2.8"
+        strokeLinecap="round" />
+    </>
+  ),
   lance: (c) => (
     <>
       <path d="M8 32L25.5 14.5" stroke={c} strokeWidth="3" strokeLinecap="round" />
@@ -258,6 +273,12 @@ const META = {
           blurb: "OneDrive, SharePoint and Outlook, synced into your private knowledge collection." },
   github: { label: "GitHub", color: "#24292f", mark: "gitbranch", category: "work",
             blurb: "Register repositories as read-only planning context for pipeline drafts; repository code is not executed." },
+
+  // Where answers can be sent, not sources Studio reads.
+  teams: { label: "Microsoft Teams", color: "#5059c9", mark: "bubble", category: "messaging",
+           blurb: "Send an answer — its text, a table of its first rows and a link back — to a Teams channel." },
+  slack: { label: "Slack", color: "#4a154b", mark: "hash", category: "messaging",
+           blurb: "Send an answer — its text, a table of its first rows and a link back — to a Slack channel." },
 
   // Environment-configured sources. They appear so the grid is the whole map
   // of what Studio can read, not just what this screen can set up.

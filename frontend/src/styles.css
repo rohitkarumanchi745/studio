@@ -1455,6 +1455,24 @@ input:focus, select:focus, .composer-pill:focus-within { box-shadow: 0 0 0 1px v
   font-size: 13px; color: var(--ink); cursor: pointer;
 }
 .menu-item:hover { background: var(--surface-3); }
+.share-menu .menu-item { display: flex; align-items: center; gap: 8px; }
+
+/* ↗ Share → Teams or Slack (SharePanel.jsx), under the answer it sends. */
+.share-panel {
+  display: flex; flex-direction: column; gap: 8px; margin: 10px 0; padding: 12px;
+  border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface-2);
+}
+.share-panel-head { display: flex; align-items: center; gap: 8px; }
+.share-panel-head .chip { margin-left: auto; }
+.share-panel .sqllab-prompt { width: 100%; }
+.share-panel select { max-width: 100%; }
+
+/* Teams and Slack channels on the connections screen (DestinationsPanel.jsx). */
+.dest-panel { display: flex; flex-direction: column; gap: 10px; }
+.dest-add { display: flex; flex-direction: column; gap: 8px; padding: 12px; border: 1px solid var(--line);
+  border-radius: var(--radius); }
+.dest-add h4 { margin: 0; font-size: 14px; }
+.dest-add input:not([type="checkbox"]) { width: 100%; box-sizing: border-box; }
 .ai-note { color: var(--ink-3); font-size: 11px; margin: 2px 0 0 8px; }
 .assistant.copilot .sqlbox { margin-top: 8px; }
 

@@ -101,7 +101,7 @@ test("search matches the display name, not just the backend identifier", () => {
   assert.ok(hit.some((t) => t.id === "supabase") && hit.some((t) => t.id === "redshift"));
   // "Microsoft 365" is findable even though its id is "m365".
   assert.deepEqual(buildTiles({ types: TYPES, sources: [], q: "microsoft" }).map((t) => t.id),
-                   ["m365", "mssql"]);
+                   ["m365", "teams", "mssql"]);
   assert.deepEqual(buildTiles({ repos: REPOS, q: "github" }).map((t) => t.id), ["github"]);
   assert.equal(buildTiles({ repos: REPOS }).find((t) => t.id === "github").instances[0].name,
                "sales-pipelines");
@@ -248,7 +248,7 @@ test("the grid renders a tile per source with an honest status", async () => {
       assert.deepEqual(requests.sort(), ["/api/catalog/sources", "/api/connections",
                                          "/api/connections/env", "/api/connections/types",
                                          "/api/m365/status", "/api/metagraph/sources",
-                                         "/api/settings/repos"]);
+                                         "/api/settings/repos", "/api/share/destinations"]);
       // Section headings, so the grid reads as a map rather than a flat wall.
       assert.match(html, /Databases/);
       assert.match(html, /Data warehouses and lakehouses/);
