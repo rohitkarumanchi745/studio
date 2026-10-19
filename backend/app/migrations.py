@@ -458,6 +458,13 @@ def _m23_autopilot_checks_and_alerts(c, is_pg):
         c.execute("DELETE FROM autopilot_runs WHERE status = 'skipped'")
 
 
+def _m24_autopilot_chat(c, is_pg):
+    # Autopilot from chat: the conversation an agent posts its runs to, and
+    # whether it draws with D3 (made in the D3 & artifacts window).
+    _add_column(c, "autopilot_agents", "conversation_id", "TEXT", is_pg)
+    _add_column(c, "autopilot_agents", "visual", "INTEGER", is_pg)
+
+
 MIGRATIONS = [
     (1, "users.verified", _m1_users_verified),
     (2, "conversations.folder_id", _m2_conversations_folder_id),
@@ -482,6 +489,7 @@ MIGRATIONS = [
     (21, "query_cache.user_id", _m21_query_cache_user_id),
     (22, "meta_objects/meta_columns description", _m22_metagraph_descriptions),
     (23, "autopilot check state + run alerts", _m23_autopilot_checks_and_alerts),
+    (24, "autopilot agents post to a chat", _m24_autopilot_chat),
 ]
 
 

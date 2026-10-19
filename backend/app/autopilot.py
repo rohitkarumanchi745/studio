@@ -92,6 +92,8 @@ def init_tables():
                 last_threshold_state INTEGER,
                 last_checked_at REAL,
                 last_check TEXT,
+                conversation_id TEXT,
+                visual INTEGER,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
             );
@@ -171,13 +173,21 @@ def _within(sql, tables):
     return bool(reads) and reads <= tables
 
 
-def _run_headless(owner, source, tables, goal, model=None):
+def _run_headless(owner, source, tables, goal, model=None, visual=False):
     """Answer the goal as the owner, with no conversation — in the order chat
     answers a question, so a scheduled report and a chat answer agree:
     a CERTIFIED metric's definition, then an exact VERIFIED query, then the
     agent. A tier's answer counts only when its SQL stays inside the agent's
     declared tables. Dormant-safe: with no LLM key the agent tier returns rows
     via its deterministic fallback."""
+    out = _answer_goal(owner, source, tables, goal, model, visual)
+    if visual:
+        # A D3 & artifacts agent: every chart drawn with D3, as in that window.
+        agent.d3_only(out)
+    return out
+
+
+def _answer_goal(owner, source, tables, goal, model, visual):
     connector, allowed, schemas, table_param = _build_scope(owner, source, tables)
     declared = {t.lower() for t in allowed} if [t for t in (tables or []) if t] else set()
     single = None if table_param == "*" else table_param
@@ -201,7 +211,8 @@ def _run_headless(owner, source, tables, goal, model=None):
     skill_md = skills.get_skill(connector, owner["role"], allowed, schemas)
     return agent.run_agent(
         prompt=goal, connector=connector, table=table_param, allowed_tables=allowed,
-        schemas=schemas, history=[], user=owner, model=model, skill_md=skill_md)
+        schemas=schemas, history=[], user=owner, model=model, skill_md=skill_md,
+        visual_mode=bool(visual))
 
 
 # ── Trigger evaluation ──────────────────────────────────────────────────
@@ -368,8 +379,11 @@ def _capped_result(result, proposed_job_id=None, action_error=None):
         "rows": (result.get("rows") or [])[:_RESULT_ROW_CAP],
         "chart": result.get("chart"),
         "panels": [{"sql": p.get("sql"), "columns": p.get("columns"),
-                    "rows": (p.get("rows") or [])[:_RESULT_ROW_CAP], "chart": p.get("chart")}
+                    "rows": (p.get("rows") or [])[:_RESULT_ROW_CAP], "chart": p.get("chart"),
+                    **({"visual": p["visual"]} if p.get("visual") else {}),
+                    **({"engine": p["engine"]} if p.get("engine") else {})}
                    for p in (result.get("panels") or [])],
+        "visual_mode": bool(result.get("visual_mode")),
         "mode": result.get("mode"),
         "served_by": result.get("served_by"),
         "row_count": len(result.get("rows") or []),
@@ -443,7 +457,8 @@ def _run_agent_now(agent_def, trigger):
     t0 = time.time()
     try:
         result = _run_headless(owner, agent_def["source"], agent_def.get("tables"),
-                               agent_def["goal"], agent_def.get("model"))
+                               agent_def["goal"], agent_def.get("model"),
+                               visual=bool(agent_def.get("visual")))
     except PermissionError as e:
         # The owner's RBAC no longer covers this scope (a demotion). Fail the run
         # — an autopilot agent can never run wider than its current owner.
@@ -479,13 +494,15 @@ def _run_agent_now(agent_def, trigger):
         summary = f"{summary[:300]} — the governed action could not be proposed: {action_error}"[:500]
     return _record_run(run_id, agent_def, trigger, "done", started, summary=summary,
                        result=_capped_result(result, proposed_job_id, action_error),
-                       trace_id=trace_id, proposed_job_id=proposed_job_id, seen=manual)
+                       trace_id=trace_id, proposed_job_id=proposed_job_id, seen=manual,
+                       full=result)
 
 
 def _record_run(run_id, agent_def, trigger, status, started, summary=None,
-                result=None, trace_id=None, proposed_job_id=None, seen=False):
-    """Write a run — unread (an alert) unless the owner started it — and keep
-    the agent's newest _KEEP_RUNS."""
+                result=None, trace_id=None, proposed_job_id=None, seen=False, full=None):
+    """Write a run — unread (an alert) unless the owner started it — keep the
+    agent's newest _KEEP_RUNS, and post it to the agent's chat (`full`: the
+    whole answer, rows uncapped)."""
     now = time.time()
     row = {
         "id": run_id, "agent_id": agent_def["id"], "owner_id": agent_def["owner_id"],
@@ -504,7 +521,39 @@ def _record_run(run_id, agent_def, trigger, status, started, summary=None,
                   "ORDER BY started_at DESC LIMIT ?)",
                   (agent_def["id"], agent_def["id"], _KEEP_RUNS))
         c.commit()
+    _deliver(agent_def, row, full, seen)
     return row
+
+
+_POSTED_KEYS = ("text", "sql", "columns", "rows", "chart", "panels", "mode", "model",
+                "served_by", "visual_mode", "errors", "inputs")
+
+
+def _deliver(agent_def, run, result, seen):
+    """Post a run to the conversation the agent was made in: the answer as
+    the chat shows any answer (charts to the canvas, or drawn with D3 in a
+    D3 & artifacts chat), or why it could not run. Best-effort — a chat that
+    is gone or no longer the owner's to edit is skipped; the run stands."""
+    cid = agent_def.get("conversation_id")
+    if not cid:
+        return
+    meta = {"agent_id": agent_def["id"], "agent_name": agent_def["name"], "run_id": run["id"],
+            "trigger": run["trigger"], "status": run["status"], "summary": run["summary"]}
+    scope = ", ".join(agent_def.get("tables") or []) or "*"
+    if run["status"] == "done" and result is not None:
+        content = {k: result[k] for k in _POSTED_KEYS if k in result}
+    else:
+        content = {"text": f"Autopilot “{agent_def['name']}” couldn't run: {run['summary']}",
+                   "mode": "autopilot_failed", "errors": [run["summary"]], "sql": None,
+                   "columns": [], "rows": [], "chart": None, "panels": []}
+    content.update({"source": agent_def["source"], "table": scope, "autopilot": meta})
+    try:
+        from . import chat
+        chat.deliver_autopilot(cid, {"id": agent_def["owner_id"]}, content, seen=seen)
+    except Exception:
+        import logging
+        logging.getLogger("studio.autopilot").warning(
+            "autopilot: could not post run %s to its chat", run["id"], exc_info=True)
 
 
 # ── Persistence helpers ─────────────────────────────────────────────────
@@ -566,7 +615,17 @@ def _public_agent(d):
         "enabled": d["enabled"], "next_run_at": d.get("next_run_at"),
         "last_run": _last_run(d["id"]), "created_at": d.get("created_at"),
         "last_checked_at": d.get("last_checked_at"), "last_check": d.get("last_check"),
+        "conversation_id": d.get("conversation_id"), "visual": bool(d.get("visual")),
+        "conversation_title": _conversation_title(d.get("conversation_id")),
     }
+
+
+def _conversation_title(cid):
+    if not cid:
+        return None
+    with db.connect() as c:
+        r = c.execute("SELECT title FROM conversations WHERE id=?", (cid,)).fetchone()
+    return r["title"] if r else None
 
 
 # ── Validation (create/update) ───────────────────────────────────────────
@@ -666,6 +725,10 @@ class AgentIn(BaseModel):
     source: str
     tables: Optional[List[str]] = None
     model: Optional[str] = None
+    # Made from a chat: its runs are posted there. `visual`: made in the D3 &
+    # artifacts window — its answers are drawn with D3 (custom visuals too).
+    conversation_id: Optional[str] = None
+    visual: bool = False
 
 
 class AgentPatch(BaseModel):
@@ -715,6 +778,10 @@ def create_agent(body: AgentIn, user=Depends(current_user)):
     allowed = _validate_scope_or_403(user, body.source, body.tables)
     model = _validate_model_or_400(user, body.model)
     cfg = _validate_trigger(body.trigger_type, body.trigger_config or {}, allowed)
+    if body.conversation_id and db.conversation_access(body.conversation_id, user["id"]) \
+            not in ("owner", "edit"):
+        # Posting into a chat needs the right to write in it.
+        raise HTTPException(404, "Conversation not found")
 
     now = time.time()
     aid = str(uuid.uuid4())
@@ -725,13 +792,14 @@ def create_agent(body: AgentIn, user=Depends(current_user)):
         "model": model, "enabled": 1,
         "next_run_at": _schedule_next(body.trigger_type, cfg),
         "claimed_at": None, "last_seen_freshness": None, "last_threshold_state": None,
+        "conversation_id": body.conversation_id or None, "visual": 1 if body.visual else 0,
         "created_at": now, "updated_at": now,
     }
     cols = ("id,owner_id,name,goal,trigger_type,trigger_config,source,tables,model,"
             "enabled,next_run_at,claimed_at,last_seen_freshness,last_threshold_state,"
-            "created_at,updated_at")
+            "conversation_id,visual,created_at,updated_at")
     with db.connect() as c:
-        c.execute(f"INSERT INTO autopilot_agents ({cols}) VALUES ({','.join('?' * 16)})",
+        c.execute(f"INSERT INTO autopilot_agents ({cols}) VALUES ({','.join('?' * 18)})",
                   tuple(row[k] for k in cols.split(",")))
         c.commit()
     db.log_activity(user, "autopilot_create", prompt=name, source=body.source,

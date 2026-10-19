@@ -23,14 +23,14 @@ const TRIGGERS = [
   { id: "manual", label: "Manual", hint: "Only when you press Run now." },
 ];
 
-const OPS = [
+export const OPS = [
   { id: "lt", label: "<" }, { id: "le", label: "≤" },
   { id: "gt", label: ">" }, { id: "ge", label: "≥" },
   { id: "eq", label: "=" }, { id: "ne", label: "≠" },
 ];
 const OP_LABEL = Object.fromEntries(OPS.map((o) => [o.id, o.label]));
 
-const INTERVALS = [
+export const INTERVALS = [
   { s: 300, label: "every 5 min" },
   { s: 900, label: "every 15 min" },
   { s: 3600, label: "hourly" },
@@ -102,6 +102,11 @@ export function checkText(a) {
 
 const SERVED = { semantic: "▣ certified metric", verified_sql: "✓ verified query" };
 
+/** The chat an agent posts to — in the D3 & artifacts window for a visual agent. */
+export function chatLink(agent) {
+  return `${agent.visual ? "/visuals/c/" : "/c/"}${agent.conversation_id}`;
+}
+
 /** One run in full: what it said, its charts and data, its SQL. */
 export function RunDetail({ run, onOpenJobs }) {
   const res = run.result || {};
@@ -132,7 +137,8 @@ export function RunDetail({ run, onOpenJobs }) {
       {res.text && <Markdown className="answer ap-run-text" text={res.text} />}
       {views.map((v, i) => (
         <div key={i} className="ap-run-view">
-          <ChartView columns={v.columns || []} rows={v.rows || []} chart={v.chart} />
+          <ChartView columns={v.columns || []} rows={v.rows || []} chart={v.chart} visual={v.visual}
+                     {...(res.visual_mode ? { engine: "d3", d3Only: true } : { engine: v.engine })} />
         </div>
       ))}
       {res.row_count > shown && (
@@ -601,6 +607,13 @@ function AgentCard({ agent, isAdmin, onChanged, onOpenJobs, focusRunId, onSeen }
             ? agent.tables.map((t) => <span key={t} className="query-tag">{t}</span>)
             : <span className="meta">all accessible tables</span>}
           {agent.model && <span className="query-tag">{agent.model}</span>}
+          {agent.visual && <span className="artifact-badge" title="Answers are drawn with D3">🎨 D3</span>}
+          {agent.conversation_id && (
+            <a className="query-tag ap-chat-link" href={chatLink(agent)}
+               title="Every run of this agent is posted to this chat">
+              ↪ posts to “{agent.conversation_title || "a chat"}”
+            </a>
+          )}
           {agent.next_run_at && agent.enabled && (
             <span className="meta">next: {whenText(agent.next_run_at)}</span>
           )}
