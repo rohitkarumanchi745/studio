@@ -140,10 +140,10 @@ test("an answer names the database it came from, and Auto shows its icon", () =>
               auto_route: { mode: "single", source: "shop", tables: ["orders"], terms: [],
                             types: { shop: { source_type: "sql", engine: "sqlite" } } } };
   const out = html(AssistantMessage, { m, onOpenCanvas() {} });
-  assert.match(out, /<b>shop<\/b><span class="source-badge-type">Any SQL database · SQLite<\/span><\/span>\/all tables/);
+  assert.match(out, /<b>shop<\/b><span class="source-badge-type">Any SQL database · SQLite<\/span><\/span> · all tables/);
   assert.match(out, /class="auto-route-icon" title="shop — Any SQL database · SQLite"><svg class="srcicon"/);
   // An older answer without source_meta keeps its plain name.
   const old = html(AssistantMessage, { m: { ...m, source_meta: undefined, auto_route: undefined },
                                        onOpenCanvas() {} });
-  assert.match(old, / · shop\/all tables/);
+  assert.match(old, / · shop · all tables/);
 });

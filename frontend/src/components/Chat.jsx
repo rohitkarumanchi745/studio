@@ -114,6 +114,34 @@ export function GroundedTables({ tables }) {
   );
 }
 
+const DATE_COL = /(^|_)(date|day|week|month|quarter|year|time|ts)$|_at$|_on$|^(date|day|month|week|year)/i;
+
+/**
+ * Follow-up questions for an answer, Copilot-style: read off its columns, so
+ * each one is a question this data can go on to answer — the trend over time,
+ * the top of a category, the same measure split another way. At most three.
+ */
+export function followUps(columns = [], rows = []) {
+  if (!columns?.length || !rows?.length) return [];
+  const sample = rows.slice(0, 50);
+  const numeric = (i) => sample.some((r) => typeof r[i] === "number")
+    && sample.every((r) => r[i] == null || typeof r[i] === "number");
+  const nice = (c) => String(c).replace(/_/g, " ");
+  const dates = columns.filter((c) => DATE_COL.test(String(c)));
+  const nums = columns.filter((c, i) => numeric(i) && !DATE_COL.test(String(c))
+    && !/(^|_)id$/i.test(String(c)));
+  const cats = columns.filter((c, i) => !numeric(i) && !DATE_COL.test(String(c)));
+  const out = [];
+  const measure = nums[0] ? nice(nums[0]) : null;
+  if (measure && dates.length === 0) out.push(`Show the trend of ${measure} over time`);
+  if (measure && dates.length > 0 && cats[0]) out.push(`Show ${measure} over time by ${nice(cats[0])}`);
+  if (measure && cats[0]) out.push(`Top 5 ${nice(cats[0])} by ${measure}`);
+  if (measure && cats[1]) out.push(`Break ${measure} down by ${nice(cats[1])}`);
+  else if (measure && !cats.length) out.push(`What drives ${measure}?`);
+  if (measure && dates.length > 0) out.push(`Compare ${measure} with the previous period`);
+  return [...new Set(out)].slice(0, 3);
+}
+
 /** The icon for one activity step. */
 export function StepIcon({ step }) {
   const kind = stepKind(step);
@@ -592,9 +620,9 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
     api(`/conversations/${conversationId}/messages`).then(loadMessages).catch(() => {});
   }
 
-  async function send(e) {
+  async function send(e, text) {
     e?.preventDefault();
-    const q = prompt.trim();
+    const q = (typeof text === "string" ? text : prompt).trim();
     if (!q || busy) return;
     taskViewEpochRef.current++;
     setPrompt("");
@@ -1000,13 +1028,23 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
               visualMode={visualMode}
               conversationId={conversationId}
               onAutopilotCreated={refreshMessages}
+              onFollowUp={i === messages.length - 1 && !busy ? (q) => send(null, q) : null}
             />
           )
         )}
 
         {busy && (
           <div className="msg">
-            <AgentActivity running steps={liveSteps} startedAt={activeStartedAt} />
+            <div className="assistant copilot">
+              <div className="assistant-head">
+                <span className="assistant-avatar" aria-hidden="true">◆</span>
+                <span className="assistant-name">Studio</span>
+                <span className="meta assistant-working">working on it…</span>
+              </div>
+              <div className="assistant-body">
+                <AgentActivity running steps={liveSteps} startedAt={activeStartedAt} />
+              </div>
+            </div>
           </div>
         )}
         {!busy && (failedActivity || error) && (
@@ -1100,7 +1138,7 @@ export function SavedSqlPipeline({ pipeline }) {
 }
 
 export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRunPipeline, onPipelineStatus, onPlatformAction, busy, activitySteps, visualMode = false,
-                                  conversationId = null, onAutopilotCreated }) {
+                                  conversationId = null, onAutopilotCreated, onFollowUp = null }) {
   const [showSql, setShowSql] = useState(false);
   const [columns, setColumns] = useState(m.columns);
   const [rows, setRows] = useState(m.rows);
@@ -1193,6 +1231,15 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
     }
   }
 
+  async function copyText() {
+    try {
+      await navigator.clipboard.writeText(m.text || "");
+      setStatus("copied");
+    } catch {
+      setStatus("could not copy");
+    }
+  }
+
   async function emailReport() {
     setStatus("emailing…");
     try {
@@ -1212,38 +1259,54 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
     }
   }
 
+  // Copilot-style: who answered and from where on one quiet line, the answer,
+  // its result as a card, its sources, then one row of actions and follow-ups.
+  const served = m.served_by === "semantic" ? "▣ certified metric"
+    : m.served_by === "bitnet" ? "🧠 BitNet (learned)"
+    : m.mode === "cached" ? "⚡ cached plan"
+    : m.mode === "fallback" ? "preview"
+    : m.model;
+  const crew = agentSummary(m.agents?.length ? m.agents
+    : (m.agents_used || []).map((name) => ({ name, role: "worker" })));
+  const views = m.panels?.length ? m.panels.length : (m.chart && rows?.length > 0 ? 1 : 0);
+  const hasRows = !expired && columns?.length > 0 && rows?.length > 0;
+  const matched = Object.fromEntries((m.matched_tables || []).map((mt) => [mt.table, mt]));
+  const sampleable = m.source && m.source !== "*" && m.source !== "auto";
+  const sources = [
+    ...[...new Set([...(m.inputs?.tables || []), ...Object.keys(matched)])].map((t) => ({
+      key: `t:${t}`, kind: "table", label: t,
+      title: [(m.inputs?.tables || []).includes(t) ? "read by this answer's SQL" : "matched your question",
+               matched[t]?.why?.length ? `matched on: ${matched[t].why.join(", ")}` : "",
+               sampleable ? "click for its latest rows" : ""].filter(Boolean).join(" — ") })),
+    ...(m.citations || []).map((c, i) => ({ key: `d:${i}`, kind: "doc",
+      label: `${c.source}${c.page ? ` p.${c.page}` : c.sheet ? ` · ${c.sheet}` : ""}`,
+      title: `from your documents${c.collection ? ` · ${c.collection}` : ""}${c.score != null ? ` · relevance ${Math.round(c.score * 100)}%` : ""}` })),
+  ];
+  const suggestions = onFollowUp && !expired && !m.clarify && !m.autopilot_draft
+    ? followUps(columns, rows) : [];
+
   return (
     <div className="msg">
-      <div className="assistant">
+      <div className="assistant copilot">
         <div className="assistant-head">
-          <span className="brand-mark">◆</span>
-          <span className="meta">
-            {m.served_by === "semantic"
-              ? "▣ Semantic layer"
-              : m.served_by === "bitnet"
-                ? "🧠 BitNet (learned)"
-                : m.mode === "cached"
-                  ? "⚡ cached"
-                  : m.mode === "fallback"
-                    ? "fallback"
-                    : m.model}
+          <span className="assistant-avatar" aria-hidden="true">◆</span>
+          <span className="assistant-name">Studio</span>
+          <span className="meta assistant-meta">
+            {served}
             {" · "}{m.source_meta
               ? <SourceBadge name={m.source} type={m.source_meta.source_type} engine={m.source_meta.engine} />
-              : m.source}/{m.table === "*" ? "all tables" : m.table}
+              : m.source}
+            {" · "}{m.table === "*" ? "all tables" : m.table}
             {m.agents?.length > 0
               ? ` · ${agentLabel(m.agents)}`
               : m.mode === "orchestrated" && m.agents_used?.length > 0
                 ? ` · agents: ${m.agents_used.join(", ")}`
                 : ""}
-            {(() => {
-              const crew = agentSummary(m.agents?.length ? m.agents
-                : (m.agents_used || []).map((name) => ({ name, role: "worker" })));
-              return crew.total > 0 && (
-                <span className="agent-count" title={crew.names.join(", ")}>
-                  {" "}· 👥 {crew.text}{crew.detail ? ` (${crew.detail})` : ""}
-                </span>
-              );
-            })()}
+            {crew.total > 0 && (
+              <span className="agent-count" title={crew.names.join(", ")}>
+                {" "}· 👥 {crew.text}{crew.detail ? ` (${crew.detail})` : ""}
+              </span>
+            )}
             {m.cached && (
               <span title={`reused your earlier plan for: "${m.cached.from_prompt || ""}"`}>
                 {" · "}reused plan{m.cached.similarity < 1 ? ` (${Math.round(m.cached.similarity * 100)}% match)` : ""} · fresh data
@@ -1260,220 +1323,220 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
             )}
           </span>
         </div>
-        {m.activity_task_id && <AgentActivity key={m.activity_task_id} taskId={m.activity_task_id} steps={activitySteps || []} graph={m.graph} agents={m.agents} />}
-        {m.autopilot && (
-          <div className={"ap-posted" + (m.autopilot.status === "failed" ? " ap-posted-bad" : "")}
-               title={m.autopilot.summary || ""}>
-            ✦ Autopilot · <b>{m.autopilot.agent_name}</b>
-            {" · "}{m.autopilot.trigger === "manual" ? "run now" : `on its ${m.autopilot.trigger}`}
-            {" "}<a className="chip" href="/autopilot">manage</a>
-          </div>
-        )}
-        {m.text && <Markdown className="answer" text={m.text} />}
-        {m.autopilot_draft && (
-          <AutopilotDraft draft={m.autopilot_draft} conversationId={conversationId}
-                          onCreated={onAutopilotCreated} />
-        )}
-        {expired && (
-          <div className="rows-expired" role="note">
-            <span><b>Result rows expired.</b> Studio keeps an answer's data for a limited time;
-              the question, SQL and chart settings are kept.</span>
-            {m.sql && (
-              <button className="chip" onClick={rerunExpired}
-                      title="Run this answer's SQL again for current data">
-                ⟳ re-run for current data
-              </button>
-            )}
-          </div>
-        )}
-        {/* The D3 & artifacts window draws every chart right in the thread,
-            with D3 alone, under the answer it illustrates. */}
-        {visualMode && !expired && (m.panels?.length > 0 || (m.chart && rows?.length > 0)) && (
-          <div className="msg-visuals">
-            {(m.panels?.length && !m.rows_purged ? m.panels : [{ columns, rows, chart: m.chart }]).map((p, i) => (
-              <div key={i} className="msg-visual">
-                <ChartView columns={p.columns} rows={p.rows} chart={p.chart} visual={p.visual}
-                           engine="d3" d3Only tall />
-              </div>
-            ))}
-          </div>
-        )}
-        <PlanningSources sources={m.pipeline?.planning_sources} />
-        {m.pipeline?.execution_mode === "airflow_dag"
-          ? <ChatWorkflow key={m.pipeline.job_id || m.message_id} pipeline={m.pipeline} messageId={m.message_id} busy={busy} onRun={onRunPipeline} onStatus={onPipelineStatus} />
-          : m.pipeline?.steps?.length > 0 && <SavedSqlPipeline pipeline={m.pipeline} />}
-        {m.platform_run && <ChatPlatformRun key={m.platform_run.job_id || m.message_id} artifact={m.platform_run} messageId={m.message_id} busy={busy} onAction={onPlatformAction} />}
-        {m.clarify && onClarify && (
-          <div className="clarify-chips">
-            {m.clarify.options.map((o) => (
-              <button
-                key={o.source}
-                className="chip"
-                onClick={() => onClarify(m.clarify.prompt, o)}
-                title={o.source === "*"
-                  ? "Query every source that has this table and compare the answers — remembered for this chat"
-                  : `Answer from ${o.source} only (has ${(o.tables || []).join(", ")}) — follow-ups stay there`}
-              >
-                {o.source === "*"
-                  ? (m.clarify.options.length > 3
-                      ? `⧉ All ${m.clarify.options.length - 1}, side by side`
-                      : "⧉ Both, side by side")
-                  : `▣ Use ${o.source}`}
-              </button>
-            ))}
-          </div>
-        )}
-        {m.auto_route && (
-          <div className="auto-route-row" title={m.auto_route.why || ""}>
-            <span className="auto-route-tag">✳ Auto</span>{" "}
-            {Object.entries(m.auto_route.types || {}).map(([name, t]) => (
-              <span key={name} className="auto-route-icon" title={`${name} — ${sourceTypeLabel(t.source_type, t.engine)}`}>
-                <SourceIcon id={sourceIconId(t.source_type, t.engine)} size={14} />
-              </span>
-            ))}
-            {describeRoute(m.auto_route)}
-          </div>
-        )}
-        {/* What the answer was computed from — read off the executed SQL, so it
-            reflects the tables actually queried, not the ones picked up top. */}
-        {m.inputs?.tables?.length > 0 && (
-          <div className="inputs-row">
-            <span className="meta">answered from</span>
-            {m.inputs.tables.map((t) => (
-              <span key={t} className="chip chip-input" title="table referenced by the executed SQL">
-                ▦ {t}
-              </span>
-            ))}
-            {m.inputs.columns?.length > 0 && (
-              <span className="meta" title={m.inputs.columns.join(", ")}>
-                · {m.inputs.columns.slice(0, 4).join(", ")}
-                {m.inputs.columns.length > 4 ? ` +${m.inputs.columns.length - 4}` : ""}
-              </span>
-            )}
-            {m.inputs.row_count > 0 && <span className="meta">· {m.inputs.row_count} rows</span>}
-          </div>
-        )}
-        {/* KAG: documents the agent grounded this answer on (knowledge_search). */}
-        {m.citations?.length > 0 && (
-          <div className="inputs-row">
-            <span className="meta">grounded on</span>
-            {m.citations.map((c, i) => (
-              <span key={i} className="chip chip-input"
-                title={`from your documents${c.collection ? ` · ${c.collection}` : ""}${c.score != null ? ` · relevance ${Math.round(c.score * 100)}%` : ""}`}>
-                📄 {c.source}{c.page ? ` p.${c.page}` : c.sheet ? ` · ${c.sheet}` : ""}
-              </span>
-            ))}
-          </div>
-        )}
-        {m.matched_tables?.length > 0 && (
-          <div className="match-row">
-            <span className="meta">matched tables:</span>
-            {m.matched_tables.map((mt) => (
-              <button
-                key={mt.table}
-                className={"chip" + (sample?.table === mt.table ? " chip-on" : "")}
-                onClick={() => loadSample(mt.table)}
-                disabled={sampleBusy === mt.table}
-                title={`matched on: ${mt.why.join(", ")}\ncolumns: ${mt.columns.join(", ")}\nclick for the latest sample — click again to refresh`}
-              >
-                ▦ {mt.table}{sampleBusy === mt.table ? " …" : ""}
-              </button>
-            ))}
-            {sample && (
-              <button className="chip" onClick={() => setSample(null)} title="Close sample">
-                ✕
-              </button>
-            )}
-          </div>
-        )}
-        {sample && (
-          <div className="sample-view">
-            <div className="meta">▦ {sample.table} — latest data, fetched {sample.at}</div>
-            <div className="msg-panels">
-              {sample.panels.map((p, i) => (
-                <ChartView key={i} columns={p.columns} rows={p.rows} chart={p.chart}
-                           {...(visualMode ? { engine: "d3", d3Only: true } : {})} />
+        <div className="assistant-body">
+          {m.activity_task_id && <AgentActivity key={m.activity_task_id} taskId={m.activity_task_id} steps={activitySteps || []} graph={m.graph} agents={m.agents} />}
+          {m.autopilot && (
+            <div className={"ap-posted" + (m.autopilot.status === "failed" ? " ap-posted-bad" : "")}
+                 title={m.autopilot.summary || ""}>
+              ✦ Autopilot · <b>{m.autopilot.agent_name}</b>
+              {" · "}{m.autopilot.trigger === "manual" ? "run now" : `on its ${m.autopilot.trigger}`}
+              {" "}<a className="chip" href="/autopilot">manage</a>
+            </div>
+          )}
+          {m.text && <Markdown className="answer" text={m.text} />}
+          {m.autopilot_draft && (
+            <AutopilotDraft draft={m.autopilot_draft} conversationId={conversationId}
+                            onCreated={onAutopilotCreated} />
+          )}
+          {expired && (
+            <div className="rows-expired" role="note">
+              <span><b>Result rows expired.</b> Studio keeps an answer's data for a limited time;
+                the question, SQL and chart settings are kept.</span>
+              {m.sql && (
+                <button className="chip" onClick={rerunExpired}
+                        title="Run this answer's SQL again for current data">
+                  ⟳ re-run for current data
+                </button>
+              )}
+            </div>
+          )}
+          {/* The D3 & artifacts window draws every chart right in the thread,
+              with D3 alone, under the answer it illustrates. */}
+          {visualMode && !expired && (m.panels?.length > 0 || (m.chart && rows?.length > 0)) && (
+            <div className="msg-visuals">
+              {(m.panels?.length && !m.rows_purged ? m.panels : [{ columns, rows, chart: m.chart }]).map((p, i) => (
+                <div key={i} className="msg-visual">
+                  <ChartView columns={p.columns} rows={p.rows} chart={p.chart} visual={p.visual}
+                             engine="d3" d3Only tall />
+                </div>
               ))}
             </div>
-          </div>
-        )}
-        {m.sql && (
-          <div className="sqlbox">
-            <button className="chip" onClick={() => setShowSql(!showSql)}>
-              {showSql ? "hide SQL" : "◦ edit / verify / save SQL"}
-            </button>{" "}
-            <button className="chip" onClick={refresh} title="Re-run this query for the newest records">
-              ⟳ refresh data
-            </button>{" "}
-            <button className="chip" onClick={emailReport} title="Email this report to yourself">
-              ✉ email report
-            </button>{" "}
-            {!m.autopilot && !expired && rows?.length > 0 && (
-              <>
-                <button className="chip" onClick={() => setAutomate(true)}
-                        title="Run this question again on a schedule or when data changes — its answers post to this chat">
-                  ⏱ Automate
-                </button>{" "}
-              </>
-            )}
-            {!expired && columns?.length > 0 && rows?.length > 0 && (
-              <>
-                <button className="chip" onClick={() => save("csv")}
-                        title="Download these rows as a CSV file">⬇ CSV</button>{" "}
-                <button className="chip" onClick={() => save("xlsx")}
-                        title="Download these rows as an Excel workbook">⬇ Excel</button>{" "}
-                <button className="chip" onClick={() => save("report")}
-                        title="Download the answer — text, charts, data and SQL — as one HTML page (print it to PDF)">
-                  ⬇ Report
-                </button>{" "}
-              </>
-            )}
-            {m.chart && !visualMode && !expired && (
-              <button className="chip" onClick={() => onOpenCanvas(m.rows_purged ? freshView() : undefined)}
-                      title="Open on the main screen">
-                ⤢ canvas
+          )}
+          {/* Elsewhere a chart lives in the canvas (center stage): the answer
+              shows it as a card that opens it there. */}
+          {!visualMode && !expired && views > 0 && (
+            <div className="result-card">
+              <span className="result-card-icon" aria-hidden="true">📊</span>
+              <span className="result-card-text">
+                <b>{m.chart?.title || m.panels?.[0]?.chart?.title || "Result"}</b>
+                <span className="meta">
+                  {views > 1 ? `${views} charts · ` : ""}{(rows || []).length.toLocaleString()} rows
+                  {columns?.length ? ` · ${columns.length} columns` : ""}
+                </span>
+              </span>
+              <button className="chip chart-open"
+                      onClick={() => onOpenCanvas(m.rows_purged ? freshView() : undefined)}>
+                ⤢ {views > 1 ? `${views} charts` : "chart"} in canvas
               </button>
-            )}
-            {status && <span className="meta"> {status}</span>}
-            {automate && (
-              <AutopilotDraft draft={draftFromAnswer(m, requirement, visualMode)}
-                              conversationId={conversationId} onDismiss={() => setAutomate(false)}
-                              onCreated={onAutopilotCreated} />
-            )}
-            {showSql && (
+            </div>
+          )}
+          <PlanningSources sources={m.pipeline?.planning_sources} />
+          {m.pipeline?.execution_mode === "airflow_dag"
+            ? <ChatWorkflow key={m.pipeline.job_id || m.message_id} pipeline={m.pipeline} messageId={m.message_id} busy={busy} onRun={onRunPipeline} onStatus={onPipelineStatus} />
+            : m.pipeline?.steps?.length > 0 && <SavedSqlPipeline pipeline={m.pipeline} />}
+          {m.platform_run && <ChatPlatformRun key={m.platform_run.job_id || m.message_id} artifact={m.platform_run} messageId={m.message_id} busy={busy} onAction={onPlatformAction} />}
+          {m.clarify && onClarify && (
+            <div className="clarify-chips">
+              {m.clarify.options.map((o) => (
+                <button
+                  key={o.source}
+                  className="chip"
+                  onClick={() => onClarify(m.clarify.prompt, o)}
+                  title={o.source === "*"
+                    ? "Query every source that has this table and compare the answers — remembered for this chat"
+                    : `Answer from ${o.source} only (has ${(o.tables || []).join(", ")}) — follow-ups stay there`}
+                >
+                  {o.source === "*"
+                    ? (m.clarify.options.length > 3
+                        ? `⧉ All ${m.clarify.options.length - 1}, side by side`
+                        : "⧉ Both, side by side")
+                    : `▣ Use ${o.source}`}
+                </button>
+              ))}
+            </div>
+          )}
+          {/* Sources, as Copilot lists references: where the answer came from
+              — read off the executed SQL — and the documents it was grounded on. */}
+          {(sources.length > 0 || m.auto_route) && (
+            <div className="references" aria-label="Sources">
+              <span className="references-label">Sources</span>
+              {m.auto_route && (
+                <span className="auto-route-row" title={m.auto_route.why || ""}>
+                  <span className="auto-route-tag">✳ Auto</span>{" "}
+                  {Object.entries(m.auto_route.types || {}).map(([name, t]) => (
+                    <span key={name} className="auto-route-icon" title={`${name} — ${sourceTypeLabel(t.source_type, t.engine)}`}>
+                      <SourceIcon id={sourceIconId(t.source_type, t.engine)} size={14} />
+                    </span>
+                  ))}
+                  {describeRoute(m.auto_route)}
+                </span>
+              )}
+              {sources.map((r, i) => r.kind === "table" && sampleable ? (
+                <button key={r.key} title={r.title}
+                        className={"chip chip-input reference" + (sample?.table === r.label ? " chip-on" : "")}
+                        onClick={() => loadSample(r.label)} disabled={sampleBusy === r.label}>
+                  <span className="ref-num">{i + 1}</span>
+                  ▦ {r.label}{sampleBusy === r.label ? " …" : ""}
+                </button>
+              ) : (
+                <span key={r.key} className="chip chip-input reference" title={r.title}>
+                  <span className="ref-num">{i + 1}</span>
+                  {r.kind === "doc" ? "📄" : "▦"} {r.label}
+                </span>
+              ))}
+              {sample && (
+                <button className="chip" onClick={() => setSample(null)} title="Close the preview">✕</button>
+              )}
+            </div>
+          )}
+          {sample && (
+            <div className="sample-view">
+              <div className="meta">▦ {sample.table} — latest data, fetched {sample.at}</div>
+              <div className="msg-panels">
+                {sample.panels.map((p, i) => (
+                  <ChartView key={i} columns={p.columns} rows={p.rows} chart={p.chart}
+                             {...(visualMode ? { engine: "d3", d3Only: true } : {})} />
+                ))}
+              </div>
+            </div>
+          )}
+          {(m.trace_id || m.sql || m.text) && (
+            <div className="response-actions" role="toolbar" aria-label="Answer actions">
+              {m.trace_id && (
+                <>
+                  <button
+                    className={"icon-btn" + (voted === 1 ? " chip-on" : "")}
+                    onClick={() => vote(1)}
+                    aria-pressed={voted === 1}
+                    title={voted === 1 ? "Take this back" : "Good answer — reinforces this behavior"}
+                  >
+                    👍
+                  </button>
+                  <button
+                    className={"icon-btn" + (voted === -1 ? " chip-on" : "")}
+                    onClick={() => vote(-1)}
+                    aria-pressed={voted === -1}
+                    title={voted === -1 ? "Take this back" : "Wrong or unhelpful — the agent learns from flagged runs"}
+                  >
+                    👎
+                  </button>
+                  <span className="action-sep" aria-hidden="true" />
+                </>
+              )}
+              {m.text && (
+                <button className="icon-btn" onClick={copyText} title="Copy the answer">⧉ Copy</button>
+              )}
+              {m.sql && (
+                <>
+                  <button className="icon-btn" onClick={() => setShowSql(!showSql)}
+                          aria-label="edit / verify / save SQL" title="Edit, verify or save the SQL">
+                    {showSql ? "hide SQL" : "‹/› SQL"}
+                  </button>
+                  <button className="icon-btn" onClick={refresh} aria-label="refresh data"
+                          title="Re-run this query for the newest records">
+                    ⟳ Refresh
+                  </button>
+                  <details className="export-menu">
+                    <summary className="icon-btn" title="Download or send this answer">⬇ Export</summary>
+                    <div className="export-menu-list" role="menu">
+                      {hasRows && (
+                        <>
+                          <button className="menu-item" role="menuitem" onClick={() => save("csv")}
+                                  title="Download these rows as a CSV file">⬇ CSV</button>
+                          <button className="menu-item" role="menuitem" onClick={() => save("xlsx")}
+                                  title="Download these rows as an Excel workbook">⬇ Excel</button>
+                          <button className="menu-item" role="menuitem" onClick={() => save("report")}
+                                  title="Download the answer — text, charts, data and SQL — as one HTML page (print it to PDF)">
+                            ⬇ Report
+                          </button>
+                        </>
+                      )}
+                      <button className="menu-item" role="menuitem" onClick={emailReport}
+                              title="Email this report to yourself">✉ email report</button>
+                    </div>
+                  </details>
+                  {!m.autopilot && !expired && rows?.length > 0 && (
+                    <button className="icon-btn" onClick={() => setAutomate(true)}
+                            title="Run this question again on a schedule or when data changes — its answers post to this chat">
+                      ⏱ Automate
+                    </button>
+                  )}
+                </>
+              )}
+              {status && <span className="meta action-status"> {status}</span>}
+            </div>
+          )}
+          {(m.sql || m.text) && !m.autopilot_draft && (
+            <div className="ai-note">AI-generated — check the SQL and sources before you rely on it.</div>
+          )}
+          {automate && (
+            <AutopilotDraft draft={draftFromAnswer(m, requirement, visualMode)}
+                            conversationId={conversationId} onDismiss={() => setAutomate(false)}
+                            onCreated={onAutopilotCreated} />
+          )}
+          {showSql && m.sql && (
+            <div className="sqlbox">
               <SqlLab sql={m.sql} source={m.source} table={m.table} requirement={requirement} />
-            )}
-          </div>
-        )}
-        {m.trace_id && (
-          <div className="feedback-row">
-            <button
-              className={"chip" + (voted === 1 ? " chip-on" : "")}
-              onClick={() => vote(1)}
-              aria-pressed={voted === 1}
-              title={voted === 1 ? "Take this back" : "Good answer — reinforces this behavior"}
-            >
-              👍
-            </button>{" "}
-            <button
-              className={"chip" + (voted === -1 ? " chip-on" : "")}
-              onClick={() => vote(-1)}
-              aria-pressed={voted === -1}
-              title={voted === -1 ? "Take this back" : "Wrong or unhelpful — the agent learns from flagged runs"}
-            >
-              👎
-            </button>
-            {!m.sql && status && <span className="meta"> {status}</span>}
-          </div>
-        )}
-        {/* Charts always live in the canvas (center stage), never inline in the
-            chat column — chat keeps a button to bring this message's view back. */}
-        {!visualMode && !expired && (m.panels?.length > 0 || (m.chart && rows?.length > 0)) && (
-          <button className="chip chart-open"
-                  onClick={() => onOpenCanvas(m.rows_purged ? freshView() : undefined)}>
-            ⤢ {m.panels?.length > 1 ? `${m.panels.length} charts` : "chart"} in canvas
-          </button>
-        )}
+            </div>
+          )}
+          {suggestions.length > 0 && (
+            <div className="followups" aria-label="Suggested follow-ups">
+              {suggestions.map((q) => (
+                <button key={q} className="followup" onClick={() => onFollowUp(q)}>{q}</button>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
