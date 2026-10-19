@@ -356,6 +356,14 @@ td { color: var(--ink-2); }
 }
 .activity-event:last-child::before { border-color: var(--accent); background: var(--accent); }
 .activity-event-label { min-width: 0; overflow-wrap: anywhere; }
+/* What each step is doing: the database's own icon, or a glyph for other work. */
+.activity-event-main { display: flex; align-items: flex-start; gap: 6px; min-width: 0; }
+.activity-icon {
+  flex: none; display: inline-flex; align-items: center; justify-content: center;
+  width: 16px; height: 16px; margin-top: 1px; font-size: 12px; line-height: 1;
+}
+.activity-icon .srcicon { width: 16px; height: 16px; }
+.activity-current .activity-icon { display: inline-flex; vertical-align: -3px; margin-right: 5px; }
 .activity-event-time { flex: none; color: var(--ink-3); font-size: 11px; font-variant-numeric: tabular-nums; }
 .activity-note { color: var(--ink-3); font-size: 12px; }
 .activity-graph { margin-top: 13px; padding-top: 11px; border-top: 1px solid var(--line); }

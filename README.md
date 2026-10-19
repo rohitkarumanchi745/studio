@@ -340,6 +340,20 @@ streamed by the worker running the turn through the background-task row the UI
 already polls (`progress.py`), so
 nothing new to deploy or open.
 
+**Each step has an icon** for what it is doing, in the chat and the D3 &
+artifacts window. A step records its kind, and for work on a source, the
+source, its type and its engine.
+- **Work on a database** shows that database's own icon: Postgres, Snowflake,
+  LanceDB, the demo data. For an *Any SQL database* connection, it's the
+  engine its URL names (MySQL, SQL Server…).
+- **Other work** shows its own glyph:
+  - 🧭 finding the data, 🗺 planning, 👥 agents, ∑ combining results;
+  - 📊 a chart, 🎨 D3, ▣ a certified metric, ✓ a verified query, ⚡ a cached
+    plan;
+  - 📄 your documents, 🔧 tools, 🧠 a model, ⚙ a pipeline, ⚠ a problem.
+- **The step being worked on now** shows its icon in the panel's header.
+- **Steps recorded before kinds existed** get theirs from their wording.
+
 Without an API key the agent degrades to a deterministic preview
 (`SELECT * … LIMIT` + auto chart), so the whole flow stays demoable. An
 *invalid* key is a different case and is called out as one — "the server's key

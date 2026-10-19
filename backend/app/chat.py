@@ -570,7 +570,7 @@ def _verified_answer(ctx, user, prompt):
     from . import verified_sql
     result = verified_sql.answer(user, ctx["source"], m)
     if result is not None:
-        progress.emit(f"answered with the verified query “{m['query']['title']}”")
+        progress.emit(f"answered with the verified query “{m['query']['title']}”", kind="verified")
     return result
 
 
@@ -663,7 +663,8 @@ def _grounding(ctx, user, prompt):
         named = ", ".join([t for t in grounded["tables"] if t in grounded["matched"]][:6])
         bridges = f" (joined through {', '.join(grounded['bridges'])})" \
             if grounded["bridges"] else ""
-        progress.emit(f"grounded in the metadata graph: {named}{bridges}")
+        progress.emit(f"grounded in the metadata graph: {named}{bridges}", kind="route",
+                      source=ctx.get("connector") or ctx.get("source"))
     try:
         extra = _focus_schemas({**ctx, "schemas": {**ctx["schemas"], **schemas}}, user, prompt)
     except Exception:
@@ -720,7 +721,7 @@ def _clarify_turn(ctx, user, clash, t0):
     this turn is a question, not an answer. _conversation() also keeps the
     exchange out of the model's history, since the re-ask repeats the question."""
     cid, prompt = ctx["cid"], ctx["prompt"]
-    progress.emit("asking which source to use")
+    progress.emit("asking which source to use", kind="route")
     by_source = {}
     for c in clash:
         for s in c["sources"]:
@@ -785,7 +786,7 @@ def _workflow_turn(ctx, user):
         plan = chat_workflows.recover(user, request_id)
     if plan is None:
         if action in ("build", "build_submit"):
-            progress.emit("matching successful recipes and planning task dependencies")
+            progress.emit("matching successful recipes and planning task dependencies", kind="pipeline")
             source_context, planning_sources = pipeline_sources.resolve(
                 user, repository_id=ctx.get("repository_id"),
                 confluence_page_ids=ctx.get("confluence_page_ids"))
@@ -798,7 +799,7 @@ def _workflow_turn(ctx, user):
         else:
             plan = previous
         if action in ("submit", "build_submit") and plan and plan.get("status") not in ("blocked", "needs_input"):
-            progress.emit("submitting generated DAG for administrator approval")
+            progress.emit("submitting generated DAG for administrator approval", kind="pipeline")
             plan = chat_workflows.submit(user, plan, request_id=request_id, conversation_id=ctx["cid"])
     if not plan:
         raise HTTPException(400, "Build an Airflow pipeline before submitting it")
@@ -858,7 +859,7 @@ def _platform_context(cid, user, target=None, before_message_id=None):
 def _platform_turn(ctx, user):
     request = {**ctx["platform_request"], "conversation_id": ctx["cid"]}
     progress.emit("checking platform job status" if request["action"] == "status"
-                  else "submitting platform job to the approval supervisor")
+                  else "submitting platform job to the approval supervisor", kind="pipeline")
     request_id = ":".join((ctx["cid"], user["id"], ctx.get("user_message_id") or str(uuid.uuid4())))
     jobs.check_claim()
     artifact = chat_platforms.submit(request, user, request_id=request_id)
@@ -919,10 +920,10 @@ def _run_turn(ctx, user):
                 verified = verified_sql.answer(user, vsource, vm)
                 if verified is not None:
                     verified["source"] = vsource
-                    progress.emit(f"answered with the verified query “{vm['query']['title']}”")
+                    progress.emit(f"answered with the verified query “{vm['query']['title']}”", kind="verified")
         clash = None
         if certified is not None:
-            progress.emit("answered from a certified metric")
+            progress.emit("answered from a certified metric", kind="semantic")
             result = certified
         elif verified is not None:
             result = verified
@@ -985,7 +986,7 @@ def _run_turn(ctx, user):
                 from . import verified_sql
                 focus["joins"] = focus["joins"] + verified_sql.hint_lines(focus["related"])
                 progress.emit(f"guided by the related verified query "
-                              f"“{focus['related']['query']['title']}”")
+                              f"“{focus['related']['query']['title']}”", kind="verified")
         out = agent.run_agent(
             prompt=prompt, connector=connector, table=ctx["table_param"],
             allowed_tables=ctx["allowed"], schemas=ctx["schemas"], history=ctx["history"],
@@ -1001,7 +1002,7 @@ def _run_turn(ctx, user):
             user, [ctx["source"]], prompt, ctx["table_param"])) is not None:
         # A certified metric's number comes from its definition in the D3
         # window too; it is drawn with D3, not a custom visual.
-        progress.emit("answered from a certified metric — drawing it with D3")
+        progress.emit("answered from a certified metric — drawing it with D3", kind="semantic")
         result = certified
         agent.d3_only(result)
     elif ctx.get("visual") and (verified := _verified_answer(ctx, user, prompt)) is not None:
@@ -1012,7 +1013,7 @@ def _run_turn(ctx, user):
         # semantic layer, the plan cache and BitNet return stock charts and
         # cannot write a custom visual. (BitNet/KAG are engines, not models,
         # so the configured frontier model stands in for them here.)
-        progress.emit("drawing the answer with D3")
+        progress.emit("drawing the answer with D3", kind="visual")
         result = _run(None if model in ("bitnet", "kag") else model, visual=True)
         result.setdefault("served_by", "frontier")
         agent.d3_only(result)
@@ -1020,7 +1021,7 @@ def _run_turn(ctx, user):
     # automatic tiers. 'bitnet' forces the self-hosted engine; 'kag' forces a
     # documents-first turn grounded in the user's own knowledge collections.
     elif model == "bitnet" and model_router.bitnet_ready(user):
-        progress.emit("routing to the self-hosted BitNet engine")
+        progress.emit("routing to the self-hosted BitNet engine", kind="model")
         # Explicitly choosing BitNet picks WHO answers first, not whether the
         # turn is allowed to fail. The automatic tier below already escalates a
         # BitNet attempt that comes back with no SQL, with errors, or raising;
@@ -1035,12 +1036,12 @@ def _run_turn(ctx, user):
         if result is not None and result.get("sql") and not result.get("errors"):
             result.setdefault("served_by", "bitnet")
         else:
-            progress.emit("BitNet couldn't answer — escalating to the frontier model")
+            progress.emit("BitNet couldn't answer — escalating to the frontier model", kind="model")
             result = _run(None)          # None = the configured frontier model
             result["served_by"] = "frontier"
             result.setdefault("routed", {})["escalated_from"] = "bitnet"
     elif model == "kag":
-        progress.emit("searching your knowledge collections")
+        progress.emit("searching your knowledge collections", kind="docs")
         result = _run(None, kag_first=True)
         result.setdefault("served_by", "kag")
     # Tier -1 — semantic layer: if the prompt resolves to admin-defined metrics,
@@ -1048,7 +1049,7 @@ def _run_turn(ctx, user):
     # and guarantees every phrasing of the same question returns the same number.
     # Anything it can't resolve returns None and falls through to the agent.
     elif (result := semantic.answer(user, ctx["source"], prompt, ctx["table_param"])) is not None:
-        progress.emit("answered from the semantic layer (canonical metric)")
+        progress.emit("answered from the semantic layer (canonical metric)", kind="semantic")
     # Tier -½ — the Verified SQL library: SQL a person verified and saved for
     # this exact question (same intent, values and direction), re-run as the
     # asker. A related question instead guides the agent (_run).
@@ -1060,7 +1061,7 @@ def _run_turn(ctx, user):
     # in every conversation — matching one against another replays the wrong plan.
     elif not ctx["history"] and (cached := qcache.lookup(
             user, ctx["source"], ctx["table_label"], prompt)) is not None:
-        progress.emit("reusing a cached plan for an equivalent question")
+        progress.emit("reusing a cached plan for an equivalent question", kind="cache")
         result = cached
     else:
         # Tier 1/2 — route learned, repeated work to the self-hosted BitNet;
@@ -1070,7 +1071,7 @@ def _run_turn(ctx, user):
         result = None
         if route == "bitnet":
             try:
-                progress.emit("trying the self-hosted BitNet engine first")
+                progress.emit("trying the self-hosted BitNet engine first", kind="model")
                 r = _run(model_router.bitnet_spec())
                 if r.get("sql") and not r.get("errors"):
                     r["served_by"] = "bitnet"
@@ -1085,7 +1086,7 @@ def _run_turn(ctx, user):
                 result = None   # escalate below
         if result is None:
             if route == "bitnet":
-                progress.emit("BitNet couldn't answer — escalating to the frontier model")
+                progress.emit("BitNet couldn't answer — escalating to the frontier model", kind="model")
             result = _run(model)   # frontier LLM (default, or BitNet escalation)
             result.setdefault("served_by", "frontier")
         if not ctx["history"]:   # same reason: a follow-up's plan is context-bound
@@ -1095,7 +1096,7 @@ def _run_turn(ctx, user):
             if cache_id:
                 result["_qcache_id"] = cache_id
                 result["_qcache_feedback_mode"] = "replace"
-    progress.emit("finalizing the answer")
+    progress.emit("finalizing the answer", kind="done")
     result["source"] = ctx["source"]
     result["table"] = ctx["table_label"]
     try:
@@ -1338,7 +1339,7 @@ def _chat_turn_job(payload, job):
         # Another worker owns this job — and therefore this task — now. Leave
         # chat_tasks exactly as it is: the owner will finish it, and marking
         # it failed here would overwrite an answer that is on its way.
-        progress.emit("this attempt lost its claim and was abandoned")
+        progress.emit("this attempt lost its claim and was abandoned", kind="error")
         log.warning("chat: task %s abandoned by a reclaimed attempt; the current "
                     "owner of job %s finishes it", tid, job.get("id"))
         raise
@@ -1346,7 +1347,7 @@ def _chat_turn_job(payload, job):
         if last_attempt:
             _finish_task(tid, "failed", str(e)[:500])
         else:
-            progress.emit(f"attempt failed ({type(e).__name__}); retrying")
+            progress.emit(f"attempt failed ({type(e).__name__}); retrying", kind="error")
         raise
     finally:
         progress.bind(None)

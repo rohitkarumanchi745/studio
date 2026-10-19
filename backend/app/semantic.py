@@ -656,7 +656,8 @@ def answer(user, source, prompt, table=None):
                     "model_filter": model.get("filter"), "grain": d.get("grain")})
                 if result["status"] in metametrics.INVALID:
                     progress.emit(f"the semantic {kind} {d['name']} is {result['status']} "
-                                  f"({'; '.join(result['reasons'])}) — not answering from it")
+                                  f"({'; '.join(result['reasons'])}) — not answering from it",
+                                  kind="semantic")
                     return None
     except Exception:
         pass

@@ -446,6 +446,11 @@ function humanize(id) {
 }
 
 /** Display metadata for a ctype or source name; never throws, never returns null. */
+/** True for a source this bundle has a tile (and an icon) for. */
+export function knownSource(id) {
+  return Boolean(id && META[id]);
+}
+
 export function metaFor(id) {
   const m = META[id];
   if (m) return { id, ...m };
