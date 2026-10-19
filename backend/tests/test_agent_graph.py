@@ -259,7 +259,7 @@ def test_a_failing_node_skips_its_dependents_instead_of_fabricating_answers(monk
     activity = []
     kinds = {}
     monkeypatch.setattr(ag.progress, "emit_for",
-                        lambda _tid, label, agent=None, kind=None, source=None:
+                        lambda _tid, label, agent=None, kind=None, **_:
                         (activity.append(label), kinds.__setitem__(label, kind)))
     _fake_agent(monkeypatch, seen, fail=("postgres",))
     recorded = []

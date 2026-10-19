@@ -16,7 +16,8 @@ const frontend = fileURLToPath(new URL("../", import.meta.url));
 const require = createRequire(import.meta.url);
 const bundle = await build({
   stdin: {
-    contents: `export {AgentActivity, StepIcon, sourceIconId, stepKind} from "./src/components/Chat.jsx";`,
+    contents: `export {AgentActivity, AssistantMessage, StepIcon, sourceIconId, sourceTypeLabel, stepKind}
+                 from "./src/components/Chat.jsx";`,
     resolveDir: frontend, loader: "jsx",
   },
   bundle: true, write: false, format: "cjs", platform: "node", jsx: "automatic",
@@ -35,7 +36,8 @@ compiled.filename = path.join(frontend, "activity-icons-test.cjs");
 compiled.paths = Module._nodeModulePaths(frontend);
 compiled.require = (id) => id === "echarts" ? { init() { return {}; } } : require(id);
 compiled._compile(bundle.outputFiles[0].text, compiled.filename);
-const { AgentActivity, StepIcon, sourceIconId, stepKind } = compiled.exports;
+const { AgentActivity, AssistantMessage, StepIcon, sourceIconId, sourceTypeLabel, stepKind } =
+  compiled.exports;
 globalThis.localStorage = { getItem() { return null; }, setItem() {}, removeItem() {} };
 const html = (c, p) => renderToStaticMarkup(React.createElement(c, p));
 
@@ -102,4 +104,46 @@ test("the activity panel shows an icon on every step, and on what it is doing no
   assert.match(out, /🧭/);
   const now = out.slice(out.indexOf('class="activity-current"'), out.indexOf("</span></span>"));
   assert.match(now, /📊/);                                         // drawing the chart now
+});
+
+test("a source is named with its type: which database, which engine", () => {
+  assert.equal(sourceTypeLabel("sql", "sqlite"), "Any SQL database · SQLite");
+  assert.equal(sourceTypeLabel("sql", "mysql"), "MySQL");
+  assert.equal(sourceTypeLabel("snowflake", "snowflake"), "Snowflake");
+  assert.equal(sourceTypeLabel("lancedb", "duckdb"), "LanceDB");
+  assert.equal(sourceTypeLabel("demo", "sqlite"), "Demo data");
+  assert.equal(sourceTypeLabel("shop", "sqlite"), "Any SQL database · SQLite");
+});
+
+test("a step names its database, and grounding names its tables", () => {
+  const steps = [
+    { t: 1, label: "grounded in the metadata graph: orders (joined through customers)", kind: "route",
+      source: "shop", source_type: "sql", engine: "sqlite",
+      tables: [{ name: "orders", why: ["amount", "region"] }, { name: "customers", bridge: true }] },
+    { t: 2, label: "Snowflake agent: running SQL on sales_sf", kind: "query", source: "sales_sf",
+      source_type: "snowflake", engine: "snowflake" },
+  ];
+  const out = html(AgentActivity, { steps, running: false });
+  assert.match(out, /class="source-badge" title="shop — Any SQL database · SQLite"/);
+  assert.match(out, /<b>shop<\/b><span class="source-badge-type">Any SQL database · SQLite<\/span>/);
+  assert.match(out, /<b>sales_sf<\/b><span class="source-badge-type">Snowflake<\/span>/);
+  assert.match(out, /title="matched amount, region">▦ orders</);
+  assert.match(out, /chip-bridge" title="joins the matched tables">▦ customers ⇄</);
+  // A step on no source names none.
+  assert.doesNotMatch(html(AgentActivity, { steps: [{ t: 1, label: "drawing the answer with D3",
+                                                      kind: "visual" }] }), /source-badge/);
+});
+
+test("an answer names the database it came from, and Auto shows its icon", () => {
+  const m = { text: "EU leads.", source: "shop", table: "*", model: "x", columns: [], rows: [],
+              source_meta: { source_type: "sql", engine: "sqlite" },
+              auto_route: { mode: "single", source: "shop", tables: ["orders"], terms: [],
+                            types: { shop: { source_type: "sql", engine: "sqlite" } } } };
+  const out = html(AssistantMessage, { m, onOpenCanvas() {} });
+  assert.match(out, /<b>shop<\/b><span class="source-badge-type">Any SQL database · SQLite<\/span><\/span>\/all tables/);
+  assert.match(out, /class="auto-route-icon" title="shop — Any SQL database · SQLite"><svg class="srcicon"/);
+  // An older answer without source_meta keeps its plain name.
+  const old = html(AssistantMessage, { m: { ...m, source_meta: undefined, auto_route: undefined },
+                                       onOpenCanvas() {} });
+  assert.match(old, / · shop\/all tables/);
 });

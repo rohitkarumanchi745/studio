@@ -351,6 +351,14 @@ source, its type and its engine.
   - 📊 a chart, 🎨 D3, ▣ a certified metric, ✓ a verified query, ⚡ a cached
     plan;
   - 📄 your documents, 🔧 tools, 🧠 a model, ⚙ a pipeline, ⚠ a problem.
+- **Which database, by name:** a step on a source also names it with a
+  badge (icon, name and type), for example "shop · Any SQL database ·
+  SQLite" or "sales_sf · Snowflake".
+- **The grounding step** (🧭) shows ▦ each table it picked, with the
+  question words that matched as a tooltip. A table only used to join the
+  others is marked ⇄.
+- **A single-source answer** shows the same badge in its header.
+- **The Auto line** shows each routed source's icon.
 - **The step being worked on now** shows its icon in the panel's header.
 - **Steps recorded before kinds existed** get theirs from their wording.
 

@@ -526,6 +526,10 @@ def _routed(body, user):
         access = _own_or_404(body.conversation_id, user, need="edit")
         previous = autoroute.previous_route(_visible_messages(body.conversation_id, user, access))
     route = autoroute.route(user, body.prompt.strip(), previous)
+    # Each routed source's type and engine, so the chat shows its icon.
+    route["types"] = {name: {k: v for k, v in progress.describe(name).items() if k != "source"}
+                      for name in ([route["source"]] if route.get("source")
+                                   else route.get("sources") or [])}
     if route["mode"] == "single":
         where = {"source": route["source"], "route_sources": None}
     else:
@@ -664,7 +668,10 @@ def _grounding(ctx, user, prompt):
         bridges = f" (joined through {', '.join(grounded['bridges'])})" \
             if grounded["bridges"] else ""
         progress.emit(f"grounded in the metadata graph: {named}{bridges}", kind="route",
-                      source=ctx.get("connector") or ctx.get("source"))
+                      source=ctx.get("connector") or ctx.get("source"),
+                      tables=[{"name": t, "why": grounded["matched"][t]}
+                              for t in grounded["tables"] if t in grounded["matched"]]
+                      + [{"name": t, "bridge": True} for t in grounded["bridges"]])
     try:
         extra = _focus_schemas({**ctx, "schemas": {**ctx["schemas"], **schemas}}, user, prompt)
     except Exception:
@@ -694,6 +701,13 @@ def _answer(ctx, result):
     """
     if ctx.get("auto_route") and isinstance(result, dict):
         result.setdefault("auto_route", ctx["auto_route"])   # where Auto sent it, and why
+    if isinstance(result, dict) and ctx.get("mode") != "*" \
+            and result.get("source") not in (None, "", "*", "auto") and "source_meta" not in result:
+        # Which database answered — its type and engine, for its icon and name.
+        # Not for an answer across sources: each agent's step names its own.
+        meta = {k: v for k, v in progress.describe(result["source"]).items() if k != "source"}
+        if meta:
+            result["source_meta"] = meta
     reply_to = ctx.get("reply_to")
     if not reply_to:
         return db.add_message(ctx["cid"], "assistant", result)

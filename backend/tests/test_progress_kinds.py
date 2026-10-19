@@ -20,12 +20,13 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("STUDIO_SQL_ALLOW_LOCAL_FILES", "1")
     from app import db as _db
     importlib.reload(_db)
-    from app import chat, connections, progress
+    from app import chat, connections, jobs, metagraph, progress
     from app.connectors import demo
     monkeypatch.setattr(demo, "WAREHOUSE_PATH", str(tmp_path / "demo.db"))
     _db.init_db()
-    chat.init_tables()
-    connections.init_tables()
+    # Saving a connection queues its metadata discovery job.
+    for module in (chat, connections, jobs, metagraph):
+        module.init_tables()
     with _db.connect() as c:
         c.execute("INSERT INTO chat_tasks (id, conversation_id, user_id, status, seen, steps, "
                   "created_at) VALUES ('t1', 'c1', 'u1', 'running', 0, '[]', ?)", (time.time(),))
@@ -64,3 +65,15 @@ def test_a_saved_connection_reports_its_type(env):
         name="shop", ctype="sql", config={"url": f"sqlite:///{path}"}), user=admin)
     described = env.progress.describe("shop")
     assert described == {"source": "shop", "source_type": "sql", "engine": "sqlite"}
+
+
+def test_a_grounding_step_lists_its_tables(env):
+    tables = [{"name": "orders", "why": ["amount", "region", "x", "y", "z"]},
+              {"name": "customers", "bridge": True}] + [{"name": f"t{i}"} for i in range(10)]
+    env.progress.emit_for("t1", "grounded in the metadata graph: orders", kind="route",
+                          source="demo", tables=tables)
+    step = env.steps()[-1]
+    assert step["kind"] == "route" and step["source_type"] == "demo"
+    assert step["tables"][0] == {"name": "orders", "why": ["amount", "region", "x", "y"]}
+    assert step["tables"][1] == {"name": "customers", "bridge": True}
+    assert len(step["tables"]) == 8                                 # bounded

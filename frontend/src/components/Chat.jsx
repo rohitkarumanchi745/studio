@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api";
 import Canvas from "./Canvas";
-import { SourceIcon, knownSource } from "./sourceCatalog";
+import { SourceIcon, knownSource, metaFor } from "./sourceCatalog";
 import ChartView, { chartImage } from "./ChartView";
 import Markdown from "./Markdown";
 import { downloadReport, downloadTable } from "../exporting";
@@ -68,6 +68,49 @@ export function stepKind(step) {
     [/finalizing/i, "done"], [/finished/i, "agent"],
   ];
   return rules.find(([re]) => re.test(label))?.[1] || null;
+}
+
+const ENGINE_LABEL = {
+  sqlite: "SQLite", postgresql: "PostgreSQL", postgres: "PostgreSQL", mysql: "MySQL",
+  mariadb: "MariaDB", mssql: "SQL Server", oracle: "Oracle", duckdb: "DuckDB",
+  snowflake: "Snowflake", databricks: "Databricks", bigquery: "BigQuery", trino: "Trino",
+  clickhouse: "ClickHouse", cql: "CQL", cypher: "Cypher",
+};
+
+/** "Any SQL database · SQLite", "Snowflake", "LanceDB": what kind of source this is. */
+export function sourceTypeLabel(type, engine) {
+  const id = sourceIconId(type, engine);
+  const label = metaFor(id).label;
+  if (id !== "sql") return label;
+  const e = String(engine || "").toLowerCase();
+  return e ? `${label} · ${ENGINE_LABEL[e] || e}` : label;
+}
+
+/** A source by its icon, name and type: "◆ shop · Any SQL database · SQLite". */
+export function SourceBadge({ name, type, engine }) {
+  const kind = sourceTypeLabel(type, engine);
+  return (
+    <span className="source-badge" title={`${name} — ${kind}`}>
+      <SourceIcon id={sourceIconId(type, engine)} size={14} />
+      <b>{name}</b>
+      <span className="source-badge-type">{kind}</span>
+    </span>
+  );
+}
+
+/** The tables a grounding step chose: ▦ each, with the words it matched;
+ *  a table only used to join the others is marked ⇄. */
+export function GroundedTables({ tables }) {
+  return (
+    <span className="activity-tables">
+      {tables.map((t) => (
+        <span key={t.name} className={"chip chip-table" + (t.bridge ? " chip-bridge" : "")}
+              title={t.bridge ? "joins the matched tables" : t.why?.length ? `matched ${t.why.join(", ")}` : ""}>
+          ▦ {t.name}{t.bridge ? " ⇄" : ""}
+        </span>
+      ))}
+    </span>
+  );
 }
 
 /** The icon for one activity step. */
@@ -210,7 +253,17 @@ export function AgentActivity({ steps = [], graph, running = false, failed = fal
               <li key={`${step.t ?? ""}-${i}`} className="activity-event">
                 <span className="activity-event-main">
                   <StepIcon step={step} />
-                  <span className="activity-event-label">{step.label}</span>
+                  <span className="activity-event-text">
+                    <span className="activity-event-label">{step.label}</span>
+                    {(step.source && (step.source_type || step.engine) || step.tables?.length > 0) && (
+                      <span className="activity-event-where">
+                        {step.source && (step.source_type || step.engine) && (
+                          <SourceBadge name={step.source} type={step.source_type} engine={step.engine} />
+                        )}
+                        {step.tables?.length > 0 && <GroundedTables tables={step.tables} />}
+                      </span>
+                    )}
+                  </span>
                 </span>
                 {Number.isFinite(step.t) && firstEvent && (
                   <span className="activity-event-time">{elapsedTime(step.t - firstEvent.t)}</span>
@@ -1163,7 +1216,9 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
                   : m.mode === "fallback"
                     ? "fallback"
                     : m.model}
-            {" · "}{m.source}/{m.table === "*" ? "all tables" : m.table}
+            {" · "}{m.source_meta
+              ? <SourceBadge name={m.source} type={m.source_meta.source_type} engine={m.source_meta.engine} />
+              : m.source}/{m.table === "*" ? "all tables" : m.table}
             {m.agents?.length > 0
               ? ` · ${agentLabel(m.agents)}`
               : m.mode === "orchestrated" && m.agents_used?.length > 0
@@ -1247,7 +1302,13 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
         )}
         {m.auto_route && (
           <div className="auto-route-row" title={m.auto_route.why || ""}>
-            <span className="auto-route-tag">✳ Auto</span> {describeRoute(m.auto_route)}
+            <span className="auto-route-tag">✳ Auto</span>{" "}
+            {Object.entries(m.auto_route.types || {}).map(([name, t]) => (
+              <span key={name} className="auto-route-icon" title={`${name} — ${sourceTypeLabel(t.source_type, t.engine)}`}>
+                <SourceIcon id={sourceIconId(t.source_type, t.engine)} size={14} />
+              </span>
+            ))}
+            {describeRoute(m.auto_route)}
           </div>
         )}
         {/* What the answer was computed from — read off the executed SQL, so it

@@ -59,13 +59,30 @@ def describe(source):
         return {"source": source} if isinstance(source, str) else {}
 
 
-def emit(label, agent=None, kind=None, source=None):
+def emit(label, agent=None, kind=None, source=None, tables=None):
     """Append one step to the bound task's live feed. No-op when unbound
     (synchronous /chat has no task row and stays silent)."""
-    emit_for(_task.get(), label, agent=agent, kind=kind, source=source)
+    emit_for(_task.get(), label, agent=agent, kind=kind, source=source, tables=tables)
 
 
-def emit_for(tid, label, agent=None, kind=None, source=None):
+def _tables(tables):
+    """The tables a step is about — [{"name", "why"?, "bridge"?}], at most 8:
+    a grounding step's matched tables (and the question words each matched)
+    and the tables it joins them through."""
+    out = []
+    for t in (tables or [])[:8]:
+        t = t if isinstance(t, dict) else {"name": t}
+        entry = {"name": str(t.get("name", ""))[:80]}
+        if t.get("why"):
+            entry["why"] = [str(w)[:40] for w in t["why"]][:4]
+        if t.get("bridge"):
+            entry["bridge"] = True
+        if entry["name"]:
+            out.append(entry)
+    return out
+
+
+def emit_for(tid, label, agent=None, kind=None, source=None, tables=None):
     """Append one step to a specific task's feed. Never raises. `agent` names
     who acted ("Snowflake agent", "Aggregator", a planner), so the UI can show
     how many agents a task is using while it runs; `kind` says what the step
@@ -88,6 +105,8 @@ def emit_for(tid, label, agent=None, kind=None, source=None):
                 step["kind"] = kind
             if source is not None:
                 step.update({k: str(v)[:80] for k, v in describe(source).items() if v})
+            if tables:
+                step["tables"] = _tables(tables)
             steps.append(step)
             c.execute("UPDATE chat_tasks SET steps=? WHERE id=?",
                       (json.dumps(steps[-MAX_STEPS:]), tid))

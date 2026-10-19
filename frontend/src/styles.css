@@ -364,6 +364,22 @@ td { color: var(--ink-2); }
 }
 .activity-icon .srcicon { width: 16px; height: 16px; }
 .activity-current .activity-icon { display: inline-flex; vertical-align: -3px; margin-right: 5px; }
+.activity-event-text { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.activity-event-where { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; }
+/* Which database: its icon, its name, what it is. */
+.source-badge {
+  display: inline-flex; align-items: center; gap: 4px; padding: 1px 7px 1px 4px;
+  border: 1px solid var(--line); border-radius: 999px; background: var(--surface);
+  font-size: 11px; color: var(--ink-2); vertical-align: middle; max-width: 100%;
+}
+.source-badge .srcicon { width: 14px; height: 14px; flex: none; }
+.source-badge b { color: var(--ink); font-weight: 600; }
+.source-badge-type { color: var(--ink-3); }
+.activity-tables { display: inline-flex; flex-wrap: wrap; gap: 4px; }
+.chip-table { font-size: 11px; padding: 1px 7px; }
+.chip-bridge { border-style: dashed; }
+.auto-route-icon { display: inline-flex; vertical-align: -2px; margin-right: 4px; }
+.auto-route-icon .srcicon { width: 14px; height: 14px; }
 .activity-event-time { flex: none; color: var(--ink-3); font-size: 11px; font-variant-numeric: tabular-nums; }
 .activity-note { color: var(--ink-3); font-size: 12px; }
 .activity-graph { margin-top: 13px; padding-top: 11px; border-top: 1px solid var(--line); }
