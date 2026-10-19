@@ -619,6 +619,37 @@ It never runs on its own. If the proposal fails, the run says so.
   its tables starts the watch over.
 - **Email.** The owner is also emailed when SMTP is configured.
 
+**From chat.** The chat, and the D3 & artifacts window, create agents too:
+
+- **Ask in words.** A message that asks for something to happen again
+  becomes a proposed agent card, not a one-off answer:
+  - "every morning show me revenue by region" (a schedule);
+  - "alert me when revenue drops below 1M" (a threshold);
+  - "whenever web_traffic gets new rows, summarize visits by page" (new data).
+
+  The card shows the trigger, goal, source and name, all editable, and an
+  agent is created only when you press **✓ Create agent**. Leave **Run once
+  now** ticked to get the first answer straight away.
+- **⏱ Automate** on any answer opens the same card for that question: daily,
+  on the same source.
+- **Recognizing a request** is deterministic (`autopilot_intent.py`), so the
+  same words always propose the same agent.
+  - "every day" alone doesn't count; it needs a cue: the schedule comes
+    first, a time of day or weekday ("every morning", "every Monday"), a
+    delivery ("send me"), or a report or monitoring word.
+  - Ordinary questions stay questions: "show daily revenue", "orders each
+    day", "what was in the report every day last week?".
+- **Every run is posted back to that chat** as an ordinary answer, under a
+  "✦ Autopilot · name" line, with its charts, data, downloads and canvas.
+  - A run that fails posts why it couldn't run.
+  - The chat is marked unread (the sidebar's blue dot) unless you started the
+    run yourself.
+- **Visual agents.** An agent made in the D3 & artifacts window draws its
+  answers with D3 (custom visuals included). Its card on the Autopilot
+  screen is tagged 🎨 D3 and links back to its chat.
+- **Permissions.** Only someone who can edit a chat can point an agent at it,
+  and a run is never posted to a chat its owner can no longer edit.
+
 ### Planning context for DAG drafts
 
 An admin can register GitHub repositories from the **GitHub tile in Data

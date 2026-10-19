@@ -10,7 +10,7 @@ from typing import List, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from . import (agent, autoroute, chat_platforms, chat_workflows, db, email_service, gateway, governance, jobs, keys,
+from . import (agent, autopilot_intent, autoroute, chat_platforms, chat_workflows, db, email_service, gateway, governance, jobs, keys,
                lightning, orchestrator, progress, qcache, queryguard, rbac,
                roster, router as model_router, semantic, sessions, skills,
                pipeline_sources)
@@ -395,6 +395,17 @@ def _scope(body, user, before_message_id=None):
         return {"mode": "platform", "model": None, "prompt": prompt,
                 "platform_request": platform_request, "platform_previous": previous}
 
+    # "Every day show revenue by region", "alert me when revenue drops below
+    # 1M": a request for something to happen AGAIN is a proposed Autopilot
+    # agent — shown as a card the user checks and creates, never created from
+    # words alone, and never answered as a one-off question.
+    draft = None if (body.pipeline_action or body.pipeline_message_id) \
+        else autopilot_intent.parse(prompt)
+    if draft:
+        return {"mode": "autopilot_draft", "model": None, "prompt": prompt,
+                "source": body.source, "table_label": "Autopilot",
+                "draft": _draft_scope(draft, body, user)}
+
     model = None
     if body.model:
         if body.model not in {m["spec"] for m in agent.available_models(user)}:
@@ -452,6 +463,57 @@ def _scope(body, user, before_message_id=None):
             "source": body.source, "connector": connector, "all_tables": all_tables,
             "allowed": allowed, "schemas": schemas, "table_param": table_param,
             "table_label": table_label}
+
+
+def _draft_scope(draft, body, user):
+    """Where a proposed agent would read: this turn's source (picked, or the
+    one Auto routed to) when the user may read it, and the tables the user
+    chose — none means every table the agent's owner may read. A D3 &
+    artifacts conversation proposes a visual agent."""
+    source = body.source if body.source and body.source != "*" else None
+    if source is None and body.route_sources:
+        source = body.route_sources[0]
+    if source and source not in rbac.allowed_sources(user["role"]):
+        source = None
+    tables = [t for t in (body.tables or ([body.table] if body.table not in (None, "", "*") else []))
+              if t]
+    return {**draft, "source": source, "tables": tables, "visual": bool(body.visual)}
+
+
+_INTERVAL_WORDS = {300: "every 5 minutes", 900: "every 15 minutes", 3600: "every hour",
+                   21600: "every 6 hours", 86400: "every day", 604800: "every week"}
+_OP_WORDS = {"lt": "drops below", "le": "is at most", "gt": "goes above", "ge": "reaches",
+             "eq": "equals", "ne": "is not"}
+
+
+def _draft_text(d):
+    cfg = d["trigger_config"]
+    goal = f"answer “{d['goal']}”"
+    if d["trigger_type"] == "schedule":
+        what = f"{goal} {_INTERVAL_WORDS.get(cfg['interval_seconds'], 'on a schedule')}"
+    elif d["trigger_type"] == "threshold":
+        value = cfg["value"]
+        shown = f"{value:,.0f}" if float(value).is_integer() else f"{value:,.2f}"
+        what = (f"check {cfg['metric_prompt']} every 5 minutes and, when it "
+                f"{_OP_WORDS.get(cfg['op'], cfg['op'])} {shown}, {goal}")
+    else:
+        what = f"watch {cfg['table']} and, when new rows land, {goal}"
+    where = f" on {d['source']}" if d.get("source") else ""
+    return (f"That's a job for an Autopilot agent: it would {what}{where}. Check it below and "
+            "create it — each time it runs, its answer is posted to this chat.")
+
+
+def _autopilot_draft_turn(ctx, user):
+    """A proposed Autopilot agent, as an assistant message the chat shows as a
+    card. Nothing runs and nothing is created here."""
+    result = {"text": _draft_text(ctx["draft"]), "mode": "autopilot_draft",
+              "autopilot_draft": ctx["draft"], "sql": None, "columns": [], "rows": [],
+              "chart": None, "panels": [], "errors": [], "source": ctx.get("source") or "*",
+              "table": "Autopilot", "author_role": user["role"]}
+    _answer(ctx, result)
+    db.log_activity(user, "autopilot_draft", prompt=ctx["prompt"], source=ctx.get("source"),
+                    mode=ctx["draft"]["trigger_type"])
+    return result
 
 
 def _record_user_turn(body, user, scope=None):
@@ -899,6 +961,8 @@ def _run_turn(ctx, user):
         return _platform_turn(ctx, user)
     if ctx["mode"] == "workflow":
         return _workflow_turn(ctx, user)
+    if ctx["mode"] == "autopilot_draft":
+        return _autopilot_draft_turn(ctx, user)
 
     if ctx["mode"] == "*":
         # A certified metric is answered from its definition here too — before
@@ -1396,6 +1460,26 @@ def _task_states(user_id):
         elif not r["seen"]:
             d["unseen"] += 1
     return out
+
+
+def deliver_autopilot(cid, owner, content, seen=False):
+    """Post an Autopilot run's answer into the conversation the agent was made
+    in, as an assistant message, and mark the conversation unread for its
+    owner (the sidebar's blue dot) unless they started the run themselves.
+    False when the owner can no longer edit the conversation (deleted, or no
+    longer shared with them) — the run itself is unaffected."""
+    if db.conversation_access(cid, owner["id"]) not in ("owner", "edit"):
+        return False
+    db.add_message(cid, "assistant", content)
+    now = time.time()
+    with db.connect() as c:
+        c.execute("INSERT INTO chat_tasks (id, conversation_id, user_id, prompt, status, seen, "
+                  "created_at, finished_at) VALUES (?,?,?,?,?,?,?,?)",
+                  (str(uuid.uuid4()), cid, owner["id"],
+                   f"Autopilot: {(content.get('autopilot') or {}).get('agent_name', '')}"[:500],
+                   "done", 1 if seen else 0, now, now))
+        c.commit()
+    return True
 
 
 def _mark_seen(cid, user_id):

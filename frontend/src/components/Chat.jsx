@@ -4,6 +4,7 @@ import Canvas from "./Canvas";
 import ChartView, { chartImage } from "./ChartView";
 import Markdown from "./Markdown";
 import { downloadReport, downloadTable } from "../exporting";
+import AutopilotDraft, { draftFromAnswer } from "./AutopilotDraft";
 import SqlLab from "./SqlLab";
 import ChatWorkflow from "./ChatWorkflow";
 import ChatPlatformRun, { PlatformComposer } from "./ChatPlatformRun";
@@ -464,6 +465,12 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
     setBusy(false);
   }
 
+  // A run an agent posted here (Autopilot from chat) shows without a reload.
+  function refreshMessages() {
+    if (!conversationId) return;
+    api(`/conversations/${conversationId}/messages`).then(loadMessages).catch(() => {});
+  }
+
   async function send(e) {
     e?.preventDefault();
     const q = prompt.trim();
@@ -870,6 +877,8 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
               busy={busy}
               activitySteps={activityByTask[m.activity_task_id]}
               visualMode={visualMode}
+              conversationId={conversationId}
+              onAutopilotCreated={refreshMessages}
             />
           )
         )}
@@ -969,7 +978,8 @@ export function SavedSqlPipeline({ pipeline }) {
   );
 }
 
-export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRunPipeline, onPipelineStatus, onPlatformAction, busy, activitySteps, visualMode = false }) {
+export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRunPipeline, onPipelineStatus, onPlatformAction, busy, activitySteps, visualMode = false,
+                                  conversationId = null, onAutopilotCreated }) {
   const [showSql, setShowSql] = useState(false);
   const [columns, setColumns] = useState(m.columns);
   const [rows, setRows] = useState(m.rows);
@@ -985,6 +995,7 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
   const [voted, setVoted] = useState(0);
   const [sample, setSample] = useState(null);
   const [sampleBusy, setSampleBusy] = useState("");
+  const [automate, setAutomate] = useState(false);   // ⏱ Automate: this answer as an agent
 
   async function loadSample(t) {
     // Every click re-queries the source — the sample is always latest data.
@@ -1127,7 +1138,19 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
           </span>
         </div>
         {m.activity_task_id && <AgentActivity key={m.activity_task_id} taskId={m.activity_task_id} steps={activitySteps || []} graph={m.graph} agents={m.agents} />}
+        {m.autopilot && (
+          <div className={"ap-posted" + (m.autopilot.status === "failed" ? " ap-posted-bad" : "")}
+               title={m.autopilot.summary || ""}>
+            ✦ Autopilot · <b>{m.autopilot.agent_name}</b>
+            {" · "}{m.autopilot.trigger === "manual" ? "run now" : `on its ${m.autopilot.trigger}`}
+            {" "}<a className="chip" href="/autopilot">manage</a>
+          </div>
+        )}
         {m.text && <Markdown className="answer" text={m.text} />}
+        {m.autopilot_draft && (
+          <AutopilotDraft draft={m.autopilot_draft} conversationId={conversationId}
+                          onCreated={onAutopilotCreated} />
+        )}
         {expired && (
           <div className="rows-expired" role="note">
             <span><b>Result rows expired.</b> Studio keeps an answer's data for a limited time;
@@ -1256,6 +1279,14 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
             <button className="chip" onClick={emailReport} title="Email this report to yourself">
               ✉ email report
             </button>{" "}
+            {!m.autopilot && !expired && rows?.length > 0 && (
+              <>
+                <button className="chip" onClick={() => setAutomate(true)}
+                        title="Run this question again on a schedule or when data changes — its answers post to this chat">
+                  ⏱ Automate
+                </button>{" "}
+              </>
+            )}
             {!expired && columns?.length > 0 && rows?.length > 0 && (
               <>
                 <button className="chip" onClick={() => save("csv")}
@@ -1275,6 +1306,11 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
               </button>
             )}
             {status && <span className="meta"> {status}</span>}
+            {automate && (
+              <AutopilotDraft draft={draftFromAnswer(m, requirement, visualMode)}
+                              conversationId={conversationId} onDismiss={() => setAutomate(false)}
+                              onCreated={onAutopilotCreated} />
+            )}
             {showSql && (
               <SqlLab sql={m.sql} source={m.source} table={m.table} requirement={requirement} />
             )}

@@ -1060,6 +1060,18 @@ input:focus, select:focus, .composer-pill:focus-within { box-shadow: 0 0 0 1px v
 .ap-run-summary { flex: 1; min-width: 120px; font-size: 12.5px; color: var(--ink-2); }
 .ap-run-gate { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
 .ap-run-body { margin-top: 6px; }
+/* Autopilot from chat: a proposed agent, and a run an agent posted. */
+.ap-draft {
+  display: flex; flex-direction: column; gap: 8px; margin: 10px 0; padding: 12px;
+  border: 1px solid var(--accent); border-radius: var(--radius); background: var(--accent-soft);
+}
+.ap-draft .sqllab-prompt { width: 100%; }
+.ap-draft-head { display: flex; align-items: center; gap: 8px; }
+.ap-draft-head .chip:last-child { margin-left: auto; }
+.ap-draft-run { display: flex; align-items: center; gap: 6px; }
+.ap-draft-done { flex-direction: row; align-items: center; flex-wrap: wrap; gap: 6px; }
+.ap-posted { color: var(--accent-2); font-size: 12px; margin-bottom: 6px; }
+.ap-posted-bad { color: var(--bad); }
 .ap-run-unread .ap-run-summary { color: var(--ink); font-weight: 600; }
 .ap-run-view { margin: 8px 0; }
 .ap-run-why { margin: 6px 0; }

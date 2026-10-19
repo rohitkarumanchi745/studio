@@ -15,7 +15,7 @@ const frontend = fileURLToPath(new URL("../", import.meta.url));
 const require = createRequire(import.meta.url);
 const bundle = await build({
   stdin: {
-    contents: `export {checkText, RunDetail, AlertsStrip} from "./src/components/Autopilot.jsx";
+    contents: `export {checkText, RunDetail, AlertsStrip, chatLink} from "./src/components/Autopilot.jsx";
                export {default as AlertsBell} from "./src/components/AlertsBell.jsx";`,
     resolveDir: frontend, loader: "jsx",
   },
@@ -35,7 +35,7 @@ compiled.filename = path.join(frontend, "autopilot-test.cjs");
 compiled.paths = Module._nodeModulePaths(frontend);
 compiled.require = (id) => id === "echarts" ? { init() { return {}; } } : require(id);
 compiled._compile(bundle.outputFiles[0].text, compiled.filename);
-const { checkText, RunDetail, AlertsStrip, AlertsBell } = compiled.exports;
+const { checkText, RunDetail, AlertsStrip, AlertsBell, chatLink } = compiled.exports;
 
 globalThis.localStorage = { getItem() { return null; }, setItem() {}, removeItem() {} };
 const html = (c, p) => renderToStaticMarkup(React.createElement(c, p));
@@ -114,4 +114,13 @@ test("the sidebar bell shows only with something unread", () => {
   assert.equal(html(AlertsBell, { count: 0, onOpen() {} }), "");
   assert.match(html(AlertsBell, { count: 1, onOpen() {} }), /🔔 1 new Autopilot alert</);
   assert.match(html(AlertsBell, { count: 3, onOpen() {} }), /🔔 3 new Autopilot alerts</);
+});
+
+test("an agent made from a chat links back to it; a D3 agent's run is drawn with D3", () => {
+  assert.equal(chatLink({ conversation_id: "c1", visual: false }), "/c/c1");
+  assert.equal(chatLink({ conversation_id: "c2", visual: true }), "/visuals/c/c2");
+  const run = { ...RUN, result: { ...RUN.result, visual_mode: true,
+    chart: { type: "bar", x: "region", y: ["revenue"], title: "Revenue" } } };
+  const out = html(RunDetail, { run, onOpenJobs() {} });
+  assert.match(out, /artifact-badge[^>]*>D3</);                     // the D3 window's own badge
 });
