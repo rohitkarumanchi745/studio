@@ -302,6 +302,32 @@ sequenceDiagram
     API-->>U: answer + chart on the canvas
 ```
 
+### Answers, Copilot-style
+
+An answer in the chat and the D3 & artifacts window reads like a Microsoft
+Copilot response, top to bottom, with no box around it:
+
+1. **Who answered:** the gradient ◆ avatar and **Studio**, then one quiet
+   line: how it was answered (model, certified metric, cached plan,
+   preview), the database badge, the scope, and the agents.
+2. **The steps:** Agent activity on one line, opening to the steps with
+   their icons.
+3. **The answer**, in reading type.
+4. **The result:** a card with the chart's title, rows and columns that
+   opens it in the canvas. The D3 window draws it inline instead.
+5. **Sources**, numbered: the Auto route, every table the answer read or
+   matched (click one for its latest rows) and every document it was
+   grounded on.
+6. **One row of actions:** 👍 👎, **⧉ Copy**, **‹/› SQL**, **⟳ Refresh**,
+   **⬇ Export** (CSV, Excel, Report, email) and **⏱ Automate**, then a short
+   note that the answer is AI-generated.
+7. **Follow-ups**, under the latest answer: up to three questions read off
+   the answer's own columns, such as "Show revenue over time by region",
+   "Top 5 region by revenue" or "Compare revenue with the previous period".
+   A click asks one.
+
+While Studio works, the same avatar and name sit above the live steps.
+
 ### Auto — the question picks its source and tables
 
 The chat toolbar's **Auto** switch is on by default, and each browser
