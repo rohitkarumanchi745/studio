@@ -208,7 +208,7 @@ def _run_orchestrated(prompt, user, history, model, conversation_id, sources):
             _announce_formation(plan)
         else:
             progress.emit("fanning out to " + ", ".join(
-                roster.name_for(s["connector"].name) for s in sources))
+                roster.name_for(s["connector"].name) for s in sources), kind="agents")
         run = agent_graph.execute(plan, sources, prompt, user, model, conversation_id,
                                   history=history)
         jobs.check_claim()
@@ -222,7 +222,7 @@ def _run_orchestrated(prompt, user, history, model, conversation_id, sources):
         subs = [run["results"][nid] for nid in run["order"]]
     else:
         progress.emit("fanning out to " + ", ".join(
-            roster.name_for(s["connector"].name) for s in sources))
+            roster.name_for(s["connector"].name) for s in sources), kind="agents")
         subs = _fanout(prompt, sources, user, model)
         for sub in subs:
             lightning.record_agent_rollout(
@@ -241,7 +241,8 @@ def _run_orchestrated(prompt, user, history, model, conversation_id, sources):
     blended, blend_error = None, None
     if table_requested:
         jobs.check_claim()
-        progress.emit("Aggregator: blending the agents' results into one table", agent="Aggregator")
+        progress.emit("Aggregator: blending the agents' results into one table", agent="Aggregator",
+                      kind="aggregate")
         try:
             blended = agent_graph.blend_parts(plan, run["results"], user)
             if blended is None:
@@ -255,7 +256,7 @@ def _run_orchestrated(prompt, user, history, model, conversation_id, sources):
 
     jobs.check_claim()
     progress.emit("Aggregator: synthesizing one answer from "
-                  f"{len(subs)} agents' results", agent="Aggregator")
+                  f"{len(subs)} agents' results", agent="Aggregator", kind="aggregate")
     reasoner_spec = agent_graph.reasoning_model_spec(spec)
     text = _aggregate(prompt, subs, user, reasoner_spec,
                       conversation_id=conversation_id)
@@ -385,12 +386,12 @@ def _announce_formation(plan):
         outcome = ("proposed the graph that was chosen" if planner.get("selected")
                    else "proposed a graph" if planner.get("status") == "valid"
                    else "could not propose a usable graph")
-        progress.emit(f"{name}: {outcome}", agent=name)
+        progress.emit(f"{name}: {outcome}", agent=name, kind="plan")
     if council:
         progress.emit(f"{len(council)} independent planner(s) formed a "
-                      f"{len(plan['nodes'])}-agent graph")
+                      f"{len(plan['nodes'])}-agent graph", kind="plan")
     else:
-        progress.emit(f"planned {len(plan['nodes'])} agent(s)")
+        progress.emit(f"planned {len(plan['nodes'])} agent(s)", kind="plan")
 
 
 def _fanout(prompt, sources, user, model):
@@ -413,9 +414,11 @@ def _fanout(prompt, sources, user, model):
             sub = agent.run_agent(prompt, conn, "*", s["allowed"], s["schemas"],
                                   [], user, model, skill_md=s["skill"], **grounded)
             progress.emit_for(tid, f"{roster.name_for(conn.name)}: finished "
-                                   f"({len(sub.get('rows') or [])} rows)", agent=roster.name_for(conn.name))
+                                   f"({len(sub.get('rows') or [])} rows)", agent=roster.name_for(conn.name),
+                              kind="agent", source=conn)
         except Exception as e:
-            progress.emit_for(tid, f"{roster.name_for(conn.name)}: failed", agent=roster.name_for(conn.name))
+            progress.emit_for(tid, f"{roster.name_for(conn.name)}: failed", agent=roster.name_for(conn.name),
+                              kind="error", source=conn)
             sub = {"text": f"(agent error: {e})", "sql": None, "columns": [],
                    "rows": [], "chart": None, "panels": [], "errors": [str(e)]}
         sub["_source"] = conn.name

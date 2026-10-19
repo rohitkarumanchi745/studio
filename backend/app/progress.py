@@ -34,16 +34,59 @@ def current():
     return _task.get()
 
 
-def emit(label, agent=None):
+#: What a step is doing — the activity feed draws an icon for each. A step on
+#: a source ("query", "schema", "agent") also carries the source, its type and
+#: its engine, so the feed shows that database's own icon.
+KINDS = ("query", "schema", "chart", "visual", "semantic", "verified", "cache", "route",
+         "plan", "agents", "agent", "aggregate", "docs", "tools", "model", "pipeline",
+         "error", "done")
+
+
+def describe(source):
+    """{source, source_type, engine} for a connector or a source name — the
+    connection's type ("lancedb", "sql", …) or the built-in source's own name
+    ("snowflake", "demo"), and the engine it speaks. {} when unknown."""
+    try:
+        if isinstance(source, str):
+            from .connectors import get_connector
+            conn = get_connector(source)
+        else:
+            conn = source
+        return {"source": conn.name,
+                "source_type": getattr(conn, "ctype", None) or conn.name,
+                "engine": str(getattr(conn, "dialect", "") or "")}
+    except Exception:
+        return {"source": source} if isinstance(source, str) else {}
+
+
+def emit(label, agent=None, kind=None, source=None, tables=None):
     """Append one step to the bound task's live feed. No-op when unbound
     (synchronous /chat has no task row and stays silent)."""
-    emit_for(_task.get(), label, agent=agent)
+    emit_for(_task.get(), label, agent=agent, kind=kind, source=source, tables=tables)
 
 
-def emit_for(tid, label, agent=None):
+def _tables(tables):
+    """The tables a step is about — [{"name", "why"?, "bridge"?}], at most 8:
+    a grounding step's matched tables (and the question words each matched)
+    and the tables it joins them through."""
+    out = []
+    for t in (tables or [])[:8]:
+        t = t if isinstance(t, dict) else {"name": t}
+        entry = {"name": str(t.get("name", ""))[:80]}
+        if t.get("why"):
+            entry["why"] = [str(w)[:40] for w in t["why"]][:4]
+        if t.get("bridge"):
+            entry["bridge"] = True
+        if entry["name"]:
+            out.append(entry)
+    return out
+
+
+def emit_for(tid, label, agent=None, kind=None, source=None, tables=None):
     """Append one step to a specific task's feed. Never raises. `agent` names
     who acted ("Snowflake agent", "Aggregator", a planner), so the UI can show
-    how many agents a task is using while it runs."""
+    how many agents a task is using while it runs; `kind` says what the step
+    is doing (KINDS) and `source` (a connector or a name) where."""
     if not tid or not label:
         return
     try:
@@ -58,6 +101,12 @@ def emit_for(tid, label, agent=None):
             step = {"t": round(time.time(), 2), "label": str(label)[:200]}
             if agent:
                 step["agent"] = str(agent)[:80]
+            if kind in KINDS:
+                step["kind"] = kind
+            if source is not None:
+                step.update({k: str(v)[:80] for k, v in describe(source).items() if v})
+            if tables:
+                step["tables"] = _tables(tables)
             steps.append(step)
             c.execute("UPDATE chat_tasks SET steps=? WHERE id=?",
                       (json.dumps(steps[-MAX_STEPS:]), tid))

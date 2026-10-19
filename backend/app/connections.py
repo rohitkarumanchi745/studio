@@ -800,6 +800,7 @@ def resolve(name):
         if hit and hit[0] == key:
             return hit[1]
     conn = TYPES[row["ctype"]]["build"](row["name"], cfg)
+    conn.ctype = row["ctype"]           # what kind of source this is (activity icons)
     old = None
     winner = None
     with _LOCK:
@@ -914,6 +915,7 @@ def _env_connector(name, row, cfg):
         if hit and hit[0] == key:
             return hit[1]
     conn = TYPES[name]["build"](name, cfg)
+    conn.ctype = name
     with _LOCK:
         hit = _ENV_CACHE.get(name)
         if hit and hit[0] == key:

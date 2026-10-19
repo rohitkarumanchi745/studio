@@ -257,8 +257,10 @@ def test_a_dependent_node_runs_after_its_upstream_and_sees_its_rows(monkeypatch)
 def test_a_failing_node_skips_its_dependents_instead_of_fabricating_answers(monkeypatch):
     seen = []
     activity = []
+    kinds = {}
     monkeypatch.setattr(ag.progress, "emit_for",
-                        lambda _tid, label, agent=None: activity.append(label))
+                        lambda _tid, label, agent=None, kind=None, **_:
+                        (activity.append(label), kinds.__setitem__(label, kind)))
     _fake_agent(monkeypatch, seen, fail=("postgres",))
     recorded = []
     monkeypatch.setattr(ag.lightning, "record_agent_rollout",
@@ -287,6 +289,9 @@ def test_a_failing_node_skips_its_dependents_instead_of_fabricating_answers(monk
     assert drawn["spend"] == drawn["report"] == "skipped"
     assert any("postgres" in label.lower() and "failed" in label for label in activity)
     assert all("warehouse unreachable" not in label for label in activity)
+    # The activity feed marks the failure and the skip as problems.
+    assert all(kinds[label] == "error" for label in activity
+               if "failed" in label or "skipped" in label)
 
 
 def test_an_empty_dependency_skips_the_dependent_instead_of_querying_without_ids(monkeypatch):

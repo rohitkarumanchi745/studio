@@ -77,7 +77,9 @@ def env(tmp_path, monkeypatch):
 
     def fake_orchestrated(prompt, user, history, model=None, conversation_id=None, sources=None):
         ran["orchestrated"].append(sorted(s["connector"].name for s in sources))
-        return {"text": "fanned out", "source": "*", "sql": None, "columns": [], "rows": [],
+        # Like the real one, the answer carries its first agent's source name.
+        return {"text": "fanned out", "source": sources[0]["connector"].name, "sql": None,
+                "columns": [], "rows": [],
                 "chart": None, "panels": [], "agents": [], "mode": "orchestrated",
                 "agents_used": [s["connector"].name for s in sources]}
     monkeypatch.setattr(agent, "run_agent", fake_agent)
@@ -166,6 +168,9 @@ def test_chat_answers_from_the_routed_source_and_says_so(env):
     msg = out["message"]
     assert env.ran["agent"] == ["shop"] and env.ran["orchestrated"] == []
     assert msg["auto_route"]["source"] == "shop" and msg["auto_route"]["mode"] == "single"
+    # Which database answered, by type and engine (its icon and name in the chat).
+    assert msg["auto_route"]["types"]["shop"]["engine"] == "sqlite"
+    assert msg["source_meta"] == {"source_type": "shop", "engine": "sqlite"}
     stored = [m for m in env.db.list_messages(out["conversation_id"]) if m["role"] == "user"]
     assert stored[-1]["content"]["source"] == "shop"
     assert stored[-1]["content"]["auto_route"]["source"] == "shop"
@@ -188,6 +193,8 @@ def test_chat_asks_only_the_sources_a_split_question_needs(env):
     stored = [m for m in env.db.list_messages(out["conversation_id"]) if m["role"] == "user"]
     assert stored[-1]["content"]["table"] == "shop, support"
     assert out["message"]["auto_route"]["mode"] == "multi"
+    assert "source_meta" not in out["message"]                     # no one database to name
+    assert set(out["message"]["auto_route"]["types"]) == {"shop", "support"}
 
 
 def test_a_route_is_never_taken_from_the_client(env):

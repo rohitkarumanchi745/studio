@@ -1159,7 +1159,7 @@ def execute(plan, sources, prompt, user, model=None, conversation_id=None,
             pending.clear()
             break
 
-        progress.emit(f"running {len(wave)} agent(s)")
+        progress.emit(f"running {len(wave)} agent(s)", kind="agents")
 
         def _one(node):
             progress.bind(tid)
@@ -1173,7 +1173,8 @@ def execute(plan, sources, prompt, user, model=None, conversation_id=None,
                     "or returned no rows: " \
                     + ", ".join(blocked_by)
                 progress.emit_for(tid, f"{roster.name_for(node['source'])}: skipped "
-                                       f"(dependency: {', '.join(blocked_by)})", agent=roster.name_for(node['source']))
+                                       f"(dependency: {', '.join(blocked_by)})", agent=roster.name_for(node['source']),
+                                  kind="error", source=node["source"])
                 return {"text": f"(agent skipped: {detail})", "sql": None,
                         "columns": [], "rows": [], "chart": None, "panels": [],
                         "errors": [detail], "_source": node["source"],
@@ -1226,7 +1227,7 @@ def execute(plan, sources, prompt, user, model=None, conversation_id=None,
                     if can_escalate:
                         progress.emit_for(
                             tid, f"{roster.name_for(node['source'])}: "
-                            "self-hosted worker failed; escalating to frontier")
+                            "self-hosted worker failed; escalating to frontier", kind="model")
                         sub = run_node(
                             node, by_source[node["source"]], prompt, user,
                             frontier, results, ask=ask, inbox=None, history=history)
@@ -1239,9 +1240,11 @@ def execute(plan, sources, prompt, user, model=None, conversation_id=None,
                 if dependent_trajectory is not None:
                     sub["_dependent_trajectory"] = dependent_trajectory
                 progress.emit_for(tid, f"{roster.name_for(node['source'])}: finished "
-                                       f"({len(sub.get('rows') or [])} rows)", agent=roster.name_for(node['source']))
+                                       f"({len(sub.get('rows') or [])} rows)", agent=roster.name_for(node['source']),
+                                  kind="agent", source=node["source"])
             except Exception as e:
-                progress.emit_for(tid, f"{roster.name_for(node['source'])}: failed", agent=roster.name_for(node['source']))
+                progress.emit_for(tid, f"{roster.name_for(node['source'])}: failed", agent=roster.name_for(node['source']),
+                                  kind="error", source=node["source"])
                 sub = {"text": f"(agent error: {e})", "sql": None, "columns": [], "rows": [],
                        "chart": None, "panels": [], "errors": [str(e)],
                        "_source": node["source"], "_node": node["id"],
@@ -1323,7 +1326,7 @@ def execute(plan, sources, prompt, user, model=None, conversation_id=None,
                 pending.update({n["id"]: n for n in additions})
                 progress.emit_for(
                     tid, f"{roster.name_for(parent['source'])}: spawned "
-                    f"{len(additions)} child agent(s)")
+                    f"{len(additions)} child agent(s)", kind="agents")
 
         for sub in done:
             # A skipped node made no agent decision, so it must not receive a
