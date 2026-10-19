@@ -1446,8 +1446,21 @@ source's tables and views — exactly the set the catalog, RBAC and the agent
 already see — reads their columns, fingerprints each object (kind plus ordered
 column names and types), and records a **snapshot**: what was added, changed
 and removed since the last one. Connections saved before this existed are
-queued once on upgrade (migration 17); an administrator can rediscover any
-source from its row in Data connections.
+queued once on upgrade (migration 17). A source set up through environment
+variables, rather than saved here, is scanned by the scheduler's first pass,
+one full tick (`STUDIO_METAGRAPH_TICK_SECONDS`, 300 s) after the server starts.
+
+**Connected sources**, at the top of **Tools & settings → Integrations**
+(administrators), shows every connected source in one place:
+- what has been scanned from it, for example "Metadata: 15 tables · 2
+  relationships · discovered 5 min ago". It also says whether the scan is
+  queued, running or failed; hover over the line to see the error.
+- a **↻ Rediscover** button for each source;
+- **↻ Rediscover N not scanned** for every source never scanned or whose scan
+  failed.
+
+Auto routing matches questions against what this list shows. The same line
+and button also sit under each connection on its own integration's screen.
 
 - **Bulk where the engine allows.** Databricks reads kind and columns from
   `information_schema` in two queries (`describe_relations`), scoped by the

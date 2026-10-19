@@ -33,6 +33,8 @@ compiled.require = (id) => id === "react" ? {
   useState: (...args) => hooks ? hooks.useState(...args) : React.useState(...args),
   useEffect: (...args) => hooks ? hooks.useEffect(...args) : React.useEffect(...args),
   useMemo: (...args) => hooks ? hooks.useMemo(...args) : React.useMemo(...args),
+  useRef: (...args) => hooks ? hooks.useRef(...args) : React.useRef(...args),
+  useCallback: (...args) => hooks ? hooks.useCallback(...args) : React.useCallback(...args),
 } : require(id);
 compiled._compile(bundle.outputFiles[0].text, compiled.filename);
 const { DataConnections, buildTiles, suggestName, planConnections, connectionReadiness,
@@ -169,6 +171,12 @@ function harness(component, props) {
     // Recompute every render: these memos are pure, and the test wants the
     // value that matches the state it just set.
     useMemo(factory) { memos[memoCursor++] = factory(); return memos[memoCursor - 1]; },
+    useRef(initial) {
+      const index = cursor++;
+      if (index >= values.length) values.push({ current: initial });
+      return values[index];
+    },
+    useCallback(fn) { return fn; },
   };
   return {
     render() {
@@ -235,10 +243,12 @@ test("the grid renders a tile per source with an honest status", async () => {
       await flush();
       const html = panel.render();
 
-      // /connections/env: how each built-in source is set (admin only).
+      // /connections/env: how each built-in source is set (admin only);
+      // /metagraph/sources: what has been scanned from each (Connected sources).
       assert.deepEqual(requests.sort(), ["/api/catalog/sources", "/api/connections",
                                          "/api/connections/env", "/api/connections/types",
-                                         "/api/m365/status", "/api/settings/repos"]);
+                                         "/api/m365/status", "/api/metagraph/sources",
+                                         "/api/settings/repos"]);
       // Section headings, so the grid reads as a map rather than a flat wall.
       assert.match(html, /Databases/);
       assert.match(html, /Data warehouses and lakehouses/);
@@ -253,10 +263,14 @@ test("the grid renders a tile per source with an honest status", async () => {
       assert.match(html, /GitHub<\/span><span class="conn-tile-status">1 registered/);
       assert.match(html, /conn-tile-off/);
       // Tiles are icon-led: one inline mark each, no missing-image holes — the
-      // featured shelf repeating its six on top.
+      // featured shelf repeating its six on top, and Connected sources one per
+      // connected source above them.
       const all = buildTiles({ types: TYPES, conns: CONNS, sources: SOURCES, repos: REPOS });
+      const connected = all.filter((t) => t.id !== "github" && t.id !== "m365")
+        .flatMap((t) => t.instances.filter((i) => i.configured && !i.disconnected));
       assert.equal((html.match(/class="srcicon"/g) || []).length,
-                   all.length + FEATURED.filter((id) => all.some((t) => t.id === id)).length);
+                   all.length + FEATURED.filter((id) => all.some((t) => t.id === id)).length
+                   + connected.length);
       assert.ok(html.indexOf(">Featured<") < html.indexOf(">Databases<"));
     });
 });
@@ -1224,5 +1238,109 @@ test("a non-admin sees the featured integrations too, and is told who connects t
                           "LanceDB"]) {
         assert.match(shelf, new RegExp(`${name}</span><span class="conn-tile-status">Ask an admin`));
       }
+    });
+});
+
+
+// ── Connected sources: what Studio has scanned, and a rescan ─────────────
+
+const SCANS = { sources: [
+  { source: "demo", status: "ok", discovered_at: Date.now() / 1000 - 120, kinds: { table: 4 },
+    relationships: 2 },
+  { source: "postgres", status: "not_discovered" },
+  { source: "sales-sf", status: "failed", error: "permission denied for schema acme" },
+] };
+
+test("Connected sources lists every connected source with what was scanned from it", async () => {
+  await withApi({ __user: ADMIN, "/catalog/sources": SOURCES, "/connections/types": TYPES,
+                  "/connections": CONNS, "/m365/status": { configured: false },
+                  "/settings/repos": { repos: REPOS }, "/metagraph/sources": SCANS },
+    async ({ calls, flush }) => {
+      const panel = harness(DataConnections, { onClose() {} });
+      panel.render();
+      panel.start();
+      await flush();
+      const html = panel.render();
+      const section = html.slice(html.indexOf('aria-label="Connected sources"'),
+                                 html.indexOf(">Featured<"));
+      assert.ok(section.length > 0 && html.indexOf("Connected sources") < html.indexOf(">Featured<"));
+      // Connected ones only (not the unconfigured Snowflake or S3), by name.
+      const names = [...section.matchAll(/<b>([^<]+)<\/b>/g)].map((m) => m[1]);
+      assert.deepEqual(names, ["demo", "postgres", "sales-sf"]);
+      assert.match(section, /Metadata: 4 tables · 2 relationships · discovered 2 min ago/);
+      assert.match(section, /Metadata: not discovered yet/);
+      assert.match(section, /title="permission denied for schema acme"[^>]*><span>Metadata: discovery failed/);
+      assert.equal(section.match(/↻ Rediscover<\/button>/g)?.length, 3);
+      assert.match(section, /↻ Rediscover 2 not scanned/);
+
+      // The panel is stateless: render it from the props the marketplace gives it.
+      const shown = () => {
+        const el = findNode(panel.tree(), (n) => n.type?.name === "ConnectedSources");
+        return el.type(el.props);
+      };
+      // "Rediscover 2 not scanned": exactly the never-scanned and the failed one.
+      const all = findNode(shown(), (n) => n.type === "button"
+        && String(n.props.children).includes("not scanned"));
+      await all.props.onClick();
+      await flush();
+      const posted = calls.filter((c) => c.method === "POST").map((c) => c.url);
+      assert.deepEqual(posted, ["/api/metagraph/sources/postgres/discover",
+                                "/api/metagraph/sources/sales-sf/discover"]);
+      assert.ok(calls.filter((c) => c.url === "/api/metagraph/sources").length >= 2);  // reloaded
+      // One row's own button rescans that source alone.
+      const demoRow = findNode(shown(), (n) => n.props?.className === "dbconn-row"
+        && findNode(n.props.children, (c) => c.type === "b" && c.props.children === "demo"));
+      const own = findNode(demoRow, (n) => n.type === "button" && n.props.children === "↻ Rediscover");
+      await own.props.onClick();
+      await flush();
+      assert.equal(calls.filter((c) => c.method === "POST").at(-1).url,
+                   "/api/metagraph/sources/demo/discover");
+    });
+});
+
+test("a scan in flight is not offered again", async () => {
+  const queued = { sources: [{ source: "demo", status: "queued" },
+                             { source: "postgres", status: "running" },
+                             { source: "sales-sf", status: "ok", discovered_at: Date.now() / 1000,
+                               kinds: { table: 1 } }] };
+  await withApi({ __user: ADMIN, "/catalog/sources": SOURCES, "/connections/types": TYPES,
+                  "/connections": CONNS, "/m365/status": { configured: false },
+                  "/settings/repos": { repos: REPOS }, "/metagraph/sources": queued },
+    async ({ flush }) => {
+      const panel = harness(DataConnections, { onClose() {} });
+      panel.render();
+      panel.start();
+      await flush();
+      const html = panel.render();
+      assert.doesNotMatch(html, /not scanned/);
+      assert.equal(html.match(/<button class="chip" disabled="">discovering…<\/button>/g)?.length, 2);
+      assert.match(html, /Metadata: discovery queued…/);
+    });
+});
+
+test("only administrators get Connected sources, and a search hides it", async () => {
+  await withApi({ __user: ANALYST, "/catalog/sources": SOURCES, "/m365/status": { configured: false },
+                  "/repos": { repos: [] }, "/metagraph/sources": SCANS },
+    async ({ requests, flush }) => {
+      const panel = harness(DataConnections, { onClose() {} });
+      panel.render();
+      panel.start();
+      await flush();
+      assert.doesNotMatch(panel.render(), /aria-label="Connected sources"/);
+      assert.ok(!requests.includes("/api/metagraph/sources"));
+    });
+  await withApi({ __user: ADMIN, "/catalog/sources": SOURCES, "/connections/types": TYPES,
+                  "/connections": CONNS, "/m365/status": { configured: false },
+                  "/settings/repos": { repos: REPOS }, "/metagraph/sources": SCANS },
+    async ({ flush }) => {
+      const panel = harness(DataConnections, { onClose() {} });
+      panel.render();
+      panel.start();
+      await flush();
+      assert.match(panel.render(), /aria-label="Connected sources"/);
+      const search = findNode(panel.tree(), (n) => n.type === "input"
+        && n.props.className === "conn-search");
+      search.props.onChange({ target: { value: "post" } });
+      assert.doesNotMatch(panel.render(), /aria-label="Connected sources"/);
     });
 });
