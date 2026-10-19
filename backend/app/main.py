@@ -11,7 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import (auth, autopilot, catalog, chat, confluence, connections, dashboards, db, freshness,
+from . import (auth, autopilot, catalog, chat, confluence, connections, dashboards, db, exports,
+               freshness,
                governance, jobs, kag, kag_graph, keys, learned_rules, mcp, memory, metacdc, metagraph,
                migrations,
                policy_trajectories, pybuild,
@@ -48,7 +49,7 @@ _ROUTERS = (auth.router, catalog.router, chat.router, dashboards.router,
             freshness.router, objectstore.router,
             semantic.router, autopilot.router, redteam.router, m365.router,
             connections.router, memory.router, learned_rules.router, retention.router,
-            metagraph.router, metacdc.router)
+            metagraph.router, metacdc.router, exports.router)
 for _router in _ROUTERS:
     app.include_router(_router, prefix="/api")
 

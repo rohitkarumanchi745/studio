@@ -24,7 +24,7 @@ const bundle = await build({
       bundler.onResolve({filter: /^\.\/(Canvas|ChartView|SqlLab|ChatWorkflow|ChatPlatformRun)$/},
         ({path: specifier}) => ({path: specifier, namespace: "chat-child"}));
       bundler.onLoad({filter: /.*/, namespace: "chat-child"}, () => ({
-        contents: "export default function Stub() { return null; } export function PlatformComposer() { return null; }",
+        contents: "export default function Stub() { return null; } export function PlatformComposer() { return null; } export function chartImage() { return null; }",
         loader: "jsx",
       }));
     },

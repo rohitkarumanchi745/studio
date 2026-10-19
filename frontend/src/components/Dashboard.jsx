@@ -13,7 +13,29 @@
 //   readOnly       bool                        — force view-only regardless of can_edit
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api as sharedApi } from "../api";
-import ChartView from "./ChartView";
+import ChartView, { chartImage } from "./ChartView";
+import { downloadReport, downloadTable } from "../exporting";
+
+/** A dashboard as a report: each tile it could draw, with its data and SQL. */
+export function dashboardReport(doc, data) {
+  const sections = [];
+  for (const t of doc?.tiles || []) {
+    const d = data?.[t.id];
+    if (!d || d.denied || d.error) continue;
+    const spec = d.spec || t.spec || null;
+    const columns = d.columns || [];
+    const rows = d.rows || [];
+    sections.push({
+      title: t.title || spec?.title || "Untitled",
+      image: chartImage(columns, rows, spec),
+      columns,
+      rows,
+      sql: t.sql || null,
+      source: t.source || null,
+    });
+  }
+  return { title: doc?.title || "Dashboard", subtitle: doc?.description || undefined, sections };
+}
 import FilterBar, { EMPTY_CONTEXT } from "./FilterBar";
 import { captureKeyOrder } from "./renderers/format";
 import { backdropClose } from "../backdrop";
@@ -432,6 +454,16 @@ export function DashboardTile({
             <button className="chip" onClick={() => setShowAsk(!showAsk)} title="Edit this visual with a prompt">✎</button>
           )}
           {onRefresh && <button className="chip" onClick={onRefresh} title="Re-run this tile">⟳</button>}
+          {rows.length > 0 && (
+            <button className="chip" title="Download this tile's data as CSV"
+              onClick={() => downloadTable("csv", { title: tile?.title || spec?.title || "tile",
+                                                    columns, rows, sql: tile?.sql || null,
+                                                    source: tile?.source || null })
+                .then((name) => setNote(`Saved ${name}.`))
+                .catch((e) => setNote(`Download failed: ${e.message}`))}>
+              ⬇
+            </button>
+          )}
           {onOpen && <button className="chip" onClick={onOpen} title="Open in canvas">⤢</button>}
           {editable && onRemove && (
             <button className="chip" onClick={onRemove} title="Remove this tile">✕</button>
@@ -505,6 +537,7 @@ export default function Dashboard({
   const [arrange, setArrange] = useState(false);
   const [selected, setSelected] = useState(null);
   const [drag, setDrag] = useState(null);
+  const [saving, setSaving] = useState("");                 // a report being built
 
   const docRef = useRef(null);
   const ctxRef = useRef(EMPTY_CONTEXT);
@@ -857,6 +890,23 @@ export default function Dashboard({
           <button className="chip" onClick={() => load({ refresh: true, includeFields: true })} disabled={pending}>
             ⟳ refresh
           </button>
+          {tiles.length > 0 && (
+            <button className="chip" disabled={!!saving}
+              title="Download every tile — charts, data and SQL — as one HTML page (print it to PDF)"
+              onClick={async () => {
+                setSaving("report");
+                setError("");
+                try {
+                  await downloadReport(dashboardReport(doc, data));
+                } catch (e) {
+                  setError(`Download failed: ${e.message}`);
+                } finally {
+                  setSaving("");
+                }
+              }}>
+              {saving ? "building…" : "⬇ Report"}
+            </button>
+          )}
           {!readOnly && doc?.can_edit && (
             <button
               className={"chip" + (arrange ? " chip-active" : "")}

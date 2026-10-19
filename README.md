@@ -2378,6 +2378,45 @@ entrance animation on the whole chart.
 
 ---
 
+### Downloads — CSV, Excel, PNG and reports
+
+Every answer, the canvas and every dashboard can be downloaded:
+
+| Where | What |
+|---|---|
+| A chat answer | **⬇ CSV**, **⬇ Excel** (its rows), **⬇ Report** (text, every chart, data and SQL) |
+| The canvas | **⬇ PNG** on each chart; **⬇ CSV** / **⬇ Excel** of the selected view, local edits included; **⬇ Report** of every view |
+| A dashboard | **⬇ Report** of every tile; **⬇** on a tile for its data as CSV |
+| A custom visual | **⬇ HTML**, the visual itself, offline |
+
+- **The rows on screen, nothing more.** The browser sends the rows it
+  already shows, which were governed when the query ran (masked and denied
+  columns applied). The server only formats them (`app/exports.py`), so a
+  download never shows more than its reader saw, and a dashboard report skips
+  any tile the reader may not see.
+- **Safe in a spreadsheet.** A text value Excel would run as a formula
+  (starting with `=`, `+`, `-` or `@`) gets a leading `'` in a CSV. In an
+  .xlsx every text cell is written as text, so `=HYPERLINK(…)` arrives as the
+  words it was. CSV carries a UTF-8 byte-order mark, so Excel reads accents.
+- **Excel** has a *Data* sheet (bold, frozen header) and an *About* sheet:
+  title, answer text, source, SQL, row count, and who exported it when.
+- **A report is one static HTML file.** No script and no external request
+  (its content security policy allows only inline styles and data-URL
+  images), and every value is escaped. It prints cleanly to PDF from the
+  browser.
+  - **Charts are vector SVG**, drawn by ECharts' own server-side renderer
+    from each chart's data and spec, so a report has its charts even when none
+    is open on screen. A table, KPI card or D3-only chart contributes its data
+    table only.
+  - **Tables show the first 1,000 rows** of each section; CSV and Excel hold
+    all of them.
+- **PNG** is the chart exactly as drawn, whichever engine drew it (ECharts,
+  Plotly, Vega or D3): its canvas and SVG layers are composited on white at
+  twice the screen size.
+- **Audited.** Every download is an activity row (`export`, its format in
+  `mode`), like an emailed report. Bounds: 200,000 rows, 1,000 columns, 60
+  report sections, 8 MB per chart image.
+
 ## Data architecture
 
 State lives in **PostgreSQL** when `DATABASE_URL` is set, otherwise SQLite.

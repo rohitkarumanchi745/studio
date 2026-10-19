@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api";
 import Canvas from "./Canvas";
-import ChartView from "./ChartView";
+import ChartView, { chartImage } from "./ChartView";
 import Markdown from "./Markdown";
+import { downloadReport, downloadTable } from "../exporting";
 import SqlLab from "./SqlLab";
 import ChatWorkflow from "./ChatWorkflow";
 import ChatPlatformRun, { PlatformComposer } from "./ChatPlatformRun";
@@ -222,6 +223,32 @@ export function describeRoute(route) {
     return `${route.kept ? "stayed with" : "asked"} ${list(route.sources || [])}${matched}`;
   }
   return "asked every source — no source's tables matched the question";
+}
+
+/**
+ * An answer as a report: one section per view — its chart (drawn without a
+ * screen, chartImage), its table and its SQL — the answer's text first.
+ */
+export function answerReport(m, { title, columns, rows }) {
+  const views = m.panels?.length && !m.rows_purged ? m.panels
+    : [{ columns, rows, chart: m.chart, sql: m.sql }];
+  const where = (p) => {
+    const s = p.source || m.source;
+    return s && s !== "*" ? s : null;
+  };
+  return {
+    title,
+    subtitle: where(m) || undefined,
+    sections: views.map((p, i) => ({
+      title: p.chart?.title || (views.length > 1 ? `View ${i + 1}` : "Result"),
+      text: i === 0 ? m.text || "" : null,
+      image: chartImage(p.columns, p.rows, p.chart),
+      columns: p.columns || [],
+      rows: p.rows || [],
+      sql: p.sql || (i === 0 ? m.sql : null) || null,
+      source: where(p),
+    })),
+  };
 }
 
 /** A D3 & artifacts conversation (its title carries the 🎨 the server gave it). */
@@ -1019,6 +1046,21 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
     }
   }
 
+  // Downloads: this answer's rows as CSV or Excel, or the answer as a report.
+  const exportTitle = requirement || m.chart?.title || `Query on ${m.table}`;
+  async function save(kind) {
+    setStatus(kind === "report" ? "building the report…" : "preparing the file…");
+    try {
+      const name = kind === "report"
+        ? await downloadReport(answerReport(m, { title: exportTitle, columns, rows }))
+        : await downloadTable(kind, { title: exportTitle, columns, rows, sql: m.sql,
+                                      text: m.text || "", source: m.source });
+      setStatus(`saved ${name}`);
+    } catch (e) {
+      setStatus(`download failed: ${e.message}`);
+    }
+  }
+
   async function emailReport() {
     setStatus("emailing…");
     try {
@@ -1214,6 +1256,18 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
             <button className="chip" onClick={emailReport} title="Email this report to yourself">
               ✉ email report
             </button>{" "}
+            {!expired && columns?.length > 0 && rows?.length > 0 && (
+              <>
+                <button className="chip" onClick={() => save("csv")}
+                        title="Download these rows as a CSV file">⬇ CSV</button>{" "}
+                <button className="chip" onClick={() => save("xlsx")}
+                        title="Download these rows as an Excel workbook">⬇ Excel</button>{" "}
+                <button className="chip" onClick={() => save("report")}
+                        title="Download the answer — text, charts, data and SQL — as one HTML page (print it to PDF)">
+                  ⬇ Report
+                </button>{" "}
+              </>
+            )}
             {m.chart && !visualMode && !expired && (
               <button className="chip" onClick={() => onOpenCanvas(m.rows_purged ? freshView() : undefined)}
                       title="Open on the main screen">

@@ -37,7 +37,7 @@ const bundle = await build({
                     ({ path: p }) => ({ path: p.slice(2), namespace: "child" }));
         b.onLoad({ filter: /.*/, namespace: "child" }, ({ path: name }) => ({
           contents: `export default function ${name}() { return null; }
-                     export function PlatformComposer() { return null; }`,
+                     export function PlatformComposer() { return null; } export function chartImage() { return null; }`,
           loader: "jsx",
         }));
       },
