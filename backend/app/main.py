@@ -11,7 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import (auth, autopilot, catalog, chat, confluence, connections, dashboards, db, exports,
+from . import (auth, autopilot, catalog, chat, confluence, connections, dashboards, db, destinations,
+               exports,
                freshness,
                governance, jobs, kag, kag_graph, keys, learned_rules, mcp, memory, metacdc, metagraph,
                migrations,
@@ -49,7 +50,7 @@ _ROUTERS = (auth.router, catalog.router, chat.router, dashboards.router,
             freshness.router, objectstore.router,
             semantic.router, autopilot.router, redteam.router, m365.router,
             connections.router, memory.router, learned_rules.router, retention.router,
-            metagraph.router, metacdc.router, exports.router)
+            metagraph.router, metacdc.router, exports.router, destinations.router)
 for _router in _ROUTERS:
     app.include_router(_router, prefix="/api")
 
@@ -93,6 +94,7 @@ def init_state():
     objectstore.init_tables()
     autopilot.init_tables()
     connections.init_tables()
+    destinations.init_tables()
     learned_rules.init_tables()
     # Microsoft 365 / Graph extraction tables (graph_accounts / _subscriptions /
     # _items). CREATE-only DDL, safe on SQLite and Postgres; inert when dormant.

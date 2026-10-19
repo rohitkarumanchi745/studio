@@ -2561,6 +2561,58 @@ Every answer, the canvas and every dashboard can be downloaded:
   `mode`), like an emailed report. Bounds: 200,000 rows, 1,000 columns, 60
   report sections, 8 MB per chart image.
 
+### Send an answer to Microsoft Teams or Slack
+
+Every answer has a **↗ Share** menu with **Microsoft Teams** and **Slack**.
+Pick one, choose a channel, add a note if you like, and press **Send**. The
+channel gets the following:
+
+- the answer's text;
+- a table of the result's first 15 rows (8 columns), which you can leave out;
+- the SQL, if you tick it;
+- the row count, the source and who sent it;
+- an **Open in Studio** button.
+
+Teams receives an Adaptive Card with a real table. Slack receives Block Kit
+with the table in a fixed-width block.
+
+**Setting up a channel (administrators).** Go to Tools & settings →
+Integrations, and open the **Microsoft Teams** or **Slack** tile under *Send
+answers to*. Paste the channel's incoming-webhook URL and tick which roles may
+send to it. Admins always can. By default a test message is posted straight
+away.
+
+- **Teams:** in the channel's ••• menu, open Workflows → *Post to a channel
+  when a webhook request is received*, or use Connectors → Incoming Webhook.
+- **Slack:** create an app at api.slack.com/apps, then Incoming Webhooks →
+  Add New Webhook to Workspace → pick the channel.
+
+- **Only real webhook hosts.** Slack URLs must be on `hooks.slack.com`.
+  Teams URLs must be on `*.webhook.office.com`, `*.logic.azure.com` or
+  `*.api.powerplatform.com`. They must use https, with no user, password or
+  other port. Anything else, an internal address included, is refused, so a
+  channel can't be used to make Studio call somewhere else.
+- **The URL is a secret.** It is encrypted at rest with the connection key,
+  never returned by the API, and never shown again.
+- **Who sees which channel.** Each role sees and sends only to the channels
+  it was given. Anyone in the channel sees what is sent there, so the panel
+  says so.
+- **Formatted for each app.** Markdown is converted to Slack's own mrkdwn
+  and to the subset Teams supports. Slack's control characters are escaped,
+  so an answer can't `@channel`. A `[label](url)` link arrives as
+  `label (url)`, so no link is disguised as words. The **Open in Studio**
+  button is added only for a conversation the sender can open, and it opens
+  in the D3 window for a 🎨 conversation.
+- **Only what the message shows leaves the browser:** the first 15 rows plus
+  the result's size, never the whole result.
+- **Audited.** Every send is an activity row (`share`, with the app in
+  `mode`), failures included. A channel that refuses the message is a 502
+  with its status code. The panel shows it as *Not sent: …*.
+- **The last channel used** is remembered per app, in that browser only.
+
+API: `GET /api/share/destinations`, `POST /api/share/destinations` (admin),
+`DELETE /api/share/destinations/{id}` (admin), `POST /api/share/send`.
+
 ## Data architecture
 
 State lives in **PostgreSQL** when `DATABASE_URL` is set, otherwise SQLite.

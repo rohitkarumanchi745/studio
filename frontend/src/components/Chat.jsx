@@ -6,6 +6,7 @@ import ChartView, { chartImage } from "./ChartView";
 import Markdown from "./Markdown";
 import { downloadReport, downloadTable } from "../exporting";
 import AutopilotDraft, { draftFromAnswer } from "./AutopilotDraft";
+import SharePanel from "./SharePanel";
 import SqlLab from "./SqlLab";
 import ChatWorkflow from "./ChatWorkflow";
 import ChatPlatformRun, { PlatformComposer } from "./ChatPlatformRun";
@@ -1224,6 +1225,7 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
   const [sample, setSample] = useState(null);
   const [sampleBusy, setSampleBusy] = useState("");
   const [automate, setAutomate] = useState(false);   // ⏱ Automate: this answer as an agent
+  const [sharing, setSharing] = useState(null);      // ↗ Share: "teams" | "slack" | null
 
   async function loadSample(t) {
     // Every click re-queries the source — the sample is always latest data.
@@ -1307,6 +1309,12 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
     } catch {
       setStatus("could not copy");
     }
+  }
+
+  // ↗ Share → a channel: the menu closes and the send panel opens under the answer.
+  function openShare(kind, e) {
+    e?.currentTarget?.closest?.("details")?.removeAttribute("open");
+    setSharing(kind);
   }
 
   async function emailReport() {
@@ -1586,6 +1594,22 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
                   )}
                 </>
               )}
+              {(m.text || m.sql) && (
+                <details className="export-menu share-menu">
+                  <summary className="icon-btn" title="Send this answer to a Microsoft Teams or Slack channel">
+                    ↗ Share
+                  </summary>
+                  <div className="export-menu-list" role="menu">
+                    {[["teams", "Microsoft Teams"], ["slack", "Slack"]].map(([kind, label]) => (
+                      <button key={kind} className="menu-item" role="menuitem"
+                              onClick={(e) => openShare(kind, e)}
+                              title={`Send this answer to a ${label} channel`}>
+                        <SourceIcon id={kind} size={16} /> {label}
+                      </button>
+                    ))}
+                  </div>
+                </details>
+              )}
               {status && <span className="meta action-status"> {status}</span>}
             </div>
           )}
@@ -1596,6 +1620,12 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
             <AutopilotDraft draft={draftFromAnswer(m, requirement, visualMode)}
                             conversationId={conversationId} onDismiss={() => setAutomate(false)}
                             onCreated={onAutopilotCreated} />
+          )}
+          {sharing && (
+            <SharePanel key={sharing} kind={sharing} onClose={() => setSharing(null)}
+                        answer={{ title: exportTitle, text: m.text || "", sql: m.sql || null,
+                                  columns: hasRows ? columns : [], rows: hasRows ? rows : [],
+                                  source: m.source, conversationId }} />
           )}
           {showSql && m.sql && (
             <div className="sqlbox">

@@ -5,7 +5,9 @@
 // /connections/types serves a field spec per connectable type and this renders
 // it, so a connector gained on the server shows up here with the right fields
 // and no frontend change. GitHub is a separate pipeline-planning context, not
-// a SQL data connector; its registry has a dedicated panel. The tile art comes
+// a SQL data connector; its registry has a dedicated panel. Microsoft Teams and
+// Slack are where answers are sent, not sources: their tiles list the channels
+// set up for sending (DestinationsPanel). The tile art comes
 // from sourceCatalog.jsx.
 //
 // The grid deliberately shows sources this screen cannot set up — object stores
@@ -24,6 +26,7 @@ import { api, getUser } from "../api";
 import { CATEGORIES, FEATURED, MARKETPLACE, SourceIcon, metaFor } from "./sourceCatalog";
 import MetadataLine, { metadataText, useMetadataStatus } from "./MetadataLine";
 import { backdropClose } from "../backdrop";
+import DestinationsPanel from "./DestinationsPanel";
 
 const STATUS_LABEL = {
   onboarding: "Onboarding — first sync running",
@@ -97,7 +100,11 @@ function sqlTile(ctype, dialect) {
   return ctype === "sql" && SQL_TILE_BY_DIALECT[dialect] ? SQL_TILE_BY_DIALECT[dialect] : ctype;
 }
 
-export function buildTiles({ types = [], conns = [], sources = [], repos = [], envs = [], q = "" }) {
+/** Tiles for where answers are sent, rather than sources Studio reads. */
+export const SEND_TO = ["teams", "slack"];
+
+export function buildTiles({ types = [], conns = [], sources = [], repos = [], envs = [],
+                             channels = [], q = "" }) {
   const byId = new Map();
   const put = (id, extra) => {
     if (!byId.has(id)) {
@@ -109,6 +116,8 @@ export function buildTiles({ types = [], conns = [], sources = [], repos = [], e
   for (const t of types) put(t.ctype, { connectable: true, fields: t.fields, ns: t.ns || {} });
   put("m365");
   put("github");
+  put("teams");
+  put("slack");
   // The featured integrations are on everyone's map, connectable or not.
   for (const id of FEATURED) put(id);
   // The marketplace: every integration on the map, each saying how it connects.
@@ -130,6 +139,13 @@ export function buildTiles({ types = [], conns = [], sources = [], repos = [], e
       configured: true,
       kind: "repository",
     });
+  }
+
+  // Channels answers can be sent to (/share/destinations) sit on their own tile.
+  for (const ch of channels) {
+    if (!SEND_TO.includes(ch.kind)) continue;
+    put(ch.kind).instances.push({ name: ch.name, id: ch.id, roles: ch.roles || [],
+                                  configured: true, kind: "channel" });
   }
 
   const connByName = new Map(conns.map((c) => [c.name, c]));
@@ -193,6 +209,7 @@ export default function DataConnections({ onClose }) {
   const [error, setError] = useState("");
   const [note, setNote] = useState("");
   const [repos, setRepos] = useState([]);       // configured GitHub planning repositories
+  const [channels, setChannels] = useState([]); // /share/destinations — Teams and Slack
   // What Studio has scanned from each connected source, for the Connected
   // sources panel (administrators), and the names being queued for a rescan.
   const scans = useMetadataStatus(isAdmin);
@@ -216,6 +233,7 @@ export default function DataConnections({ onClose }) {
   function load() {
     api("/catalog/sources").then((d) => setSources(Array.isArray(d) ? d : [])).catch(() => {});
     api("/m365/status").then(setM365).catch(() => setM365({ configured: false }));
+    api("/share/destinations").then((d) => setChannels(d.destinations || [])).catch(() => {});
     if (isAdmin) {
       api("/settings/repos").then((d) => setRepos(d.repos || [])).catch((e) => setError(e.message));
     } else if (user?.role === "analyst") {
@@ -250,8 +268,8 @@ export default function DataConnections({ onClose }) {
     load();
   }, [isAdmin]);
 
-  const tiles = useMemo(() => buildTiles({ types, conns, sources, repos, envs, q }),
-                        [types, conns, sources, repos, envs, q]);
+  const tiles = useMemo(() => buildTiles({ types, conns, sources, repos, envs, channels, q }),
+                        [types, conns, sources, repos, envs, channels, q]);
 
   // A disconnected connection is absent from /catalog/sources but still owns
   // its name on the server, so it counts as taken here too.
@@ -319,6 +337,9 @@ export default function DataConnections({ onClose }) {
           ) : tile.id === "github" ? (
             <GithubPanel repos={repos} isAdmin={isAdmin} reload={load}
               onNote={setNote} onError={setError} />
+          ) : SEND_TO.includes(tile.id) ? (
+            <DestinationsPanel kind={tile.id} channels={tile.instances} isAdmin={isAdmin}
+              reload={load} onNote={setNote} onError={setError} />
           ) : tile.connectable && isAdmin ? (
             <ConnectForm
               tile={tile}
@@ -354,7 +375,8 @@ export function needsScan(summary) {
  * scan status and the rescans in flight belong to the marketplace.
  */
 export function ConnectedSources({ tiles, scans, rescanning, onRediscover, onPick }) {
-  const rows = tiles.flatMap((tile) => tile.id === "github" || tile.id === "m365" ? []
+  const rows = tiles.flatMap((tile) => tile.id === "github" || tile.id === "m365"
+    || SEND_TO.includes(tile.id) ? []
     : tile.instances.filter((i) => i.configured && !i.disconnected).map((inst) => ({ tile, inst })))
     .sort((a, b) => a.inst.name.localeCompare(b.inst.name));
   if (!rows.length) return null;
@@ -442,7 +464,8 @@ const VIA_LABEL = {
 
 function Tile({ tile, isAdmin, onPick }) {
   const live = tile.instances.filter((i) => i.configured);
-  const dormant = !live.length && !tile.connectable && !(tile.id === "github" && isAdmin);
+  const dormant = !live.length && !tile.connectable
+    && !((tile.id === "github" || SEND_TO.includes(tile.id)) && isAdmin);
   return (
     <button
       className={`conn-tile${dormant ? " conn-tile-off" : ""}`}
@@ -454,6 +477,9 @@ function Tile({ tile, isAdmin, onPick }) {
       <span className="conn-tile-status">
         {tile.id === "github"
           ? live.length ? `${live.length} registered` : isAdmin ? "Register repository" : "Ask an admin"
+          : SEND_TO.includes(tile.id)
+          ? live.length ? `${live.length} channel${live.length === 1 ? "" : "s"}`
+            : isAdmin ? "Add a channel" : "Ask an admin"
           : live.length
           ? `${live.length} connected`
           : tile.connectable
