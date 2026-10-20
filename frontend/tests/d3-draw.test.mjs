@@ -199,6 +199,26 @@ test("a flow that loops back, or a box with no groups, is refused", () => {
   assert.equal(render("radar", ["a", "v"], [["x", 1], ["y", 2]], { x: "a", y: ["v"] }).out, false);
 });
 
+test("a table aligns each column by what it holds, and counts its rows", () => {
+  // A number column is right-aligned whole — its header and its blanks too —
+  // decided by the column, not cell by cell.
+  const t = render("table", ["region", "revenue", "orders"],
+                   [["West", 1200.5, null], ["East", null, 7], ["North", 30, 2]]);
+  assert.deepEqual([...t.el.querySelectorAll("th")].map((th) => th.className), ["", "num", "num"]);
+  assert.deepEqual([...t.el.querySelectorAll("tbody tr:nth-child(2) td")].map((td) => [td.className, td.textContent]),
+                   [["", "East"], ["num", ""], ["num", "7"]]);
+  assert.equal(t.el.querySelector("td.num").textContent, "1,200.5");
+  assert.equal(t.el.querySelector(".table-more").textContent, "3 rows");
+  // One number: one row, its header over it.
+  const one = render("table", ["count"], [[10]]);
+  assert.equal(one.el.querySelector("th").className, "num");
+  assert.equal(one.el.querySelector(".table-more").textContent, "1 row");
+  // Long results: what is shown of how many.
+  const long = render("table", ["n"], Array.from({ length: 250 }, (_, i) => [i]));
+  assert.equal(long.count("tbody tr"), 200);
+  assert.equal(long.el.querySelector(".table-more").textContent, "Showing 200 rows of 250");
+});
+
 test("table cells are text, never markup", () => {
   const { el } = render("table", ["name"], [["<img src=x onerror=alert(1)>"]]);
   assert.equal(el.querySelectorAll("img").length, 0);

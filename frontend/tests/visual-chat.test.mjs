@@ -424,6 +424,19 @@ test("an answer with no chart is still drawn: one number as a KPI, more as a tab
   assert.match(html(ChartView, { columns: ["count"], rows: [[10]], chart: null }), /kpi-card/);
 });
 
+test("a table's frame is as tall as its rows; a chart's is the size chosen", () => {
+  const table = html(ChartView, { columns: ["count"], rows: [[10]], chart: { type: "table", x: "count", y: [] },
+                                  d3Only: true });
+  assert.match(table, /class="viz-body viz-fit" style="max-height:\d+px"/);
+  assert.match(table, /class="echart d3-chart d3-chart-table"/);
+  const bar = html(ChartView, { columns: COLUMNS, rows: ROWS, chart: BAR, d3Only: true });
+  assert.match(bar, /class="viz-body" style="height:\d+px"/);
+  assert.doesNotMatch(bar, /viz-fit|d3-chart-table/);
+  // A type the data does not fit shows the table, fitted the same way.
+  const unfit = html(ChartView, { columns: ["region", "segment"], rows: [["West", "A"]], chart: BAR, d3Only: true });
+  assert.match(unfit, /viz-fit/);
+});
+
 test("picking another type for a chart-less answer draws that type", () => {
   const view = held({ columns: COLUMNS, rows: ROWS, chart: null, d3Only: true });
   assert.equal(view.drawn().type, "table");

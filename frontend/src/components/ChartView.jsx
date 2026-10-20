@@ -412,7 +412,7 @@ export default function ChartView({
         // The D3 & artifacts window: the reader sizes the visual (VizFrame).
         // A type the data does not fit is never an empty box: D3 draws the
         // table instead, under the note that says so.
-        <VizFrame title={chart?.title}>
+        <VizFrame title={chart?.title} fit={!plottable || spec.type === "table"}>
           <D3View columns={columns} rows={shownRows} spec={plottable ? spec : { ...spec, type: "table" }}
                   fill motion />
         </VizFrame>
