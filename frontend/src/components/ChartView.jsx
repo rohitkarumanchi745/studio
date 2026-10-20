@@ -160,6 +160,22 @@ export function computeFit(columns, rows, spec) {
 }
 
 /**
+ * A spec for a result that came without one — the agent answered without
+ * proposing a chart (a single count, say). x is the first text column (else
+ * the first column), y the numbers; one row with a number reads as a KPI,
+ * anything else as a table. Every type in the picker then has something to
+ * draw from. Exported for tests.
+ */
+export function defaultSpec(columns, rows) {
+  const first = rows?.[0] || [];
+  const numeric = (i) => typeof first[i] === "number";
+  const xi = Math.max(0, columns.findIndex((_, i) => !numeric(i)));
+  let y = columns.filter((_, i) => i !== xi && numeric(i)).slice(0, 4);
+  if (!y.length) y = columns.filter((_, i) => numeric(i)).slice(0, 1);
+  return { type: rows?.length === 1 && y.length ? "kpi" : "table", x: columns[xi], y };
+}
+
+/**
  * A chart as an SVG data URL, drawn by ECharts with no screen at all (its
  * server-side renderer) — what a report embeds, so a chart is in the report
  * even when it is not open anywhere. null for a table, a KPI card, a type
@@ -207,15 +223,22 @@ export default function ChartView({
   // report clicks upward, and surface format warnings. All optional.
   tileId, highlight, onSelect, onWarnings,
 }) {
+  // No chart with the result: one is made from the data, so the type picker
+  // always has something to switch (and the D3 window something to draw).
+  const fallback = useMemo(() => (chart || !columns?.length ? null : defaultSpec(columns, rows)),
+                           [chart, columns, rows]);
   const pickType = (t) => (d3Only ? d3Type(t) : t || "table");
-  const [type, setType] = useState(pickType(chart?.type));
-  useEffect(() => setType(pickType(chart?.type)), [chart]);
+  const [type, setType] = useState(pickType(chart?.type || fallback?.type));
+  useEffect(() => setType(pickType(chart?.type || fallback?.type)), [chart, fallback]);
 
   const [engine, setEngine] = useState(
     d3Only ? "d3" : chosenEngine || localStorage.getItem("studio_renderer") || "echarts");
   useEffect(() => { if (chosenEngine && !d3Only) setEngine(chosenEngine); }, [chosenEngine, d3Only]);
 
-  const spec = useMemo(() => (chart ? { ...chart, type } : null), [chart, type]);
+  const spec = useMemo(() => {
+    const base = chart || fallback;
+    return base ? { ...base, type } : null;
+  }, [chart, fallback, type]);
 
   const [showVisual, setShowVisual] = useState(true);
   const [showCode, setShowCode] = useState(false);
@@ -368,7 +391,7 @@ export default function ChartView({
       {!typeOk && (
         <div className="chart-note">
           {LABELS[type]} doesn’t fit this data — {fit[type]?.reason}.
-          {d3Only ? " Pick another D3 chart above, or ask for a custom visual."
+          {d3Only ? " Showing the table; pick another D3 chart above, or ask for a custom visual."
             : " Showing the table; pick a compatible type or reshape the data with a prompt."}
         </div>
       )}
@@ -385,10 +408,13 @@ export default function ChartView({
         <PlotlyView columns={columns} rows={rows} spec={spec} tall={tall} />
       ) : plottable && drawEngine === "vega" ? (
         <VegaView columns={columns} rows={rows} spec={spec} tall={tall} />
-      ) : nothingLeft ? nothingLeft : plottable && drawEngine === "d3" && d3Only ? (
+      ) : nothingLeft ? nothingLeft : d3Only && spec ? (
         // The D3 & artifacts window: the reader sizes the visual (VizFrame).
+        // A type the data does not fit is never an empty box: D3 draws the
+        // table instead, under the note that says so.
         <VizFrame title={chart?.title}>
-          <D3View columns={columns} rows={shownRows} spec={spec} fill motion />
+          <D3View columns={columns} rows={shownRows} spec={plottable ? spec : { ...spec, type: "table" }}
+                  fill motion />
         </VizFrame>
       ) : plottable && drawEngine === "d3" ? (
         <D3View columns={columns} rows={d3Only ? shownRows : rows} spec={spec} tall={tall}
