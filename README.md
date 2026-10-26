@@ -2568,6 +2568,17 @@ each column by what it holds (numbers right-aligned under right-aligned
 headers), is only as wide as its columns need, counts its rows, and its frame
 is only as tall as its rows, up to the size chosen.
 
+**Its home.** A new conversation in the window opens on a home of its own
+(`VisualHome.jsx`), in a violet accent with soft cards, scoped to this window:
+- a greeting and one question, "What would you like to visualize today?";
+- the composer in the middle of the page;
+- quick starts (Chart, Table, Dashboard, Map, Custom visual, Automate) that
+  fill the composer with a phrase to finish, with the part to type already
+  selected;
+- three bigger starts: build a dashboard, write a custom visual, map your data;
+- ideas read from the data;
+- the conversations visualized lately, each with a thumbnail of its kind.
+
 **Your charts** (⊞ in that window's toolbar) puts the two side by side for
 every chart in your conversations, in D3 terms only: a chart is "D3" or "not
 D3 yet", and **Use this** saves a D3 chart (never another engine). Pick a chart

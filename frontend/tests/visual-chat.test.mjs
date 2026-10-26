@@ -234,17 +234,18 @@ async function ask(chat, text) {
     (el) => el.type === "textarea" && el.props.className === "pill-input");
   input.props.onChange({ target: { value: text } });
   const form = findElement(chat.render().tree,
-    (el) => el.type === "form" && el.props.className === "composer chat-composer");
+    (el) => el.type === "form" && String(el.props.className).startsWith("composer chat-composer"));
   await form.props.onSubmit({ preventDefault() {} });
 }
 
 test("the window opens as a prompt for a visual, without the pipeline controls", () => {
   const { markup } = chatHarness({ conversationId: null, visualMode: true, onOpenCharts() {} }).render();
-  assert.match(markup, /🎨 What do you want to see\?/);
-  assert.match(markup, /Every answer is drawn\s+with D3/);
+  // Its home (VisualHome.jsx): the one question, and what the window draws.
+  assert.match(markup, /What would you like to visualize today\?/);
+  assert.match(markup, /Every answer is drawn with D3/);
   assert.match(markup, /🎨 D3 &amp; artifacts/);
   assert.match(markup, /⊞ your charts/);
-  assert.match(markup, /Describe the visualization/);
+  assert.match(markup, /Describe the visual you want to create/);
   assert.doesNotMatch(markup, /Run on Airflow|composer-pipeline-option/);
   // Auto is on by default: Studio picks the source; with it off, any source
   // can be picked by hand, all sources included.

@@ -1579,8 +1579,9 @@ input:focus, select:focus, .composer-pill:focus-within { box-shadow: 0 0 0 1px v
 }
 .chat-composer .model-mini {
   border: 1px solid var(--line); background: var(--surface-2); color: var(--ink-2);
-  border-radius: 999px; padding: 5px 10px; font-size: 12px; max-width: 220px;
+  border-radius: 999px; padding: 5px 10px; font-size: 12px; max-width: min(220px, 100%); min-width: 0;
 }
+.chat-composer .composer-tools { flex: 1 1 auto; }
 .chat-composer .send-btn {
   flex: none; width: 36px; height: 36px; border-radius: 50%; border: none; padding: 0;
   display: inline-flex; align-items: center; justify-content: center;
@@ -1593,3 +1594,107 @@ input:focus, select:focus, .composer-pill:focus-within { box-shadow: 0 0 0 1px v
 .composer-note { text-align: center; color: var(--ink-3); font-size: 11px; }
 /* A stopped answer: a quiet line, not an answer. */
 .assistant.copilot .answer-stopped { color: var(--ink-3); font-size: 13px; margin: 4px 0 6px; }
+
+/* ── The D3 & artifacts window: its own look ────────────────────────────
+   A violet accent and soft, rounded cards, scoped to this window (the rest
+   of Studio keeps its Fluent blue). Its home (VisualHome.jsx): a greeting,
+   one question, the composer in the middle, quick starts, three bigger
+   starts and recent visuals. The chart palette is the validated one in
+   renderers/common.js and is not touched here. */
+.visual-chat {
+  --v-accent: #7c3aed; --v-accent-2: #6d28d9; --v-soft: #f3efff;
+  --v-mint: #0f9f6e; --v-mint-soft: #e6f7f0; --v-peach: #ea6a12; --v-peach-soft: #fff0e5;
+  --v-ink: #0f172a; --v-line: #e7e5e4; --v-card: #ffffff;
+  background: linear-gradient(180deg, #faf8ff 0, var(--page) 360px);
+}
+.visual-chat .chat-composer .composer-box:focus-within {
+  border-color: var(--v-accent); box-shadow: 0 0 0 3px rgba(124, 58, 237, .14), var(--shadow-2);
+}
+.visual-chat .chat-composer .send-btn:not(:disabled):not(.stop-btn) { background: var(--v-accent); }
+.visual-chat .chat-composer .send-btn:not(:disabled):not(.stop-btn):hover { background: var(--v-accent-2); }
+.visual-chat .artifact-badge { color: var(--v-accent-2); background: var(--v-soft); }
+.visual-chat .msg-visual {
+  border-radius: 16px; border-color: var(--v-line); padding: 14px;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, .04), 0 8px 24px rgba(15, 23, 42, .05);
+}
+
+/* The home: header, the composer, then the starts — one centred column. */
+.chatpane.visual-home { overflow-y: auto; }
+.chatpane.visual-home .messages { flex: none; overflow: visible; padding: 9vh 20px 0; }
+.vh-head { max-width: 740px; margin: 0 auto; }
+.vh-hello { color: var(--ink-3); font-size: 15px; }
+.vh-title {
+  font-size: 30px; line-height: 1.2; font-weight: 700; color: var(--v-ink);
+  margin: 4px 0 6px; letter-spacing: -0.01em;
+}
+.vh-sub { color: var(--ink-2); font-size: 14px; }
+.chat-composer.is-home { padding-top: 18px; padding-bottom: 8px; }
+.chat-composer.is-home .composer-box {
+  border-radius: 20px; padding: 16px 14px 12px 20px; border-color: var(--v-line);
+  box-shadow: 0 12px 32px rgba(15, 23, 42, .08), 0 1px 2px rgba(15, 23, 42, .06);
+}
+.chat-composer.is-home textarea.pill-input { font-size: 16px; min-height: 52px; }
+.vh-below {
+  max-width: 780px; margin: 0 auto; width: 100%; padding: 4px 20px 48px;
+  display: flex; flex-direction: column; gap: 24px;
+}
+.vh-icon { flex: none; }
+.vh-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.vh-chip {
+  display: inline-flex; align-items: center; gap: 6px; padding: 6px 13px; border-radius: 999px;
+  border: 1px solid var(--v-line); background: var(--v-card); color: var(--ink-2);
+  font: inherit; font-size: 13px; cursor: pointer; transition: background .15s, border-color .15s, color .15s;
+}
+.vh-chip:hover, .vh-chip:focus-visible { border-color: var(--v-accent); color: var(--v-accent-2); background: var(--v-soft); }
+.vh-cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.vh-card {
+  display: flex; gap: 12px; align-items: flex-start; text-align: left; padding: 16px;
+  border-radius: 16px; border: 1px solid var(--v-line); background: var(--v-card); font: inherit;
+  cursor: pointer; box-shadow: 0 1px 2px rgba(15, 23, 42, .04);
+  transition: transform .15s, box-shadow .15s, border-color .15s;
+}
+.vh-card:hover, .vh-card:focus-visible {
+  transform: translateY(-1px); border-color: #d6d3d1; box-shadow: 0 10px 26px rgba(15, 23, 42, .08);
+}
+.vh-tile {
+  flex: none; width: 40px; height: 40px; border-radius: 12px;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.vh-tile-violet { background: var(--v-soft); color: var(--v-accent); }
+.vh-tile-mint { background: var(--v-mint-soft); color: var(--v-mint); }
+.vh-tile-peach { background: var(--v-peach-soft); color: var(--v-peach); }
+.vh-card-text { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.vh-card-text b { color: var(--v-ink); font-size: 14px; }
+.vh-card-text span { color: var(--ink-3); font-size: 12.5px; line-height: 1.4; }
+.vh-section-head {
+  display: flex; justify-content: space-between; align-items: baseline;
+  font-weight: 600; color: var(--v-ink); font-size: 14px; margin-bottom: 10px;
+}
+.vh-link { border: none; background: none; color: var(--v-accent-2); font: inherit; font-size: 12.5px; cursor: pointer; }
+.vh-link:hover { text-decoration: underline; }
+.vh-ideas { display: flex; flex-wrap: wrap; gap: 8px; }
+.vh-idea {
+  border: 1px dashed #d6d3d1; background: transparent; color: var(--ink-2); border-radius: 12px;
+  padding: 7px 12px; font: inherit; font-size: 13px; cursor: pointer; text-align: left;
+}
+.vh-idea:hover { border-style: solid; border-color: var(--v-accent); color: var(--v-accent-2); }
+.vh-recent { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.vh-recent-card {
+  display: flex; flex-direction: column; gap: 8px; text-align: left; padding: 12px; min-width: 0;
+  border-radius: 14px; border: 1px solid var(--v-line); background: var(--v-card); font: inherit; cursor: pointer;
+  transition: box-shadow .15s, border-color .15s;
+}
+.vh-recent-card:hover, .vh-recent-card:focus-visible { border-color: #d6d3d1; box-shadow: 0 8px 20px rgba(15, 23, 42, .07); }
+.vh-recent-title {
+  font-size: 12.5px; font-weight: 600; color: var(--v-ink); min-height: 2.8em;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.vh-thumb { width: 100%; height: 56px; background: #fafaf9; border-radius: 8px; }
+.vh-recent-at { font-size: 11px; color: var(--ink-3); }
+@media (max-width: 760px) {
+  .vh-cards { grid-template-columns: 1fr; }
+  .vh-recent { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .vh-title { font-size: 24px; }
+  .chatpane.visual-home .messages { padding-top: 5vh; }
+}
+@media (prefers-reduced-motion: reduce) { .vh-card { transition: none; } .vh-card:hover { transform: none; } }

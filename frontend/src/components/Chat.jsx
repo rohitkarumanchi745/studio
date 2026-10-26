@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { api } from "../api";
+import { api, getUser } from "../api";
 import Canvas from "./Canvas";
 import { SourceIcon, knownSource, metaFor } from "./sourceCatalog";
 import ChartView, { chartImage } from "./ChartView";
 import Markdown from "./Markdown";
 import { downloadReport, downloadTable } from "../exporting";
 import AutopilotDraft, { draftFromAnswer } from "./AutopilotDraft";
+import { VisualHomeHeader, VisualHomeStarts, fillStart } from "./VisualHome";
 import SharePanel from "./SharePanel";
 import SqlLab from "./SqlLab";
 import ChatWorkflow from "./ChatWorkflow";
@@ -411,7 +412,8 @@ export function isVisualConversation(c) {
 // tasks as the chat — but every answer is visualized, drawn with D3 alone (or
 // as a custom visual the AI writes), and shown right in the thread.
 export default function Chat({ conversationId, onConversationCreated, onOpenDashboard, modelsEpoch,
-                               visualMode = false, onOpenCharts, onConversationMissing }) {
+                               visualMode = false, onOpenCharts, onConversationMissing,
+                               recent = [], onOpenConversation }) {
   const [canvas, setCanvas] = useState(null);
   const [chatOpen, setChatOpen] = useState(true);
   const [models, setModels] = useState([]);
@@ -464,6 +466,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
   const [activityByTask, setActivityByTask] = useState({});
   const [activeStartedAt, setActiveStartedAt] = useState(null);
   const endRef = useRef(null);
+  const inputRef = useRef(null);       // the composer, for a start to fill and select
   // Background-task polling lives in refs, NOT state/effects: creating a new
   // conversation changes conversationId, and an effect keyed on it used to
   // reset the poll mid-flight — so a fast (cached) task finished but nothing
@@ -903,6 +906,22 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
     };
   }, [source, selKey, studioPicks]);
 
+  // The D3 & artifacts window opens a new conversation on its home (VisualHome):
+  // the composer centred, with starts that fill it.
+  const home = visualMode && !conversationId && messages.length === 0 && !busy;
+  function applyStart(key) {
+    const start = fillStart(key);
+    if (!start) return;
+    setPrompt(start.text);
+    // After React writes the text: focus it with the "…" selected, to type over.
+    setTimeout(() => {
+      const el = inputRef.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange?.(...start.select);
+    }, 0);
+  }
+
   return (
     <div className={"workspace" + (canvas ? " with-canvas" : "") + (canvas && !chatOpen ? " chat-hidden" : "")}>
       {canvas && (
@@ -923,7 +942,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
           💬
         </button>
       )}
-      <main className={"chatpane" + (visualMode ? " visual-chat" : "")}>
+      <main className={"chatpane" + (visualMode ? " visual-chat" : "") + (home ? " visual-home" : "")}>
       <div className="toolbar">
         <label className={"auto-switch" + (auto ? " on" : "")}
                title={auto ? "Studio picks the source and tables from each question. Turn off to choose them yourself."
@@ -1001,7 +1020,8 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
             <div className="chat-notice" role="status">{notice}</div>
           </div>
         )}
-        {messages.length === 0 && !busy && (
+        {home && <VisualHomeHeader user={getUser()} />}
+        {messages.length === 0 && !busy && !visualMode && (
           <div className="empty">
             <div className="empty-title">
               {visualMode ? <>🎨 What do you want to see?</>
@@ -1084,9 +1104,10 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
         <div ref={endRef} />
       </div>
 
-      <form className="composer chat-composer" onSubmit={send}>
+      <form className={"composer chat-composer" + (home ? " is-home" : "")} onSubmit={send}>
         <div className="composer-box">
           <textarea
+            ref={inputRef}
             className="pill-input"
             rows={1}
             aria-label="Message Studio"
@@ -1101,7 +1122,9 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
               }
             }}
             placeholder={
-              visualMode
+              home
+                ? "Describe the visual you want to create…"
+                : visualMode
                 ? "Describe the visualization — e.g. “revenue by region as circle packing”…"
                 : auto
                 ? "Ask about your data — Studio finds the source and tables…"
@@ -1164,6 +1187,11 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
             )}
           </div>
         </div>
+        {home && (
+          <VisualHomeStarts onStart={applyStart} recent={recent} onOpen={onOpenConversation}
+            onOpenCharts={onOpenCharts} ideas={suggestions.slice(0, 4).map((x) => x.question)}
+            onIdea={(q) => { setPrompt(q); inputRef.current?.focus(); }} />
+        )}
         {!visualMode && buildAirflow && (
           <PlanningContextPicker {...planningCatalog}
             repositoryId={repositoryId} confluencePageIds={confluencePageIds}
