@@ -74,7 +74,9 @@ export default function D3View({ columns, rows, spec, tall, motion = false, fill
 
   useEffect(() => {
     const el = ref.current;
-    if (!el || !size || size.w < 60 || size.h < 60) return undefined;
+    // A table lays itself out (its height is its rows): only charts need room.
+    const sized = spec?.type === "table" || (size && size.w >= 60 && size.h >= 60);
+    if (!el || !size || !sized) return undefined;
     let dead = false;
     let stop = null;
     // A map needs its base map (countries / US states) as well as d3.
@@ -105,7 +107,8 @@ export default function D3View({ columns, rows, spec, tall, motion = false, fill
   return (
     <>
       {err && <div className="chart-note">{err}</div>}
-      <div ref={ref} className={"echart d3-chart" + (fill ? " echart-fill" : tall ? " echart-tall" : "")}
+      <div ref={ref} className={"echart d3-chart" + (spec?.type === "table" ? " d3-chart-table"
+                                 : fill ? " echart-fill" : tall ? " echart-tall" : "")}
            style={err ? { display: "none" } : undefined} />
     </>
   );
@@ -1132,20 +1135,33 @@ function drawSankey(d3, el, columns, rows, spec, { w, h }) {
 }
 
 /** The rows as a table, built with D3 like every other view — cells as text. */
+/** Which columns hold numbers — by the column, not cell by cell, so a
+ *  number column is aligned whole, its header and its blanks included.
+ *  Exported for tests. */
+export function numericColumns(columns, rows) {
+  return columns.map((_, i) => {
+    const seen = rows.find((r) => r[i] !== null && r[i] !== undefined && r[i] !== "");
+    return typeof seen?.[i] === "number";
+  });
+}
+
 function drawTable(d3, el, columns, rows) {
   if (!columns?.length) return false;
-  const wrap = d3.select(el).append("div").attr("class", "table-wrap d3-table")
-    .style("height", "100%").style("overflow", "auto");
-  const table = wrap.append("table");
-  table.append("thead").append("tr").selectAll("th").data(columns).join("th").text((c) => c);
+  const numeric = numericColumns(columns, rows);
+  const cls = (i) => (numeric[i] ? "num" : null);
+  const wrap = d3.select(el).append("div").attr("class", "table-wrap d3-table");
+  const table = wrap.append("table").attr("class", "d3-data-table");
+  table.append("thead").append("tr").selectAll("th").data(columns).join("th")
+    .attr("class", (_, i) => cls(i)).attr("scope", "col").text((c) => c);
   const shown = rows.slice(0, LIMITS.tableRows);
   table.append("tbody").selectAll("tr").data(shown).join("tr")
-    .selectAll("td").data((r) => r).join("td")
-    .style("text-align", (v) => (typeof v === "number" ? "right" : null))
+    .selectAll("td").data((r) => columns.map((_, i) => r[i])).join("td")
+    .attr("class", (_, i) => cls(i))
     .text((v) => (v == null ? "" : typeof v === "number" ? fmtNum(v) : String(v)));
-  if (rows.length > shown.length) {
-    wrap.append("div").attr("class", "table-more").text(`… ${rows.length - shown.length} more rows`);
-  }
+  const count = (n) => `${n.toLocaleString()} row${n === 1 ? "" : "s"}`;
+  wrap.append("div").attr("class", "table-more")
+    .text(rows.length > shown.length ? `Showing ${count(shown.length)} of ${rows.length.toLocaleString()}`
+      : count(rows.length));
   return null;
 }
 

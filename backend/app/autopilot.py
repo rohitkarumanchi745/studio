@@ -183,7 +183,7 @@ def _run_headless(owner, source, tables, goal, model=None, visual=False):
     out = _answer_goal(owner, source, tables, goal, model, visual)
     if visual:
         # A D3 & artifacts agent: every chart drawn with D3, as in that window.
-        agent.d3_only(out)
+        agent.d3_only(out, goal)
     return out
 
 

@@ -16,7 +16,7 @@ const bundle = await build({
   stdin: {
     contents: `export {default as Chat, AssistantMessage, isVisualConversation}
                  from "./src/components/Chat.jsx";
-               export {default as ChartView} from "./src/components/ChartView.jsx";
+               export {default as ChartView, defaultSpec} from "./src/components/ChartView.jsx";
                export {D3_TYPES} from "./src/components/renderers/D3View.jsx";`,
     resolveDir: frontend, loader: "jsx",
   },
@@ -58,7 +58,7 @@ compiled.require = (id) => id === "react" ? {
   useMemo: (...a) => (hooks ? hooks.useMemo(...a) : React.useMemo(...a)),
 } : id === "echarts" ? { init() { return {}; } } : require(id);
 compiled._compile(bundle.outputFiles[0].text, compiled.filename);
-const { Chat, AssistantMessage, isVisualConversation, ChartView, D3_TYPES } =
+const { Chat, AssistantMessage, isVisualConversation, ChartView, defaultSpec, D3_TYPES } =
   compiled.exports;
 
 globalThis.localStorage = { getItem() { return null; }, setItem() {}, removeItem() {} };
@@ -108,12 +108,13 @@ test("every type opens as itself in D3", () => {
                /kpi-card/);
 });
 
-test("data no D3 chart fits gets a note, not a table", () => {
+test("data a D3 chart does not fit gets a note and the D3 table — never an empty box", () => {
   const text = { columns: ["region", "segment"], rows: [["West", "A"], ["East", "B"]] };
   const markup = html(ChartView, { ...text, chart: BAR, d3Only: true });
   assert.match(markup, /doesn’t fit this data/);
-  assert.match(markup, /Pick another D3 chart above, or ask for a custom visual/);
-  assert.doesNotMatch(markup, /<table|d3-chart/);
+  assert.match(markup, /Showing the table; pick another D3 chart above, or ask for a custom visual/);
+  assert.match(markup, /class="viz-frame"[\s\S]*d3-chart/);      // drawn by D3, in its frame
+  assert.doesNotMatch(markup, /<table/);                         // not the HTML table
 
   // Outside the window the table still stands in.
   assert.match(html(ChartView, { ...text, chart: BAR }), /<table/);
@@ -356,4 +357,95 @@ test("reopening a window conversation keeps its charts in the thread, not the ca
       }
     });
   }
+});
+
+// ── An answer that came without a chart ─────────────────────────────────
+// The agent answered "how many sales?" with one number and proposed no chart.
+// The D3 window used to show an empty box, whatever type was picked.
+
+/** ChartView with its hooks held here, so a test can pick a type. */
+function held(props) {
+  const values = [];
+  let cursor = 0;
+  const own = {
+    useState(initial) {
+      const i = cursor++;
+      if (!(i in values)) values[i] = typeof initial === "function" ? initial() : initial;
+      return [values[i], (next) => { values[i] = typeof next === "function" ? next(values[i]) : next; }];
+    },
+    useRef(initial) {
+      const i = cursor++;
+      if (!(i in values)) values[i] = { current: initial };
+      return values[i];
+    },
+    useMemo(factory) { cursor++; return factory(); },
+    useEffect() {},
+  };
+  const tree = () => {
+    cursor = 0;
+    hooks = own;
+    try { return ChartView(props); } finally { hooks = null; }
+  };
+  const find = (node, pred) => {
+    if (Array.isArray(node)) { for (const c of node) { const f = find(c, pred); if (f) return f; } return null; }
+    if (!React.isValidElement(node)) return null;
+    return pred(node) ? node : find(node.props.children, pred);
+  };
+  return {
+    pick(type) {
+      const select = find(tree(), (n) => n.type === "select" && n.props.className === "type-select");
+      select.props.onChange({ target: { value: type } });
+    },
+    drawn() {
+      const view = find(tree(), (n) => n.type?.name === "D3View");
+      return view && view.props.spec;
+    },
+  };
+}
+
+test("an answer with no chart is still drawn: one number as a KPI, more as a table", () => {
+  assert.deepEqual(defaultSpec(["count"], [[10]]), { type: "kpi", x: "count", y: ["count"] });
+  assert.deepEqual(defaultSpec(["region", "revenue", "orders"], [["West", 1, 2], ["East", 3, 4]]),
+                   { type: "table", x: "region", y: ["revenue", "orders"] });
+  assert.deepEqual(defaultSpec(["name"], [["a"], ["b"]]), { type: "table", x: "name", y: [] });
+  // The label is the text column wherever it sits.
+  assert.deepEqual(defaultSpec(["revenue", "region"], [[1, "West"], [2, "East"]]),
+                   { type: "table", x: "region", y: ["revenue"] });
+
+  const count = html(ChartView, { columns: ["count"], rows: [[10]], chart: null, d3Only: true });
+  assert.match(count, /<option value="kpi" selected=""/);
+  assert.match(count, /class="viz-frame"[\s\S]*d3-chart/);
+  assert.doesNotMatch(count, /doesn’t fit/);
+  // Several rows: the D3 table, and the chart types that fit are offered as fitting.
+  const many = html(ChartView, { columns: COLUMNS, rows: ROWS, chart: null, d3Only: true });
+  assert.match(many, /<option value="table" selected=""/);
+  assert.match(many, /d3-chart/);
+  assert.match(many, /<option value="bar"[^>]*>Bar<\/option>/);         // no ⚠
+  // Outside the D3 window the one number is a KPI card too.
+  assert.match(html(ChartView, { columns: ["count"], rows: [[10]], chart: null }), /kpi-card/);
+});
+
+test("a table's frame is as tall as its rows; a chart's is the size chosen", () => {
+  const table = html(ChartView, { columns: ["count"], rows: [[10]], chart: { type: "table", x: "count", y: [] },
+                                  d3Only: true });
+  assert.match(table, /class="viz-body viz-fit" style="max-height:\d+px"/);
+  assert.match(table, /class="echart d3-chart d3-chart-table"/);
+  const bar = html(ChartView, { columns: COLUMNS, rows: ROWS, chart: BAR, d3Only: true });
+  assert.match(bar, /class="viz-body" style="height:\d+px"/);
+  assert.doesNotMatch(bar, /viz-fit|d3-chart-table/);
+  // A type the data does not fit shows the table, fitted the same way.
+  const unfit = html(ChartView, { columns: ["region", "segment"], rows: [["West", "A"]], chart: BAR, d3Only: true });
+  assert.match(unfit, /viz-fit/);
+});
+
+test("picking another type for a chart-less answer draws that type", () => {
+  const view = held({ columns: COLUMNS, rows: ROWS, chart: null, d3Only: true });
+  assert.equal(view.drawn().type, "table");
+  view.pick("bar");
+  assert.deepEqual(view.drawn(), { type: "bar", x: "region", y: ["revenue"] });
+  view.pick("pie");
+  assert.equal(view.drawn().type, "pie");
+  // A type the data does not fit draws the table, not nothing.
+  view.pick("sankey");
+  assert.equal(view.drawn().type, "table");
 });

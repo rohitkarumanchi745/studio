@@ -276,6 +276,15 @@ def test_a_visual_turn_goes_straight_to_the_agent_and_is_stored_d3_only(turns):
     assert len(turns) == 2 and turns[1]["visual_mode"] is True and turns[1]["history"]
 
 
+def test_asking_the_window_for_a_table_stores_a_table(turns):
+    # The agent drew a treemap anyway; the question asked for a table.
+    out = chat.ask(chat.Ask(prompt="revenue share by region as a table", source="demo",
+                            table="sales", visual=True), user=ANA)
+    stored = _stored(out["conversation_id"])
+    assert stored["chart"]["type"] == "table"
+    assert [(p["chart"]["type"], p["engine"]) for p in stored["panels"]] == [("table", "d3")]
+
+
 def test_an_ordinary_turn_is_untouched(monkeypatch, turns):
     monkeypatch.setattr(semantic, "answer", lambda *a, **k: None)
     monkeypatch.setattr(qcache, "lookup", lambda *a, **k: None)
