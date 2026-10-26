@@ -31,6 +31,7 @@ def seed():
     if os.path.exists(WAREHOUSE_PATH):
         seed_manufacturing()
         seed_marketing()
+        seed_logistics()
         return
     rng = random.Random(42)
     c = sqlite3.connect(WAREHOUSE_PATH)
@@ -101,6 +102,7 @@ def seed():
     c.close()
     seed_manufacturing()
     seed_marketing()
+    seed_logistics()
 
 
 PLANTS = ["Pune", "Chennai", "Frankfurt"]
@@ -326,6 +328,100 @@ def seed_marketing():
             c.execute("INSERT INTO qualtrics_nps VALUES (?,?,?,?,?,?)",
                       (day, survey, round(rng.uniform(18, 62), 1), round(rng.uniform(2.1, 4.6), 2),
                        rng.randint(40, 400), rng.choice(DIFFICULTY)))
+    c.commit()
+    c.close()
+
+
+# Places with real coordinates, so the maps have something to draw: Chicago
+# 'L' stations by line (route maps of rides), countries that trade (route maps
+# and shaded countries), and US stores (dots, and shaded states).
+L_LINES = {
+    "Blue": [("O'Hare", 41.9773, -87.9045), ("Clark/Lake", 41.8857, -87.6309),
+             ("Forest Park", 41.8740, -87.8171)],
+    "Red": [("Howard", 42.0190, -87.6728), ("Clark/Lake", 41.8857, -87.6309),
+            ("95th/Dan Ryan", 41.7222, -87.6244)],
+    "Orange": [("Midway", 41.7868, -87.7375), ("Clark/Lake", 41.8857, -87.6309)],
+    "Brown": [("Kimball", 41.9678, -87.7132), ("Clark/Lake", 41.8857, -87.6309)],
+    "Green": [("Harlem/Lake", 41.8869, -87.8034), ("Clark/Lake", 41.8857, -87.6309),
+              ("Ashland/63rd", 41.7781, -87.6638)],
+    "Pink": [("54th/Cermak", 41.8517, -87.7567), ("Clark/Lake", 41.8857, -87.6309)],
+    "Purple": [("Linden", 42.0732, -87.6909), ("Howard", 42.0190, -87.6728)],
+}
+TRADE_LANES = [
+    ("China", "United States", "Ocean"), ("United States", "Canada", "Road"),
+    ("Mexico", "United States", "Road"), ("Germany", "United States", "Air"),
+    ("United States", "United Kingdom", "Air"), ("Japan", "United States", "Ocean"),
+    ("South Korea", "Germany", "Ocean"), ("India", "United Kingdom", "Air"),
+    ("Netherlands", "Germany", "Road"), ("France", "Spain", "Road"),
+    ("Brazil", "United States", "Ocean"), ("Australia", "Japan", "Ocean"),
+    ("China", "Australia", "Ocean"), ("Canada", "United Kingdom", "Air"),
+    ("United States", "Brazil", "Ocean"), ("Germany", "France", "Road"),
+]
+STORES = [
+    ("New York", "NY", 40.7128, -74.0060), ("Los Angeles", "CA", 34.0522, -118.2437),
+    ("Chicago", "IL", 41.8781, -87.6298), ("Houston", "TX", 29.7604, -95.3698),
+    ("Phoenix", "AZ", 33.4484, -112.0740), ("Philadelphia", "PA", 39.9526, -75.1652),
+    ("San Diego", "CA", 32.7157, -117.1611), ("Dallas", "TX", 32.7767, -96.7970),
+    ("Austin", "TX", 30.2672, -97.7431), ("Seattle", "WA", 47.6062, -122.3321),
+    ("Denver", "CO", 39.7392, -104.9903), ("Boston", "MA", 42.3601, -71.0589),
+    ("Miami", "FL", 25.7617, -80.1918), ("Atlanta", "GA", 33.7490, -84.3880),
+    ("Minneapolis", "MN", 44.9778, -93.2650), ("Portland", "OR", 45.5152, -122.6784),
+    ("Las Vegas", "NV", 36.1699, -115.1398), ("Detroit", "MI", 42.3314, -83.0458),
+    ("Nashville", "TN", 36.1627, -86.7816), ("Charlotte", "NC", 35.2271, -80.8431),
+    ("Columbus", "OH", 39.9612, -82.9988), ("Salt Lake City", "UT", 40.7608, -111.8910),
+    ("Kansas City", "MO", 39.0997, -94.5786), ("Raleigh", "NC", 35.7796, -78.6382),
+    ("Honolulu", "HI", 21.3069, -157.8583), ("Anchorage", "AK", 61.2181, -149.9003),
+]
+
+
+def seed_logistics():
+    """Tables with places in them, for the maps: transit_trips (rides between
+    Chicago 'L' stations, with each end's latitude/longitude), shipments
+    (goods between countries) and stores (US stores with coordinates and
+    state). Idempotent — skipped when already present."""
+    c = sqlite3.connect(WAREHOUSE_PATH)
+    if c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='transit_trips'").fetchone():
+        c.close()
+        return
+    rng = random.Random(23)
+    c.executescript(
+        """
+        CREATE TABLE transit_trips (
+            trip_date TEXT, line TEXT, from_stop TEXT, to_stop TEXT,
+            from_lat REAL, from_lon REAL, to_lat REAL, to_lon REAL, riders INTEGER
+        );
+        CREATE TABLE shipments (
+            ship_date TEXT, origin_country TEXT, destination_country TEXT, mode TEXT,
+            units INTEGER, revenue REAL
+        );
+        CREATE TABLE stores (
+            store_id INTEGER, store TEXT, city TEXT, state TEXT, latitude REAL, longitude REAL,
+            revenue REAL, orders INTEGER
+        );
+        """
+    )
+    start = dt.date.today() - dt.timedelta(days=89)
+    trips, ships = [], []
+    for d in range(90):
+        day = start + dt.timedelta(days=d)
+        weekend = day.weekday() >= 5
+        for line, stops in L_LINES.items():
+            for a, b in zip(stops, stops[1:]):
+                for (fa, la, lo), (fb, lb, ob) in ((a, b), (b, a)):
+                    base = 2400 if "Clark/Lake" in (fa, fb) else 1100
+                    riders = int(base * (0.55 if weekend else 1.0) * rng.uniform(0.8, 1.2))
+                    trips.append((day.isoformat(), line, fa, fb, la, lo, lb, ob, riders))
+        for origin, dest, mode in TRADE_LANES:
+            if rng.random() < 0.6:
+                units = rng.randint(200, 5000) * (3 if mode == "Ocean" else 1)
+                ships.append((day.isoformat(), origin, dest, mode, units,
+                              round(units * rng.uniform(18, 60), 2)))
+    c.executemany("INSERT INTO transit_trips VALUES (?,?,?,?,?,?,?,?,?)", trips)
+    c.executemany("INSERT INTO shipments VALUES (?,?,?,?,?,?)", ships)
+    c.executemany("INSERT INTO stores VALUES (?,?,?,?,?,?,?,?)", [
+        (i + 1, f"Studio {city}", city, state, lat, lon,
+         round(rng.uniform(0.4, 4.5) * 1e6, 2), rng.randint(2000, 30000))
+        for i, (city, state, lat, lon) in enumerate(STORES)])
     c.commit()
     c.close()
 

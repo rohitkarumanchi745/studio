@@ -1628,28 +1628,41 @@ input:focus, select:focus, .composer-pill:focus-within { box-shadow: 0 0 0 1px v
   margin: 4px 0 6px; letter-spacing: -0.01em;
 }
 .vh-sub { color: var(--ink-2); font-size: 14px; }
-.chat-composer.is-home { padding-top: 18px; padding-bottom: 8px; }
+/* The home's prompt: one slim bar — mark, message, a quiet model pill and a
+   violet arrow — as a search field reads, not a form. */
+.chat-composer.is-home { padding-top: 18px; padding-bottom: 6px; }
 .chat-composer.is-home .composer-box {
-  border-radius: 20px; padding: 16px 14px 12px 20px; border-color: var(--v-line);
-  box-shadow: 0 12px 32px rgba(15, 23, 42, .08), 0 1px 2px rgba(15, 23, 42, .06);
+  flex-direction: row; align-items: center; gap: 10px; min-height: 58px;
+  border-radius: 16px; padding: 8px 8px 8px 16px; border-color: var(--v-line);
+  box-shadow: 0 10px 28px rgba(15, 23, 42, .07), 0 1px 2px rgba(15, 23, 42, .05);
 }
-.chat-composer.is-home textarea.pill-input { font-size: 16px; min-height: 52px; }
+.chat-composer.is-home textarea.pill-input { flex: 1; font-size: 15px; min-height: 24px; padding: 8px 0; }
+.chat-composer.is-home .composer-row { flex: none; gap: 6px; }
+.chat-composer.is-home .composer-tools { flex: none; }
+.chat-composer.is-home .model-mini {
+  max-width: 150px; background: transparent; border-color: transparent; color: var(--ink-3);
+}
+.chat-composer.is-home .model-mini:hover, .chat-composer.is-home .model-mini:focus { border-color: var(--v-line); }
+.chat-composer.is-home .send-btn { width: 40px; height: 40px; border-radius: 12px; font-size: 17px; }
+.chat-composer.is-home .send-btn:disabled { background: var(--v-soft); color: var(--v-accent); }
+.vh-prompt-mark { display: inline-flex; flex: none; color: var(--v-accent); }
 .vh-below {
   max-width: 780px; margin: 0 auto; width: 100%; padding: 4px 20px 48px;
-  display: flex; flex-direction: column; gap: 24px;
+  display: flex; flex-direction: column; gap: 22px;
 }
 .vh-icon { flex: none; }
 .vh-chips { display: flex; flex-wrap: wrap; gap: 8px; }
 .vh-chip {
-  display: inline-flex; align-items: center; gap: 6px; padding: 6px 13px; border-radius: 999px;
-  border: 1px solid var(--v-line); background: var(--v-card); color: var(--ink-2);
-  font: inherit; font-size: 13px; cursor: pointer; transition: background .15s, border-color .15s, color .15s;
+  display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px; border-radius: 999px;
+  border: 1px solid transparent; background: #efeeec; color: var(--ink-2);
+  font: inherit; font-size: 12.5px; cursor: pointer; transition: background .15s, border-color .15s, color .15s;
 }
+.vh-chip .vh-icon { width: 14px; height: 14px; }
 .vh-chip:hover, .vh-chip:focus-visible { border-color: var(--v-accent); color: var(--v-accent-2); background: var(--v-soft); }
 .vh-cards { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
 .vh-card {
-  display: flex; gap: 12px; align-items: flex-start; text-align: left; padding: 16px;
-  border-radius: 16px; border: 1px solid var(--v-line); background: var(--v-card); font: inherit;
+  display: flex; gap: 12px; align-items: center; text-align: left; padding: 14px 16px;
+  border-radius: 14px; border: 1px solid var(--v-line); background: var(--v-card); font: inherit;
   cursor: pointer; box-shadow: 0 1px 2px rgba(15, 23, 42, .04);
   transition: transform .15s, box-shadow .15s, border-color .15s;
 }
@@ -1657,7 +1670,7 @@ input:focus, select:focus, .composer-pill:focus-within { box-shadow: 0 0 0 1px v
   transform: translateY(-1px); border-color: #d6d3d1; box-shadow: 0 10px 26px rgba(15, 23, 42, .08);
 }
 .vh-tile {
-  flex: none; width: 40px; height: 40px; border-radius: 12px;
+  flex: none; width: 38px; height: 38px; border-radius: 10px;
   display: inline-flex; align-items: center; justify-content: center;
 }
 .vh-tile-violet { background: var(--v-soft); color: var(--v-accent); }
@@ -1680,17 +1693,23 @@ input:focus, select:focus, .composer-pill:focus-within { box-shadow: 0 0 0 1px v
 .vh-idea:hover { border-style: solid; border-color: var(--v-accent); color: var(--v-accent-2); }
 .vh-recent { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
 .vh-recent-card {
-  display: flex; flex-direction: column; gap: 8px; text-align: left; padding: 12px; min-width: 0;
+  display: flex; flex-direction: column; gap: 10px; text-align: left; padding: 12px; min-width: 0;
   border-radius: 14px; border: 1px solid var(--v-line); background: var(--v-card); font: inherit; cursor: pointer;
   transition: box-shadow .15s, border-color .15s;
 }
 .vh-recent-card:hover, .vh-recent-card:focus-visible { border-color: #d6d3d1; box-shadow: 0 8px 20px rgba(15, 23, 42, .07); }
 .vh-recent-title {
-  font-size: 12.5px; font-weight: 600; color: var(--v-ink); min-height: 2.8em;
-  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  font-size: 12.5px; font-weight: 600; color: var(--v-ink);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.vh-thumb { width: 100%; height: 56px; background: #fafaf9; border-radius: 8px; }
+.vh-thumb { width: 100%; height: 76px; background: linear-gradient(180deg, #fbfaff, #f4f4f2); border-radius: 10px; }
 .vh-recent-at { font-size: 11px; color: var(--ink-3); }
+@media (max-width: 560px) {
+  /* The prompt bar stacks: the message on top, the model and arrow under it. */
+  .chat-composer.is-home .composer-box { flex-wrap: wrap; }
+  .chat-composer.is-home textarea.pill-input { flex: 1 1 calc(100% - 40px); }
+  .chat-composer.is-home .composer-row { width: 100%; justify-content: space-between; }
+}
 @media (max-width: 760px) {
   .vh-cards { grid-template-columns: 1fr; }
   .vh-recent { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -1698,3 +1717,34 @@ input:focus, select:focus, .composer-pill:focus-within { box-shadow: 0 0 0 1px v
   .chatpane.visual-home .messages { padding-top: 5vh; }
 }
 @media (prefers-reduced-motion: reduce) { .vh-card { transition: none; } .vh-card:hover { transform: none; } }
+
+/* A real chart, small (MiniChart): drawn at its stage size and scaled down. */
+.mini-chart { position: relative; width: 100%; overflow: hidden; border-radius: 10px;
+  background: linear-gradient(180deg, #fbfaff, #f4f4f2); pointer-events: none; }
+.mini-chart-stage { transform-origin: top left; }
+.mini-chart .d3-tip, .mini-chart .chart-note { display: none; }
+
+/* All the ways to see this (ChartView, D3 window): every chart the data fits. */
+.view-gallery { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
+.view-gallery-head {
+  display: flex; align-items: baseline; gap: 10px; width: 100%; border: none; background: none;
+  padding: 0 0 8px; font: inherit; font-size: 13px; font-weight: 600; color: var(--ink); cursor: pointer;
+  text-align: left;
+}
+.view-gallery-head .meta { font-weight: 400; }
+.view-gallery-strip {
+  display: grid; grid-auto-flow: column; grid-auto-columns: 168px; gap: 10px;
+  overflow-x: auto; padding-bottom: 6px; scroll-snap-type: x proximity;
+}
+.view-card {
+  display: flex; flex-direction: column; gap: 6px; padding: 8px; text-align: left; font: inherit;
+  border: 1px solid var(--line); border-radius: 12px; background: var(--surface); cursor: pointer;
+  scroll-snap-align: start; transition: border-color .15s, box-shadow .15s;
+}
+.view-card:hover, .view-card:focus-visible { border-color: var(--v-accent, var(--accent)); box-shadow: 0 6px 16px rgba(15, 23, 42, .08); }
+.view-card-label { font-size: 12px; font-weight: 600; color: var(--ink-2); }
+.view-gallery-top { display: flex; align-items: center; gap: 10px; }
+.view-gallery-top .view-gallery-head { flex: 1; }
+.view-gallery-back { flex: none; }
+.view-card.is-on { border-color: var(--v-accent, var(--accent)); box-shadow: 0 0 0 2px rgba(124, 58, 237, .15); }
+.view-card-title { font-size: 11px; color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

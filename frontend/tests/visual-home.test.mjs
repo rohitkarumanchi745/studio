@@ -105,7 +105,8 @@ test("the greeting follows the clock and the user's first name", () => {
 });
 
 test("a start fills the composer with the part to type selected", () => {
-  assert.deepEqual(fillStart("map"), { text: "Map … on a route map", select: [4, 5] });
+  assert.deepEqual(fillStart("map"), { text: "Show … on a map", select: [5, 6] });
+  assert.equal(fillStart("automate").text, "Every week, chart …");
   assert.deepEqual(fillStart("table"), { text: "Show … as a table", select: [5, 6] });
   assert.equal(fillStart("nope"), null);
   // Every start has a "…" to type over, and every big start is a quick start too.
@@ -123,6 +124,12 @@ test("recent visuals: newest first, four, without their 🎨, each with a fittin
   assert.equal(glyphFor("sales dashboard"), "grid");
   assert.equal(glyphFor("revenue by region"), "bars");
   assert.equal(recentVisuals([{ id: "x", title: "🎨 " }])[0].title, "Untitled visual");
+  // The same question asked twice is one card (the newest), and the list
+  // still fills to four from what is left.
+  const twice = recentVisuals([{ id: "a", title: "🎨 How has impressions trended by month?" },
+                               { id: "b", title: "🎨 how has impressions trended by month? " },
+                               ...CONVS]);
+  assert.deepEqual(twice.map((c) => c.id), ["a", "c1", "c2", "c3"]);
   assert.deepEqual([ago(100, 130), ago(0, 600), ago(0, 7300), ago(0, 200000)],
                    ["just now", "10 min ago", "2 h ago", "2 d ago"]);
 });
@@ -135,21 +142,39 @@ test("the starts: quick chips, three cards, ideas and recent — each doing what
   const markup = html(VisualHomeStarts, props);
   assert.equal((markup.match(/class="vh-chip"/g) || []).length, 6);
   assert.equal((markup.match(/class="vh-card"/g) || []).length, 3);
-  assert.match(markup, /aria-label="From your data"/);
+  assert.match(markup, /aria-label="Try one from your data"/);
+  // Recent comes before the ideas, as the reference lays it out.
+  assert.ok(markup.indexOf('aria-label="Recent"') < markup.indexOf("Try one from your data"));
   assert.equal((markup.match(/class="vh-recent-card"/g) || []).length, 4);
   assert.match(markup, /2 min ago/);
   const tree = VisualHomeStarts(props);
   const button = (label) => find(tree, (n) => n.type === "button" && text(n.props.children).includes(label));
   button("Map").props.onClick();
-  button("Write a custom visual").props.onClick();
+  find(tree, (n) => n.props?.className === "vh-card" && text(n.props.children).includes("Custom visual"))
+    .props.onClick();
   button("Top 10 platform").props.onClick();
   button("sales by country map").props.onClick();
-  button("Your charts").props.onClick();
+  button("See all charts").props.onClick();
   assert.deepEqual(calls, [["start", "map"], ["start", "custom"], ["idea", "Top 10 platform by impressions"],
                            ["open", "c2"], ["charts"]]);
+  // A card draws its conversation's real latest chart when there is one;
+  // the sketch only when there is nothing to draw.
+  const withPreview = VisualHomeStarts({ ...props, previews: {
+    c1: { columns: ["region", "revenue"], rows: [["West", 1]], chart: { type: "donut", x: "region", y: ["revenue"] } } } });
+  const cards = [];
+  (function walk(n) {
+    if (Array.isArray(n)) return n.forEach(walk);
+    if (!React.isValidElement(n)) return;
+    if (n.props.className === "vh-recent-card") cards.push(n);
+    walk(n.props.children);
+  })(withPreview);
+  const mini = (card) => find(card, (n) => n.type?.name === "MiniChart");
+  assert.equal(mini(cards[0]).props.chart.type, "donut");
+  assert.deepEqual(mini(cards[0]).props.rows, [["West", 1]]);
+  assert.equal(mini(cards[1]), null);                              // c2: no preview — a sketch
   // Nothing to list: no empty sections.
   const bare = html(VisualHomeStarts, { onStart() {} });
-  assert.doesNotMatch(bare, /From your data|Recent/);
+  assert.doesNotMatch(bare, /from your data|Recent/);
 });
 
 // ── In the chat window ──────────────────────────────────────────────────
@@ -187,18 +212,70 @@ test("a new conversation in the window opens on the home; a chosen start fills t
   assert.match(markup, /Good (morning|afternoon|evening), Rohit/);
   assert.match(markup, /class="composer chat-composer is-home"/);
   assert.match(markup, /placeholder="Describe the visual you want to create…"/);
+  assert.match(markup, /class="composer-box"><span class="vh-prompt-mark">/);   // the slim bar's mark
   assert.doesNotMatch(markup, /class="empty"/);                // not the old empty state
   const starts = find(tree, (n) => n.type === VisualHomeStarts);
   assert.equal(starts.props.recent, CONVS);
   starts.props.onStart("map");
   const input = find(render(), (n) => n.type === "textarea");
-  assert.equal(input.props.value, "Map … on a route map");
+  assert.equal(input.props.value, "Show … on a map");
 });
 
 test("no home in an existing conversation, or in the ordinary chat", () => {
   const open = renderToStaticMarkup(chatHarness({ visualMode: true, conversationId: "c1", recent: CONVS })());
-  assert.doesNotMatch(open, /vh-title|visual-home|is-home/);
+  assert.doesNotMatch(open, /vh-title|visual-home|is-home|vh-prompt-mark/);
   const ordinary = renderToStaticMarkup(chatHarness({ conversationId: null })());
   assert.doesNotMatch(ordinary, /vh-title|visual-home|is-home/);
   assert.match(ordinary, /class="empty"/);                       // its own empty state stays
+});
+
+test("with Auto on, ideas come from the user's own data, and say from where", async () => {
+  const sources = [
+    { name: "demo", configured: true, allowed: true },
+    // Not usable: disconnected, or not this role's — passed over.
+    { name: "parked", ctype: "snowflake", configured: false, allowed: true },
+    { name: "theirs", ctype: "bigquery", configured: true, allowed: false },
+    { name: "postgres", configured: true, allowed: true },
+    { name: "lake", ctype: "databricks", configured: true, allowed: true },
+  ];
+  const asked = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    asked.push(url);
+    const body = url === "/api/catalog/sources" ? sources
+      : url.includes("/suggestions") ? { suggestions: [{ question: "Revenue by month?", table: "sales" }] } : [];
+    return { ok: true, status: 200, json: async () => body };
+  };
+  try {
+    const values = [];
+    const effects = [];
+    let cursor = 0;
+    const own = {
+      useState(initial) {
+        const i = cursor++;
+        if (!(i in values)) values[i] = typeof initial === "function" ? initial() : initial;
+        return [values[i], (next) => { values[i] = typeof next === "function" ? next(values[i]) : next; }];
+      },
+      useRef(initial) { const i = cursor++; if (!(i in values)) values[i] = { current: initial }; return values[i]; },
+      useMemo(factory) { return factory(); },
+      useEffect(effect) { effects.push(effect); },
+    };
+    const render = () => { cursor = 0; effects.length = 0; hooks = own;
+                           try { return Chat({ visualMode: true, conversationId: null }); } finally { hooks = null; } };
+    const settle = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
+    render(); effects.forEach((e) => e()); await settle();        // sources load
+    render(); effects.forEach((e) => e()); await settle();        // ideas load from the real source
+    const urls = asked.filter((u) => u.includes("/suggestions"));
+    assert.ok(urls.at(-1).startsWith("/api/catalog/sources/lake/suggestions"), urls.join(" | "));
+    const starts = find(render(), (n) => n.type === VisualHomeStarts);
+    assert.equal(starts.props.ideasFrom, "lake");
+    assert.deepEqual(starts.props.ideas, ["Revenue by month?"]);
+    assert.match(renderToStaticMarkup(React.createElement(VisualHomeStarts, starts.props)),
+                 /<span>Try one from lake<\/span>/);
+    // Nothing of their own yet: the demo data, and it says so.
+    assert.match(renderToStaticMarkup(React.createElement(VisualHomeStarts,
+      { ...starts.props, ideasFrom: "demo" })), /Try one from the demo data/);
+  } finally {
+    globalThis.fetch = original;
+  }
 });

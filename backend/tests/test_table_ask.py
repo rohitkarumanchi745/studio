@@ -74,3 +74,50 @@ def test_the_agent_is_told_a_table_is_the_visual():
     source = open(agent.__file__).read()
     assert "When the user asks for a table" in source
     assert "the table is the visual" in source
+
+
+# ── Any chart named in the question ─────────────────────────────────────
+
+STORES = (["store", "latitude", "longitude", "revenue"], [["NYC", 40.7, -74.0, 5], ["LA", 34.0, -118.2, 7]])
+
+
+@pytest.mark.parametrize("prompt, kind", [
+    ("Show revenue by region as a bar chart", "bar"),
+    ("revenue share as a pie chart", "pie"),
+    ("show it as a stacked bar chart", "stacked_bar"),
+    ("an area chart of revenue", "area"),
+    ("use a sankey", "sankey"),
+    ("revenue heat map", "heatmap"),
+    ("Show stores on a map", "point_map"),           # the map the data's places call for
+    ("show it as a table", "table"),
+])
+def test_a_named_chart(prompt, kind):
+    assert agent.asked_chart(prompt, *STORES) == kind
+
+
+@pytest.mark.parametrize("prompt", [
+    "line items by order", "show the sales funnel", "sales in the area", "barcode scans by store",
+    "revenue in area 51",
+    "Write a custom interactive D3 visual of revenue by region",
+    "Build a dashboard of revenue with a view by day, by month and by year",
+    "Every week, chart revenue by region",
+])
+def test_no_chart_named(prompt):
+    assert agent.asked_chart(prompt, *STORES) is None
+
+
+def test_a_map_is_asked_for_only_where_the_data_has_places():
+    assert agent.asked_chart("Show sales on a map", ["region", "revenue"], [["West", 1]]) is None
+
+
+def test_the_window_draws_the_chart_named_and_keeps_a_custom_visual():
+    out = agent.d3_only(_answer(), "Show revenue by region as a pie chart")
+    assert out["chart"]["type"] == "pie"
+    assert [p["chart"]["type"] for p in out["panels"]] == ["pie", "pie"]
+    assert out["panels"][1]["visual"]["title"] == "Rings"    # the visual written stays
+    # On a map: each panel from its own data.
+    stores = {"chart": {"type": "bar", "x": "store", "y": ["revenue"]}, "columns": STORES[0],
+              "rows": STORES[1], "panels": [{"columns": STORES[0], "rows": STORES[1],
+                                             "chart": {"type": "bar", "x": "store", "y": ["revenue"]}}]}
+    out = agent.d3_only(stores, "Show stores on a map")
+    assert out["chart"]["type"] == "point_map" and out["panels"][0]["chart"]["type"] == "point_map"

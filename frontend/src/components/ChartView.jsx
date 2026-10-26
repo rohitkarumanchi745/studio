@@ -24,6 +24,8 @@ import D3View, {
   packData,
 } from "./renderers/D3View";
 import { choroplethData, pointMapData, routeMapData } from "./renderers/geo";
+import MiniChart from "./MiniChart";
+import { recommendViews } from "./recommend";
 
 const ENGINES = [
   ["echarts", "ECharts"],
@@ -207,7 +209,7 @@ export function chartImage(columns, rows, chart, { width = 900, height = 420 } =
 }
 
 export default function ChartView({
-  columns, rows, chart, tall, plain,
+  columns: answerColumns, rows: answerRows, chart: answerChart, tall, plain,
   // A custom visual the agent wrote as code (backend app/visuals.py): shown
   // in its sandbox by default, with the ordinary chart one click away. Its
   // code was written for the panel's ORIGINAL columns, so visual.columns /
@@ -223,6 +225,18 @@ export default function ChartView({
   // report clicks upward, and surface format warnings. All optional.
   tileId, highlight, onSelect, onWarnings,
 }) {
+  // The D3 window: a view picked from "All the ways to see this" — its own
+  // (summarized) data and spec — is drawn in place of the answer's chart
+  // until the reader goes back; new answer data starts from the answer again.
+  const [picked, setPicked] = useState(null);
+  useEffect(() => setPicked(null), [answerColumns, answerRows, answerChart]);
+  const columns = picked ? picked.columns : answerColumns;
+  const rows = picked ? picked.rows : answerRows;
+  const chart = picked ? picked.spec : answerChart;
+  // Every view the answer's data can make, read from the data (recommend.js).
+  const ways = useMemo(() => (d3Only ? recommendViews(answerColumns, answerRows) : []),
+                       [d3Only, answerColumns, answerRows]);
+
   // No chart with the result: one is made from the data, so the type picker
   // always has something to switch (and the D3 window something to draw).
   const fallback = useMemo(() => (chart || !columns?.length ? null : defaultSpec(columns, rows)),
@@ -425,7 +439,57 @@ export default function ChartView({
         <DataTable columns={columns} rows={rows} />
       )}
       </div>
+      {d3Only && ways.length > 0 && (
+        <ViewGallery ways={ways} picked={picked}
+                     onPick={(v) => { setPicked(v); setType(pickType(v.type)); }}
+                     onBack={() => { setPicked(null); setType(pickType(answerChart?.type || defaultSpec(answerColumns, answerRows).type)); }} />
+      )}
     </div>
+  );
+}
+
+/** The views among `ways` that draw: each one's fit check passes for its own data. */
+export function drawableViews(ways) {
+  return ways.filter((v) => computeFit(v.columns, v.rows, v.spec)[v.type]?.ok !== false);
+}
+
+/**
+ * The D3 window: under each answer, every chart its data can make — each
+ * built for what it shows (recommend.js) and drawn small from its own data —
+ * so the reader sees all the ways to look at it at once. Picking one draws it
+ * above; "back" returns to the answer's chart.
+ */
+function ViewGallery({ ways, picked, onPick, onBack }) {
+  const views = useMemo(() => drawableViews(ways), [ways]);
+  const [open, setOpen] = useState(true);
+  if (!views.length) return null;
+  return (
+    <section className="view-gallery" aria-label="All the ways to see this">
+      <div className="view-gallery-top">
+        <button type="button" className="view-gallery-head" onClick={() => setOpen(!open)}
+                aria-expanded={open}>
+          <span>{open ? "▾" : "▸"} All the ways to see this</span>
+          <span className="meta">{views.length} views of this data</span>
+        </button>
+        {picked && (
+          <button type="button" className="chip view-gallery-back" onClick={onBack}>
+            ↺ Back to the answer's chart
+          </button>
+        )}
+      </div>
+      {open && (
+        <div className="view-gallery-strip">
+          {views.map((v) => (
+            <button key={v.key} type="button" title={v.title} aria-pressed={picked?.key === v.key}
+                    className={"view-card" + (picked?.key === v.key ? " is-on" : "")} onClick={() => onPick(v)}>
+              <MiniChart columns={v.columns} rows={v.rows} chart={v.spec} height={88} />
+              <span className="view-card-label">{LABELS[v.type].replace(/ \(D3\)$/, "")}</span>
+              <span className="view-card-title">{v.title}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </section>
   );
 }
 

@@ -172,6 +172,39 @@ def messages(cid: str, user=Depends(current_user)):
     return _visible_messages(cid, user, access)
 
 
+#: The most a preview carries: a thumbnail needs the shape of the chart, not
+#: every row behind it.
+PREVIEW_ROWS = 400
+
+
+@router.get("/conversations/previews")
+def previews(ids: str = "", user=Depends(current_user)):
+    """The latest chart of each of up to eight conversations — what the D3 &
+    artifacts home draws as a Recent card's thumbnail. Read the way the thread
+    is (_visible_messages: redacted for the READER's role at read time), and
+    without marking any of them read: a glance at Recent is not opening a chat.
+    A conversation the user cannot see, or with no chart to show (rows expired,
+    withheld, or never queried), is simply absent."""
+    out = {}
+    for cid in [x for x in ids.split(",") if x.strip()][:8]:
+        access = db.conversation_access(cid, user["id"])
+        if access is None:
+            continue
+        for m in reversed(_visible_messages(cid, user, access)):
+            content = m.get("content") if m.get("role") == "assistant" else None
+            if not isinstance(content, dict):     # rows expired: none left to draw
+                continue
+            panel = next((p for p in content.get("panels") or []
+                          if isinstance(p, dict) and p.get("columns") and p.get("rows")), None) \
+                or (content if content.get("columns") and content.get("rows") else None)
+            if panel:
+                out[cid] = {"chart": panel.get("chart") or content.get("chart"),
+                            "columns": panel["columns"], "rows": panel["rows"][:PREVIEW_ROWS],
+                            "row_count": len(panel["rows"])}
+                break
+    return out
+
+
 @router.delete("/conversations/{cid}")
 def remove(cid: str, user=Depends(current_user)):
     # Deleting destroys it for everyone it is shared with — owner only.

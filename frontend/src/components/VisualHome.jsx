@@ -5,6 +5,7 @@
 // is for (charts, dashboards, maps, custom visuals) before you type a word.
 //
 // Pure helpers are exported for tests; the components only lay them out.
+import MiniChart from "./MiniChart";
 
 /** "Good morning" / "Good afternoon" / "Good evening" for a local hour. */
 export function greeting(hour) {
@@ -24,21 +25,26 @@ export function firstName(user) {
 export const QUICK_STARTS = [
   { key: "chart", label: "Chart", icon: "bars", text: "Show … as a bar chart" },
   { key: "table", label: "Table", icon: "table", text: "Show … as a table" },
+  // No views fixed in advance: the ones the data supports (the answer then
+  // shows every chart that fits it, too).
   { key: "dashboard", label: "Dashboard", icon: "grid",
-    text: "Build a dashboard of … with a view by day, by month and by year" },
-  { key: "map", label: "Map", icon: "pin", text: "Map … on a route map" },
+    text: "Build a dashboard of … with every view that fits the data" },
+  // Any map: the agent picks routes, dots or shaded regions from the data.
+  { key: "map", label: "Map", icon: "pin", text: "Show … on a map" },
   { key: "custom", label: "Custom visual", icon: "spark",
     text: "Write a custom interactive D3 visual of …" },
-  { key: "automate", label: "Automate", icon: "bolt", text: "Every Monday at 9, chart …" },
+  // An interval Autopilot reads exactly ("every week"); a time of day it
+  // does not keep, so the phrase never promises one.
+  { key: "automate", label: "Automate", icon: "bolt", text: "Every week, chart …" },
 ];
 
 export const BIG_STARTS = [
   { key: "dashboard", title: "Build a dashboard", tone: "violet", icon: "grid",
-    sub: "Several views of one question, side by side." },
-  { key: "custom", title: "Write a custom visual", tone: "mint", icon: "spark",
-    sub: "The AI writes interactive D3 you can save as a file." },
+    sub: "Several views, side by side" },
+  { key: "custom", title: "Custom visual", tone: "mint", icon: "spark",
+    sub: "Interactive D3, written for you" },
   { key: "map", title: "Map your data", tone: "peach", icon: "pin",
-    sub: "Routes, places and regions — transit, shipments, sales by country." },
+    sub: "Routes, places and regions" },
 ];
 
 /** The composer's text for a start, and the span to select (the "…"). */
@@ -63,12 +69,19 @@ export function glyphFor(title) {
   return "bars";
 }
 
-/** Up to `n` recent visual conversations, titled without their 🎨 mark. */
+/** Up to `n` recent visual conversations, newest first, titled without
+ *  their 🎨 mark — one per question: asking the same thing twice is one card. */
 export function recentVisuals(conversations, n = 4) {
-  return (conversations || []).slice(0, n).map((c) => {
-    const title = String(c.title || "").replace(/^🎨\s*/, "") || "Untitled visual";
-    return { id: c.id, title, glyph: glyphFor(title), at: c.created_at };
-  });
+  const seen = new Set(), out = [];
+  for (const c of conversations || []) {
+    const title = String(c.title || "").replace(/^🎨\s*/, "").trim() || "Untitled visual";
+    const key = title.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ id: c.id, title, glyph: glyphFor(title), at: c.created_at });
+    if (out.length >= n) break;
+  }
+  return out;
 }
 
 /** "just now" / "5 min ago" / "3 h ago" / "2 d ago" for epoch seconds. */
@@ -92,6 +105,11 @@ const ICONS = {
   spark: <><path d="M12 3v4M12 17v4M3 12h4M17 12h4M6 6l2.5 2.5M15.5 15.5 18 18M18 6l-2.5 2.5M8.5 15.5 6 18" /></>,
   bolt: <><path d="M13 3 5 13h6l-1 8 8-10h-6z" /></>,
 };
+
+/** The mark at the start of the home's prompt bar. */
+export function PromptMark() {
+  return <span className="vh-prompt-mark"><Icon name="spark" size={18} /></span>;
+}
 
 export function Icon({ name, size = 18 }) {
   return (
@@ -158,7 +176,8 @@ export function VisualHomeHeader({ user, now = new Date() }) {
 
 /** Below the composer: quick starts, bigger starts, ideas from the data, and
  *  recent visuals. `onStart(key)` fills the composer. */
-export function VisualHomeStarts({ onStart, recent = [], onOpen, onOpenCharts, ideas = [], onIdea }) {
+export function VisualHomeStarts({ onStart, recent = [], onOpen, onOpenCharts, ideas = [], onIdea,
+                                   ideasFrom = null, previews = {} }) {
   const shown = recentVisuals(recent);
   return (
     <div className="vh-below">
@@ -183,9 +202,37 @@ export function VisualHomeStarts({ onStart, recent = [], onOpen, onOpenCharts, i
         ))}
       </div>
 
+      {shown.length > 0 && (
+        <section className="vh-section" aria-label="Recent">
+          <div className="vh-section-head">
+            <span>Recent</span>
+            {onOpenCharts && (
+              <button type="button" className="vh-link" onClick={onOpenCharts}>See all charts →</button>
+            )}
+          </div>
+          <div className="vh-recent">
+            {shown.map((c) => (
+              <button key={c.id} type="button" className="vh-recent-card" onClick={() => onOpen?.(c.id)}
+                      title={c.title}>
+                <span className="vh-recent-title">{c.title}</span>
+                {/* The conversation's own latest chart, drawn from its data; the
+                    sketch only when there is nothing to draw (rows expired…). */}
+                {previews[c.id]
+                  ? <MiniChart columns={previews[c.id].columns} rows={previews[c.id].rows}
+                               chart={previews[c.id].chart} height={76} />
+                  : <Thumb glyph={c.glyph} />}
+                {c.at && <span className="vh-recent-at">{ago(c.at)}</span>}
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
       {ideas.length > 0 && (
-        <section className="vh-section" aria-label="From your data">
-          <div className="vh-section-head"><span>From your data</span></div>
+        <section className="vh-section" aria-label="Try one from your data">
+          <div className="vh-section-head">
+            <span>{ideasFrom === "demo" ? "Try one from the demo data"
+              : ideasFrom ? `Try one from ${ideasFrom}` : "Try one from your data"}</span>
+          </div>
           <div className="vh-ideas">
             {ideas.map((q) => (
               <button key={q} type="button" className="vh-idea" onClick={() => onIdea(q)}>{q}</button>
@@ -194,26 +241,6 @@ export function VisualHomeStarts({ onStart, recent = [], onOpen, onOpenCharts, i
         </section>
       )}
 
-      {shown.length > 0 && (
-        <section className="vh-section" aria-label="Recent">
-          <div className="vh-section-head">
-            <span>Recent</span>
-            {onOpenCharts && (
-              <button type="button" className="vh-link" onClick={onOpenCharts}>Your charts →</button>
-            )}
-          </div>
-          <div className="vh-recent">
-            {shown.map((c) => (
-              <button key={c.id} type="button" className="vh-recent-card" onClick={() => onOpen?.(c.id)}
-                      title={c.title}>
-                <span className="vh-recent-title">{c.title}</span>
-                <Thumb glyph={c.glyph} />
-                {c.at && <span className="vh-recent-at">{ago(c.at)}</span>}
-              </button>
-            ))}
-          </div>
-        </section>
-      )}
     </div>
   );
 }

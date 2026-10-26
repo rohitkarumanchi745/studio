@@ -6,7 +6,7 @@ import ChartView, { chartImage } from "./ChartView";
 import Markdown from "./Markdown";
 import { downloadReport, downloadTable } from "../exporting";
 import AutopilotDraft, { draftFromAnswer } from "./AutopilotDraft";
-import { VisualHomeHeader, VisualHomeStarts, fillStart } from "./VisualHome";
+import { PromptMark, VisualHomeHeader, VisualHomeStarts, fillStart, recentVisuals } from "./VisualHome";
 import SharePanel from "./SharePanel";
 import SqlLab from "./SqlLab";
 import ChatWorkflow from "./ChatWorkflow";
@@ -891,24 +891,44 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
   const [sugBusy, setSugBusy] = useState(false);
   const studioPicks = auto || orchestrated;
   const selKey = studioPicks ? "*" : sel.length ? sel.join(",") : "*";
+  // With Studio picking the source, ideas come from the first real source the
+  // user can read — a connection made here before a built-in one — and from
+  // the demo data only when there is nothing else.
+  const ideaSource = useMemo(() => {
+    const usable = sources.filter((x) => x.configured && x.allowed && x.name !== "demo");
+    return (usable.find((x) => x.ctype) || usable[0] || { name: "demo" }).name;
+  }, [sources]);
+  const suggestFrom = studioPicks ? ideaSource : source;
 
   useEffect(() => {
     if (!source) return;
     let cancelled = false;
     setSugBusy(true);
     setSuggestions([]);
-    api(`/catalog/sources/${studioPicks ? "demo" : source}/suggestions?table=${encodeURIComponent(selKey)}`)
+    api(`/catalog/sources/${encodeURIComponent(suggestFrom)}/suggestions?table=${encodeURIComponent(selKey)}`)
       .then((d) => !cancelled && setSuggestions(d.suggestions || []))
       .catch(() => !cancelled && setSuggestions([]))
       .finally(() => !cancelled && setSugBusy(false));
     return () => {
       cancelled = true;
     };
-  }, [source, selKey, studioPicks]);
+  }, [source, selKey, studioPicks, suggestFrom]);
 
   // The D3 & artifacts window opens a new conversation on its home (VisualHome):
   // the composer centred, with starts that fill it.
   const home = visualMode && !conversationId && messages.length === 0 && !busy;
+  // Recent cards draw each conversation's real latest chart: fetched once per
+  // set of cards, read-only (a glance at Recent does not mark a chat read).
+  const recentKey = home ? recentVisuals(recent).map((c) => c.id).join(",") : "";
+  const [previews, setPreviews] = useState({});
+  useEffect(() => {
+    if (!recentKey) return undefined;
+    let live = true;
+    api(`/conversations/previews?ids=${encodeURIComponent(recentKey)}`)
+      .then((d) => live && setPreviews(d || {}))
+      .catch(() => {});
+    return () => { live = false; };
+  }, [recentKey]);
   function applyStart(key) {
     const start = fillStart(key);
     if (!start) return;
@@ -1106,6 +1126,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
 
       <form className={"composer chat-composer" + (home ? " is-home" : "")} onSubmit={send}>
         <div className="composer-box">
+          {home && <PromptMark />}
           <textarea
             ref={inputRef}
             className="pill-input"
@@ -1190,6 +1211,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
         {home && (
           <VisualHomeStarts onStart={applyStart} recent={recent} onOpen={onOpenConversation}
             onOpenCharts={onOpenCharts} ideas={suggestions.slice(0, 4).map((x) => x.question)}
+            ideasFrom={suggestFrom} previews={previews}
             onIdea={(q) => { setPrompt(q); inputRef.current?.focus(); }} />
         )}
         {!visualMode && buildAirflow && (
