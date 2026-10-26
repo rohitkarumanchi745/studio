@@ -55,14 +55,36 @@ D3_CHART_TYPES = (
 # The D3 & artifacts window draws every one of them, plus custom visuals.
 
 
-def d3_only(result):
+# An explicit ask for rows rather than a picture: "show it as a table", "in a
+# table", "table view", "tabular", "give me a table of…". Not "the sales table"
+# or "rows in the table", which name a database table.
+_TABLE_ASK = re.compile(
+    r"\bas\s+(?:a\s+)?(?:data\s+)?table\b"
+    r"|\bin(?:to)?\s+a\s+(?:data\s+)?table\b"
+    r"|\btable\s+(?:view|format|form)\b"
+    r"|\btabular\b"
+    r"|^\s*(?:please\s+)?(?:show|give|list|display)\s+(?:me\s+)?(?:it\s+)?a\s+(?:data\s+)?table\b",
+    re.IGNORECASE)
+
+
+def asked_for_table(prompt):
+    """Whether the question asks for its answer as a table."""
+    return bool(_TABLE_ASK.search(str(prompt or "")))
+
+
+def d3_only(result, prompt=None):
     """Make every chart in a result one the D3 & artifacts window draws — an
     unknown type becomes a bar — and put every panel on the D3 engine. Custom
     visuals are D3 code already. Covers answers that did not come from a
     visual-mode agent — a cached plan, the keyless fallback, the multi-source
-    orchestrator."""
+    orchestrator. A question that asks for a table gets one: the window
+    always visualizes, and a table is the visual asked for."""
+    table = asked_for_table(prompt)
+
     def fix(chart):
-        if isinstance(chart, dict) and chart.get("type") not in D3_CHART_TYPES:
+        if isinstance(chart, dict) and table:
+            chart = {**chart, "type": "table"}
+        elif isinstance(chart, dict) and chart.get("type") not in D3_CHART_TYPES:
             chart = {**chart, "type": "bar"}
         return chart
 
@@ -71,7 +93,9 @@ def d3_only(result):
     panels = result.get("panels")
     if isinstance(panels, list):
         result["panels"] = [
-            {**p, "chart": fix(p.get("chart")), "engine": "d3"} if isinstance(p, dict) else p
+            {**p, "chart": fix(p.get("chart")), "engine": "d3",
+             **({"visual": None} if table and p.get("visual") else {})}
+            if isinstance(p, dict) else p
             for p in panels]
     result["visual_mode"] = True
     return result
@@ -1018,7 +1042,10 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
                if offers_visual else "Call render_chart")
         system += ("\n\nD3 & ARTIFACTS WINDOW: every answer here is drawn with D3 only. "
                    f"After run_sql, ALWAYS visualize. {how} with any of its types — D3 "
-                   "draws them all. Keep the text brief — the visual is the answer.")
+                   "draws them all. When the user asks for a table (\"as a table\", "
+                   "\"table view\", a list of records), render_chart with chart_type "
+                   "\"table\": the table is the visual. Keep the text brief — the visual "
+                   "is the answer.")
     if kag_first:
         # User explicitly chose the KAG engine: ground the answer in their own
         # documents first, and only touch the warehouse if the docs can't answer.

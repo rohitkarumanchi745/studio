@@ -1024,7 +1024,7 @@ def _run_turn(ctx, user):
             result["resolved_tables"] = [c["table"] for c in clash]   # sticky for this chat
         result.setdefault("source", "*")
         if ctx.get("visual"):
-            agent.d3_only(result)
+            agent.d3_only(result, prompt)
         result["table"] = "all sources"
         result["matched_tables"] = []
         result["inputs"] = _query_inputs(result)
@@ -1082,10 +1082,10 @@ def _run_turn(ctx, user):
         # window too; it is drawn with D3, not a custom visual.
         progress.emit("answered from a certified metric — drawing it with D3", kind="semantic")
         result = certified
-        agent.d3_only(result)
+        agent.d3_only(result, prompt)
     elif ctx.get("visual") and (verified := _verified_answer(ctx, user, prompt)) is not None:
         result = verified
-        agent.d3_only(result)
+        agent.d3_only(result, prompt)
     elif ctx.get("visual"):
         # The D3 & artifacts window goes straight to the frontier agent: the
         # semantic layer, the plan cache and BitNet return stock charts and
@@ -1094,7 +1094,7 @@ def _run_turn(ctx, user):
         progress.emit("drawing the answer with D3", kind="visual")
         result = _run(None if model in ("bitnet", "kag") else model, visual=True)
         result.setdefault("served_by", "frontier")
-        agent.d3_only(result)
+        agent.d3_only(result, prompt)
     # Explicit engine chosen in the model selector: honor it directly, ahead of the
     # automatic tiers. 'bitnet' forces the self-hosted engine; 'kag' forces a
     # documents-first turn grounded in the user's own knowledge collections.

@@ -3,7 +3,8 @@
 // freely (double-click resets; arrow keys work), a wide mode that breaks out
 // of the chat column, and full screen (Esc closes). The visual inside fills
 // whatever the frame is — D3 charts redraw to the new size, custom visuals
-// re-run their draw — so nothing is cropped or stretched.
+// re-run their draw — so nothing is cropped or stretched. A table (`fit`) is
+// as tall as its rows, up to the chosen size, and scrolls past it.
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
@@ -40,7 +41,7 @@ function overlay(node) {
   return typeof document !== "undefined" && document.body ? createPortal(node, document.body) : node;
 }
 
-export default function VizFrame({ title, children }) {
+export default function VizFrame({ title, children, fit = false }) {
   const [height, setHeight] = useState(rememberedHeight);
   const [wide, setWide] = useState(false);
   const [full, setFull] = useState(false);
@@ -110,7 +111,8 @@ export default function VizFrame({ title, children }) {
       {full ? (
         <div className="viz-placeholder" style={{ height }}>Shown full screen — press Esc to return.</div>
       ) : (
-        <div className="viz-body" style={{ height }}>{children}</div>
+        <div className={"viz-body" + (fit ? " viz-fit" : "")}
+             style={fit ? { maxHeight: height } : { height }}>{children}</div>
       )}
       {!full && (
         <div className="viz-handle" role="separator" aria-orientation="horizontal"

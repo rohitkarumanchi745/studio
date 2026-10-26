@@ -2556,7 +2556,17 @@ fallback and the multi-agent orchestrator. Custom visuals need one source; the
 multi-agent workers draw D3 charts. The turn skips the semantic layer, the plan cache and BitNet routing,
 which return stock charts and cannot write a visual. Commands are read as
 questions there, so the window never builds a pipeline or submits a platform
-job, and its conversations carry a 🎨 in the title so they reopen in it.
+job, and its conversations carry a 🎨 in the title so they reopen in it. An
+answer that came without a chart (the agent answered "how many sales?" with one
+number and proposed none) is still drawn from its data: one row with a number
+as a KPI, anything else as a table. Every type in the picker then switches it,
+and a type the data doesn't fit shows the D3 table under a note saying why,
+never an empty box. Asking for a table ("as a table", "in a table", "table view",
+"tabular") gets one: the agent is told a table is the visual, and the ask wins
+over whatever chart came back (`agent.asked_for_table`). The D3 table aligns
+each column by what it holds (numbers right-aligned under right-aligned
+headers), is only as wide as its columns need, counts its rows, and its frame
+is only as tall as its rows, up to the size chosen.
 
 **Your charts** (⊞ in that window's toolbar) puts the two side by side for
 every chart in your conversations, in D3 terms only: a chart is "D3" or "not
