@@ -22,6 +22,7 @@ The browser only ever sees aggregated/preview rows, never raw terabytes.
 Without an API key for the selected provider, run_agent degrades to a
 deterministic fallback (SELECT * ... LIMIT + auto chart).
 """
+import functools
 import json
 import os
 import re
@@ -72,28 +73,73 @@ def asked_for_table(prompt):
     return bool(_TABLE_ASK.search(str(prompt or "")))
 
 
+# Chart words that name a chart only in context ("as a bar chart", "in a pie",
+# "line chart"), since alone they are ordinary words ("line items", "the sales
+# funnel", "in the area"). These few are only ever chart names.
+_CHART_ONLY_WORDS = {"choropleth", "beeswarm", "sankey", "treemap", "histogram", "boxplot",
+                     "heatmap"}
+
+
+@functools.lru_cache(maxsize=1)
+def _asked_patterns():
+    """Built on first use: _CHART_PHRASES is defined further down."""
+    out = []
+    for phrase, kind in _CHART_PHRASES:
+        if kind == "table":
+            continue                    # asked_for_table, which knows "the sales table" is not one
+        p = re.escape(phrase)
+        if " " in phrase or phrase in _CHART_ONLY_WORDS:
+            pattern = rf"\b{p}s?\b"                         # "stacked bar", "on a map", "sankey"
+        else:
+            pattern = (rf"\bas\s+(?:an?\s+)?{p}s?\b|\bin(?:to)?\s+an?\s+{p}s?\b"
+                       rf"|\b{p}\s+(?:chart|graph|plot|diagram)s?\b")
+        out.append((re.compile(pattern, re.IGNORECASE), kind))
+    return out
+
+
+def asked_chart(prompt, columns=None, rows=None):
+    """The chart type a question names ("as a bar chart", "pie chart", "on a
+    map"), or None. "A map" is the map the result's places call for — routes,
+    dots or shaded regions — and nothing when the result has no places."""
+    text = str(prompt or "")
+    if asked_for_table(text):
+        return "table"
+    for pattern, kind in _asked_patterns():
+        if pattern.search(text):
+            if kind == "map":
+                from .geo_columns import suggest_map
+                found = suggest_map(columns or [], rows or [])
+                return found["type"] if found else None
+            return kind
+    return None
+
+
 def d3_only(result, prompt=None):
     """Make every chart in a result one the D3 & artifacts window draws — an
     unknown type becomes a bar — and put every panel on the D3 engine. Custom
     visuals are D3 code already. Covers answers that did not come from a
     visual-mode agent — a cached plan, the keyless fallback, the multi-source
-    orchestrator. A question that asks for a table gets one: the window
-    always visualizes, and a table is the visual asked for."""
-    table = asked_for_table(prompt)
-
-    def fix(chart):
-        if isinstance(chart, dict) and table:
-            chart = {**chart, "type": "table"}
-        elif isinstance(chart, dict) and chart.get("type") not in D3_CHART_TYPES:
-            chart = {**chart, "type": "bar"}
+    orchestrator. A question that names its chart gets that chart ("as a
+    table", "as a bar chart", "on a map"): the window always visualizes, and
+    the visual asked for wins over one picked for it. A table also replaces a
+    custom visual; a named chart type only sets the chart under one."""
+    def fix(chart, columns, rows):
+        if not isinstance(chart, dict):
+            return chart
+        asked = asked_chart(prompt, columns, rows)
+        if asked:
+            return {**chart, "type": asked}
+        if chart.get("type") not in D3_CHART_TYPES:
+            return {**chart, "type": "bar"}
         return chart
 
+    table = asked_for_table(prompt)
     if isinstance(result.get("chart"), dict):
-        result["chart"] = fix(result["chart"])
+        result["chart"] = fix(result["chart"], result.get("columns"), result.get("rows"))
     panels = result.get("panels")
     if isinstance(panels, list):
         result["panels"] = [
-            {**p, "chart": fix(p.get("chart")), "engine": "d3",
+            {**p, "chart": fix(p.get("chart"), p.get("columns"), p.get("rows")), "engine": "d3",
              **({"visual": None} if table and p.get("visual") else {})}
             if isinstance(p, dict) else p
             for p in panels]

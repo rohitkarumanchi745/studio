@@ -891,20 +891,28 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
   const [sugBusy, setSugBusy] = useState(false);
   const studioPicks = auto || orchestrated;
   const selKey = studioPicks ? "*" : sel.length ? sel.join(",") : "*";
+  // With Studio picking the source, ideas come from the first real source the
+  // user can read — a connection made here before a built-in one — and from
+  // the demo data only when there is nothing else.
+  const ideaSource = useMemo(() => {
+    const usable = sources.filter((x) => x.configured && x.allowed && x.name !== "demo");
+    return (usable.find((x) => x.ctype) || usable[0] || { name: "demo" }).name;
+  }, [sources]);
+  const suggestFrom = studioPicks ? ideaSource : source;
 
   useEffect(() => {
     if (!source) return;
     let cancelled = false;
     setSugBusy(true);
     setSuggestions([]);
-    api(`/catalog/sources/${studioPicks ? "demo" : source}/suggestions?table=${encodeURIComponent(selKey)}`)
+    api(`/catalog/sources/${encodeURIComponent(suggestFrom)}/suggestions?table=${encodeURIComponent(selKey)}`)
       .then((d) => !cancelled && setSuggestions(d.suggestions || []))
       .catch(() => !cancelled && setSuggestions([]))
       .finally(() => !cancelled && setSugBusy(false));
     return () => {
       cancelled = true;
     };
-  }, [source, selKey, studioPicks]);
+  }, [source, selKey, studioPicks, suggestFrom]);
 
   // The D3 & artifacts window opens a new conversation on its home (VisualHome):
   // the composer centred, with starts that fill it.
@@ -1191,6 +1199,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
         {home && (
           <VisualHomeStarts onStart={applyStart} recent={recent} onOpen={onOpenConversation}
             onOpenCharts={onOpenCharts} ideas={suggestions.slice(0, 4).map((x) => x.question)}
+            ideasFrom={suggestFrom}
             onIdea={(q) => { setPrompt(q); inputRef.current?.focus(); }} />
         )}
         {!visualMode && buildAirflow && (

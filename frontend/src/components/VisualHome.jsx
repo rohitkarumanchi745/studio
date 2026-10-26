@@ -26,10 +26,13 @@ export const QUICK_STARTS = [
   { key: "table", label: "Table", icon: "table", text: "Show … as a table" },
   { key: "dashboard", label: "Dashboard", icon: "grid",
     text: "Build a dashboard of … with a view by day, by month and by year" },
-  { key: "map", label: "Map", icon: "pin", text: "Map … on a route map" },
+  // Any map: the agent picks routes, dots or shaded regions from the data.
+  { key: "map", label: "Map", icon: "pin", text: "Show … on a map" },
   { key: "custom", label: "Custom visual", icon: "spark",
     text: "Write a custom interactive D3 visual of …" },
-  { key: "automate", label: "Automate", icon: "bolt", text: "Every Monday at 9, chart …" },
+  // An interval Autopilot reads exactly ("every week"); a time of day it
+  // does not keep, so the phrase never promises one.
+  { key: "automate", label: "Automate", icon: "bolt", text: "Every week, chart …" },
 ];
 
 export const BIG_STARTS = [
@@ -170,7 +173,8 @@ export function VisualHomeHeader({ user, now = new Date() }) {
 
 /** Below the composer: quick starts, bigger starts, ideas from the data, and
  *  recent visuals. `onStart(key)` fills the composer. */
-export function VisualHomeStarts({ onStart, recent = [], onOpen, onOpenCharts, ideas = [], onIdea }) {
+export function VisualHomeStarts({ onStart, recent = [], onOpen, onOpenCharts, ideas = [], onIdea,
+                                   ideasFrom = null }) {
   const shown = recentVisuals(recent);
   return (
     <div className="vh-below">
@@ -217,7 +221,10 @@ export function VisualHomeStarts({ onStart, recent = [], onOpen, onOpenCharts, i
       )}
       {ideas.length > 0 && (
         <section className="vh-section" aria-label="Try one from your data">
-          <div className="vh-section-head"><span>Try one from your data</span></div>
+          <div className="vh-section-head">
+            <span>{ideasFrom === "demo" ? "Try one from the demo data"
+              : ideasFrom ? `Try one from ${ideasFrom}` : "Try one from your data"}</span>
+          </div>
           <div className="vh-ideas">
             {ideas.map((q) => (
               <button key={q} type="button" className="vh-idea" onClick={() => onIdea(q)}>{q}</button>

@@ -105,7 +105,8 @@ test("the greeting follows the clock and the user's first name", () => {
 });
 
 test("a start fills the composer with the part to type selected", () => {
-  assert.deepEqual(fillStart("map"), { text: "Map … on a route map", select: [4, 5] });
+  assert.deepEqual(fillStart("map"), { text: "Show … on a map", select: [5, 6] });
+  assert.equal(fillStart("automate").text, "Every week, chart …");
   assert.deepEqual(fillStart("table"), { text: "Show … as a table", select: [5, 6] });
   assert.equal(fillStart("nope"), null);
   // Every start has a "…" to type over, and every big start is a quick start too.
@@ -202,7 +203,7 @@ test("a new conversation in the window opens on the home; a chosen start fills t
   assert.equal(starts.props.recent, CONVS);
   starts.props.onStart("map");
   const input = find(render(), (n) => n.type === "textarea");
-  assert.equal(input.props.value, "Map … on a route map");
+  assert.equal(input.props.value, "Show … on a map");
 });
 
 test("no home in an existing conversation, or in the ordinary chat", () => {
@@ -211,4 +212,55 @@ test("no home in an existing conversation, or in the ordinary chat", () => {
   const ordinary = renderToStaticMarkup(chatHarness({ conversationId: null })());
   assert.doesNotMatch(ordinary, /vh-title|visual-home|is-home/);
   assert.match(ordinary, /class="empty"/);                       // its own empty state stays
+});
+
+test("with Auto on, ideas come from the user's own data, and say from where", async () => {
+  const sources = [
+    { name: "demo", configured: true, allowed: true },
+    // Not usable: disconnected, or not this role's — passed over.
+    { name: "parked", ctype: "snowflake", configured: false, allowed: true },
+    { name: "theirs", ctype: "bigquery", configured: true, allowed: false },
+    { name: "postgres", configured: true, allowed: true },
+    { name: "lake", ctype: "databricks", configured: true, allowed: true },
+  ];
+  const asked = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    asked.push(url);
+    const body = url === "/api/catalog/sources" ? sources
+      : url.includes("/suggestions") ? { suggestions: [{ question: "Revenue by month?", table: "sales" }] } : [];
+    return { ok: true, status: 200, json: async () => body };
+  };
+  try {
+    const values = [];
+    const effects = [];
+    let cursor = 0;
+    const own = {
+      useState(initial) {
+        const i = cursor++;
+        if (!(i in values)) values[i] = typeof initial === "function" ? initial() : initial;
+        return [values[i], (next) => { values[i] = typeof next === "function" ? next(values[i]) : next; }];
+      },
+      useRef(initial) { const i = cursor++; if (!(i in values)) values[i] = { current: initial }; return values[i]; },
+      useMemo(factory) { return factory(); },
+      useEffect(effect) { effects.push(effect); },
+    };
+    const render = () => { cursor = 0; effects.length = 0; hooks = own;
+                           try { return Chat({ visualMode: true, conversationId: null }); } finally { hooks = null; } };
+    const settle = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
+    render(); effects.forEach((e) => e()); await settle();        // sources load
+    render(); effects.forEach((e) => e()); await settle();        // ideas load from the real source
+    const urls = asked.filter((u) => u.includes("/suggestions"));
+    assert.ok(urls.at(-1).startsWith("/api/catalog/sources/lake/suggestions"), urls.join(" | "));
+    const starts = find(render(), (n) => n.type === VisualHomeStarts);
+    assert.equal(starts.props.ideasFrom, "lake");
+    assert.deepEqual(starts.props.ideas, ["Revenue by month?"]);
+    assert.match(renderToStaticMarkup(React.createElement(VisualHomeStarts, starts.props)),
+                 /<span>Try one from lake<\/span>/);
+    // Nothing of their own yet: the demo data, and it says so.
+    assert.match(renderToStaticMarkup(React.createElement(VisualHomeStarts,
+      { ...starts.props, ideasFrom: "demo" })), /Try one from the demo data/);
+  } finally {
+    globalThis.fetch = original;
+  }
 });

@@ -2576,8 +2576,28 @@ is only as tall as its rows, up to the size chosen.
   fill the composer with a phrase to finish, with the part to type already
   selected;
 - three bigger starts: build a dashboard, write a custom visual, map your data;
-- ideas read from the data;
-- the conversations visualized lately, each with a thumbnail of its kind.
+- the conversations visualized lately, once per question, each with a
+  thumbnail of its kind;
+- ideas read from the data. With Auto on, these come from the first real
+  source the user can read (a connection made here before a built-in one), and
+  from the demo data only when there is nothing else; the heading says which.
+
+Every start works on its own, with or without a model:
+- Chart gives the chart it names ("as a bar chart").
+- Table gives a table.
+- Dashboard gives a view by day, by month and by year.
+- Map ("Show … on a map") gives routes, dots or shaded regions, whichever the
+  data's places call for.
+- Automate ("Every week, chart …") proposes a weekly Autopilot agent.
+
+In the window, a chart named in the question ("as a pie chart", "line chart",
+"on a map", "as a table") wins over the one picked for it (`agent.asked_chart`).
+Only unmistakable names count: "line items", "the sales funnel" and "in the
+area" are not charts. A named chart type keeps a custom visual the AI wrote;
+only a table replaces it. The demo warehouse includes places to map:
+`transit_trips` (Chicago 'L' rides with each station's coordinates),
+`shipments` (goods between countries) and `stores` (US stores with
+coordinates and state).
 
 **Your charts** (⊞ in that window's toolbar) puts the two side by side for
 every chart in your conversations, in D3 terms only: a chart is "D3" or "not
