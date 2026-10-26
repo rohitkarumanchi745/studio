@@ -34,11 +34,11 @@ export const QUICK_STARTS = [
 
 export const BIG_STARTS = [
   { key: "dashboard", title: "Build a dashboard", tone: "violet", icon: "grid",
-    sub: "Several views of one question, side by side." },
-  { key: "custom", title: "Write a custom visual", tone: "mint", icon: "spark",
-    sub: "The AI writes interactive D3 you can save as a file." },
+    sub: "Several views, side by side" },
+  { key: "custom", title: "Custom visual", tone: "mint", icon: "spark",
+    sub: "Interactive D3, written for you" },
   { key: "map", title: "Map your data", tone: "peach", icon: "pin",
-    sub: "Routes, places and regions — transit, shipments, sales by country." },
+    sub: "Routes, places and regions" },
 ];
 
 /** The composer's text for a start, and the span to select (the "…"). */
@@ -63,12 +63,19 @@ export function glyphFor(title) {
   return "bars";
 }
 
-/** Up to `n` recent visual conversations, titled without their 🎨 mark. */
+/** Up to `n` recent visual conversations, newest first, titled without
+ *  their 🎨 mark — one per question: asking the same thing twice is one card. */
 export function recentVisuals(conversations, n = 4) {
-  return (conversations || []).slice(0, n).map((c) => {
-    const title = String(c.title || "").replace(/^🎨\s*/, "") || "Untitled visual";
-    return { id: c.id, title, glyph: glyphFor(title), at: c.created_at };
-  });
+  const seen = new Set(), out = [];
+  for (const c of conversations || []) {
+    const title = String(c.title || "").replace(/^🎨\s*/, "").trim() || "Untitled visual";
+    const key = title.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ id: c.id, title, glyph: glyphFor(title), at: c.created_at });
+    if (out.length >= n) break;
+  }
+  return out;
 }
 
 /** "just now" / "5 min ago" / "3 h ago" / "2 d ago" for epoch seconds. */
@@ -92,6 +99,11 @@ const ICONS = {
   spark: <><path d="M12 3v4M12 17v4M3 12h4M17 12h4M6 6l2.5 2.5M15.5 15.5 18 18M18 6l-2.5 2.5M8.5 15.5 6 18" /></>,
   bolt: <><path d="M13 3 5 13h6l-1 8 8-10h-6z" /></>,
 };
+
+/** The mark at the start of the home's prompt bar. */
+export function PromptMark() {
+  return <span className="vh-prompt-mark"><Icon name="spark" size={18} /></span>;
+}
 
 export function Icon({ name, size = 18 }) {
   return (
@@ -183,23 +195,12 @@ export function VisualHomeStarts({ onStart, recent = [], onOpen, onOpenCharts, i
         ))}
       </div>
 
-      {ideas.length > 0 && (
-        <section className="vh-section" aria-label="From your data">
-          <div className="vh-section-head"><span>From your data</span></div>
-          <div className="vh-ideas">
-            {ideas.map((q) => (
-              <button key={q} type="button" className="vh-idea" onClick={() => onIdea(q)}>{q}</button>
-            ))}
-          </div>
-        </section>
-      )}
-
       {shown.length > 0 && (
         <section className="vh-section" aria-label="Recent">
           <div className="vh-section-head">
             <span>Recent</span>
             {onOpenCharts && (
-              <button type="button" className="vh-link" onClick={onOpenCharts}>Your charts →</button>
+              <button type="button" className="vh-link" onClick={onOpenCharts}>See all charts →</button>
             )}
           </div>
           <div className="vh-recent">
@@ -214,6 +215,17 @@ export function VisualHomeStarts({ onStart, recent = [], onOpen, onOpenCharts, i
           </div>
         </section>
       )}
+      {ideas.length > 0 && (
+        <section className="vh-section" aria-label="Try one from your data">
+          <div className="vh-section-head"><span>Try one from your data</span></div>
+          <div className="vh-ideas">
+            {ideas.map((q) => (
+              <button key={q} type="button" className="vh-idea" onClick={() => onIdea(q)}>{q}</button>
+            ))}
+          </div>
+        </section>
+      )}
+
     </div>
   );
 }

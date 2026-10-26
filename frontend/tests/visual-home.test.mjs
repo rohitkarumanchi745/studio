@@ -123,6 +123,12 @@ test("recent visuals: newest first, four, without their 🎨, each with a fittin
   assert.equal(glyphFor("sales dashboard"), "grid");
   assert.equal(glyphFor("revenue by region"), "bars");
   assert.equal(recentVisuals([{ id: "x", title: "🎨 " }])[0].title, "Untitled visual");
+  // The same question asked twice is one card (the newest), and the list
+  // still fills to four from what is left.
+  const twice = recentVisuals([{ id: "a", title: "🎨 How has impressions trended by month?" },
+                               { id: "b", title: "🎨 how has impressions trended by month? " },
+                               ...CONVS]);
+  assert.deepEqual(twice.map((c) => c.id), ["a", "c1", "c2", "c3"]);
   assert.deepEqual([ago(100, 130), ago(0, 600), ago(0, 7300), ago(0, 200000)],
                    ["just now", "10 min ago", "2 h ago", "2 d ago"]);
 });
@@ -135,21 +141,24 @@ test("the starts: quick chips, three cards, ideas and recent — each doing what
   const markup = html(VisualHomeStarts, props);
   assert.equal((markup.match(/class="vh-chip"/g) || []).length, 6);
   assert.equal((markup.match(/class="vh-card"/g) || []).length, 3);
-  assert.match(markup, /aria-label="From your data"/);
+  assert.match(markup, /aria-label="Try one from your data"/);
+  // Recent comes before the ideas, as the reference lays it out.
+  assert.ok(markup.indexOf('aria-label="Recent"') < markup.indexOf("Try one from your data"));
   assert.equal((markup.match(/class="vh-recent-card"/g) || []).length, 4);
   assert.match(markup, /2 min ago/);
   const tree = VisualHomeStarts(props);
   const button = (label) => find(tree, (n) => n.type === "button" && text(n.props.children).includes(label));
   button("Map").props.onClick();
-  button("Write a custom visual").props.onClick();
+  find(tree, (n) => n.props?.className === "vh-card" && text(n.props.children).includes("Custom visual"))
+    .props.onClick();
   button("Top 10 platform").props.onClick();
   button("sales by country map").props.onClick();
-  button("Your charts").props.onClick();
+  button("See all charts").props.onClick();
   assert.deepEqual(calls, [["start", "map"], ["start", "custom"], ["idea", "Top 10 platform by impressions"],
                            ["open", "c2"], ["charts"]]);
   // Nothing to list: no empty sections.
   const bare = html(VisualHomeStarts, { onStart() {} });
-  assert.doesNotMatch(bare, /From your data|Recent/);
+  assert.doesNotMatch(bare, /from your data|Recent/);
 });
 
 // ── In the chat window ──────────────────────────────────────────────────
@@ -187,6 +196,7 @@ test("a new conversation in the window opens on the home; a chosen start fills t
   assert.match(markup, /Good (morning|afternoon|evening), Rohit/);
   assert.match(markup, /class="composer chat-composer is-home"/);
   assert.match(markup, /placeholder="Describe the visual you want to create…"/);
+  assert.match(markup, /class="composer-box"><span class="vh-prompt-mark">/);   // the slim bar's mark
   assert.doesNotMatch(markup, /class="empty"/);                // not the old empty state
   const starts = find(tree, (n) => n.type === VisualHomeStarts);
   assert.equal(starts.props.recent, CONVS);
@@ -197,7 +207,7 @@ test("a new conversation in the window opens on the home; a chosen start fills t
 
 test("no home in an existing conversation, or in the ordinary chat", () => {
   const open = renderToStaticMarkup(chatHarness({ visualMode: true, conversationId: "c1", recent: CONVS })());
-  assert.doesNotMatch(open, /vh-title|visual-home|is-home/);
+  assert.doesNotMatch(open, /vh-title|visual-home|is-home|vh-prompt-mark/);
   const ordinary = renderToStaticMarkup(chatHarness({ conversationId: null })());
   assert.doesNotMatch(ordinary, /vh-title|visual-home|is-home/);
   assert.match(ordinary, /class="empty"/);                       // its own empty state stays

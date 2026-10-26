@@ -6,7 +6,7 @@ import ChartView, { chartImage } from "./ChartView";
 import Markdown from "./Markdown";
 import { downloadReport, downloadTable } from "../exporting";
 import AutopilotDraft, { draftFromAnswer } from "./AutopilotDraft";
-import { VisualHomeHeader, VisualHomeStarts, fillStart } from "./VisualHome";
+import { PromptMark, VisualHomeHeader, VisualHomeStarts, fillStart } from "./VisualHome";
 import SharePanel from "./SharePanel";
 import SqlLab from "./SqlLab";
 import ChatWorkflow from "./ChatWorkflow";
@@ -1106,6 +1106,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
 
       <form className={"composer chat-composer" + (home ? " is-home" : "")} onSubmit={send}>
         <div className="composer-box">
+          {home && <PromptMark />}
           <textarea
             ref={inputRef}
             className="pill-input"
