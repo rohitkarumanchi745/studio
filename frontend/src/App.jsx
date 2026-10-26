@@ -73,7 +73,7 @@ function ChatPage({ modelsEpoch, onConversationCreated, onConversationMissing })
 // "/visuals" and "/visuals/c/:conversationId": the D3 & artifacts window — the
 // same Chat, in visual mode. One element for both routes, for the same reason
 // as ChatPage: the first answer creates the conversation mid-stream.
-function VisualChatPage({ modelsEpoch, onConversationCreated, onConversationMissing }) {
+function VisualChatPage({ modelsEpoch, onConversationCreated, onConversationMissing, recent }) {
   const { conversationId = null } = useParams();
   const navigate = useNavigate();
   return (
@@ -85,6 +85,8 @@ function VisualChatPage({ modelsEpoch, onConversationCreated, onConversationMiss
       modelsEpoch={modelsEpoch}
       visualMode
       onOpenCharts={() => navigate("/visuals/charts")}
+      recent={recent}
+      onOpenConversation={(id) => navigate(`/visuals/c/${id}`)}
     />
   );
 }
@@ -200,6 +202,8 @@ export default function App() {
   const visualChat = (
     <VisualChatPage
       modelsEpoch={modelsEpoch}
+      // What the D3 & artifacts home lists under Recent: its own conversations.
+      recent={conversations.filter(isVisualConversation)}
       onConversationCreated={(id) => { navigate(`/visuals/c/${id}`); refresh(); }}
       onConversationMissing={() => { navigate("/visuals", { replace: true }); refresh(); }}
     />
