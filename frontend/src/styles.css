@@ -1717,3 +1717,34 @@ input:focus, select:focus, .composer-pill:focus-within { box-shadow: 0 0 0 1px v
   .chatpane.visual-home .messages { padding-top: 5vh; }
 }
 @media (prefers-reduced-motion: reduce) { .vh-card { transition: none; } .vh-card:hover { transform: none; } }
+
+/* A real chart, small (MiniChart): drawn at its stage size and scaled down. */
+.mini-chart { position: relative; width: 100%; overflow: hidden; border-radius: 10px;
+  background: linear-gradient(180deg, #fbfaff, #f4f4f2); pointer-events: none; }
+.mini-chart-stage { transform-origin: top left; }
+.mini-chart .d3-tip, .mini-chart .chart-note { display: none; }
+
+/* All the ways to see this (ChartView, D3 window): every chart the data fits. */
+.view-gallery { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
+.view-gallery-head {
+  display: flex; align-items: baseline; gap: 10px; width: 100%; border: none; background: none;
+  padding: 0 0 8px; font: inherit; font-size: 13px; font-weight: 600; color: var(--ink); cursor: pointer;
+  text-align: left;
+}
+.view-gallery-head .meta { font-weight: 400; }
+.view-gallery-strip {
+  display: grid; grid-auto-flow: column; grid-auto-columns: 168px; gap: 10px;
+  overflow-x: auto; padding-bottom: 6px; scroll-snap-type: x proximity;
+}
+.view-card {
+  display: flex; flex-direction: column; gap: 6px; padding: 8px; text-align: left; font: inherit;
+  border: 1px solid var(--line); border-radius: 12px; background: var(--surface); cursor: pointer;
+  scroll-snap-align: start; transition: border-color .15s, box-shadow .15s;
+}
+.view-card:hover, .view-card:focus-visible { border-color: var(--v-accent, var(--accent)); box-shadow: 0 6px 16px rgba(15, 23, 42, .08); }
+.view-card-label { font-size: 12px; font-weight: 600; color: var(--ink-2); }
+.view-gallery-top { display: flex; align-items: center; gap: 10px; }
+.view-gallery-top .view-gallery-head { flex: 1; }
+.view-gallery-back { flex: none; }
+.view-card.is-on { border-color: var(--v-accent, var(--accent)); box-shadow: 0 0 0 2px rgba(124, 58, 237, .15); }
+.view-card-title { font-size: 11px; color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

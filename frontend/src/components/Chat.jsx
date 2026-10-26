@@ -6,7 +6,7 @@ import ChartView, { chartImage } from "./ChartView";
 import Markdown from "./Markdown";
 import { downloadReport, downloadTable } from "../exporting";
 import AutopilotDraft, { draftFromAnswer } from "./AutopilotDraft";
-import { PromptMark, VisualHomeHeader, VisualHomeStarts, fillStart } from "./VisualHome";
+import { PromptMark, VisualHomeHeader, VisualHomeStarts, fillStart, recentVisuals } from "./VisualHome";
 import SharePanel from "./SharePanel";
 import SqlLab from "./SqlLab";
 import ChatWorkflow from "./ChatWorkflow";
@@ -917,6 +917,18 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
   // The D3 & artifacts window opens a new conversation on its home (VisualHome):
   // the composer centred, with starts that fill it.
   const home = visualMode && !conversationId && messages.length === 0 && !busy;
+  // Recent cards draw each conversation's real latest chart: fetched once per
+  // set of cards, read-only (a glance at Recent does not mark a chat read).
+  const recentKey = home ? recentVisuals(recent).map((c) => c.id).join(",") : "";
+  const [previews, setPreviews] = useState({});
+  useEffect(() => {
+    if (!recentKey) return undefined;
+    let live = true;
+    api(`/conversations/previews?ids=${encodeURIComponent(recentKey)}`)
+      .then((d) => live && setPreviews(d || {}))
+      .catch(() => {});
+    return () => { live = false; };
+  }, [recentKey]);
   function applyStart(key) {
     const start = fillStart(key);
     if (!start) return;
@@ -1199,7 +1211,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
         {home && (
           <VisualHomeStarts onStart={applyStart} recent={recent} onOpen={onOpenConversation}
             onOpenCharts={onOpenCharts} ideas={suggestions.slice(0, 4).map((x) => x.question)}
-            ideasFrom={suggestFrom}
+            ideasFrom={suggestFrom} previews={previews}
             onIdea={(q) => { setPrompt(q); inputRef.current?.focus(); }} />
         )}
         {!visualMode && buildAirflow && (

@@ -157,6 +157,21 @@ test("the starts: quick chips, three cards, ideas and recent — each doing what
   button("See all charts").props.onClick();
   assert.deepEqual(calls, [["start", "map"], ["start", "custom"], ["idea", "Top 10 platform by impressions"],
                            ["open", "c2"], ["charts"]]);
+  // A card draws its conversation's real latest chart when there is one;
+  // the sketch only when there is nothing to draw.
+  const withPreview = VisualHomeStarts({ ...props, previews: {
+    c1: { columns: ["region", "revenue"], rows: [["West", 1]], chart: { type: "donut", x: "region", y: ["revenue"] } } } });
+  const cards = [];
+  (function walk(n) {
+    if (Array.isArray(n)) return n.forEach(walk);
+    if (!React.isValidElement(n)) return;
+    if (n.props.className === "vh-recent-card") cards.push(n);
+    walk(n.props.children);
+  })(withPreview);
+  const mini = (card) => find(card, (n) => n.type?.name === "MiniChart");
+  assert.equal(mini(cards[0]).props.chart.type, "donut");
+  assert.deepEqual(mini(cards[0]).props.rows, [["West", 1]]);
+  assert.equal(mini(cards[1]), null);                              // c2: no preview — a sketch
   // Nothing to list: no empty sections.
   const bare = html(VisualHomeStarts, { onStart() {} });
   assert.doesNotMatch(bare, /from your data|Recent/);

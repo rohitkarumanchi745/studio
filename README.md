@@ -2576,8 +2576,11 @@ is only as tall as its rows, up to the size chosen.
   fill the composer with a phrase to finish, with the part to type already
   selected;
 - three bigger starts: build a dashboard, write a custom visual, map your data;
-- the conversations visualized lately, once per question, each with a
-  thumbnail of its kind;
+- the conversations visualized lately, once per question, each drawn from its
+  own latest chart and data (`GET /api/conversations/previews`). That endpoint
+  is read the way the thread is, redacted for the reader. It returns up to 400
+  rows per chart and never marks a chat read. A sketch stands in only when
+  there is nothing to draw;
 - ideas read from the data. With Auto on, these come from the first real
   source the user can read (a connection made here before a built-in one), and
   from the demo data only when there is nothing else; the heading says which.
@@ -2585,10 +2588,28 @@ is only as tall as its rows, up to the size chosen.
 Every start works on its own, with or without a model:
 - Chart gives the chart it names ("as a bar chart").
 - Table gives a table.
-- Dashboard gives a view by day, by month and by year.
+- Dashboard ("… with every view that fits the data") gives the views the data
+  supports; nothing is fixed in advance.
 - Map ("Show … on a map") gives routes, dots or shaded regions, whichever the
   data's places call for.
 - Automate ("Every week, chart …") proposes a weekly Autopilot agent.
+
+**All the ways to see this.** Under every answer in the window there is a
+strip of every chart its data can make (`recommend.js`). Each one is built
+for what it shows, not the same rows redrawn as another type:
+- places on a map (routes, dots, shaded regions);
+- a total per day as a line, an area, a stacked area by category, and a
+  calendar;
+- a total per category as bars, biggest first; shares as a donut or treemap;
+  the top labels;
+- flows from one end to the other as a network; two categories as a heatmap;
+- the spread of a measure (histogram, box plot), two measures against each
+  other, the total as a KPI, and the rows themselves.
+
+Each card is a real, small drawing of its own summarized data (`MiniChart`:
+the D3 chart drawn at full size and scaled down, drawn once on screen). Every
+card passes its fit check. Picking one draws it as the answer's chart, with its
+own data, and "↺ Back to the answer's chart" returns.
 
 In the window, a chart named in the question ("as a pie chart", "line chart",
 "on a map", "as a table") wins over the one picked for it (`agent.asked_chart`).

@@ -5,6 +5,7 @@
 // is for (charts, dashboards, maps, custom visuals) before you type a word.
 //
 // Pure helpers are exported for tests; the components only lay them out.
+import MiniChart from "./MiniChart";
 
 /** "Good morning" / "Good afternoon" / "Good evening" for a local hour. */
 export function greeting(hour) {
@@ -24,8 +25,10 @@ export function firstName(user) {
 export const QUICK_STARTS = [
   { key: "chart", label: "Chart", icon: "bars", text: "Show … as a bar chart" },
   { key: "table", label: "Table", icon: "table", text: "Show … as a table" },
+  // No views fixed in advance: the ones the data supports (the answer then
+  // shows every chart that fits it, too).
   { key: "dashboard", label: "Dashboard", icon: "grid",
-    text: "Build a dashboard of … with a view by day, by month and by year" },
+    text: "Build a dashboard of … with every view that fits the data" },
   // Any map: the agent picks routes, dots or shaded regions from the data.
   { key: "map", label: "Map", icon: "pin", text: "Show … on a map" },
   { key: "custom", label: "Custom visual", icon: "spark",
@@ -174,7 +177,7 @@ export function VisualHomeHeader({ user, now = new Date() }) {
 /** Below the composer: quick starts, bigger starts, ideas from the data, and
  *  recent visuals. `onStart(key)` fills the composer. */
 export function VisualHomeStarts({ onStart, recent = [], onOpen, onOpenCharts, ideas = [], onIdea,
-                                   ideasFrom = null }) {
+                                   ideasFrom = null, previews = {} }) {
   const shown = recentVisuals(recent);
   return (
     <div className="vh-below">
@@ -212,7 +215,12 @@ export function VisualHomeStarts({ onStart, recent = [], onOpen, onOpenCharts, i
               <button key={c.id} type="button" className="vh-recent-card" onClick={() => onOpen?.(c.id)}
                       title={c.title}>
                 <span className="vh-recent-title">{c.title}</span>
-                <Thumb glyph={c.glyph} />
+                {/* The conversation's own latest chart, drawn from its data; the
+                    sketch only when there is nothing to draw (rows expired…). */}
+                {previews[c.id]
+                  ? <MiniChart columns={previews[c.id].columns} rows={previews[c.id].rows}
+                               chart={previews[c.id].chart} height={76} />
+                  : <Thumb glyph={c.glyph} />}
                 {c.at && <span className="vh-recent-at">{ago(c.at)}</span>}
               </button>
             ))}
