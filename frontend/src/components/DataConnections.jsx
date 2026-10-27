@@ -10,10 +10,12 @@
 // set up for sending (DestinationsPanel). The tile art comes
 // from sourceCatalog.jsx.
 //
-// The grid deliberately shows sources this screen cannot set up — object stores
-// and the marketing APIs are configured by an operator through environment
-// variables — because the useful question is "what can Studio read?", and a
-// tile that explains how it gets switched on beats a tile that isn't there.
+// The grid deliberately shows sources this screen cannot set up — the marketing
+// APIs are configured by an operator through environment variables — because
+// the useful question is "what can Studio read?", and a tile that explains how
+// it gets switched on beats a tile that isn't there. Object stores (S3, Azure
+// Blob, GCS) are set up here: keys plus the first files to read as a table,
+// and more files from the source's row (StoreFiles).
 //
 // Nothing here ever sees a stored secret. Microsoft 365 runs its OAuth grant on
 // Microsoft's site; database credentials are posted once, encrypted at rest by
@@ -47,6 +49,9 @@ const NAME_RE = /^[a-z0-9][a-z0-9_-]{1,30}$/;
 const NO_AUTOFILL = { "data-1p-ignore": "true", "data-lpignore": "true",
                       "data-bwignore": "true", "data-form-type": "other" };
 
+// Fields whose values run long (a URL, a key file, a path, a connection string).
+const WIDE_FIELDS = new Set(["dsn", "credentials_json", "path", "connection_string"]);
+
 function fmtWhen(epoch) {
   if (!epoch) return "never";
   return new Date(epoch * 1000).toLocaleString();
@@ -58,6 +63,29 @@ export function suggestName(ctype, taken) {
   if (!taken.has(base)) return base;
   for (let i = 2; i < 50; i++) if (!taken.has(`${base}-${i}`)) return `${base}-${i}`;
   return "";
+}
+
+/** The object stores: a source of files, which become tables once named. */
+export const STORES = ["s3", "azure_blob", "gcs"];
+
+const FILE_FORMATS = { parquet: "parquet", pq: "parquet", csv: "csv", tsv: "csv",
+                       json: "json", jsonl: "json", ndjson: "json" };
+
+/** The format a path's files are in, by their extension ("" when it can't
+ * tell) — the server's objectstore.guess_format. */
+export function guessFormat(path) {
+  const tail = String(path || "").toLowerCase().split("/").pop().replace(/\.gz$/, "");
+  const ext = tail.includes(".") ? tail.split(".").pop() : "";
+  return FILE_FORMATS[ext] || "";
+}
+
+/** A store's name from its bucket or container (s3://trips/… → trips), free
+ * of the names taken; "" when the path names none. */
+export function nameFromPath(path, taken) {
+  const bucket = String(path || "").split("://")[1]?.split("/")[0] || "";
+  const base = bucket.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^[-_]+|-+$/g, "")
+    .slice(0, 28).replace(/-+$/, "");
+  return base.length >= 2 ? suggestName(base, taken) : "";
 }
 
 /**
@@ -711,9 +739,22 @@ export function ConnectForm({ tile, preset, defaultName, takenNames, onDone, onE
   const [replacing, setReplacing] = useState("");
   const [rowBusy, setRowBusy] = useState("");
 
+  // What the admin chose themselves, which a typed path must not overwrite.
+  const [chose, setChose] = useState({ name: false, format: false });
+
   // A credential edit invalidates everything downstream of it.
   function setField(k, v) {
-    setCfg((c) => ({ ...c, [k]: v }));
+    setCfg((c) => {
+      const next = { ...c, [k]: v };
+      // A store's files say their format and (by their bucket) a name.
+      if (k === "path" && !chose.format && guessFormat(v)) next.format = guessFormat(v);
+      return next;
+    });
+    if (k === "format") setChose((c) => ({ ...c, format: true }));
+    if (k === "path" && !chose.name && !replacing) {
+      const named = nameFromPath(v, takenNames);
+      if (named) setName(named);
+    }
     setTest(null);
     setBrowse(null);
     setPicked([]);
@@ -725,6 +766,8 @@ export function ConnectForm({ tile, preset, defaultName, takenNames, onDone, onE
   const key = namespaceKey;
   // One source can read everything this sign-in sees (Databricks): the default.
   const spans = !!tile.spans;
+  // An object store: keys plus the files to read as a table.
+  const store = STORES.includes(ctype);
   // Sources this sign-in is already connected as that read (some of) `n`.
   const takenBy = (result, n) => (result?.connected_as || [])
     .filter((c) => overlaps(c, n)).map((c) => c.name);
@@ -825,6 +868,7 @@ export function ConnectForm({ tile, preset, defaultName, takenNames, onDone, onE
   function startReplacing(sourceName) {
     setReplacing(sourceName);
     setCfg(initial());
+    setChose({ name: false, format: false });
     setTest(null);
     setBrowse(null);
     setPicked([]);
@@ -862,11 +906,17 @@ export function ConnectForm({ tile, preset, defaultName, takenNames, onDone, onE
   // A connection made here: disconnect parks it (credential and name kept,
   // reconnect is one click); remove forgets it. Both take it out of the picker
   // immediately.
-  // "schemas" opens the add-schemas step under the rows instead of calling out.
+  // "schemas" opens the add-schemas step under the rows instead of calling out;
+  // "files", a store's files.
   const [adding, setAdding] = useState("");     // source name whose schemas are open
+  const [filing, setFiling] = useState("");     // store source whose files are open
   async function act(inst, verb) {
     if (verb === "schemas") {
       setAdding((a) => (a === inst.name ? "" : inst.name));
+      return;
+    }
+    if (verb === "files") {
+      setFiling((a) => (a === inst.name ? "" : inst.name));
       return;
     }
     if (verb === "everything") {
@@ -932,32 +982,50 @@ export function ConnectForm({ tile, preset, defaultName, takenNames, onDone, onE
           onDone={onDone} onError={onError} onPartial={onRemoved}
           onCancel={() => setAdding("")} />
       )}
+      {filing && (
+        <StoreFiles key={filing} source={filing} onError={onError}
+          onClose={() => setFiling("")} />
+      )}
 
       <div className="conn-form">
         {fields.map((f) => (
-          <label key={f.key} className={`conn-field${f.key === "dsn" || f.key === "credentials_json" ? " conn-field-wide" : ""}`}>
+          <label key={f.key} className={`conn-field${WIDE_FIELDS.has(f.key) ? " conn-field-wide" : ""}`}>
             <span className="conn-label">
               {f.label}{f.required && <b className="conn-req"> *</b>}
             </span>
-            <input
-              type={f.secret ? "password" : "text"}
-              name={`conn-${tile.id}-${f.key}`}
-              className={fieldProblems[f.key] ? "conn-input-bad" : undefined}
-              aria-invalid={fieldProblems[f.key] ? "true" : undefined}
-              placeholder={f.placeholder || ""}
-              value={cfg[f.key] ?? ""}
-              onChange={(e) => setField(f.key, e.target.value)}
-              disabled={!!busy}
-              {...NO_AUTOFILL}
-              autoComplete={f.secret ? "new-password" : "off"}
-            />
+            {f.options ? (
+              <select
+                name={`conn-${tile.id}-${f.key}`}
+                className={fieldProblems[f.key] ? "conn-input-bad" : undefined}
+                aria-invalid={fieldProblems[f.key] ? "true" : undefined}
+                value={cfg[f.key] ?? f.default ?? ""}
+                onChange={(e) => setField(f.key, e.target.value)}
+                disabled={!!busy}
+              >
+                {f.options.map((o) => <option key={o} value={o}>{o}</option>)}
+              </select>
+            ) : (
+              <input
+                type={f.secret ? "password" : "text"}
+                name={`conn-${tile.id}-${f.key}`}
+                className={fieldProblems[f.key] ? "conn-input-bad" : undefined}
+                aria-invalid={fieldProblems[f.key] ? "true" : undefined}
+                placeholder={f.placeholder || ""}
+                value={cfg[f.key] ?? ""}
+                onChange={(e) => setField(f.key, e.target.value)}
+                disabled={!!busy}
+                {...NO_AUTOFILL}
+                autoComplete={f.secret ? "new-password" : "off"}
+              />
+            )}
             {fieldProblems[f.key] && <span className="conn-field-error">{fieldProblems[f.key]}</span>}
           </label>
         ))}
         {!replacing && (
           <label className="conn-field">
             <span className="conn-label">Name it in Studio</span>
-            <input value={name} onChange={(e) => setName(e.target.value)}
+            <input value={name}
+                   onChange={(e) => { setName(e.target.value); setChose((c) => ({ ...c, name: true })); }}
                    disabled={!!busy} {...NO_AUTOFILL} autoComplete="off" />
           </label>
         )}
@@ -984,7 +1052,10 @@ export function ConnectForm({ tile, preset, defaultName, takenNames, onDone, onE
         ? <div className="meta share-notice">
             {test.discovery
               ? `✓ Signed in — ${browse?.namespaces?.length || 0} schemas visible`
-              : `✓ Connected — ${test.tables} tables${test.sample?.length ? `: ${test.sample.join(", ")}` : ""}`}
+              : store
+              ? `✓ Signed in and read the files — they become the table “${test.sample?.[0] || ""}”`
+              : `✓ Connected — ${test.tables} table${test.tables === 1 ? "" : "s"}`
+                + `${test.sample?.length ? `: ${test.sample.join(", ")}` : ""}`}
           </div>
         : <div className="error">{test.error}</div>)}
 
@@ -1028,6 +1099,9 @@ export function ConnectForm({ tile, preset, defaultName, takenNames, onDone, onE
         {spans
           ? "One source reads every catalog and schema this credential can see — grant its " +
             "tables to other roles in Governance."
+          : store
+          ? "The files are read as one table; add more from the source's row (＋ Add files). " +
+            "Only administrators reach it until it is granted to other roles in Governance."
           : ns.schema
           ? "The source reads the schema you pick — grant it to other roles in Governance."
           : "Only administrators reach a new source until it is granted to other roles in " +
@@ -1136,6 +1210,183 @@ function AddSchemas({ source, takenNames, onDone, onError, onPartial, onCancel }
       <div className="meta">
         Uses {source}'s existing credential — nothing to re-enter. {source} itself stays
         pinned to its own schema.
+      </div>
+    </div>
+  );
+}
+
+// ── A store's files: what it reads as tables, and more of them ───────────
+//
+// Object storage has no tables: a set of files (one file, a folder/*, a
+// pattern) is named as one. The source's own setup brings the first; more are
+// added here on the keys it already has. The server reads them before saving
+// (POST /settings/objectstore with check), so a wrong path or format is
+// refused here rather than on some later question.
+
+const EXAMPLE_PATH = { s3: "s3://bucket/sales/*.parquet", azure_blob: "az://container/sales/*.parquet",
+                       gcs: "gs://bucket/sales/*.parquet" };
+const TABLE_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/** A store source's tables, {name, uri, format, removable}, from
+ * GET /settings/objectstore. Only the registry's own rows can be removed: the
+ * first one belongs to the source's setup, the environment's to the deployment. */
+export function storeTables(state, source) {
+  const own = new Set((state?.datasets || []).filter((d) => d.source === source)
+    .map((d) => d.name));
+  return (state?.live?.[source] || []).map((d) => ({ ...d, removable: own.has(d.name) }));
+}
+
+/** What is wrong with the add-files form before it is sent, or "". */
+export function fileFormProblem(form, tables = [], schemes = []) {
+  const name = String(form.name || "").trim();
+  const uri = String(form.uri || "").trim();
+  if (uri && schemes.length && !schemes.some((s) => uri.startsWith(s))) {
+    return `Files here start with ${schemes.join(" or ")}.`;
+  }
+  if (name && !TABLE_NAME_RE.test(name)) {
+    return "A table name is letters, digits and _, starting with a letter.";
+  }
+  if (name && tables.some((t) => t.name === name)) {
+    return `“${name}” is already a table here — pick another name.`;
+  }
+  return "";
+}
+
+export function StoreFiles({ source, onError, onClose }) {
+  const [state, setState] = useState(null);     // GET /settings/objectstore
+  const [form, setForm] = useState({ name: "", uri: "", format: "parquet" });
+  const [chose, setChose] = useState(false);    // the format was picked by hand
+  const [problems, setProblems] = useState({}); // the server's, by field ("_": the rest)
+  const [busy, setBusy] = useState("");
+  const [note, setNote] = useState("");
+
+  const load = () => api("/settings/objectstore").then(setState)
+    .catch((e) => setState({ error: e.message }));
+  useEffect(() => { load(); }, [source]);
+
+  const tables = storeTables(state, source);
+  const schemes = state?.sources?.[source] || [];
+  const problem = fileFormProblem(form, tables, schemes);
+
+  function set(k, v) {
+    setForm((f) => {
+      const next = { ...f, [k]: v };
+      if (k === "uri" && !chose && guessFormat(v)) next.format = guessFormat(v);
+      return next;
+    });
+    if (k === "format") setChose(true);
+    setProblems({});
+    setNote("");
+  }
+
+  async function add() {
+    const name = form.name.trim();
+    setBusy("add");
+    setProblems({});
+    setNote("");
+    onError("");
+    try {
+      await api("/settings/objectstore", {
+        method: "POST",
+        body: JSON.stringify({ source, name, uri: form.uri.trim(), format: form.format, check: true }),
+      });
+      // Queue a scan, so the new table's columns reach the agents' map of the source.
+      api(`/metagraph/sources/${encodeURIComponent(source)}/discover`, { method: "POST" })
+        .catch(() => {});
+      setNote(`✓ Read the files — “${name}” is a table on ${source} now.`);
+      setForm((f) => ({ name: "", uri: "", format: f.format }));
+      setChose(false);
+      load();
+    } catch (e) {
+      const fields = e.detail?.fields || {};
+      setProblems(Object.keys(fields).length ? fields : { _: e.message });
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function remove(name) {
+    if (!confirm(`Stop reading “${name}” from ${source}? The files stay where they are; `
+      + `chats and dashboards that query “${name}” stop working.`)) return;
+    setBusy(`remove:${name}`);
+    setNote("");
+    onError("");
+    try {
+      await api(`/settings/objectstore/${encodeURIComponent(source)}/${encodeURIComponent(name)}`,
+                { method: "DELETE" });
+      load();
+    } catch (e) {
+      onError(e.message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  const bad = (k) => (problems[k] ? { className: "conn-input-bad", "aria-invalid": "true" } : {});
+  return (
+    <div className="conn-add-schemas conn-files">
+      <div className="conn-ns-head">
+        <span className="conn-label">Files {source} reads, each as a table</span>
+        <button className="chip" onClick={onClose} disabled={!!busy}>Close</button>
+      </div>
+      {!state ? <div className="meta">Looking up {source}'s files…</div>
+        : state.error ? <div className="meta conn-warn">Couldn't list the files ({state.error}).</div>
+        : (
+          <div className="conn-files-list">
+            {tables.map((t) => (
+              <div key={t.name} className="conn-file">
+                <b>{t.name}</b>
+                <span className="query-tag">{t.format}</span>
+                <span className="meta conn-file-uri" title={t.uri}>{t.uri}</span>
+                {t.removable ? (
+                  <button className="chip ctx-danger" onClick={() => remove(t.name)} disabled={!!busy}>
+                    {busy === `remove:${t.name}` ? "working…" : "✕ Remove"}
+                  </button>
+                ) : <span className="meta">part of {source}'s setup</span>}
+              </div>
+            ))}
+            {!tables.length && <div className="meta">No files read yet.</div>}
+          </div>
+        )}
+      <div className="conn-form">
+        <label className="conn-field conn-field-wide">
+          <span className="conn-label">Files<b className="conn-req"> *</b></span>
+          <input value={form.uri} onChange={(e) => set("uri", e.target.value)} disabled={!!busy}
+                 placeholder={`${EXAMPLE_PATH[state?.kinds?.[source]] || "s3://bucket/sales/*.parquet"}`
+                   + " — a file, a folder/* or a pattern"}
+                 {...bad("uri")} {...NO_AUTOFILL} autoComplete="off" />
+          {problems.uri && <span className="conn-field-error">{problems.uri}</span>}
+        </label>
+        <label className="conn-field">
+          <span className="conn-label">Name them as a table<b className="conn-req"> *</b></span>
+          <input value={form.name} onChange={(e) => set("name", e.target.value)} disabled={!!busy}
+                 placeholder="the table agents query, e.g. stations"
+                 {...bad("name")} {...NO_AUTOFILL} autoComplete="off" />
+          {problems.name && <span className="conn-field-error">{problems.name}</span>}
+        </label>
+        <label className="conn-field">
+          <span className="conn-label">Format</span>
+          <select value={form.format} onChange={(e) => set("format", e.target.value)}
+                  disabled={!!busy} {...bad("format")}>
+            {(state?.formats || ["csv", "json", "parquet"]).map((f) => (
+              <option key={f} value={f}>{f}</option>
+            ))}
+          </select>
+          {problems.format && <span className="conn-field-error">{problems.format}</span>}
+        </label>
+      </div>
+      {problem && <div className="meta conn-warn">{problem}</div>}
+      {problems._ && <div className="error">{problems._}</div>}
+      {note && <div className="meta share-notice">{note}</div>}
+      <div className="m365-actions">
+        <button className="primary" onClick={add}
+          disabled={!!busy || !form.name.trim() || !form.uri.trim() || !!problem}>
+          {busy === "add" ? "reading the files…" : "✓ Add files"}
+        </button>
+      </div>
+      <div className="meta">
+        Uses {source}'s keys — nothing to re-enter. The files are read before they are added,
+        so a wrong path or format shows up here.
       </div>
     </div>
   );
@@ -1320,6 +1571,8 @@ export function Instances({ tile, onAct, onManage, busy = "" }) {
   // of it widens instead — and takes the other copies of its sign-in with it.
   const canWiden = (i) => !!tile.spans && i.kind === "user" && i.configured && !i.disconnected
     && !i.everything;
+  // A store reads more files on the keys it already has.
+  const canFile = (i) => STORES.includes(tile.id) && i.configured && !i.disconnected;
   return (
     <div className="conn-instances">
       {tile.instances.map((i) => (
@@ -1335,6 +1588,12 @@ export function Instances({ tile, onAct, onManage, busy = "" }) {
           {onAct && canAdd(i) && (
             <button className="chip" onClick={() => onAct(i, "schemas")} disabled={!!busy}>
               ＋ Add schemas
+            </button>
+          )}
+          {onAct && canFile(i) && (
+            <button className="chip" onClick={() => onAct(i, "files")} disabled={!!busy}
+                    title="Read more files from this store, each as a table">
+              ＋ Add files
             </button>
           )}
           {onAct && canWiden(i) && (

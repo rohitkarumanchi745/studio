@@ -259,7 +259,7 @@ test("the grid renders a tile per source with an honest status", async () => {
       assert.match(html, /Snowflake<\/span><span class="conn-tile-status">1 connected/);
       // BigQuery is offered even though nothing is configured for it…
       assert.match(html, /PostgreSQL<\/span><span class="conn-tile-status">1 connected/);
-      // …and S3, which this screen cannot set up, says so instead of vanishing.
+      // …and S3, when the server serves no form for it, says so instead of vanishing.
       assert.match(html, /Amazon S3<\/span><span class="conn-tile-status">Not configured/);
       assert.match(html, /GitHub<\/span><span class="conn-tile-status">1 registered/);
       assert.match(html, /conn-tile-off/);
