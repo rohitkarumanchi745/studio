@@ -70,6 +70,8 @@ from .connectors.jira_conn import JiraConnector
 from .connectors.lancedb_conn import LanceDBConnector
 from .connectors.n8n_conn import N8nConnector
 from .connectors.servicenow_conn import ServiceNowConnector
+from .connectors import objectstore
+from .connectors.objectstore import ObjectStoreConnector
 from .connectors.sql_conn import SqlConnector
 from .connectors.sql_conn import check_url as check_sql_url
 
@@ -210,6 +212,37 @@ class _DynN8n(N8nConnector):
         super().__init__(name, cfg)
 
 
+def _object_store(kind):
+    """The builder for a store of `kind`: an ObjectStoreConnector on the
+    connection's own credentials and first dataset (connectors/objectstore.py)."""
+    def build(name, cfg):
+        return ObjectStoreConnector(name, kind, cfg)
+    return build
+
+
+def _check_object_store(kind):
+    return lambda cfg: objectstore.check_config(kind, cfg)
+
+
+def _classify_object_store(kind):
+    return lambda exc: objectstore.classify_error(exc, kind)
+
+
+def _explain_object_store(kind):
+    return lambda exc: (objectstore.classify_error(exc, kind) or {}).get("said")
+
+
+def _store_fields(kind):
+    """What every store's form asks after its credentials: its first dataset —
+    the files, the table name agents query them by, and their format."""
+    return [
+        _field("path", "Files", required=True,
+               placeholder=f"{objectstore.EXAMPLE_PATH[kind]} — a file, a folder/* or a pattern"),
+        _field("dataset", "Name them as a table", placeholder="the table agents query, e.g. sales"),
+        _field("format", "Format", default="parquet", options=("parquet", "csv", "json")),
+    ]
+
+
 class _DynPowerBI(PowerBIConnector):
     def __init__(self, name, cfg):
         super().__init__()                      # per-connection metadata cache
@@ -223,9 +256,12 @@ class _DynPowerBI(PowerBIConnector):
         return base
 
 
-def _field(key, label, required=False, secret=False, default="", placeholder=""):
-    return {"key": key, "label": label, "required": required, "secret": secret,
-            "default": default, "placeholder": placeholder}
+def _field(key, label, required=False, secret=False, default="", placeholder="", options=None):
+    out = {"key": key, "label": label, "required": required, "secret": secret,
+           "default": default, "placeholder": placeholder}
+    if options:
+        out["options"] = list(options)      # the form offers these as a choice
+    return out
 
 
 # ── Form checks, before any sign-in ─────────────────────────────────────
@@ -659,7 +695,70 @@ TYPES = {
             _field("dataset", "Semantic model", placeholder="name or ID — or pick below"),
         ],
     },
+    # Object storage, read through DuckDB (connectors/objectstore.py). A store
+    # has no tables until files are named as one, so the form asks for the
+    # first dataset with the credentials; the test reads those files (binding
+    # a reader fetches their footers / samples them), so wrong keys or a wrong
+    # path fail here, not on a later question. More datasets are added from
+    # the source's row. These names are also the built-in sources', so the
+    # same form sets those up in place of environment variables.
+    "s3": {
+        "needs_tables": True, "verify": True,
+        "label": "Amazon S3", "dialect": "duckdb", "build": _object_store("s3"),
+        "check": _check_object_store("s3"), "classify": _classify_object_store("s3"),
+        "explain": _explain_object_store("s3"),
+        "hint_key": "path",
+        "fields": [
+            _field("access_key_id", "Access key ID", required=True, placeholder="AKIA…"),
+            _field("secret_access_key", "Secret access key", required=True, secret=True),
+            _field("region", "Region", default="us-east-1"),
+            _field("endpoint", "Endpoint (S3-compatible stores only)",
+                   placeholder="MinIO, Cloudflare R2, Wasabi: host:port — empty for AWS"),
+            _field("session_token", "Session token (temporary keys only)", secret=True),
+            *_store_fields("s3"),
+        ],
+    },
+    "azure_blob": {
+        "needs_tables": True, "verify": True,
+        "label": "Azure Blob Storage", "dialect": "duckdb", "build": _object_store("azure_blob"),
+        "check": _check_object_store("azure_blob"), "classify": _classify_object_store("azure_blob"),
+        "explain": _explain_object_store("azure_blob"),
+        "hint_key": "path",
+        "fields": [
+            _field("connection_string", "Connection string", secret=True,
+                   placeholder="DefaultEndpointsProtocol=https;AccountName=…;AccountKey=…"),
+            _field("account_name", "Storage account (service principal)",
+                   placeholder="or sign in as a service principal: these four"),
+            _field("tenant_id", "Tenant ID (service principal)"),
+            _field("client_id", "Client ID (service principal)"),
+            _field("client_secret", "Client secret (service principal)", secret=True),
+            *_store_fields("azure_blob"),
+        ],
+    },
+    "gcs": {
+        "needs_tables": True, "verify": True,
+        "label": "Google Cloud Storage", "dialect": "duckdb", "build": _object_store("gcs"),
+        "check": _check_object_store("gcs"), "classify": _classify_object_store("gcs"),
+        "explain": _explain_object_store("gcs"),
+        "hint_key": "path",
+        "fields": [
+            _field("hmac_key_id", "HMAC access key", required=True,
+                   placeholder="GOOG1E… — Cloud Storage → Settings → Interoperability"),
+            _field("hmac_secret", "HMAC secret", required=True, secret=True),
+            *_store_fields("gcs"),
+        ],
+    },
 }
+
+#: The connection types that are object stores.
+OBJECT_STORE_TYPES = ("s3", "azure_blob", "gcs")
+
+
+def object_store_connections():
+    """{name: kind} for the object-store connections made on this screen (on)."""
+    with db.connect() as c:
+        rows = c.execute("SELECT name, ctype FROM data_connections WHERE enabled=1").fetchall()
+    return {r["name"]: r["ctype"] for r in rows if r["ctype"] in OBJECT_STORE_TYPES}
 
 
 def init_tables():
@@ -709,8 +808,9 @@ _ENV_TYPES = ((PostgresConnector, "postgres"), (SnowflakeConnector, "snowflake")
 
 def _env_parent(name):
     """(ctype, live config) for a configured env source whose type has
-    namespaces, else None. Read from the connector itself, so it is exactly
-    the credential the deployment runs with right now."""
+    namespaces, or that is an object store, else None. Read from the connector
+    itself, so it is exactly the credential the deployment runs with right
+    now."""
     from . import connectors
     conn = connectors._REGISTRY.get(name)
     if conn is None:
@@ -726,6 +826,10 @@ def _env_parent(name):
             cfg = ({"dsn": conn._dsn(), "schema": conn._schema()} if ctype == "postgres"
                    else conn._cfg())
             return ctype, {k: str(v) for k, v in cfg.items() if v}
+    # A store has no namespaces, but its keys are a sign-in all the same: a
+    # connection made here with the deployment's own keys is a duplicate.
+    if isinstance(conn, ObjectStoreConnector) and conn.configured():
+        return conn.kind, {k: v for k, v in conn._cfg().items() if v}
     return None
 
 
@@ -886,9 +990,10 @@ _ENV_CACHE = {}      # name -> ((updated_at, ciphertext), connector)
 
 def _env_type(name):
     """The connection type a built-in source can be managed as, or None. The
-    warehouse sources share their type's key — `databricks` is a Databricks SQL
-    source — so a form exists for exactly those; demo, the object stores and
-    the API connectors stay environment-only."""
+    warehouse sources and the object stores share their type's key —
+    `databricks` is a Databricks SQL source, `s3` an Amazon S3 one — so a form
+    exists for exactly those; demo and the API connectors stay
+    environment-only."""
     from . import connectors
     return name if name in TYPES and name in connectors._REGISTRY else None
 
@@ -969,6 +1074,8 @@ def _namespace(ctype, cfg):
     only: qualifiers() remains the thing that enforces it."""
     t = TYPES.get(ctype) or {}
     cfg = cfg or {}
+    if ctype in OBJECT_STORE_TYPES:
+        return ""                  # a store's "dataset" is a table name, not a namespace
     schema = (cfg.get("schema") or cfg.get("dataset") or "").strip()
     database = (cfg.get("database") or cfg.get("catalog") or cfg.get("project")
                 or cfg.get("workspace") or "").strip()
@@ -1041,11 +1148,13 @@ _SIGN_IN = {
     "servicenow": ("instance", "username"),
     "n8n": ("url", "api_key"),
     "powerbi": ("tenant_id", "client_id"),
+    "s3": ("endpoint", "access_key_id"),
+    "gcs": ("hmac_key_id",),
 }
 #: When the "who" field is blank, the credential itself is the identity.
 _SIGN_IN_SECRET = {"jira": ("email", "api_token"), "servicenow": ("username", "token")}
 _CASELESS = {"server_hostname", "account", "user", "uri", "site", "instance", "url",
-             "contact_points", "tenant_id", "client_id", "region", "host_override"}
+             "contact_points", "tenant_id", "client_id", "region", "host_override", "endpoint"}
 
 
 def _url_sign_in(raw):
@@ -1079,6 +1188,10 @@ def _sign_in(ctype, cfg):
             return ["sa", json.loads(creds).get("client_email", "")] if creds else ["adc"]
         except (ValueError, AttributeError):
             return ["creds", hashlib.sha256(creds.encode()).hexdigest()]
+    if ctype == "azure_blob":
+        account = re.search(r"AccountName=([^;]+)", str(cfg.get("connection_string") or ""), re.I)
+        return ([account.group(1).lower(), ""] if account
+                else [val("account_name").lower(), val("client_id").lower()])
     if ctype == "cassandra":
         points = sorted(p.strip().lower() for p in val("contact_points").split(",") if p.strip())
         return [points, val("port") or "9042", val("username")]
@@ -1170,7 +1283,12 @@ def _refuse_duplicate(ctype, cfg, **skip):
                  None)
     if clash is None:
         return
-    if clash["everything"]:
+    if ctype in OBJECT_STORE_TYPES:
+        # One set of keys reads every bucket it may: more files are datasets
+        # on the source already connected, not a second copy of the keys.
+        said = (f"These keys are already connected as “{clash['name']}” — add these files to "
+                f"it instead (＋ Add files, on its row).")
+    elif clash["everything"]:
         said = (f"This sign-in is already connected as “{clash['name']}”, which reads "
                 f"everything it can see — use that source.")
     elif _everything(scope):
@@ -1209,6 +1327,10 @@ def _probe(ctype, cfg, before_sign_in=None):
         if not conn.configured():
             return {"ok": False, "error": "the connector reports itself unconfigured — check the fields"}
         tables = conn.list_tables()
+        if tables and t.get("verify"):
+            # A store lists its tables from the form, without reading a byte:
+            # read them, so a wrong key or path fails now.
+            conn.get_schema(tables[0])
     except Exception as e:
         return _failed(t, e, cfg)
     finally:
@@ -1837,6 +1959,10 @@ def delete_connection(cid: str, user=Depends(current_user)):
         if r is None:
             raise HTTPException(404, "Not found")
         c.execute("DELETE FROM data_connections WHERE id=?", (cid,))
+        if r["ctype"] in OBJECT_STORE_TYPES:
+            # Its datasets go with it: a later source given the same name must
+            # not inherit paths that were registered for these keys.
+            c.execute("DELETE FROM objectstore_datasets WHERE source=?", (r["name"],))
         c.commit()
     _evict_cached(r["name"])
     _announce(r["name"], "removed")

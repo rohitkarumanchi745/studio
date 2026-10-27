@@ -299,7 +299,8 @@ function PlanningSourcesPreview() {
   );
 }
 
-// Order here is the display order of the groups below.
+// The built-in stores, in display order; the server adds the stores connected
+// on the Integrations screen (`kinds`: source name → s3 / azure_blob / gcs).
 const STORE_SOURCES = ["s3", "azure_blob", "gcs"];
 const URI_HINT = {
   s3: "s3://bucket/prefix/*.parquet",
@@ -307,15 +308,29 @@ const URI_HINT = {
   gcs: "gs://bucket/prefix/*.parquet",
 };
 
+/** Every store source, built-ins first: [[name, kind]]. */
+export function storeSources(kinds) {
+  const all = { ...Object.fromEntries(STORE_SOURCES.map((s) => [s, s])), ...(kinds || {}) };
+  return Object.entries(all).sort(([a], [b]) =>
+    (STORE_SOURCES.includes(b) - STORE_SOURCES.includes(a))
+    || (STORE_SOURCES.indexOf(a) - STORE_SOURCES.indexOf(b)) || a.localeCompare(b));
+}
+
 function ObjectStores() {
   const [datasets, setDatasets] = useState([]);
+  const [kinds, setKinds] = useState({});
   const [form, setForm] = useState({ source: "s3", name: "", uri: "", format: "parquet" });
   const [err, setErr] = useState("");
 
   const load = () =>
     api("/settings/objectstore")
-      .then((d) => setDatasets(d.datasets || []))
+      .then((d) => {
+        setDatasets(d.datasets || []);
+        setKinds(d.kinds || {});
+      })
       .catch((e) => setErr(e.message));
+  const sources = storeSources(kinds);
+  const hint = (s) => URI_HINT[kinds[s] || s];
 
   useEffect(() => {
     load();
@@ -341,7 +356,8 @@ function ObjectStores() {
   }
 
   async function remove(source, name) {
-    await api(`/settings/objectstore/${source}/${name}`, { method: "DELETE" });
+    await api(`/settings/objectstore/${encodeURIComponent(source)}/${encodeURIComponent(name)}`,
+              { method: "DELETE" });
     load();
   }
 
@@ -357,13 +373,13 @@ function ObjectStores() {
       {err && <div className="error">{err}</div>}
       <div className="job-form-row" style={{ marginTop: 8 }}>
         <select value={form.source} onChange={(e) => setForm({ ...form, source: e.target.value })}>
-          {STORE_SOURCES.map((s) => (
-            <option key={s} value={s}>{s}</option>
+          {sources.map(([s, kind]) => (
+            <option key={s} value={s}>{s === kind ? s : `${s} (${kind})`}</option>
           ))}
         </select>
         <input className="sqllab-prompt" style={{ maxWidth: 150 }} placeholder="name (the table agents see)"
           value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
-        <input className="sqllab-prompt" style={{ flex: 1 }} placeholder={URI_HINT[form.source]}
+        <input className="sqllab-prompt" style={{ flex: 1 }} placeholder={hint(form.source)}
           value={form.uri} onChange={(e) => setForm({ ...form, uri: e.target.value })} />
         <select value={form.format} onChange={(e) => setForm({ ...form, format: e.target.value })}>
           <option value="parquet">parquet</option>
@@ -374,12 +390,12 @@ function ObjectStores() {
           disabled={!form.name.trim() || !form.uri.trim()}>＋ register</button>
       </div>
       <div className="share-list">
-        {STORE_SOURCES.map((s) => {
+        {sources.map(([s]) => {
           const rows = datasets.filter((d) => d.source === s);
           if (rows.length === 0) return null;
           return (
             <Fragment key={s}>
-              <div className="meta">{s} — {URI_HINT[s]}</div>
+              <div className="meta">{s} — {hint(s)}</div>
               {rows.map((d) => (
                 <div key={`${d.source}/${d.name}`} className="share-row">
                   <div>
