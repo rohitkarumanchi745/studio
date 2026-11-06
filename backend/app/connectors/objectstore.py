@@ -9,10 +9,17 @@ existing guardrails unchanged (rbac.py allowlists them, queryguard.py rejects
 everything else), and a raw object URI in agent SQL simply fails validation.
 The view DDL is built here from the vetted registry, never from model output.
 
-Datasets come from the admin table plus a STUDIO_OBJECT_DATASETS env bootstrap,
-so a deploy can ship with datasets already present; the DB wins a name
-collision. Credentials never enter the registry — they stay in env (see
-.env.example), so a registry row leaks nothing but a bucket path.
+Two ways a store is set up. The built-in sources (s3, azure_blob, gcs) read
+their credentials from the environment (see .env.example). A connection made
+on the Integrations screen (connections.py) carries its own — stored
+encrypted with the connection, as every other connector's are — together with
+its first dataset; an admin can set up a built-in source the same way. Either
+way, credentials never enter the dataset registry, so a registry row leaks
+nothing but a bucket path.
+
+Datasets come from the admin table, the connection's own first dataset, and
+(built-ins only) a STUDIO_OBJECT_DATASETS env bootstrap; the DB wins a name
+collision.
 
 Requires `pip install duckdb` (commented in requirements.txt). Without it, or
 without credentials, or with no datasets registered, the source reports
@@ -79,17 +86,17 @@ def _esc(v):
     return str(v).replace("'", "''")
 
 
-def _valid(source, name, uri, fmt):
+def _valid(kind, name, uri, fmt):
     """A dataset is only usable if its name is an identifier, its format has a
     reader, and its URI belongs to this source and carries no query string —
     DuckDB's legacy `s3://…?s3_access_key_id=…` form lets a URI smuggle its own
     credentials and endpoint. (SET s3_url_compatibility_mode closes that hole
     too, but it also disables globbing on S3 URLs, which every dataset uses.)"""
-    if source not in _SOURCES or fmt not in _FORMATS:
+    if kind not in _SOURCES or fmt not in _FORMATS:
         return False
     if not _NAME_RE.match(name or ""):
         return False
-    if not (uri or "").startswith(_SOURCES[source]["schemes"]):
+    if not (uri or "").startswith(_SOURCES[kind]["schemes"]):
         return False
     return "?" not in uri and not re.search(r"""[\s'"\\]""", uri)
 
@@ -107,17 +114,31 @@ def _env_datasets(source):
         return []
 
 
-def datasets(source):
-    """Registered datasets for a source, name-sorted: env bootstrap first, DB
-    rows on top (the DB wins a collision). Validation happens here, not only on
-    the add path, so the view builder can never see a name or URI that has not
+def config_dataset(config):
+    """The first dataset a connection was set up with (its form's path, name
+    and format), or None."""
+    config = config or {}
+    uri = str(config.get("path") or "").strip()
+    if not uri:
+        return None
+    return {"name": str(config.get("dataset") or "data").strip(), "uri": uri,
+            "format": str(config.get("format") or "parquet").strip().lower()}
+
+
+def datasets(source, kind=None, config=None):
+    """Registered datasets for a source, name-sorted: a built-in's env
+    bootstrap first, then the connection's own first dataset, then DB rows on
+    top (the DB wins a collision). Validation happens here, not only on the
+    add path, so the view builder can never see a name or URI that has not
     been vetted — including a row written before a rule tightened."""
+    kind = kind or source
     out = {}
-    rows = _rows(source)
-    for d in _env_datasets(source) + rows:
+    first = config_dataset(config)
+    bootstrap = _env_datasets(source) if source in _SOURCES else []
+    for d in bootstrap + ([first] if first else []) + _rows(source):
         name, uri = str((d or {}).get("name", "")), str((d or {}).get("uri", ""))
         fmt = str((d or {}).get("format", "parquet")).lower()
-        if _valid(source, name, uri, fmt):
+        if _valid(kind, name, uri, fmt):
             out[name] = {"source": source, "name": name, "uri": uri, "format": fmt}
     return [out[n] for n in sorted(out)]
 
@@ -141,7 +162,155 @@ def _view_sql(d):
             f"{reader}('{_esc(d['uri'])}', hive_partitioning=true, union_by_name=true)")
 
 
-# ── Credentials (env only; never in the registry) ───────────────────────
+# ── Setting a store up from the Integrations screen ─────────────────────
+
+_EXTENSIONS = {".parquet": "parquet", ".pq": "parquet", ".csv": "csv", ".tsv": "csv",
+               ".json": "json", ".jsonl": "json", ".ndjson": "json"}
+EXAMPLE_PATH = {"s3": "s3://bucket/sales/*.parquet", "azure_blob": "az://container/sales/*.parquet",
+                "gcs": "gs://bucket/sales/*.parquet"}
+
+
+def guess_format(uri):
+    """The format a path's files are in, from their extension, or None."""
+    tail = str(uri or "").lower().rsplit("/", 1)[-1].removesuffix(".gz")
+    return next((fmt for ext, fmt in _EXTENSIONS.items() if tail.endswith(ext)), None)
+
+
+# Instance-metadata services: AWS (also over IPv6), GCP, Azure, Oracle, and
+# Alibaba's — besides the link-local range most of them sit in.
+_METADATA_ADDRS = {"169.254.169.254", "fd00:ec2::254", "100.100.100.200"}
+
+
+def _host_of(endpoint):
+    """The host in `host[:port]`, `[v6]:port` or a URL."""
+    rest = re.sub(r"^[a-z][a-z0-9+.-]*://", "", str(endpoint or "").strip(), flags=re.I)
+    rest = rest.split("/")[0].rsplit("@", 1)[-1]
+    bracketed = re.match(r"^\[([^\]]+)\]", rest)
+    if bracketed:
+        return bracketed.group(1)
+    return rest.rsplit(":", 1)[0] if rest.count(":") == 1 else rest
+
+
+def _metadata_host(host):
+    """A cloud instance-metadata address (169.254.169.254, metadata.google.
+    internal…): never a storage endpoint, and the one address an endpoint
+    field must not be able to point the server at. Names are resolved, and an
+    IPv4 address written as IPv6 is read as the IPv4 it is."""
+    import ipaddress
+    import socket
+    host = str(host or "").strip().rstrip(".").lower()
+    if host in ("metadata", "metadata.google.internal"):
+        return True
+
+    def addr(text):
+        a = ipaddress.ip_address(text.split("%")[0])      # an IPv6 scope is not part of it
+        return (a.ipv4_mapped or a) if a.version == 6 else a
+    try:
+        addrs = {addr(host)}
+    except ValueError:
+        try:
+            addrs = {addr(a[4][0]) for a in socket.getaddrinfo(host, None)}
+        except (OSError, ValueError, UnicodeError):
+            return False
+    return any(a.is_link_local or str(a) in _METADATA_ADDRS for a in addrs)
+
+
+def _azure_endpoints(conn_str):
+    """The hosts an Azure connection string names (BlobEndpoint=…, …)."""
+    pairs = (part.split("=", 1) for part in str(conn_str or "").split(";") if "=" in part)
+    return [_host_of(v) for k, v in pairs if k.strip().lower().endswith("endpoint") and v.strip()]
+
+
+def check_config(kind, cfg):
+    """(tidied config, {field: problem}) for a store's connect form, before
+    anything signs in. Fills what has an obvious answer (the format from the
+    files' extension, "data" as the name) and says, per field, what is wrong
+    — never repeating a value typed, which may be a secret in the wrong box."""
+    cfg = {k: str(v).strip() for k, v in (cfg or {}).items() if v is not None}
+    problems = {}
+    path = cfg.get("path", "")
+    cfg["format"] = (cfg.get("format") or guess_format(path) or "parquet").lower()
+    cfg["dataset"] = cfg.get("dataset") or "data"
+    schemes = _SOURCES[kind]["schemes"]
+    if not path.startswith(schemes):
+        problems["path"] = (f"A path here starts with {' or '.join(schemes)} — for example "
+                            f"{EXAMPLE_PATH[kind]}.")
+    elif "?" in path or re.search(r"""[\s'"\\]""", path):
+        problems["path"] = "A path cannot hold spaces, quotes or a query string (?…)."
+    if not _NAME_RE.match(cfg["dataset"]):
+        problems["dataset"] = ("Letters, digits and _ only, starting with a letter — it becomes the "
+                               "table agents query.")
+    if cfg["format"] not in _FORMATS:
+        problems["format"] = f"One of {', '.join(sorted(_FORMATS))}."
+    if kind == "s3" and cfg.get("endpoint"):
+        endpoint = cfg["endpoint"]
+        if endpoint.lower().startswith("http://"):
+            cfg["use_ssl"] = "false"
+        endpoint = re.sub(r"^https?://", "", endpoint, flags=re.I).rstrip("/")
+        cfg["endpoint"] = endpoint
+        if "/" in endpoint:
+            problems["endpoint"] = "Just the host and port — for example minio.example.com:9000."
+        elif _metadata_host(_host_of(endpoint)):
+            problems["endpoint"] = "That is a cloud metadata address, not a storage endpoint."
+    if kind == "azure_blob":
+        principal = all(cfg.get(k) for k in ("account_name", "tenant_id", "client_id", "client_secret"))
+        if cfg.get("connection_string"):
+            if "accountname=" not in cfg["connection_string"].lower():
+                problems["connection_string"] = ("A connection string has AccountName=…;AccountKey=… in "
+                                                 "it — copy it from the storage account's Access keys.")
+            elif any(_metadata_host(h) for h in _azure_endpoints(cfg["connection_string"])):
+                # BlobEndpoint=… is how Azurite and sovereign clouds are named —
+                # and how a string could point the server at its metadata service.
+                problems["connection_string"] = ("It names a cloud metadata address as an endpoint, "
+                                                 "not a storage account.")
+        elif not principal:
+            problems["connection_string"] = (
+                "Paste the storage account's connection string (Access keys, in the Azure portal), "
+                "or fill in all four service-principal fields.")
+    return cfg, problems
+
+
+def classify_error(exc, kind):
+    """{said, field, stage} for a store that would not read, or None. The
+    error text is only matched, never returned: `said` is a fixed sentence, so
+    nothing a driver echoed (a key, a signed URL) can reach the screen."""
+    seen, stack, texts = set(), [exc], []
+    while stack:
+        e = stack.pop()
+        if e is None or id(e) in seen:
+            continue
+        seen.add(id(e))
+        texts.append(str(e))
+        stack += [getattr(e, "__cause__", None), getattr(e, "__context__", None)]
+    text = " ".join(texts).lower()
+    has = lambda *words: any(w in text for w in words)
+    if "extension" in text and has("install", "download", "failed to load"):
+        return {"said": "Studio could not load DuckDB's storage extension — it is downloaded once, "
+                        "from extensions.duckdb.org, so the server has to be able to reach it.",
+                "field": None, "stage": "check"}
+    if has("403", "accessdenied", "access denied", "invalidaccesskeyid", "signaturedoesnotmatch",
+           "authorizationfailure", "authenticationfailed", "forbidden", "401", "unauthorized",
+           "invalid credentials", "invalid_grant"):
+        field = {"s3": "secret_access_key", "gcs": "hmac_secret", "azure_blob": "connection_string"}[kind]
+        return {"said": "The store refused these credentials — check them, and that they may read "
+                        "this bucket or container.", "field": field, "stage": "sign_in"}
+    if has("no files found", "nosuchbucket", "nosuchkey", "404", "not found", "does not exist",
+           "containernotfound", "blobnotfound", "resourcenotfound"):
+        return {"said": "Signed in, but there are no files at that path — check the bucket and the "
+                        "pattern.", "field": "path", "stage": "signed_in"}
+    if has("could not resolve", "could not establish", "connection refused", "timed out", "timeout",
+           "name or service not known", "ssl", "certificate"):
+        return {"said": "Could not reach the store — check the region" +
+                        (" and the endpoint." if kind == "s3" else "."),
+                "field": "endpoint" if kind == "s3" else None, "stage": "sign_in"}
+    if has("magic bytes", "not a parquet", "invalid parquet", "no magic", "error when sniffing",
+           "sniffer", "malformed json", "invalid json", "json parse", "could not convert"):
+        return {"said": "Signed in and found the files, but they are not in the format chosen — pick "
+                        "the format they are in.", "field": "format", "stage": "signed_in"}
+    return None
+
+
+# ── Credentials (the environment, or a connection's own) ────────────────
 
 # DuckDB's S3 filesystem ingests AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY /
 # AWS_SESSION_TOKEN straight from the process environment into these settings,
@@ -152,28 +321,50 @@ _S3_LEAKY_SETTINGS = ["RESET s3_access_key_id", "RESET s3_secret_access_key",
                       "RESET s3_session_token"]
 
 
-def _credentials(source):
-    """{present, secret, legacy, reset} for a source. Two SQL forms because the
-    secrets manager only exists from DuckDB 0.10; the legacy SET path is the
-    fallback and is strictly worse — its values are readable from any SELECT
-    via duckdb_settings(), which is a credential-disclosure channel."""
+#: A connection's config keys for what the environment calls by these names.
+_FROM_CONFIG = {
+    "AWS_ACCESS_KEY_ID": "access_key_id", "AWS_SECRET_ACCESS_KEY": "secret_access_key",
+    "AWS_SESSION_TOKEN": "session_token", "AWS_REGION": "region",
+    "STUDIO_S3_ENDPOINT": "endpoint", "STUDIO_S3_URL_STYLE": "url_style", "STUDIO_S3_USE_SSL": "use_ssl",
+    "GCS_HMAC_KEY_ID": "hmac_key_id", "GCS_HMAC_SECRET": "hmac_secret",
+    "AZURE_STORAGE_CONNECTION_STRING": "connection_string", "AZURE_STORAGE_ACCOUNT": "account_name",
+    "AZURE_STORAGE_TENANT_ID": "tenant_id", "AZURE_STORAGE_CLIENT_ID": "client_id",
+    "AZURE_STORAGE_CLIENT_SECRET": "client_secret",
+}
+
+
+def _reader(config):
+    """getenv, or — for a connection with its own credentials — its config."""
+    if config is None:
+        return os.getenv
+    return lambda name, default="": (str(config.get(_FROM_CONFIG.get(name, ""), "") or "").strip()
+                                     or default)
+
+
+def _credentials(source, config=None):
+    """{present, secret, legacy, reset} for a source — from the environment,
+    or from `config` (a connection's stored credentials). Two SQL forms because
+    the secrets manager only exists from DuckDB 0.10; the legacy SET path is
+    the fallback and is strictly worse — its values are readable from any
+    SELECT via duckdb_settings(), which is a credential-disclosure channel."""
+    getenv = _reader(config)
     if source == "s3":
-        key, sec = os.getenv("AWS_ACCESS_KEY_ID", ""), os.getenv("AWS_SECRET_ACCESS_KEY", "")
-        region = os.getenv("AWS_REGION", "us-east-1")
+        key, sec = getenv("AWS_ACCESS_KEY_ID", ""), getenv("AWS_SECRET_ACCESS_KEY", "")
+        region = getenv("AWS_REGION", "us-east-1")
         parts = [f"KEY_ID '{_esc(key)}'", f"SECRET '{_esc(sec)}'", f"REGION '{_esc(region)}'"]
         legacy = [f"SET s3_access_key_id='{_esc(key)}'",
                   f"SET s3_secret_access_key='{_esc(sec)}'",
                   f"SET s3_region='{_esc(region)}'"]
-        token = os.getenv("AWS_SESSION_TOKEN", "")
+        token = getenv("AWS_SESSION_TOKEN", "")
         if token:
             parts.append(f"SESSION_TOKEN '{_esc(token)}'")
             legacy.append(f"SET s3_session_token='{_esc(token)}'")
-        endpoint = os.getenv("STUDIO_S3_ENDPOINT", "")
+        endpoint = getenv("STUDIO_S3_ENDPOINT", "")
         if endpoint:
             # MinIO/Ceph/Tigris: host[:port] with no scheme, and path-style
             # URLs — virtual-host style needs per-bucket DNS they rarely have.
-            style = os.getenv("STUDIO_S3_URL_STYLE", "path")
-            ssl = "false" if os.getenv("STUDIO_S3_USE_SSL", "true").lower() in ("0", "false", "no") else "true"
+            style = getenv("STUDIO_S3_URL_STYLE", "path")
+            ssl = "false" if getenv("STUDIO_S3_USE_SSL", "true").lower() in ("0", "false", "no") else "true"
             parts += [f"ENDPOINT '{_esc(endpoint)}'", f"URL_STYLE '{_esc(style)}'", f"USE_SSL {ssl}"]
             legacy += [f"SET s3_endpoint='{_esc(endpoint)}'", f"SET s3_url_style='{_esc(style)}'",
                        f"SET s3_use_ssl={ssl}"]
@@ -184,7 +375,7 @@ def _credentials(source):
     if source == "gcs":
         # DuckDB reaches GCS over its S3-compatible endpoint, so these must be
         # HMAC interoperability keys — a service-account JSON key will not work.
-        key, sec = os.getenv("GCS_HMAC_KEY_ID", ""), os.getenv("GCS_HMAC_SECRET", "")
+        key, sec = getenv("GCS_HMAC_KEY_ID", ""), getenv("GCS_HMAC_SECRET", "")
         return {"present": bool(key and sec),
                 "secret": f"CREATE OR REPLACE SECRET studio_gcs (TYPE gcs, KEY_ID '{_esc(key)}', SECRET '{_esc(sec)}')",
                 "legacy": [f"SET s3_access_key_id='{_esc(key)}'",
@@ -193,17 +384,17 @@ def _credentials(source):
                            "SET s3_url_style='path'"],
                 "reset": _S3_LEAKY_SETTINGS}
 
-    conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
-    account = os.getenv("AZURE_STORAGE_ACCOUNT", "")
+    conn_str = getenv("AZURE_STORAGE_CONNECTION_STRING", "")
+    account = getenv("AZURE_STORAGE_ACCOUNT", "")
     if conn_str:
         return {"present": True,
                 "secret": f"CREATE OR REPLACE SECRET studio_azure (TYPE azure, CONNECTION_STRING '{_esc(conn_str)}')",
                 "legacy": [f"SET azure_storage_connection_string='{_esc(conn_str)}'"],
                 "reset": []}
     # Service principal — the form to use when the account key is not shareable.
-    tenant = os.getenv("AZURE_STORAGE_TENANT_ID", "")
-    client = os.getenv("AZURE_STORAGE_CLIENT_ID", "")
-    secret = os.getenv("AZURE_STORAGE_CLIENT_SECRET", "")
+    tenant = getenv("AZURE_STORAGE_TENANT_ID", "")
+    client = getenv("AZURE_STORAGE_CLIENT_ID", "")
+    secret = getenv("AZURE_STORAGE_CLIENT_SECRET", "")
     return {"present": bool(account and tenant and client and secret),
             "secret": ("CREATE OR REPLACE SECRET studio_azure (TYPE azure, PROVIDER service_principal, "
                        f"TENANT_ID '{_esc(tenant)}', CLIENT_ID '{_esc(client)}', "
@@ -261,9 +452,16 @@ class ObjectStoreConnector(Connector):
 
     dialect = "duckdb"
 
-    def __init__(self, name):
+    def __init__(self, name, kind=None, config=None, only=None):
         self.name = name
-        self._spec = _SOURCES[name]
+        # The store it reads (s3 / azure_blob / gcs): a built-in's own name, or
+        # a connection's type. `config` is a connection's stored credentials
+        # and first dataset; None reads the environment (the built-ins).
+        # `only` pins the datasets (try_read: files not registered yet).
+        self.kind = kind or name
+        self._spec = _SOURCES[self.kind]
+        self._config = config
+        self._only = only
         self._pool_conn = None
         self._pool_lock = threading.Lock()
         self._fingerprint = None
@@ -272,11 +470,11 @@ class ObjectStoreConnector(Connector):
         # Runs on every /catalog/sources for every source, so the cheap env
         # checks come first and the registry read last. Never raises: any
         # failure here just means "not configured".
-        if not _credentials(self.name)["present"]:
+        if not _credentials(self.kind, self._config)["present"]:
             return False
         try:
             import duckdb  # noqa: F401
-            return bool(datasets(self.name))
+            return bool(self._datasets())
         except Exception:
             return False
 
@@ -294,7 +492,7 @@ class ObjectStoreConnector(Connector):
         for ext in self._spec["extensions"]:
             con.execute(f"INSTALL {ext}")
             con.execute(f"LOAD {ext}")
-        creds = _credentials(self.name)
+        creds = _credentials(self.kind, self._config)
         try:
             con.execute(creds["secret"])
             # The secret is now the credential in use, so drop the copies
@@ -307,17 +505,31 @@ class ObjectStoreConnector(Connector):
         except duckdb.Error:
             for stmt in creds["legacy"]:  # DuckDB < 0.10: no secrets manager
                 con.execute(stmt)
-        for d in datasets(self.name):
+        for d in self._datasets():
             # CREATE VIEW binds the reader, so a bad URI or credential fails
             # here rather than on some later agent query.
             con.execute(_view_sql(d))
         _harden(con)
         return con
 
+    def _datasets(self):
+        if self._only is not None:
+            return [d for d in self._only if _valid(self.kind, d["name"], d["uri"], d["format"])]
+        return datasets(self.name, self.kind, self._config)
+
+    def _cfg(self):
+        """The keys it signs in with, by a connection's config names — to tell
+        a connection made with the same keys apart (connections.same_sign_in).
+        Server-side only; never returned to a client."""
+        getenv = _reader(self._config)
+        cfg = {key: getenv(env, "") for env, key in _FROM_CONFIG.items()}
+        cfg["endpoint"] = re.sub(r"^https?://", "", cfg.get("endpoint", ""), flags=re.I).rstrip("/")
+        return cfg
+
     def _fp(self):
         """Fingerprint of the registry. Views are baked into the connection at
         build time, so registering or removing a dataset means a rebuild."""
-        return json.dumps(datasets(self.name), sort_keys=True)
+        return json.dumps(self._datasets(), sort_keys=True)
 
     def _dispose(self):
         if self._pool_conn is not None:
@@ -375,10 +587,10 @@ class ObjectStoreConnector(Connector):
 
     def list_tables(self):
         """The registry defines the tables, so this needs no engine round-trip."""
-        return [d["name"] for d in datasets(self.name)]
+        return [d["name"] for d in self._datasets()]
 
     def get_schema(self, table):
-        if table not in {d["name"] for d in datasets(self.name)}:
+        if table not in {d["name"] for d in self._datasets()}:
             raise ValueError(f"Unknown dataset {table}")
 
         def go(con):
@@ -417,12 +629,67 @@ class DatasetIn(BaseModel):
     source: str
     name: str
     uri: str
-    format: str = "parquet"
+    format: str = ""              # empty: from the files' extension, else parquet
+    # Read the files with the source's own keys before registering them, so a
+    # wrong path or format is refused now, not on some later question.
+    check: bool = False
 
 
 def _admin(user):
     if (user or {}).get("role") != "admin":
         raise HTTPException(403, "Object-store datasets are admin-only")
+
+
+def store_sources():
+    """{source name: kind} for every object-store source: the built-ins and
+    the object-store connections made on the Integrations screen."""
+    from .. import connections          # lazy: connections builds on this module
+    return {**{s: s for s in _SOURCES}, **connections.object_store_connections()}
+
+
+def kind_of(source):
+    """The store a source reads (s3 / azure_blob / gcs), or None."""
+    return store_sources().get(source)
+
+
+def _live(source):
+    """The store connector a source runs on now, or None (unknown, or switched
+    off on the Integrations screen)."""
+    from . import get_connector
+    try:
+        conn = get_connector(source)
+    except KeyError:
+        return None
+    return conn if isinstance(conn, ObjectStoreConnector) else None
+
+
+def live_datasets(source):
+    """Every dataset a source reads now: a built-in's env bootstrap, the
+    connection's own first one, and the registry's."""
+    conn = _live(source)
+    return conn._datasets() if conn else []
+
+
+def try_read(source, kind, d):
+    """None when dataset `d` reads with `source`'s own keys, else {said,
+    field, stage} — classify_error's fixed sentences, never the driver's text."""
+    conn = _live(source)
+    if conn is None:
+        return {"said": f"“{source}” is not connected — reconnect it first.", "field": None,
+                "stage": "check"}
+    if not _credentials(kind, conn._config)["present"]:
+        return {"said": f"“{source}” has no keys yet — set it up first.", "field": None,
+                "stage": "check"}
+    probe = ObjectStoreConnector(source, kind, conn._config, only=[d])
+    try:
+        probe.get_schema(d["name"])
+    except Exception as exc:
+        return classify_error(exc, kind) or {
+            "said": "Studio could not read those files — check the path and the format.",
+            "field": None, "stage": "signed_in"}
+    finally:
+        probe.close()
+    return None
 
 
 @router.get("")
@@ -432,10 +699,15 @@ def list_datasets(user=Depends(current_user)):
     stored = {(r["source"], r["name"]) for r in rows}
     # Bootstrap datasets are live but have no row to delete, so the UI needs
     # them listed separately rather than mixed into the removable ones.
+    sources = store_sources()
     return {"datasets": rows,
             "env_datasets": [d for s in _SOURCES for d in datasets(s)
                              if (s, d["name"]) not in stored],
-            "sources": {s: list(v["schemes"]) for s, v in _SOURCES.items()},
+            "sources": {s: list(_SOURCES[k]["schemes"]) for s, k in sources.items()},
+            "kinds": sources,
+            # What each source reads right now, its setup's own dataset
+            # included — only the registry's rows (`datasets`) can be removed.
+            "live": {s: live_datasets(s) for s in sources},
             "formats": sorted(_FORMATS)}
 
 
@@ -464,17 +736,27 @@ def _upsert_dataset(source, name, uri, fmt):
 def add_dataset(body: DatasetIn, user=Depends(current_user)):
     _admin(user)
     source, name = body.source.strip(), body.name.strip()
-    uri, fmt = body.uri.strip(), (body.format or "parquet").strip().lower()
-    if source not in _SOURCES:
-        raise HTTPException(400, f"source must be one of {', '.join(_SOURCES)}")
+    uri = body.uri.strip()
+    fmt = (body.format.strip() or guess_format(uri) or "parquet").lower()
+    kind = kind_of(source)
+    if kind is None:
+        raise HTTPException(400, f"'{source}' is not an object-store source")
     if not _NAME_RE.match(name):
         raise HTTPException(400, "name must be a SQL identifier — it becomes the "
                                  "view name agents query and RBAC allowlists")
     if fmt not in _FORMATS:
         raise HTTPException(400, f"format must be one of {', '.join(sorted(_FORMATS))}")
-    if not _valid(source, name, uri, fmt):
-        raise HTTPException(400, f"uri must start with {' or '.join(_SOURCES[source]['schemes'])} "
+    if not _valid(kind, name, uri, fmt):
+        raise HTTPException(400, f"uri must start with {' or '.join(_SOURCES[kind]['schemes'])} "
                                  "and contain no query string, quotes or whitespace")
+    if body.check:
+        problem = try_read(source, kind, {"source": source, "name": name, "uri": uri, "format": fmt})
+        if problem:
+            # The form's own names: the files are its "uri"; a refused key is
+            # the source's, not this form's.
+            field = {"path": "uri", "format": "format"}.get(problem["field"])
+            raise HTTPException(400, {"error": problem["said"], "stage": problem["stage"],
+                                      "fields": {field: problem["said"]} if field else {}})
     # The connector notices via its registry fingerprint and rebuilds its views
     # on the next query — nothing to invalidate here.
     _upsert_dataset(source, name, uri, fmt)

@@ -1323,7 +1323,7 @@ flowchart LR
 An admin connects a warehouse straight from the **Data connections** screen — no
 env vars, no redeploy. Pick a type (PostgreSQL, Snowflake, Databricks SQL,
 BigQuery, Neo4j, Power BI, Apache Cassandra, LanceDB, Atlassian Jira, ServiceNow,
-n8n, or **Any SQL database**, and every integration of the marketplace below), enter its
+n8n, Amazon S3, Azure Blob Storage, Google Cloud Storage, or **Any SQL database**, and every integration of the marketplace below), enter its
 credentials, and test them. For SQL
 warehouses and Power BI the test also lists the visible schemas/datasets/models; select one or several, and Studio
 saves **one independently named and governed source per namespace**. A namespace
@@ -1351,7 +1351,11 @@ skill files all apply to it unchanged.
   is *where* it signs in and *as whom*:
   - Databricks: host and token;
   - Snowflake: account and user;
-  - Postgres: host, port, database and user (not the password).
+  - Postgres: host, port, database and user (not the password);
+  - Amazon S3: the access key ID and the endpoint (empty for AWS);
+  - Google Cloud Storage: the HMAC access key;
+  - Azure Blob Storage: the storage account (or a service principal's
+    account and client).
 
   The schema a source reads, the warehouse it runs on and a rotated password
   don't make a different sign-in. A second connection with a sign-in that's
@@ -1408,7 +1412,7 @@ skill files all apply to it unchanged.
   store and the per-type form contracts.
 - **Built-in sources are managed here too.** The env-configured warehouse
   sources (`databricks`, `postgres`, `snowflake`, `bigquery`, `neo4j`, `powerbi`)
-  get row actions: **Change** (or **Set up**, when the environment never
+  and object stores (`s3`, `azure_blob`, `gcs`) get row actions: **Change** (or **Set up**, when the environment never
   configured them) points the source at a credential entered on the screen;
   **Disconnect** / **Reconnect** take it offline and back; **Back to
   environment** forgets both. The source keeps its **name** throughout, so the
@@ -1519,6 +1523,61 @@ tile. Icons are geometric marks in each brand's colour, not vendor logo files.
 - **Scope:** at most `N8N_MAX_ROWS` executions, newest first, cached
   `N8N_CACHE_SECONDS`. A self-hosted port (`:5678`) is kept.
 - Only a connection test signs in.
+
+### Object storage — Amazon S3, Azure Blob Storage, Google Cloud Storage
+
+Buckets are connected on this screen like any other source; the environment
+variables in `.env.example` remain a way to configure the built-in `s3`,
+`azure_blob` and `gcs` sources. Files are read through DuckDB
+(`connectors/objectstore.py`); Parquet, CSV and JSON.
+
+- **The form:** the store's keys, then the first files to read and the table
+  they become.
+  - **Amazon S3:** an access key ID and secret, a region, and an optional
+    session token. An optional endpoint covers S3-compatible stores such as
+    MinIO, Cloudflare R2 and Wasabi.
+  - **Azure Blob Storage:** a connection string, or a service principal
+    (account, tenant, client ID and secret).
+  - **Google Cloud Storage:** HMAC interoperability keys (DuckDB reaches GCS
+    over its S3-compatible API).
+- **Files** are one file, a `folder/*` or a pattern: `s3://bucket/sales/*.parquet`,
+  `az://container/…` or `abfss://…`, `gs://bucket/…`. The table name defaults
+  to `data`. The format comes from the files' extension unless one is picked.
+  A source is named after its bucket until another name is typed.
+- **Tested by reading the files.** A store lists its tables from the form
+  without reading a byte, so the probe binds the reader as well.
+  - A wrong key, path or format fails before anything is saved, and the fault
+    is marked on its own field.
+  - Each fault is a fixed sentence: refused keys, no files at that path, files
+    not in the chosen format, store unreachable. The driver's own text, which
+    may carry a key or a signed URL, never reaches the screen.
+- **Refused before anything signs in:**
+  - a path with another store's scheme, a query string, quotes or spaces;
+  - a table name that is not an identifier;
+  - an S3 endpoint with a path in it.
+
+  An S3 endpoint is reduced to `host:port` (`http://` turns TLS off). Neither
+  that endpoint nor an Azure connection string's `BlobEndpoint=…` may name a
+  cloud metadata address: link-local, AWS's IPv6 one, Alibaba's, or
+  `metadata.google.internal`. That holds when the address is written as IPv6
+  or reached through DNS.
+- **More files from the source's row.** **＋ Add files** lists what the source
+  reads and adds more, each as its own table.
+  - New files are read with the source's own keys before they are added
+    (`POST /api/settings/objectstore` with `check: true`). A wrong path or
+    format is marked on the form, and a metadata scan is queued.
+  - Only files added here can be removed. The first files belong to the
+    source's setup.
+  - Removing the source removes its files, so a later source with the same
+    name starts clean.
+  - `GET /api/settings/objectstore` lists every store, the ones connected here
+    included (`kinds`), and what each reads now (`live`).
+- **Same guarantees as before.** A connection's keys are stored encrypted with
+  it, and it never borrows the deployment's keys. `STUDIO_OBJECT_DATASETS`
+  still applies to the built-ins only. Agents query the named tables through
+  the same query guard, so `read_parquet('s3://…')` and settings reads are
+  refused. The Docker image installs DuckDB's `httpfs` and `azure` extensions
+  at build time, so connecting does not wait on a download.
 
 ### Any SQL database — one connection URL, nothing vendor-specific
 

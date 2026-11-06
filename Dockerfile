@@ -11,6 +11,11 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY backend/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
+# DuckDB's object-store readers (S3/GCS, Azure) are extensions it otherwise
+# downloads on first use; baked in here, connecting a bucket never waits on
+# extensions.duckdb.org. Not fatal: without them, the first use downloads.
+RUN python -c "import duckdb; c = duckdb.connect(); [c.execute(f'INSTALL {e}') for e in ('httpfs', 'azure')]" \
+    || echo "duckdb extensions not pre-installed; they download on first use"
 COPY backend/ ./
 COPY --from=frontend /fe/dist ./static
 ENV STUDIO_STATIC_DIR=/app/static

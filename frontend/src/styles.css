@@ -1373,6 +1373,14 @@ input:focus, select:focus, .composer-pill:focus-within { box-shadow: 0 0 0 1px v
   display: flex; flex-direction: column; gap: 8px;
   border-left: 3px solid var(--accent); padding-left: 10px;
 }
+/* A store's files (StoreFiles): one row per table, its path cut to fit. */
+.conn-files-list { display: flex; flex-direction: column; gap: 4px; }
+.conn-file {
+  display: flex; align-items: center; gap: 8px; min-width: 0;
+  padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface);
+}
+.conn-file b { font-size: 13px; }
+.conn-file-uri { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .conn-req { color: var(--bad); }
 .conn-warn { color: var(--warn); }
 

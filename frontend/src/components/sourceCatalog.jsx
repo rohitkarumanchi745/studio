@@ -280,8 +280,8 @@ const META = {
   slack: { label: "Slack", color: "#4a154b", mark: "hash", category: "messaging",
            blurb: "Send an answer — its text, a table of its first rows and a link back — to a Slack channel." },
 
-  // Environment-configured sources. They appear so the grid is the whole map
-  // of what Studio can read, not just what this screen can set up.
+  // Object storage: set up on the Integrations screen (keys plus the files to
+  // read as a table) or by the deployment's environment.
   s3: { label: "Amazon S3", color: "#569a31", mark: "bucket", category: "storage",
         blurb: "Parquet, CSV and JSON in S3 (or any S3-compatible store), read through DuckDB." },
   azure_blob: { label: "Azure Blob Storage", color: "#0078d4", mark: "blobs", category: "storage",
