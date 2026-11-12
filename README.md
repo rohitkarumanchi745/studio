@@ -6,7 +6,8 @@ Power BI / Tableau-class visualizations you can pin, cross-filter, and share.
 Every answer is **verified SQL** run through one governed gate, and anything
 that writes (a script, a Spark job) goes through **supervised Jobs** with a
 human in the loop. Python that Studio drafts (**Build Python**) is a
-**deliverable Studio never executes**. A chat workflow path builds
+**deliverable Studio never executes in-process** — it can run on a **Ray**
+cluster as an approved platform run. A chat workflow path builds
 dependency-aware, single-source SQL DAGs for Airflow from declarative plans,
 using a trusted compiler and administrator-approved publication and execution.
 Around these paths sit **governance-as-code** and two deliberately separate
@@ -27,8 +28,8 @@ flow** screens, were removed. A pipeline drafted that way in an old
 conversation stays visible as a record of its SQL, still checked against the
 reader's current permissions, but it no longer runs.
 
-Chat also submits runs to **Airflow, Databricks Jobs, dbt Cloud, and Spark on
-Kubernetes**. For example, say **"trigger Airflow DAG daily_sales"**, **"run
+Chat also submits runs to **Airflow, Databricks Jobs, dbt Cloud, Spark on
+Kubernetes, and Ray Jobs**. For example, say **"trigger Airflow DAG daily_sales"**, **"run
 Databricks job 123"**, or **"run dbt job 456"**. Supply parameters as JSON, or
 open **Run on Airflow / another platform** in the composer to choose a platform
 and enter its payload. Every external run requires an administrator's approval
@@ -111,7 +112,7 @@ flowchart TB
         llm{{"Frontier LLM · Claude / GPT (BYOK)"}}
         harr{{"Harrier · embeddings"}}
         mcp{{"MCP servers · built tools sandboxed"}}
-        plat{{"Platforms · Airflow / Databricks Jobs<br/>dbt Cloud / K8s-Spark"}}
+        plat{{"Platforms · Airflow / Databricks Jobs<br/>dbt Cloud / K8s-Spark / Ray Jobs"}}
     end
 
     client -->|JWT| tiers
@@ -1035,8 +1036,10 @@ commands and the composer's platform/JSON form into the same supervised
 request. This existing-job path requires an Airflow `dag_id`; new typed SQL DAGs
 use the separate approval-gated chat workflow path above. Databricks accepts an existing
 `job_id` (`jobs/run-now`) or explicit `tasks` (`runs/submit`), dbt Cloud uses an
-existing `job_id`, and Kubernetes accepts a SparkApplication definition that
-names its image and deployed entry point. Missing or malformed identifiers, omitted
+existing `job_id`, Kubernetes accepts a SparkApplication definition that
+names its image and deployed entry point, and Ray Jobs takes an `entrypoint`
+with a `runtime_env` — or a Python `script`, which Studio packages, uploads to
+the cluster and runs as `python main.py`. Missing or malformed identifiers, omitted
 parameters, and unconfigured credentials produce a clarification/configuration
 card; the agent does not invent a deployment. A follow-up can check status or
 submit a corrected run for fresh approval. Queue retries reuse one submission
@@ -1044,6 +1047,28 @@ ID, and concurrent approve/reject requests atomically claim a decision, so
 neither repeats the external trigger. Closing chat does not stop monitoring
 while the durable worker is running. Platform success/failure becomes a
 rewarded outcome only when the platform reports that terminal state.
+
+**Ray Jobs** (`platforms.RayJobsPlatform`) is the platform for Python at
+cluster scale. Studio speaks the Jobs API of a Ray head's dashboard
+(`RAY_ADDRESS` — what `ray job submit --address` takes; a KubeRay or Anyscale
+head works the same) with no `ray` dependency of its own.
+- A payload is the API's own body — `entrypoint`, `runtime_env`, `metadata`,
+  the `entrypoint_*` resource keys — or a Python `script`. A script is
+  packaged as `main.py`, uploaded to the cluster's package store under a hash
+  of its bytes (a resubmission reuses it) and run as `python main.py` with
+  `args` appended; `runtime_env` (`pip`, `env_vars`…) applies to it.
+- **Build Python → Run on Ray Jobs** submits the drafted module that way. It
+  is still never executed in-process: the submission is a platform run, so an
+  administrator approves it in Jobs before the cluster sees it, and its
+  status, logs and failure diagnostic come back through the same live poll as
+  every platform's.
+- States map to the canonical set (`PENDING` queued, `RUNNING`, `SUCCEEDED`,
+  `FAILED`, `STOPPED` canceled). Logs are the driver's, tail-bounded; the
+  failure diagnostic is the job's message plus those logs, redacted. A
+  browser link appears only when `RAY_PUBLIC_URL` names a dashboard the
+  browser can reach; `RAY_JOBS_TOKEN` is sent as a Bearer token for a cluster
+  behind an authenticating proxy; `RAY_VERIFY_SSL=false` accepts a
+  self-signed dashboard.
 
 **One job kind is an approval record, not an execution.** A tool-builder
 registration (`mcp_build`, `supervisor.ARTIFACT_KIND`) is Python, and it went
@@ -3527,7 +3552,7 @@ one-line uncomment in `requirements.txt`.
 
 **Shipped this cycle** (on `main`): object-storage (S3 / Azure / GCS) + BigQuery
 connectors with the hardened guard; the **Pipeline Control Service** (Airflow /
-Databricks Jobs / dbt Cloud / K8s-Spark behind the supervisor); the **semantic
+Databricks Jobs / dbt Cloud / K8s-Spark / Ray Jobs behind the supervisor); the **semantic
 layer** (one definition of truth per metric); a light **Microsoft-Fluent /
 Data-Formulator** reskin with an encoding-shelf chart builder; the **pipeline-flow
 visualization** (source → transforms → target, per-step pass/fail + email digest);
@@ -3580,8 +3605,9 @@ way round from the feature list above:
   Python, UPDATE/DELETE/MERGE, cross-source execution, recurring scheduling, or
   backfills. Triggering an existing platform job and compiling a new typed DAG
   are distinct paths.
-- **Model-generated Python is delivered, never executed.** Build Python hands
-  over a module for you to review.
+- **Model-generated Python is never executed in-process.** Build Python hands
+  over a module for you to review; **Run on Ray Jobs** submits it to a Ray
+  cluster as a platform run, which an administrator approves first.
   (Model-written JavaScript for a *custom visual* does run — only in the
   viewer's browser, in a sandboxed frame with no network and no access to
   Studio; see *Visualization*.)
@@ -3611,8 +3637,10 @@ way round from the feature list above:
 
 ### Future rollouts
 
-**Scale-out with Ray** (a scale-out upgrade — the single-node CPU path stays the
-default; not needed at today's volume, adopt when data/QPS justify a cluster):
+**Scale-out with Ray.** Ray Jobs is on `main` as a platform run (see *Ray
+Jobs* under *Supervised Jobs*). The rest of the Ray stack is a scale-out
+upgrade — the single-node CPU path stays the default; not needed at today's
+volume, adopt when data/QPS justify a cluster:
 - **Ray Data** — distributed, streaming data feed for training: pull rollouts,
   condition, tokenize, mine DPO pairs in parallel across workers (our per-rollout
   transforms are already pure, so they map cleanly). The answer to "feed lots of
@@ -3642,11 +3670,11 @@ default; not needed at today's volume, adopt when data/QPS justify a cluster):
 - Prune finished `background_jobs` rows and move `purge_message_rows` onto the
   worker's leased scheduler (both run best-effort at startup today); expose
   `jobs.stats()` on `/api/health`.
-- **Actually running generated Python** — today Build Python's module is a
-  deliverable Studio hands over and never executes. Executing it means submitting it to a real runtime (an Airflow
-  `PythonOperator` task, a Databricks job, a container) behind the same
-  supervisor + human-approval gate, with the sandbox guarantees the tool-builder
-  runners already give — a deliberate piece of work, not a flag to flip.
+- **Running generated Python elsewhere** — Ray Jobs runs a Build Python
+  module behind the supervisor + human-approval gate today. An Airflow
+  `PythonOperator` task, a Databricks job or a container would be the same
+  shape, with the sandbox guarantees the tool-builder runners already give —
+  each a deliberate piece of work, not a flag to flip.
 - Backfill legacy SSO accounts with the `UNUSABLE_PASSWORD_HASH` marker so
   `has_usable_password()` can tell them apart; today a pre-change SSO row reads
   as "has a password" and would refuse an `STUDIO_ADMIN_EMAIL` promotion (fail-

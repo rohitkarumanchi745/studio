@@ -22,6 +22,8 @@ _TARGETS = {
     "kubernetes spark": "k8s_spark", "k8s spark": "k8s_spark",
     "spark on kubernetes": "k8s_spark", "spark on k8s": "k8s_spark",
     "k8s_spark": "k8s_spark",
+    "ray": "ray", "ray jobs": "ray", "ray job": "ray", "ray cluster": "ray",
+    "kuberay": "ray", "anyscale": "ray",
 }
 _PLATFORM = re.compile(r"\b(" + "|".join(
     re.escape(k) for k in sorted(_TARGETS, key=len, reverse=True)) + r")\b", re.I)
@@ -75,7 +77,7 @@ def _positive_id(value):
 
 def _missing(target, payload):
     if target not in platforms.PLATFORMS:
-        return ["choose Airflow, Databricks Jobs, dbt Cloud, or Spark on Kubernetes"]
+        return ["choose Airflow, Databricks Jobs, dbt Cloud, Spark on Kubernetes, or Ray Jobs"]
     errors = []
     if target == "airflow":
         dag = payload.get("dag_id")
@@ -104,6 +106,21 @@ def _missing(target, payload):
             if "steps_override" in payload and (not isinstance(payload["steps_override"], list)
                     or not all(isinstance(s, str) for s in payload["steps_override"])):
                 errors.append("steps_override must be a list of strings")
+    elif target == "ray":
+        if "script" in payload:
+            if "entrypoint" in payload:
+                errors.append("choose an entrypoint or a script, not both")
+            if not isinstance(payload["script"], str) or not payload["script"].strip():
+                errors.append("script: provide the Python source to run")
+            args = payload.get("args")
+            if args is not None and not (isinstance(args, str) or (
+                    isinstance(args, list) and all(isinstance(a, str) for a in args))):
+                errors.append("args must be a list of strings")
+        elif not isinstance(payload.get("entrypoint"), str) or not payload["entrypoint"].strip():
+            errors.append("entrypoint: provide the command the cluster runs, or a script")
+        for field in ("runtime_env", "metadata"):
+            if field in payload and not isinstance(payload[field], dict):
+                errors.append(f"{field} must be a JSON object")
     else:
         full = "spec" in payload or "kind" in payload
         spec = payload.get("spec") if full else payload

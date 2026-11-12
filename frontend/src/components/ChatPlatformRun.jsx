@@ -6,6 +6,7 @@ const EXAMPLES = {
   databricks_jobs: '{"job_id":123,"job_parameters":{}}',
   dbt_cloud: '{"job_id":123,"cause":"Requested in Studio chat"}',
   k8s_spark: '{"main_file":"local:///opt/jobs/etl.py","image":"your-spark-image","arguments":[]}',
+  ray: '{"entrypoint":"python etl.py","runtime_env":{"working_dir":"https://…/job.zip"}}',
 };
 const TERMINAL = new Set(["succeeded", "failed", "canceled", "cancelled", "rejected", "escalated"]);
 

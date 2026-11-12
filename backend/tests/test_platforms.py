@@ -172,7 +172,8 @@ ALL_ENV = ["AIRFLOW_URL", "AIRFLOW_PUBLIC_URL", "AIRFLOW_TOKEN", "AIRFLOW_USERNA
            "AIRFLOW_API_VERSION", "DATABRICKS_SERVER_HOSTNAME", "DATABRICKS_TOKEN",
            "DBT_CLOUD_ACCOUNT_ID", "DBT_CLOUD_API_TOKEN", "DBT_CLOUD_JOB_ID",
            "DBT_CLOUD_BASE_URL", "K8S_API_URL", "K8S_TOKEN", "K8S_NAMESPACE",
-           "K8S_VERIFY_SSL"]
+           "K8S_VERIFY_SSL", "RAY_ADDRESS", "RAY_JOBS_TOKEN", "RAY_PUBLIC_URL",
+           "RAY_VERIFY_SSL"]
 
 
 @pytest.fixture
@@ -218,7 +219,7 @@ def k8s_env(base, clean_env):
 # ── Registry & configured() ─────────────────────────────────────────────
 
 def test_registry_and_lookup():
-    assert set(PLATFORMS) == {"airflow", "databricks_jobs", "dbt_cloud", "k8s_spark"}
+    assert set(PLATFORMS) == {"airflow", "databricks_jobs", "dbt_cloud", "k8s_spark", "ray"}
     rows = all_platforms()
     assert {r["name"] for r in rows} == set(PLATFORMS)
     assert all(set(r) == {"name", "label", "configured"} for r in rows)

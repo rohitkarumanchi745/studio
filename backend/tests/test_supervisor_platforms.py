@@ -378,7 +378,7 @@ def test_platforms_picker_role_gate(airflow_env):
     assert e.value.status_code == 403
     rows = list_platforms(user=ANALYST)
     assert {r["name"] for r in rows} == {"airflow", "databricks_jobs",
-                                         "dbt_cloud", "k8s_spark"}
+                                         "dbt_cloud", "k8s_spark", "ray"}
     assert next(r for r in rows if r["name"] == "airflow")["configured"] is True
 
 
