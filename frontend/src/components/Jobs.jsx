@@ -1,5 +1,5 @@
 // Supervised jobs. Agents submit scripts / Spark jobs / platform runs
-// (Airflow, Databricks Jobs, dbt Cloud, K8s Spark) against real environments;
+// (Airflow, Databricks Jobs, dbt Cloud, K8s Spark, Ray Jobs) against real environments;
 // a supervisor agent reviews each one (read-only auto-approves, writes and
 // jobs need a human). Repeated failures escalate — an admin approves a retry
 // or rejects. Admins are the human in the loop. Platform runs expose a live
@@ -44,6 +44,8 @@ const PAYLOAD_PLACEHOLDER = {
     '{"job_id": 123, "cause": "why"}\n(job_id falls back to DBT_CLOUD_JOB_ID; extra keys like steps_override pass through)',
   k8s_spark:
     '{"main_file": "local:///opt/jobs/etl.py", "type": "Python", "image": "spark:3.5.0", "arguments": []}\n(shorthand — or paste a full SparkApplication manifest)',
+  ray:
+    '{"entrypoint": "python etl.py --day 2026-11-12", "runtime_env": {"working_dir": "https://…/job.zip", "pip": ["pandas"]}}\n(the Jobs API body — or {"script": "<python source>", "args": []}, packaged and run on the cluster as python main.py)',
 };
 
 // Live status panel for a platform run. Polls every ~5s while the run is

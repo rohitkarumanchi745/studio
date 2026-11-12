@@ -1,6 +1,6 @@
 """Pipeline Control Service: one thin adapter per orchestration platform so the
 supervisor can trigger, watch, and audit external pipeline runs through a single
-contract instead of four bespoke integrations. Adapters speak stdlib
+contract instead of five bespoke integrations. Adapters speak stdlib
 urllib.request (no new HTTP deps), read credentials from env at call time, and
 normalize every platform's run states to the canonical set:
 
@@ -26,15 +26,24 @@ Payload shapes (the UI renders these):
                      "Scala", "main_class": ..., "image": ..., "spark_version":
                      ..., "arguments": [...], "name": ..., "service_account":
                      ..., "driver": {...}, "executor": {...}}
+    ray:             the Jobs API's own body: {"entrypoint": "python etl.py",
+                     "runtime_env": {...}, "metadata": {...}, ...}, or
+                     {"script": "<python source>", "args": [...], "runtime_env":
+                     {...}}: the script is packaged, uploaded to the cluster
+                     and run as `python main.py`
 """
 import base64
+import hashlib
+import io
 import json
 import os
 import re
+import shlex
 import ssl
 import urllib.error
 import urllib.request
 import uuid
+import zipfile
 from urllib.parse import quote, urlencode
 
 
@@ -72,15 +81,18 @@ def _redact_diagnostic(value, limit=_MAX_FAILURE_DIAGNOSTIC):
 
 
 def _http(method, url, headers=None, body=None, timeout=30, context=None,
-          max_bytes=_MAX_HTTP_BODY):
+          max_bytes=_MAX_HTTP_BODY, raw=None):
     """One HTTP round-trip; returns the response body as text. On HTTPError the
     RuntimeError carries the response body so a 403 from Airflow says WHY, not
-    just '403'."""
+    just '403'. `body` is sent as JSON; `raw` as the bytes given."""
     hdrs = dict(headers or {})
     data = None
     if body is not None:
         data = json.dumps(body).encode()
         hdrs.setdefault("Content-Type", "application/json")
+    elif raw is not None:
+        data = raw
+        hdrs.setdefault("Content-Type", "application/octet-stream")
     req = urllib.request.Request(url, data=data, method=method, headers=hdrs)
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=context) as r:
@@ -751,11 +763,170 @@ class K8sSparkPlatform(Platform):
             return ""
 
 
+# ── Ray Jobs ─────────────────────────────────────────────────────────────
+
+class RayJobsPlatform(Platform):
+    """Ray's Jobs API, served by the head node's dashboard (port 8265).
+
+    Env: RAY_ADDRESS (the dashboard URL the `ray job` CLI takes, e.g.
+    http://ray-head:8265 — a KubeRay or Anyscale head works the same),
+    RAY_JOBS_TOKEN (optional Bearer, for a cluster behind an authenticating
+    proxy), RAY_PUBLIC_URL (a dashboard the browser can reach; without it no
+    link is offered, as with Airflow), RAY_VERIFY_SSL (default verify).
+
+    Two payloads. The API's own body passes through: "entrypoint" (the command
+    the cluster runs), "runtime_env", "metadata", "submission_id" and the
+    entrypoint_* resource keys. Or "script": Python source, which Studio
+    packages as main.py, uploads to the cluster (PUT /api/packages, named by
+    its hash, so a resubmission reuses it) and runs as `python main.py` with
+    "args" appended — the runtime a Build Python module gets, behind the same
+    supervisor and human approval as every platform run.
+
+    quality() returns [] — Ray reports no data-quality results.
+    """
+    name = "ray"
+    label = "Ray Jobs"
+    _STATES = {"PENDING": "queued", "RUNNING": "running",
+               "SUCCEEDED": "succeeded", "FAILED": "failed", "STOPPED": "canceled"}
+    _BODY = ("entrypoint", "runtime_env", "metadata", "submission_id",
+             "entrypoint_num_cpus", "entrypoint_num_gpus", "entrypoint_memory",
+             "entrypoint_resources")
+
+    def _cfg(self):
+        return {
+            "base": os.getenv("RAY_ADDRESS", "").rstrip("/"),
+            "token": os.getenv("RAY_JOBS_TOKEN", ""),
+            "public_url": os.getenv("RAY_PUBLIC_URL", "").rstrip("/"),
+            "verify": os.getenv("RAY_VERIFY_SSL", "true").lower() not in ("false", "0", "no"),
+        }
+
+    def configured(self):
+        # RAY_ADDRESS is also how ray.init() finds a cluster (ray://host:10001,
+        # "auto"); only a dashboard URL is a Jobs API.
+        return self._cfg()["base"].lower().startswith(("http://", "https://"))
+
+    def _headers(self, cfg):
+        return {"Authorization": f"Bearer {cfg['token']}"} if cfg["token"] else {}
+
+    def _ctx(self, cfg):
+        return None if cfg["verify"] else ssl._create_unverified_context()
+
+    def _job_url(self, cfg, run_ref):
+        if not cfg["public_url"]:
+            return None
+        return f"{cfg['public_url']}/#/jobs/{quote(run_ref, safe='')}"
+
+    @staticmethod
+    def _package(script):
+        """A zip holding main.py, byte-for-byte the same for the same script:
+        its name is a hash of those bytes (what the Ray SDK does for a working
+        directory), so the cluster keeps one copy per distinct script."""
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            info = zipfile.ZipInfo("main.py", date_time=(1980, 1, 1, 0, 0, 0))
+            info.external_attr = 0o644 << 16
+            z.writestr(info, script)
+        data = buf.getvalue()
+        return f"_ray_pkg_{hashlib.sha256(data).hexdigest()[:32]}.zip", data
+
+    def _upload(self, cfg, name, data):
+        """Put the package on the cluster unless it is there already."""
+        url = f"{cfg['base']}/api/packages/gcs/{name}"
+        try:
+            _http("GET", url, self._headers(cfg), context=self._ctx(cfg))
+            return False
+        except RuntimeError as e:
+            if "HTTP 404" not in str(e):
+                raise
+        _http("PUT", url, self._headers(cfg), raw=data, context=self._ctx(cfg))
+        return True
+
+    def trigger(self, payload):
+        if not isinstance(payload, dict) or not payload:
+            raise RuntimeError('ray payload must be a JSON object with an "entrypoint" '
+                               'or a "script"')
+        cfg = self._cfg()
+        body = {k: json.loads(json.dumps(payload[k])) for k in self._BODY if k in payload}
+        env = body.get("runtime_env")
+        if env is not None and not isinstance(env, dict):
+            raise RuntimeError('ray "runtime_env" must be a JSON object')
+        if "script" in payload:
+            if "entrypoint" in payload:
+                raise RuntimeError('ray payload takes "entrypoint" or "script", not both')
+            script = payload["script"]
+            if not isinstance(script, str) or not script.strip():
+                raise RuntimeError('ray "script" must be Python source')
+            args = payload.get("args") or []
+            if isinstance(args, str):
+                args = shlex.split(args)
+            if not isinstance(args, list) or not all(isinstance(a, (str, int, float))
+                                                    and not isinstance(a, bool) for a in args):
+                raise RuntimeError('ray "args" must be a list of strings')
+            name, data = self._package(script)
+            self._upload(cfg, name, data)
+            body["runtime_env"] = {**(env or {}), "working_dir": f"gcs://{name}"}
+            body["entrypoint"] = " ".join(["python", "main.py",
+                                           *(shlex.quote(str(a)) for a in args)])
+        entrypoint = body.get("entrypoint")
+        if not isinstance(entrypoint, str) or not entrypoint.strip():
+            raise RuntimeError('ray payload needs "entrypoint" (the command to run) or '
+                               '"script" (Python source)')
+        meta = body.get("metadata") or {}
+        if not isinstance(meta, dict):
+            raise RuntimeError('ray "metadata" must be a JSON object')
+        # Ray takes metadata as strings; the run says where it came from.
+        body["metadata"] = {"submitted_by": "studio",
+                            **{str(k): str(v) for k, v in meta.items()}}
+        out = _json("POST", f"{cfg['base']}/api/jobs/", self._headers(cfg), body,
+                    context=self._ctx(cfg))
+        ref = out.get("submission_id") or out.get("job_id")
+        if not ref:
+            raise RuntimeError("Ray accepted the job but returned no submission id")
+        return {"run_ref": str(ref), "url": self._job_url(cfg, str(ref))}
+
+    def _get(self, cfg, run_ref):
+        return _json("GET", f"{cfg['base']}/api/jobs/{quote(run_ref, safe='')}",
+                     self._headers(cfg), context=self._ctx(cfg))
+
+    def status(self, run_ref):
+        cfg = self._cfg()
+        try:
+            d = self._get(cfg, run_ref)
+        except Exception as e:
+            return {"state": "unknown", "detail": str(e), "url": None, "metrics": {}}
+        raw = str(d.get("status") or "").upper()
+        metrics = {k: d.get(k) for k in ("start_time", "end_time", "driver_node_id")
+                   if d.get(k) is not None}
+        start, end = metrics.get("start_time"), metrics.get("end_time")
+        if isinstance(start, (int, float)) and isinstance(end, (int, float)):
+            metrics["duration_ms"] = int(end - start)
+        return {"state": self._STATES.get(raw, "unknown"),
+                "detail": d.get("message") or None,
+                "url": self._job_url(cfg, run_ref), "metrics": metrics}
+
+    def logs(self, run_ref):
+        cfg = self._cfg()
+        try:
+            d = _json("GET", f"{cfg['base']}/api/jobs/{quote(run_ref, safe='')}/logs",
+                      self._headers(cfg), context=self._ctx(cfg))
+        except Exception:
+            return ""
+        return str(d.get("logs") or "")[-_MAX_FAILURE_LOG_PAGE:]
+
+    def failure_diagnostic(self, run_ref):
+        try:
+            message = str(self._get(self._cfg(), run_ref).get("message") or "")
+        except Exception:
+            message = ""
+        return _redact_diagnostic("\n".join(p for p in (message, self.logs(run_ref)) if p))
+
+
 PLATFORMS = {
     "airflow": AirflowPlatform(),
     "databricks_jobs": DatabricksJobsPlatform(),
     "dbt_cloud": DbtCloudPlatform(),
     "k8s_spark": K8sSparkPlatform(),
+    "ray": RayJobsPlatform(),
 }
 
 
