@@ -565,6 +565,13 @@ td { color: var(--ink-2); }
 /* ── Build forms and planning-context cards ── */
 .pl-build { margin-bottom: 14px; }
 .pl-draft { margin-top: 10px; border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px; background: var(--surface); }
+/* The planning context under the chat composer: one line until opened. */
+.pl-context { margin-top: 6px; font-size: 12.5px; }
+.pl-context > summary { cursor: pointer; list-style: none; color: var(--ink-2); padding: 2px 4px; width: fit-content; }
+.pl-context > summary::-webkit-details-marker { display: none; }
+.pl-context > summary::before { content: "▸ "; color: var(--ink-3); }
+.pl-context[open] > summary::before { content: "▾ "; }
+.pl-context > .pl-draft { margin-top: 6px; }
 
 /* ── Chat task indicators (blue dot / running) ── */
 .conv-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;

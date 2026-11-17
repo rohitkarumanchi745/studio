@@ -190,11 +190,14 @@ test("Enter sends; Shift+Enter is a new line", async () => {
 
 test("the Airflow option shows as a chip in the composer, removable", () => {
   const chat = chatHarness({ conversationId: null });
-  const option = findElement(chat.render().tree, (el) => el.type === "input" && el.props.type === "checkbox"
-    && el.props.onChange && String(el.props.checked) === "false");
-  option.props.onChange({ target: { checked: true } });
+  // The ＋ menu (ComposerPlus) reports the choice; Chat shows the chip.
+  const plus = findElement(chat.render().tree, (el) => el.type?.name === "ComposerPlus");
+  assert.equal(plus.props.buildAirflow, false);
+  plus.props.onBuildAirflow(true);
   const { markup, tree } = chat.render();
   assert.match(markup, /⚙ Airflow DAG/);
+  // The planning context sits under the composer as one line, not a panel.
+  assert.equal(findElement(tree, (el) => el.type?.name === "PlanningContextPicker").props.compact, true);
   assert.match(markup, /aria-label="Build Airflow DAG"/);
   findElement(tree, (el) => el.type === "button" && el.props["aria-label"] === "Don't build a DAG")
     .props.onClick();

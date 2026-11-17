@@ -11,6 +11,7 @@ import SharePanel from "./SharePanel";
 import SqlLab from "./SqlLab";
 import ChatWorkflow from "./ChatWorkflow";
 import ChatPlatformRun, { PlatformComposer } from "./ChatPlatformRun";
+import ComposerPlus from "./ComposerPlus";
 import { chatPipelineFields, PlanningContextPicker, PlanningSources,
   usePlanningCatalog } from "./planningContext";
 
@@ -1162,21 +1163,8 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
           <div className="composer-row">
             <div className="composer-tools">
               {!visualMode && (
-                <details className="composer-plus">
-                  <summary className="composer-plus-btn" aria-label="More options"
-                           title="Build an Airflow DAG, or run on a platform">＋</summary>
-                  <div className="composer-menu" role="menu">
-                    <label className="composer-pipeline-option menu-item">
-                      <input type="checkbox" checked={buildAirflow} disabled={busy}
-                        onChange={(e) => setBuildAirflow(e.target.checked)} />
-                      Build an approval-gated Airflow DAG from this prompt
-                    </label>
-                    <button type="button" className="menu-item" disabled={busy}
-                            onClick={() => setShowPlatform((v) => !v)}>
-                      Run on Airflow / another platform
-                    </button>
-                  </div>
-                </details>
+                <ComposerPlus buildAirflow={buildAirflow} busy={busy} onBuildAirflow={setBuildAirflow}
+                              onPlatform={() => setShowPlatform((v) => !v)} />
               )}
               {buildAirflow && !visualMode && (
                 <span className="composer-chip">
@@ -1219,7 +1207,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
             onIdea={(q) => { setPrompt(q); inputRef.current?.focus(); }} />
         )}
         {!visualMode && buildAirflow && (
-          <PlanningContextPicker {...planningCatalog}
+          <PlanningContextPicker {...planningCatalog} compact
             repositoryId={repositoryId} confluencePageIds={confluencePageIds}
             onRepositoryChange={setRepositoryId} onConfluenceChange={setConfluencePageIds}
             disabled={busy} />
