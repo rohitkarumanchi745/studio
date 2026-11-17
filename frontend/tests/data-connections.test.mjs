@@ -245,8 +245,9 @@ test("the grid renders a tile per source with an honest status", async () => {
       const html = panel.render();
 
       // /connections/env: how each built-in source is set (admin only);
-      // /metagraph/sources: what has been scanned from each (Connected sources).
-      assert.deepEqual(requests.sort(), ["/api/catalog/sources", "/api/connections",
+      // /metagraph/sources: what has been scanned from each (Connected sources);
+      // /clusters: which Spark clusters are connected (admin only).
+      assert.deepEqual(requests.sort(), ["/api/catalog/sources", "/api/clusters", "/api/connections",
                                          "/api/connections/env", "/api/connections/types",
                                          "/api/m365/status", "/api/metagraph/sources",
                                          "/api/settings/repos", "/api/share/destinations"]);
@@ -1457,5 +1458,51 @@ test("Read everything on a row asks, then widens that connection", async () => {
       assert.deepEqual(calls.filter((c) => c.method === "POST").map((c) => c.url),
                        ["/api/connections/d2/everything"]);
       assert.match(done[0], /“databricks-2-2” now reads everything this sign-in can see — removed/);
+    });
+});
+
+test("Spark clusters: their shelf, an honest status per role, and a tile opens its panel", async () => {
+  const CLUSTERS = { clusters: [
+    { kind: "aks", label: "Azure Kubernetes Service", connected: false },
+    { kind: "gke", label: "Google Kubernetes Engine", connected: false },
+    { kind: "local", label: "Local Kubernetes", connected: true, server_host: "127.0.0.1",
+      namespace: "spark-jobs", auth: "certificate", verified_tls: true, image: "" }],
+    server_settings: false, default: "local", order: ["aks", "gke", "default", "local"] };
+  await withApi({ __user: ADMIN, "/catalog/sources": SOURCES, "/connections/types": TYPES,
+                  "/connections": CONNS, "/clusters": CLUSTERS },
+    async ({ flush }) => {
+      const panel = harness(DataConnections, { onClose() {} });
+      panel.render();
+      panel.start();
+      await flush();
+      const html = panel.render();
+      assert.match(html, />Compute for Spark</);
+      assert.match(html, /Local Kubernetes<\/span><span class="conn-tile-status">Connected/);
+      assert.match(html, /Azure Kubernetes Service<\/span><span class="conn-tile-status">Set up/);
+      assert.match(html, /Google Kubernetes Engine<\/span><span class="conn-tile-status">Set up/);
+      // Not a data source: absent from Connected sources.
+      assert.doesNotMatch(html.slice(0, html.indexOf(">Featured<")), /Local Kubernetes/);
+      panel.set(S.picked, "k8s_local");
+      const local = panel.render();
+      assert.match(local, /127\.0\.0\.1<\/b> · namespace <b>spark-jobs<\/b> · signs in with a client certificate/);
+      assert.match(local, /Spark jobs that name no cluster run here\./);
+      panel.set(S.picked, "aks");
+      const aks = panel.render();
+      assert.match(aks, /az aks get-credentials/);
+      assert.match(aks, /Test connection/);
+    });
+  await withApi({ __user: ANALYST, "/catalog/sources": SOURCES, "/repos": { repos: REPOS } },
+    async ({ requests, flush }) => {
+      const panel = harness(DataConnections, { onClose() {} });
+      panel.render();
+      panel.start();
+      await flush();
+      assert.ok(!requests.includes("/api/clusters"));      // admin only
+      const html = panel.render();
+      assert.match(html, /Local Kubernetes<\/span><span class="conn-tile-status">Ask an admin/);
+      panel.set(S.picked, "gke");
+      const gke = panel.render();
+      assert.match(gke, /An administrator connects Spark clusters/);
+      assert.doesNotMatch(gke, /Test connection|kubeconfig/i);
     });
 });

@@ -101,3 +101,23 @@ test("the panel points at plain English, and its Submit button is not the round 
   assert.match(css, /\.composer \.chat-platform-submit, \.chat-platform-submit \{ width: auto;/);
   assert.match(css, /\.chat-platform-payload \{\n  display: block; width: 100%; box-sizing: border-box; min-height: 52px;/);
 });
+
+test("a Spark card says which cluster it runs on, and nothing for other platforms", () => {
+  const spark = { execution_mode: "platform_run", target: "k8s_spark", label: "Spark on Kubernetes",
+                  status: "awaiting_approval", job_id: "j1",
+                  payload: { main_file: "local:///opt/jobs/etl.py", image: "a:1", cluster: "local" } };
+  const html = (artifact) => renderToStaticMarkup(render(ChatPlatformRun, { artifact, busy: false,
+                                                                            messageId: "m1", onAction() {} }));
+  assert.match(html(spark), /<p class="meta chat-platform-cluster">Runs on Local Kubernetes<\/p>/);
+  assert.match(html({ ...spark, payload: { ...spark.payload, cluster: "aks" } }),
+               /Runs on Azure Kubernetes Service/);
+  assert.doesNotMatch(html({ ...spark, payload: { main_file: "x" } }), /Runs on/);
+  assert.doesNotMatch(html({ ...spark, payload: { ...spark.payload, cluster: "<b>x" } }), /Runs on/);
+  assert.doesNotMatch(html({ ...CARD, payload: { dag_id: "d", cluster: "local" } }), /Runs on/);
+  // Not yet queued (a cluster not connected, say): the missing list speaks instead.
+  const waiting = html({ ...spark, status: "needs_input", job_id: undefined,
+                         payload: { ...spark.payload, cluster: "aks" },
+                         missing: ["cluster: AKS is not connected"] });
+  assert.doesNotMatch(waiting, /Runs on/);
+  assert.match(waiting, /cluster: AKS is not connected/);
+});

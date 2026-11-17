@@ -8,7 +8,8 @@
 // a SQL data connector; its registry has a dedicated panel. Microsoft Teams and
 // Slack are where answers are sent, not sources: their tiles list the channels
 // set up for sending (DestinationsPanel). The tile art comes
-// from sourceCatalog.jsx.
+// from sourceCatalog.jsx. AKS, GKE and Local Kubernetes are where Spark jobs
+// run, not sources: their tiles open ClusterPanel (admins only, /clusters).
 //
 // The grid deliberately shows sources this screen cannot set up — the marketing
 // APIs are configured by an operator through environment variables — because
@@ -29,6 +30,7 @@ import { CATEGORIES, FEATURED, MARKETPLACE, SourceIcon, metaFor } from "./source
 import MetadataLine, { metadataText, useMetadataStatus } from "./MetadataLine";
 import { backdropClose } from "../backdrop";
 import DestinationsPanel from "./DestinationsPanel";
+import ClusterPanel, { CLUSTER_TILES } from "./ClusterPanel";
 
 const STATUS_LABEL = {
   onboarding: "Onboarding — first sync running",
@@ -131,8 +133,11 @@ function sqlTile(ctype, dialect) {
 /** Tiles for where answers are sent, rather than sources Studio reads. */
 export const SEND_TO = ["teams", "slack"];
 
+/** Tiles that are not data sources: their instances are not sources either. */
+const NOT_SOURCES = ["github", "m365", ...SEND_TO, ...Object.keys(CLUSTER_TILES)];
+
 export function buildTiles({ types = [], conns = [], sources = [], repos = [], envs = [],
-                             channels = [], q = "" }) {
+                             channels = [], clusters = [], q = "" }) {
   const byId = new Map();
   const put = (id, extra) => {
     if (!byId.has(id)) {
@@ -148,6 +153,7 @@ export function buildTiles({ types = [], conns = [], sources = [], repos = [], e
   put("github");
   put("teams");
   put("slack");
+  for (const id of Object.keys(CLUSTER_TILES)) put(id);
   // The featured integrations are on everyone's map, connectable or not.
   for (const id of FEATURED) put(id);
   // The marketplace: every integration on the map, each saying how it connects.
@@ -169,6 +175,14 @@ export function buildTiles({ types = [], conns = [], sources = [], repos = [], e
       configured: true,
       kind: "repository",
     });
+  }
+
+  // Spark clusters (/clusters, admins): a connected one is its tile's instance.
+  const tileOfKind = Object.fromEntries(Object.entries(CLUSTER_TILES).map(([t, k]) => [k, t]));
+  for (const c of clusters) {
+    if (!c.connected || !tileOfKind[c.kind]) continue;
+    put(tileOfKind[c.kind]).instances.push({ name: c.label, configured: true, kind: "cluster",
+                                             hint: `${c.server_host} · ${c.namespace}` });
   }
 
   // Channels answers can be sent to (/share/destinations) sit on their own tile.
@@ -248,6 +262,7 @@ export default function DataConnections({ onClose }) {
   const [note, setNote] = useState("");
   const [repos, setRepos] = useState([]);       // configured GitHub planning repositories
   const [channels, setChannels] = useState([]); // /share/destinations — Teams and Slack
+  const [clusters, setClusters] = useState({ clusters: [] }); // /clusters — Spark (admins)
   // What Studio has scanned from each connected source, for the Connected
   // sources panel (administrators), and the names being queued for a rescan.
   const scans = useMetadataStatus(isAdmin);
@@ -302,6 +317,7 @@ export default function DataConnections({ onClose }) {
       api("/connections/types").then((d) => setTypes(Array.isArray(d) ? d : [])).catch(() => {});
       api("/connections").then((d) => setConns(Array.isArray(d) ? d : [])).catch(() => {});
       api("/connections/env").then((d) => setEnvs(Array.isArray(d) ? d : [])).catch(() => {});
+      api("/clusters").then((d) => setClusters(d?.clusters ? d : { clusters: [] })).catch(() => {});
     }
   }
 
@@ -327,8 +343,9 @@ export default function DataConnections({ onClose }) {
     load();
   }, [isAdmin]);
 
-  const tiles = useMemo(() => buildTiles({ types, conns, sources, repos, envs, channels, q }),
-                        [types, conns, sources, repos, envs, channels, q]);
+  const tiles = useMemo(() => buildTiles({ types, conns, sources, repos, envs, channels, q,
+                                           clusters: clusters.clusters }),
+                        [types, conns, sources, repos, envs, channels, clusters, q]);
 
   // A disconnected connection is absent from /catalog/sources but still owns
   // its name on the server, so it counts as taken here too.
@@ -396,6 +413,11 @@ export default function DataConnections({ onClose }) {
           ) : tile.id === "github" ? (
             <GithubPanel repos={repos} isAdmin={isAdmin} reload={load}
               onNote={setNote} onError={setError} />
+          ) : CLUSTER_TILES[tile.id] ? (
+            <ClusterPanel kind={CLUSTER_TILES[tile.id]} label={tile.meta.label}
+              state={clusters.clusters.find((c) => c.kind === CLUSTER_TILES[tile.id])}
+              defaultKind={clusters.default} isAdmin={isAdmin} reload={load}
+              onNote={setNote} onError={setError} />
           ) : SEND_TO.includes(tile.id) ? (
             <DestinationsPanel kind={tile.id} channels={tile.instances} isAdmin={isAdmin}
               reload={load} onNote={setNote} onError={setError} />
@@ -440,7 +462,7 @@ export function scopeText(inst) {
 export function signInGroups(tiles) {
   const groups = new Map();
   for (const tile of tiles) {
-    if (tile.id === "github" || tile.id === "m365" || SEND_TO.includes(tile.id)) continue;
+    if (NOT_SOURCES.includes(tile.id)) continue;
     for (const inst of tile.instances) {
       if (!inst.configured || inst.disconnected) continue;
       const key = inst.account ? `${tile.id}\u0000${inst.account}` : `\u0000${inst.name}`;
@@ -595,7 +617,7 @@ const VIA_LABEL = {
 function Tile({ tile, isAdmin, onPick }) {
   const live = tile.instances.filter((i) => i.configured);
   const dormant = !live.length && !tile.connectable
-    && !((tile.id === "github" || SEND_TO.includes(tile.id)) && isAdmin);
+    && !((tile.id === "github" || SEND_TO.includes(tile.id) || CLUSTER_TILES[tile.id]) && isAdmin);
   return (
     <button
       className={`conn-tile${dormant ? " conn-tile-off" : ""}`}
@@ -610,6 +632,8 @@ function Tile({ tile, isAdmin, onPick }) {
           : SEND_TO.includes(tile.id)
           ? live.length ? `${live.length} channel${live.length === 1 ? "" : "s"}`
             : isAdmin ? "Add a channel" : "Ask an admin"
+          : CLUSTER_TILES[tile.id]
+          ? live.length ? "Connected" : isAdmin ? "Set up" : "Ask an admin"
           : live.length
           ? `${live.length} connected`
           : tile.connectable

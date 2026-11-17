@@ -1049,7 +1049,14 @@ request. Commands are plain English — "kick off", "launch", "I'd like to run�
 - **Spark on Kubernetes:** the file (a path, a URI, or a bare name under
   `K8S_SPARK_JOBS_DIR`), "image X", "class X", "named X" and "with args …";
   a `.jar` is a Scala (or, said so, Java) job and needs its class. The only
-  default is the operator's `K8S_SPARK_IMAGE`.
+  default image is the cluster's own, else the operator's `K8S_SPARK_IMAGE`.
+  It runs on AKS, GKE or a local cluster (kind, minikube, Docker Desktop)
+  that an administrator connects in **Integrations › Compute for Spark**
+  (`clusters.py`; setup in [deploy/spark-k8s](deploy/spark-k8s/README.md)).
+  "On AKS", "on GKE" or "locally" picks one. A request that names none runs
+  on the first connected of AKS, GKE, the server's `K8S_API_URL`, local, so
+  with no cloud cluster connected it runs locally. The approval card names
+  the cluster.
 - **Ray:** a `quoted` command, or one that starts with python / bash / sh.
 
 Anything left over ("tomorrow") is asked about, never guessed; questions and

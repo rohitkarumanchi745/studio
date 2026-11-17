@@ -1,0 +1,57 @@
+# What Studio needs on a cluster to run Spark jobs, and nothing more: a
+# namespace for the jobs, an account Studio signs in as, and permission there
+# to create and watch SparkApplications and read the driver's log.
+#
+#   kubectl apply -f studio-access.yaml
+#   kubectl -n spark-jobs get secret studio-submitter-token -o jsonpath='{.data.token}' | base64 -d
+#
+# Paste that token into Integrations › Compute for Spark in Studio. Install the
+# Spark operator watching this namespace (see README.md) — it creates the
+# spark-operator-spark account the driver runs as.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: spark-jobs
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: studio-submitter
+  namespace: spark-jobs
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: studio-submitter
+  namespace: spark-jobs
+rules:
+  - apiGroups: ["sparkoperator.k8s.io"]
+    resources: ["sparkapplications"]
+    verbs: ["create", "get", "list"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: studio-submitter
+  namespace: spark-jobs
+subjects:
+  - kind: ServiceAccount
+    name: studio-submitter
+    namespace: spark-jobs
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: studio-submitter
+---
+# A long-lived token for the account (Kubernetes no longer makes one by itself).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: studio-submitter-token
+  namespace: spark-jobs
+  annotations:
+    kubernetes.io/service-account.name: studio-submitter
+type: kubernetes.io/service-account-token

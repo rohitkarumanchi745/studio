@@ -20,6 +20,7 @@ const CATEGORIES = [
   { key: "nosql", label: "NoSQL, vector and graph" },
   { key: "work", label: "Work management and collaboration" },
   { key: "automation", label: "Automation and workflows" },
+  { key: "compute", label: "Compute for Spark" },
   { key: "messaging", label: "Send answers to" },
   { key: "bi", label: "BI and semantic models" },
   { key: "storage", label: "Cloud file storage" },
@@ -238,6 +239,16 @@ const MARKS = {
       <circle cx="31" cy="24" r="2" fill={c} opacity=".3" />
     </>
   ),
+  // A cluster: three pods on a ring, joined.
+  pods: (c) => (
+    <>
+      <circle cx="20" cy="20" r="13" fill="none" stroke={c} strokeWidth="2.2" opacity=".35" />
+      <g stroke={c} strokeWidth="2.2"><path d="M20 12.5 13 25M20 12.5 27 25M13 25h14" /></g>
+      <rect x="15" y="7" width="10" height="10" rx="2.5" fill={c} />
+      <rect x="8" y="20" width="10" height="10" rx="2.5" fill={c} opacity=".75" />
+      <rect x="22" y="20" width="10" height="10" rx="2.5" fill={c} opacity=".55" />
+    </>
+  ),
   beaker: (c) => (
     <>
       <path d="M16 6v10L9 29a3 3 0 0 0 2.7 4.4h16.6A3 3 0 0 0 31 29l-7-13V6" fill="none" stroke={c} strokeWidth="2.4" strokeLinejoin="round" />
@@ -273,6 +284,14 @@ const META = {
           blurb: "OneDrive, SharePoint and Outlook, synced into your private knowledge collection." },
   github: { label: "GitHub", color: "#24292f", mark: "gitbranch", category: "work",
             blurb: "Register repositories as read-only planning context for pipeline drafts; repository code is not executed." },
+
+  // Kubernetes clusters Spark jobs run on — set up on the Integrations screen.
+  aks: { label: "Azure Kubernetes Service", color: "#0078d4", mark: "pods", category: "compute",
+         blurb: "Run Spark jobs on an AKS cluster through the Spark operator." },
+  gke: { label: "Google Kubernetes Engine", color: "#4285f4", mark: "pods", category: "compute",
+         blurb: "Run Spark jobs on a GKE cluster through the Spark operator." },
+  k8s_local: { label: "Local Kubernetes", color: "#326ce5", mark: "pods", category: "compute",
+               blurb: "Run Spark jobs on kind, minikube or Docker Desktop — where they run when no cloud cluster is connected." },
 
   // Where answers can be sent, not sources Studio reads.
   teams: { label: "Microsoft Teams", color: "#5059c9", mark: "bubble", category: "messaging",

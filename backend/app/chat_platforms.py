@@ -10,7 +10,12 @@ field only when they say it outright — a DAG named in words is looked up in
 the DAGs Airflow actually has (one match, or a choice of several), a path is
 a path, "image X" is the image — and anything left over is asked about,
 never guessed. The one default is the operator's: K8S_SPARK_IMAGE (and
-K8S_SPARK_JOBS_DIR for a bare file name).
+K8S_SPARK_JOBS_DIR for a bare file name), or the image set on the cluster.
+
+Spark runs on a Kubernetes cluster an administrator connected (clusters.py):
+"on AKS", "on GKE", "locally" / "on minikube" pick one; a request that names
+none runs on the first connected of AKS, GKE, the server's own, local — and
+the card queued for approval says which.
 """
 import copy
 import json
@@ -37,8 +42,20 @@ _TARGETS = {
     "ray": "ray", "ray jobs": "ray", "ray job": "ray", "ray cluster": "ray",
     "kuberay": "ray", "anyscale": "ray",
 }
-_PLATFORM = re.compile(r"\b(" + "|".join(
-    re.escape(k) for k in sorted(_TARGETS, key=len, reverse=True)) + r")\b", re.I)
+# A cluster named is Spark on that cluster ("run etl.py on AKS"). Short names
+# like "gke" are whole words only — never part of a path (s3a://gke-lake/…).
+_CLUSTER_TARGETS = {
+    "aks": "k8s_spark", "azure kubernetes service": "k8s_spark", "azure kubernetes": "k8s_spark",
+    "gke": "k8s_spark", "google kubernetes engine": "k8s_spark", "google kubernetes": "k8s_spark",
+    "local kubernetes": "k8s_spark", "local k8s": "k8s_spark", "minikube": "k8s_spark",
+    "kind cluster": "k8s_spark", "docker desktop": "k8s_spark", "k3d": "k8s_spark",
+}
+_WORD_START, _WORD_END = r"(?<![\w/.:-])", r"(?![\w/:-])(?!\.\w)"
+_PLATFORM = re.compile(r"\b(?:" + "|".join(
+    re.escape(k) for k in sorted(_TARGETS, key=len, reverse=True)) + r")\b|" + _WORD_START + "(?:"
+    + "|".join(re.escape(k) for k in sorted(_CLUSTER_TARGETS, key=len, reverse=True)) + ")" + _WORD_END,
+    re.I)
+_TARGETS.update(_CLUSTER_TARGETS)
 _IDENTIFIER = r'''(?:"([^"\n]+)"|'([^'\n]+)'|`([^`\n]+)`|([\w.-]+))'''
 _NEGATION = re.compile(r"\b(?:don't|don’t|do not|never|without|not yet|instead of|except|unless)\b", re.I)
 _COMMAND = re.compile(r"^(?:trigger|re-?run|run|execute|start|submit|deploy|kick[\s-]+off|launch|"
@@ -152,8 +169,17 @@ def _missing(target, payload):
         main = spec.get("mainApplicationFile") if full else spec.get("main_file") or spec.get("mainApplicationFile")
         if not isinstance(main, str) or not main.strip():
             errors.append("mainApplicationFile" if full else "main_file: provide the deployed Spark application path")
+        cluster = payload.get("cluster")
+        if cluster is not None:
+            from . import clusters
+            if cluster not in clusters.ORDER:
+                errors.append("cluster: choose aks, gke, local or default")
+            elif _cluster_for(payload)[0] is None:
+                errors.append(f"cluster: {_CLUSTER_NAMES[cluster]} is not connected — an administrator "
+                              "connects it in Integrations › Compute for Spark")
         if not isinstance(spec.get("image"), str) or not spec["image"].strip():
-            errors.append("image: provide the Spark container image")
+            if full or not (_cluster_for(payload)[1] or {}).get("image"):
+                errors.append("image: provide the Spark container image")
         if spec.get("type") in ("Scala", "Java") and not spec.get("mainClass" if full else "main_class"):
             errors.append("mainClass" if full else
                           f"main_class: provide the {spec['type']} entry point (class com.example.Main)")
@@ -248,7 +274,7 @@ new named DAG/job starts with an empty payload, even on the same platform.
         text = f"dag {picked}"
     filling = bool(previous and previous.get("status") == "needs_input" and (
         re.match(r"^(?:dag|job)(?:_id)?\b", text, re.I) or (supplied is not None and not text)
-        or (previous.get("target") == "k8s_spark" and _spark_said(text))
+        or (previous.get("target") == "k8s_spark" and (_spark_said(text) or _cluster_said(text)))
         or (previous.get("target") == "ray" and _command_said(text))))
     if not command and not filling:
         return None
@@ -298,6 +324,7 @@ new named DAG/job starts with an empty payload, even on the same platform.
             errors.append("key=value parameters are Airflow conf or Databricks job parameters; "
                           "give this platform a JSON payload")
     if selected == "k8s_spark":
+        tail = _cluster_words(text, tail, body, errors)
         tail = _spark_words(tail, body, errors)
     elif selected == "ray":
         tail = _ray_words(tail, body)
@@ -329,7 +356,7 @@ def _one_per_field(messages):
     DAG identifier"."""
     seen, out = set(), []
     for m in dict.fromkeys(messages):
-        field = re.match(r"^([a-z_]+(?:_id|_file|_class)?|image|arguments):", m)
+        field = re.match(r"^([a-z_]+(?:_id|_file|_class)?|image|arguments|cluster):", m)
         key = field.group(1) if field else m
         if key not in seen:
             seen.add(key)
@@ -433,6 +460,43 @@ _SPARK_IMAGE = re.compile(r"\b(?:(?:using|with|on)\s+)?(?:the\s+)?(?:docker\s+|c
                           r"\s*[:=]?\s*([A-Za-z0-9][\w./:@-]*)", re.I)
 _SPARK_CLASS = re.compile(r"\b(?:main[\s_-]?class|class)\s*[:=]?\s*([A-Za-z_$][\w.$]*)", re.I)
 _SPARK_NAME = re.compile(r"\b(?:named|called)\s+([A-Za-z0-9][\w-]*)", re.I)
+# Which cluster: said outright. "kind" alone is an English word: only "kind cluster" / "on kind".
+_CLUSTER_WORDS = tuple((kind, re.compile(_WORD_START + "(?:" + words + ")" + _WORD_END, re.I)) for kind, words in (
+    ("aks", r"aks|azure kubernetes(?: service)?|azure k8s"),
+    ("gke", r"gke|google kubernetes(?: engine)?|google k8s"),
+    ("local", r"locally|(?:(?:on|in) )?(?:the |my )?local (?:kubernetes|k8s|cluster)|"
+              r"minikube|kind cluster|on kind|docker desktop|k3d"),
+))
+_CLUSTER_NAMES = {"aks": "AKS", "gke": "GKE", "local": "the local cluster",
+                  "default": "the server's cluster"}
+
+
+def _cluster_words(text, tail, body, errors):
+    """Set the cluster a Spark request names ("on AKS", "locally"); returns
+    the tail without those words."""
+    said = [kind for kind, pattern in _CLUSTER_WORDS if pattern.search(text)]
+    for _, pattern in _CLUSTER_WORDS:
+        tail = pattern.sub(" ", tail)
+    if len(said) > 1:
+        errors.append("cluster: name one cluster — AKS, GKE or local")
+        tail = re.sub(r"\b(?:or|and|either)\b", " ", tail, flags=re.I)
+    elif said:
+        body["cluster"] = said[0]
+    return re.sub(r"\bcluster\b", " ", tail, flags=re.I)
+
+
+def _cluster_said(text):
+    return any(pattern.search(text) for _, pattern in _CLUSTER_WORDS)
+
+
+def _cluster_for(payload):
+    """(name, config) of the cluster a Spark payload would run on, or (None, None)."""
+    try:
+        return platforms.PLATFORMS["k8s_spark"].pick(payload.get("cluster"))
+    except Exception:
+        return None, None
+
+
 _SPARK_ARGS = re.compile(r"\b(?:with\s+)?(?:args|arguments)\s*[:=]?\s+(.+)$", re.I)
 _TRAILING = re.compile(r"(?:\s+(?:on|in|now|please|right away))+\s*$", re.I)
 
@@ -479,8 +543,10 @@ def _spark_words(tail, body, errors):
         body["type"] = "Java" if re.search(r"\bjava\b", original, re.I) else "Scala"
     elif main.lower().endswith(".r") and "type" not in body:
         body["type"] = "R"
-    if "image" not in body and "spec" not in body and os.getenv("K8S_SPARK_IMAGE", "").strip():
-        body["image"] = os.getenv("K8S_SPARK_IMAGE").strip()   # the operator's default
+    if "image" not in body and "spec" not in body:
+        image = (_cluster_for(body)[1] or {}).get("image") or os.getenv("K8S_SPARK_IMAGE", "").strip()
+        if image:
+            body["image"] = image          # the cluster's, else the operator's default
     return re.sub(r"\b(?:java|scala|python|with|and)\b", " ", tail, flags=re.I)
 
 
@@ -558,6 +624,17 @@ def submit(request, user, *, request_id):
     if not platforms.PLATFORMS[target].configured():
         artifact.update(status="needs_configuration", missing=[f"configure {artifact['label']} credentials in Studio"])
         return artifact
+    if target == "k8s_spark":
+        # Name the cluster (and its image) in what is queued: the approver
+        # sees where the run goes, and it goes there even if another cluster
+        # is connected before the approval.
+        cluster, cfg = _cluster_for(payload)
+        if cluster and cluster != "default":
+            payload["cluster"] = cluster
+        full = "spec" in payload or "kind" in payload
+        if cfg and not full and not payload.get("image") and cfg.get("image"):
+            payload["image"] = cfg["image"]
+        artifact["payload"] = copy.deepcopy(payload)
     if not request_id:
         raise HTTPException(400, "A request_id is required for a platform submission")
     learning_context = {k: request[k] for k in ("prompt", "conversation_id") if request.get(k) is not None}
