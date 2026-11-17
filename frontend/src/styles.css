@@ -443,6 +443,9 @@ td { color: var(--ink-2); }
 }
 .chat-platform-payload:focus { outline-color: var(--accent); }
 .chat-platform-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.chat-platform-choices { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 2px; }
+/* Not the round send button: the composer's own .primary rule must not shrink it. */
+.composer .chat-platform-submit, .chat-platform-submit { width: auto; border-radius: 8px; margin-top: 8px; }
 
 /* ── Canvas mode: chart on main screen, chat docked aside ── */
 .workspace { flex: 1; display: flex; min-width: 0; }

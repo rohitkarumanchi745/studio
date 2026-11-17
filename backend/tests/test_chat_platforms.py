@@ -193,3 +193,55 @@ def test_status_chat_reports_stored_approval_without_triggering(client):
     assert artifact["job_id"] == first["message"]["platform_run"]["job_id"]
     assert artifact["status"] == "awaiting_approval"
     assert count_jobs() == 1
+
+
+def test_plain_english_prompts_reach_the_platform_and_a_card_offers_the_dags(client, monkeypatch):
+    """"Kick off the orders load pipeline on Airflow" goes through the chat to
+    a supervised job, as an explicit command does; a name that matches
+    several DAGs is a card offering them, and picking one queues that DAG."""
+    from app import chat_platforms
+    chat_platforms._DAG_CACHE.clear()
+    monkeypatch.setattr(supervisor.platforms.PLATFORMS["airflow"], "list_dags",
+                        lambda limit=1000: ["daily_sales", "daily_sales_backfill", "orders_load"])
+    answer = ask(client, "Kick off the orders load pipeline on Airflow with day=2026-11-01")
+    cid = answer["conversation_id"]
+    artifact = answer["message"]["platform_run"]
+    assert artifact["status"] == "awaiting_approval"
+    assert artifact["payload"] == {"dag_id": "orders_load", "conf": {"day": "2026-11-01"}}
+    assert count_jobs() == 1
+    card = ask(client, "run the sales dag on airflow", cid)["message"]["platform_run"]
+    assert card["status"] == "needs_input"
+    assert card["choices"] == ["daily_sales", "daily_sales_backfill"]
+    # One reason per field on the card, the specific one.
+    assert card["missing"] == ["dag_id: more than one Airflow DAG matches “sales” — pick one: "
+                               "daily_sales, daily_sales_backfill"]
+    assert count_jobs() == 1
+    # The card's button: that platform, the DAG picked.
+    card_id = latest_assistant(cid)["id"]
+    picked = ask(client, "Run Airflow DAG daily_sales_backfill", cid, platform_action="submit",
+                 platform_message_id=card_id, platform_target="airflow",
+                 platform_payload={"dag_id": "daily_sales_backfill"})
+    assert picked["message"]["platform_run"]["payload"] == {"dag_id": "daily_sales_backfill"}
+    assert picked["message"]["platform_run"]["status"] == "awaiting_approval"
+    assert count_jobs() == 2
+    chat_platforms._DAG_CACHE.clear()
+
+
+def test_run_names_an_existing_dag_but_a_pipeline_to_build_still_builds(client, monkeypatch):
+    """"Run the daily sales pipeline on Airflow" used to reach the DAG builder
+    (it starts with "run" and says pipeline + Airflow), which asked for
+    requirements. A DAG Airflow has — or an exact id — is a run of it; a
+    request that describes new work still goes to the builder."""
+    from app import chat_platforms
+    chat_platforms._DAG_CACHE.clear()
+    monkeypatch.setattr(supervisor.platforms.PLATFORMS["airflow"], "list_dags",
+                        lambda limit=1000: ["daily_sales", "orders_load"])
+    run = ask(client, "Run the daily sales pipeline on Airflow")["message"]
+    assert run["platform_run"]["payload"] == {"dag_id": "daily_sales"}
+    assert run["platform_run"]["status"] == "awaiting_approval"
+    exact = ask(client, "Run Airflow DAG orders_load")["message"]
+    assert exact["platform_run"]["payload"] == {"dag_id": "orders_load"}
+    build = ask(client, "Run an Airflow pipeline that loads orders into analytics.orders_clean")["message"]
+    assert build.get("platform_run") is None and build["mode"] == "pipeline"
+    assert count_jobs() == 2
+    chat_platforms._DAG_CACHE.clear()

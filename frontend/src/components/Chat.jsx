@@ -1089,8 +1089,12 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
               onClarify={resend}
               onRunPipeline={() => runPipeline(m)}
               onPipelineStatus={() => runPipeline(m, "status")}
-              onPlatformAction={(action) => platformAction({ platform_action: action, platform_message_id: m.message_id },
-                action === "status" ? "Check this platform job's status" : "Submit this platform job again for approval")}
+              onPlatformAction={(action, pick) => platformAction(
+                { platform_action: action, platform_message_id: m.message_id,
+                  // A DAG picked on the card: that platform, the card's parameters with it.
+                  ...(pick ? { platform_target: m.platform_run?.target, platform_payload: pick.payload } : {}) },
+                pick ? pick.text
+                  : action === "status" ? "Check this platform job's status" : "Submit this platform job again for approval")}
               busy={busy}
               activitySteps={activityByTask[m.activity_task_id]}
               visualMode={visualMode}

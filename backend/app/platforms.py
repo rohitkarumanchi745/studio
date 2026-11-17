@@ -204,6 +204,25 @@ class AirflowPlatform(Platform):
         dag_id, _, run_id = run_ref.partition(":")
         return dag_id, run_id
 
+    def list_dags(self, limit=1000):
+        """The DAG ids this Airflow has, for naming a DAG in plain words ("the
+        daily sales pipeline"). Read-only; paged; bounded by `limit`. Raises
+        RuntimeError when Airflow cannot be reached or refuses."""
+        cfg = self._cfg()
+        if not cfg["url"]:
+            raise RuntimeError("Airflow is not configured")
+        headers, out, offset = self._headers(cfg), [], 0
+        while len(out) < limit:
+            page = _json("GET", self._api(cfg, f"/dags?limit=100&offset={offset}"), headers,
+                         timeout=10)
+            dags = page.get("dags") or []
+            out += [d["dag_id"] for d in dags
+                    if isinstance(d, dict) and d.get("dag_id") and d.get("is_active") is not False]
+            offset += len(dags)
+            if not dags or offset >= int(page.get("total_entries") or 0):
+                break
+        return out[:limit]
+
     def dag_ready(self, dag_id):
         """Observe scheduler registration; never enable an existing DAG."""
         cfg = self._cfg()
@@ -686,8 +705,8 @@ class K8sSparkPlatform(Platform):
             spec["pythonVersion"] = "3"
         if shorthand.get("main_class"):
             spec["mainClass"] = shorthand["main_class"]
-        elif typ == "Scala":
-            raise RuntimeError('k8s_spark Scala jobs need "main_class"')
+        elif typ in ("Scala", "Java"):
+            raise RuntimeError(f'k8s_spark {typ} jobs need "main_class"')
         if shorthand.get("arguments"):
             spec["arguments"] = list(shorthand["arguments"])
         return {"apiVersion": "sparkoperator.k8s.io/v1beta2",
