@@ -32,6 +32,7 @@ def seed():
         seed_manufacturing()
         seed_marketing()
         seed_logistics()
+        seed_supply_chain()
         return
     rng = random.Random(42)
     c = sqlite3.connect(WAREHOUSE_PATH)
@@ -103,6 +104,7 @@ def seed():
     seed_manufacturing()
     seed_marketing()
     seed_logistics()
+    seed_supply_chain()
 
 
 PLANTS = ["Pune", "Chennai", "Frankfurt"]
@@ -424,6 +426,198 @@ def seed_logistics():
         for i, (city, state, lat, lon) in enumerate(STORES)])
     c.commit()
     c.close()
+
+
+# ── Supply chain tracking: where each shipment was, over time ───────────
+#
+# Position reports for shipments in motion — container ships on real lanes
+# (through Singapore and Suez, across the Pacific, through Panama), freight
+# trains and trucks across the US, and cargo flights — one row per report,
+# like a carrier's or a telematics feed's: filter to a time and map them to
+# see where everything was then. Waypoints are (name, latitude, longitude,
+# hours dwelt there); a ship sails the great circle between two.
+
+EARTH_KM = 6371.0
+
+SHANGHAI = ("Shanghai", 31.35, 122.05, 0)
+SUPPLY_LANES = [
+    # (mode, carrier, km/h, hours between reports, waypoints)
+    ("Ocean", "Blue Meridian Lines", 34, 6, [
+        SHANGHAI, ("East China Sea", 30.5, 126.0, 0), ("off Tokyo", 33.8, 141.5, 0),
+        ("Los Angeles", 33.72, -118.26, 0)]),
+    ("Ocean", "Pacific Crest Shipping", 33, 6, [
+        ("Shenzhen", 22.55, 114.27, 0), ("Luzon Strait", 20.8, 121.2, 0),
+        ("North Pacific", 34.0, 145.0, 0), ("Strait of Juan de Fuca", 48.45, -124.8, 0),
+        ("Tacoma", 47.27, -122.41, 0)]),
+    ("Ocean", "Blue Meridian Lines", 35, 6, [
+        SHANGHAI, ("Taiwan Strait", 24.5, 119.5, 0), ("South China Sea", 10.0, 109.5, 0),
+        ("Singapore", 1.26, 103.84, 12), ("Strait of Malacca", 4.0, 100.0, 0),
+        ("off Aceh", 6.0, 95.0, 0), ("off Sri Lanka", 5.8, 80.6, 0),
+        ("Gulf of Aden", 12.5, 52.0, 0), ("Bab-el-Mandeb", 12.6, 43.4, 0),
+        ("Red Sea", 20.0, 38.5, 0), ("Suez Canal", 29.95, 32.56, 10),
+        ("Port Said", 31.3, 32.35, 0), ("Eastern Mediterranean", 33.5, 25.0, 0),
+        ("Strait of Sicily", 37.3, 11.5, 0), ("Gibraltar", 35.95, -5.6, 0),
+        ("off Portugal", 37.0, -9.8, 0), ("Cape Finisterre", 43.8, -9.8, 0),
+        ("Ushant", 48.6, -5.5, 0), ("Dover Strait", 51.0, 1.5, 0),
+        ("Rotterdam", 51.95, 4.05, 0)]),
+    ("Ocean", "Pacific Crest Shipping", 34, 6, [
+        ("Busan", 35.08, 129.07, 0), ("off Japan", 34.0, 140.0, 0),
+        ("off Mexico", 15.0, -105.0, 0), ("Panama Canal", 8.9, -79.55, 12),
+        ("Colón", 9.38, -79.92, 0), ("Caribbean Sea", 14.0, -77.0, 0),
+        ("Windward Passage", 19.9, -73.9, 0), ("off the Bahamas", 24.0, -74.0, 0),
+        ("off Florida", 30.0, -79.5, 0), ("Savannah", 32.03, -80.85, 0)]),
+    ("Rail", "Prairie Rail", 45, 3, [
+        ("Los Angeles", 34.05, -118.24, 0), ("Barstow", 34.90, -117.02, 0),
+        ("Flagstaff", 35.20, -111.65, 0), ("Albuquerque", 35.08, -106.65, 2),
+        ("Amarillo", 35.22, -101.83, 0), ("Kansas City", 39.10, -94.58, 3),
+        ("Chicago", 41.85, -87.65, 0)]),
+    ("Rail", "Prairie Rail", 42, 3, [
+        ("Seattle", 47.60, -122.33, 0), ("Spokane", 47.66, -117.43, 0),
+        ("Havre", 48.55, -109.68, 0), ("Minot", 48.23, -101.29, 0),
+        ("Minneapolis", 44.98, -93.27, 3), ("Chicago", 41.85, -87.65, 0)]),
+    ("Truck", "Northstar Freight", 70, 1, [
+        ("Los Angeles", 33.74, -118.26, 0), ("Ontario DC", 34.06, -117.65, 2),
+        ("Phoenix", 33.45, -112.07, 0), ("El Paso", 31.76, -106.49, 0),
+        ("Dallas DC", 32.90, -96.90, 0)]),
+    ("Truck", "Lone Star Haulers", 68, 1, [
+        ("Savannah", 32.08, -81.09, 0), ("Atlanta DC", 33.65, -84.42, 0)]),
+    ("Truck", "Lone Star Haulers", 68, 1, [
+        ("Houston", 29.73, -95.27, 0), ("Dallas DC", 32.90, -96.90, 0)]),
+    ("Truck", "Northstar Freight", 70, 1, [
+        ("Chicago", 41.85, -87.65, 0), ("Indianapolis", 39.77, -86.16, 0),
+        ("Columbus DC", 39.96, -83.00, 0)]),
+    ("Truck", "Northstar Freight", 60, 1, [
+        ("Newark", 40.68, -74.15, 0), ("Allentown DC", 40.60, -75.49, 0)]),
+    ("Truck", "Lone Star Haulers", 70, 1, [
+        ("Memphis", 35.04, -89.98, 0), ("Chicago", 41.85, -87.65, 0)]),
+    ("Truck", "Lone Star Haulers", 70, 1, [
+        ("Dallas DC", 32.90, -96.90, 0), ("Shreveport", 32.52, -93.75, 0),
+        ("Jackson", 32.30, -90.18, 0), ("Birmingham", 33.52, -86.80, 0),
+        ("Atlanta DC", 33.65, -84.42, 0)]),
+    ("Truck", "Northstar Freight", 65, 1, [
+        ("Tacoma", 47.27, -122.41, 0), ("Portland DC", 45.52, -122.68, 0)]),
+    ("Air", "Skybridge Cargo", 850, 0.5, [
+        ("Hong Kong", 22.31, 113.92, 0), ("Anchorage", 61.17, -150.0, 2),
+        ("Memphis", 35.04, -89.98, 0)]),
+    ("Air", "Skybridge Cargo", 850, 0.5, [
+        ("Frankfurt", 50.03, 8.57, 0), ("Chicago", 41.98, -87.90, 0)]),
+]
+# How long ago shipments of each mode left (days, earliest–latest), and what
+# a stop on the way is called.
+SUPPLY_DEPARTS = {"Ocean": (2.0, 14.0), "Rail": (0.5, 5.0), "Truck": (0.1, 3.0), "Air": (0.05, 1.5)}
+SUPPLY_STOP = {"Ocean": "At port", "Rail": "At terminal", "Truck": "At DC", "Air": "At hub"}
+SUPPLY_UNITS = {"Ocean": (1200, 6500), "Rail": (120, 300), "Truck": (18, 30), "Air": (40, 120)}
+SUPPLY_JITTER = {"Ocean": 0.08, "Rail": 0.0, "Truck": 0.02, "Air": 0.0}
+
+
+def _unit(lat, lon):
+    la, lo = math.radians(lat), math.radians(lon)
+    return (math.cos(la) * math.cos(lo), math.cos(la) * math.sin(lo), math.sin(la))
+
+
+def _arc(a, b):
+    """The great-circle angle between two (lat, lon) points, in radians."""
+    u, v = _unit(*a), _unit(*b)
+    return math.acos(max(-1.0, min(1.0, sum(x * y for x, y in zip(u, v)))))
+
+
+def _along(a, b, f):
+    """The point a fraction f of the way from a to b along the great circle."""
+    w = _arc(a, b)
+    if w < 1e-9:
+        return a
+    u, v = _unit(*a), _unit(*b)
+    k1, k2 = math.sin((1 - f) * w) / math.sin(w), math.sin(f * w) / math.sin(w)
+    x, y, z = (k1 * p + k2 * q for p, q in zip(u, v))
+    return (math.degrees(math.atan2(z, math.hypot(x, y))), math.degrees(math.atan2(y, x)))
+
+
+def _legs(waypoints, depart, kmh):
+    """The journey as legs — ("move", start, end, a, b) between waypoints and
+    ("dwell", start, end, a, a) at a stop on the way — and the arrival time."""
+    legs, t = [], depart
+    for i, (a, b) in enumerate(zip(waypoints, waypoints[1:])):
+        hours = _arc(a[1:3], b[1:3]) * EARTH_KM / kmh
+        legs.append(("move", t, t + dt.timedelta(hours=hours), a, b))
+        t += dt.timedelta(hours=hours)
+        if i + 2 < len(waypoints) and b[3]:
+            legs.append(("dwell", t, t + dt.timedelta(hours=b[3]), b, b))
+            t += dt.timedelta(hours=b[3])
+    return legs, t
+
+
+def supply_chain_rows(now):
+    """Position reports up to `now` (a naive UTC datetime): (shipment_id,
+    ping_time, latitude, longitude, mode, carrier, origin, destination,
+    status, speed_kmh, units). Deterministic for a given `now`."""
+    rng = random.Random(77)
+    rows, n = [], 24000
+    for mode, carrier, kmh, every, waypoints in SUPPLY_LANES:
+        for _ in range(2):
+            n += 1
+            pace = rng.uniform(0.82, 1.1)            # under 0.92: running late
+            lo, hi = SUPPLY_DEPARTS[mode]
+            depart = now - dt.timedelta(hours=round(rng.uniform(lo, hi) * 24 / every) * every)
+            legs, arrive = _legs(waypoints, depart, kmh * pace)
+            units = rng.randint(*SUPPLY_UNITS[mode])
+            jitter = SUPPLY_JITTER[mode]
+            origin, destination = waypoints[0][0], waypoints[-1][0]
+            step = dt.timedelta(hours=every)
+            times, t = [], depart
+            while t < arrive and t <= now:
+                times.append(t)
+                t += step
+            if arrive <= now:
+                times.append(arrive)
+            for t in times:
+                if t >= arrive:
+                    (lat, lon), status, speed = waypoints[-1][1:3], "Delivered", 0.0
+                else:
+                    kind, start, end, a, b = next(leg for leg in legs if leg[1] <= t < leg[2])
+                    if kind == "dwell":
+                        (lat, lon), status, speed = a[1:3], SUPPLY_STOP[mode], 0.0
+                    else:
+                        f = (t - start) / (end - start)
+                        lat, lon = _along(a[1:3], b[1:3], f)
+                        if 0 < f < 1 and jitter:
+                            lat += rng.uniform(-jitter, jitter)
+                            lon += rng.uniform(-jitter, jitter)
+                        status = "Delayed" if pace < 0.92 else "In transit"
+                        speed = round(kmh * pace * rng.uniform(0.9, 1.1), 1)
+                rows.append((f"SHP-{n}", t.strftime("%Y-%m-%d %H:%M:%S"), round(lat, 4), round(lon, 4),
+                             mode, carrier, origin, destination, status, speed, units))
+    rows.sort(key=lambda r: (r[1], r[0]))
+    return rows
+
+
+def seed_supply_chain(now=None):
+    """shipment_tracking: where each shipment was, every few hours, up to
+    now. Re-seeded when its newest report is a day old, so a long-running
+    demo still has shipments moving "now". Safe to call on every query."""
+    now = now or dt.datetime.utcnow().replace(minute=0, second=0, microsecond=0)
+    c = sqlite3.connect(WAREHOUSE_PATH, timeout=30, isolation_level=None)
+    try:
+        c.execute("""CREATE TABLE IF NOT EXISTS shipment_tracking (
+            shipment_id TEXT, ping_time TEXT, latitude REAL, longitude REAL, mode TEXT,
+            carrier TEXT, origin TEXT, destination TEXT, status TEXT, speed_kmh REAL,
+            units INTEGER)""")
+
+        def fresh():
+            newest = c.execute("SELECT MAX(ping_time) FROM shipment_tracking").fetchone()[0]
+            return bool(newest) and now - dt.datetime.fromisoformat(newest) < dt.timedelta(hours=24)
+
+        if fresh():
+            return
+        c.execute("BEGIN IMMEDIATE")              # one writer; the others wait, then see it fresh
+        if fresh():
+            c.execute("ROLLBACK")
+            return
+        c.execute("DELETE FROM shipment_tracking")
+        c.executemany("INSERT INTO shipment_tracking VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                      supply_chain_rows(now))
+        c.execute("COMMIT")
+    finally:
+        c.close()
 
 
 class DemoConnector(Connector):
