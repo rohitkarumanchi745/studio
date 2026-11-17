@@ -10,7 +10,7 @@ from typing import List, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from . import (agent, autopilot_intent, autoroute, chat_platforms, chat_workflows, db, email_service, gateway, governance, jobs, keys,
+from . import (agent, answer_uses, autopilot_intent, autoroute, chat_platforms, chat_workflows, db, email_service, gateway, governance, jobs, keys,
                lightning, orchestrator, progress, qcache, queryguard, rbac,
                roster, router as model_router, semantic, sessions, skills,
                pipeline_sources)
@@ -813,6 +813,11 @@ def _answer(ctx, result):
         meta = {k: v for k, v in progress.describe(result["source"]).items() if k != "source"}
         if meta:
             result["source_meta"] = meta
+    if isinstance(result, dict) and "uses" not in result and (result.get("sql") or result.get("panels")):
+        # Which sources it read, and under each the tables and columns its SQL
+        # names — the side panel's tree. Names only; withheld with the SQL.
+        result["uses"] = answer_uses.safe_uses(result, schemas=ctx.get("schemas"),
+                                               schema_source=ctx.get("source"))
     reply_to = ctx.get("reply_to")
     if not reply_to:
         return db.add_message(ctx["cid"], "assistant", result)
