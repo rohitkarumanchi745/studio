@@ -694,6 +694,37 @@ def enforce_limit(sql, max_rows=500):
     return f"{cleaned} LIMIT {max_rows}"
 
 
+# Words that may follow a table reference without being its alias.
+_NOT_ALIAS = _FROM_STOP | {"on", "using", "join", "inner", "left", "right", "full", "outer",
+                           "cross", "natural", "lateral", "tablesample", "pivot", "unpivot",
+                           "for", "select", "from", "with", "as"}
+
+
+def table_aliases(sql):
+    """[(table, alias)] for every FROM/JOIN target that is not a CTE, in the
+    order read — the table's last part AS WRITTEN, its alias or None. For
+    describing what an answer read (answer_uses.py), never for allowing it:
+    validate() is the check. Lexical; [] for empty or unreadable input."""
+    try:
+        toks, _ = _tokens((sql or "").strip().rstrip(";").strip())
+        ctes = _cte_bindings(toks)
+        out, n = [], len(toks)
+        for parts, at in _table_refs(toks):
+            if _cte_legal(ctes, _canon(parts[-1]), at):
+                continue
+            j = at + 2 * len(parts) - 1             # the token after `a.b.c`
+            if j < n and toks[j][0] == "word" and toks[j][1].lower() == "as":
+                j += 1
+            alias = None
+            if j < n and (toks[j][0] == "ident" or (
+                    toks[j][0] == "word" and toks[j][1].lower() not in _NOT_ALIAS)):
+                alias = toks[j][1]
+            out.append((parts[-1].text, alias))
+        return out
+    except QueryRejected:
+        return []
+
+
 def base_tables(sql):
     """Lowercased names of every FROM/JOIN target that is NOT resolved by a CTE
     binding — the real tables a query reads. BARE names, qualifier dropped:

@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api, getUser } from "../api";
 import Canvas from "./Canvas";
-import { SourceIcon, knownSource, metaFor } from "./sourceCatalog";
+import { SourceIcon } from "./sourceCatalog";
+import { sourceIconId, sourceTypeLabel, stepKind } from "./sourceLabels";
 import ChartView, { chartImage } from "./ChartView";
 import Markdown from "./Markdown";
 import { downloadReport, downloadTable } from "../exporting";
@@ -12,8 +13,38 @@ import SqlLab from "./SqlLab";
 import ChatWorkflow from "./ChatWorkflow";
 import ChatPlatformRun, { PlatformComposer } from "./ChatPlatformRun";
 import ComposerPlus from "./ComposerPlus";
+import AnswerPanel from "./AnswerPanel";
 import { chatPipelineFields, PlanningContextPicker, PlanningSources,
   usePlanningCatalog } from "./planningContext";
+
+// The answer-details panel on the right: open by default on a wide screen,
+// then however the reader last left it (this browser only).
+const PANEL_KEY = "studio_answer_panel";
+
+export function readPanelPref() {
+  try {
+    const saved = localStorage.getItem(PANEL_KEY);
+    if (saved === "open" || saved === "closed") return saved === "open";
+  } catch { /* storage unavailable: fall through to the screen width */ }
+  try {
+    return typeof window !== "undefined" && !!window.matchMedia?.("(min-width: 1200px)")?.matches;
+  } catch {
+    return false;
+  }
+}
+
+function writePanelPref(open) {
+  try { localStorage.setItem(PANEL_KEY, open ? "open" : "closed"); } catch { /* a convenience */ }
+}
+
+/** The answer the panel describes: the one picked, else the newest. */
+export function panelAnswer(messages, picked) {
+  const at = Number.isInteger(picked) && messages[picked]?.role === "assistant" ? picked
+    : messages.map((m) => m.role).lastIndexOf("assistant");
+  if (at < 0) return null;
+  const asked = messages.slice(0, at).reverse().find((m) => m.role === "user");
+  return { m: messages[at], index: at, question: asked?.text || "" };
+}
 
 // "Demo agent" for a single worker; "Snowflake agent + Databricks agent →
 // Aggregator" when a question fanned out across sources.
@@ -31,12 +62,6 @@ const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 // the engine an "Any SQL database" URL names); every other kind of work has
 // its own glyph. Steps recorded before steps carried a kind are read from
 // their wording.
-const ENGINE_ICON = {
-  postgresql: "postgres", postgres: "postgres", mysql: "mysql", mariadb: "mariadb",
-  mssql: "mssql", oracle: "oracle", snowflake: "snowflake", databricks: "databricks",
-  bigquery: "bigquery", cypher: "neo4j", cql: "cassandra", trino: "trino",
-  clickhouse: "clickhouse",
-};
 const STEP_GLYPH = {
   chart: ["📊", "Drawing a chart"], visual: ["🎨", "Drawing with D3"],
   semantic: ["▣", "Certified metric"], verified: ["✓", "Verified query"],
@@ -47,48 +72,7 @@ const STEP_GLYPH = {
   query: ["🛢", "Querying"], schema: ["▦", "Reading the schema"],
 };
 const SOURCE_KINDS = new Set(["query", "schema", "agent", "route", "error"]);
-
-/** The tile whose icon stands for a source: its type when this bundle knows
- *  it, else the engine it speaks, else the generic database. */
-export function sourceIconId(type, engine) {
-  if (type && type !== "sql" && knownSource(type)) return type;
-  const byEngine = ENGINE_ICON[String(engine || "").toLowerCase()];
-  return byEngine && knownSource(byEngine) ? byEngine : "sql";
-}
-
-/** A step's kind — recorded, or read from its words for older steps. */
-export function stepKind(step) {
-  if (step?.kind) return step.kind;
-  const label = String(step?.label || "");
-  const rules = [
-    [/running SQL|querying/i, "query"], [/reading the (question|columns|schema)/i, "schema"],
-    [/custom visual|with D3/i, "visual"], [/rendering .* chart/i, "chart"],
-    [/certified|semantic layer|semantic (metric|dimension)/i, "semantic"],
-    [/verified query/i, "verified"], [/cached plan/i, "cache"], [/knowledge/i, "docs"],
-    [/Aggregator/, "aggregate"], [/planner|planned/i, "plan"],
-    [/fanning out|agent\(s\)|child agent/i, "agents"], [/BitNet|frontier/i, "model"],
-    [/MCP|tools/i, "tools"], [/DAG|pipeline|platform job/i, "pipeline"],
-    [/failed|error|retrying|skipped|abandoned/i, "error"], [/grounded|which source/i, "route"],
-    [/finalizing/i, "done"], [/finished/i, "agent"],
-  ];
-  return rules.find(([re]) => re.test(label))?.[1] || null;
-}
-
-const ENGINE_LABEL = {
-  sqlite: "SQLite", postgresql: "PostgreSQL", postgres: "PostgreSQL", mysql: "MySQL",
-  mariadb: "MariaDB", mssql: "SQL Server", oracle: "Oracle", duckdb: "DuckDB",
-  snowflake: "Snowflake", databricks: "Databricks", bigquery: "BigQuery", trino: "Trino",
-  clickhouse: "ClickHouse", cql: "CQL", cypher: "Cypher",
-};
-
-/** "Any SQL database · SQLite", "Snowflake", "LanceDB": what kind of source this is. */
-export function sourceTypeLabel(type, engine) {
-  const id = sourceIconId(type, engine);
-  const label = metaFor(id).label;
-  if (id !== "sql") return label;
-  const e = String(engine || "").toLowerCase();
-  return e ? `${label} · ${ENGINE_LABEL[e] || e}` : label;
-}
+export { sourceIconId, sourceTypeLabel, stepKind };
 
 /** A source by its icon, name and type: "◆ shop · Any SQL database · SQLite". */
 export function SourceBadge({ name, type, engine }) {
@@ -466,6 +450,8 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
   const [liveSteps, setLiveSteps] = useState([]);
   const [activityByTask, setActivityByTask] = useState({});
   const [activeStartedAt, setActiveStartedAt] = useState(null);
+  const [panelOpen, setPanelOpen] = useState(readPanelPref);
+  const [panelPick, setPanelPick] = useState(null);   // a message index, or null: the newest
   const endRef = useRef(null);
   const inputRef = useRef(null);       // the composer, for a start to fill and select
   // Background-task polling lives in refs, NOT state/effects: creating a new
@@ -535,6 +521,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
     setError("");
     setFailedActivity(null);
     setBusy(false);
+    setPanelPick(null);
     setLiveSteps([]);
     setActiveStartedAt(null);
     // Another conversation's chart must not stay open over this one.
@@ -918,6 +905,15 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
   // The D3 & artifacts window opens a new conversation on its home (VisualHome):
   // the composer centred, with starts that fill it.
   const home = visualMode && !conversationId && messages.length === 0 && !busy;
+  // The panel follows the run in progress, else the answer picked, else the newest.
+  const described = busy ? null : panelAnswer(messages, panelPick);
+  const hasPanel = !home && !canvas && (busy || !!described);
+  const togglePanel = (open) => {
+    setPanelOpen(open);
+    writePanelPref(open);
+  };
+  // A new turn: follow it.
+  useEffect(() => { if (busy) setPanelPick(null); }, [busy]);
   // Recent cards draw each conversation's real latest chart: fetched once per
   // set of cards, read-only (a glance at Recent does not mark a chat read).
   const recentKey = home ? recentVisuals(recent).map((c) => c.id).join(",") : "";
@@ -1022,6 +1018,14 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
             </div>
           </>
         )}
+        {hasPanel && (
+          <button type="button" className={"chip panel-toggle" + (panelOpen ? " chip-on" : "")}
+                  aria-pressed={panelOpen} onClick={() => togglePanel(!panelOpen)}
+                  title={panelOpen ? "Hide the answer's steps, sources and tools"
+                    : "Show the answer's steps, sources and tools"}>
+            ◧ Details
+          </button>
+        )}
         {visualMode && (
           <span className="visual-toolbar-right">
             <span className="artifact-badge">🎨 D3 &amp; artifacts</span>
@@ -1102,6 +1106,8 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
               conversationId={conversationId}
               onAutopilotCreated={refreshMessages}
               onFollowUp={i === messages.length - 1 && !busy ? (q) => send(null, q) : null}
+              onDetails={() => { setPanelPick(i); togglePanel(true); }}
+              detailed={hasPanel && panelOpen && described?.index === i}
             />
           )
         )}
@@ -1218,8 +1224,23 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
         <div className="composer-note">Studio can make mistakes. Check the SQL and sources.</div>
       </form>
       </main>
+      {hasPanel && panelOpen && (busy ? (
+        <AnswerPanel key="live" running steps={liveSteps} question={lastQuestion(messages)}
+                     onClose={() => togglePanel(false)} />
+      ) : (
+        <AnswerPanel key={described.m.message_id || described.index} answer={described.m}
+                     question={described.question}
+                     steps={activityByTask[described.m.activity_task_id]}
+                     onSteps={(taskId, steps) => setActivityByTask((saved) => ({ ...saved, [taskId]: steps }))}
+                     onOpen={() => setCanvas(buildCanvas(described.m))}
+                     onClose={() => togglePanel(false)} />
+      ))}
     </div>
   );
+}
+
+function lastQuestion(messages) {
+  return [...messages].reverse().find((m) => m.role === "user")?.text || "";
 }
 
 // A read-only SQL pipeline saved in this conversation before that feature was
@@ -1249,7 +1270,7 @@ export function SavedSqlPipeline({ pipeline }) {
   );
 }
 
-export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRunPipeline, onPipelineStatus, onPlatformAction, busy, activitySteps, visualMode = false,
+export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRunPipeline, onPipelineStatus, onPlatformAction, busy, activitySteps, visualMode = false, onDetails, detailed = false,
                                   conversationId = null, onAutopilotCreated, onFollowUp = null }) {
   const [showSql, setShowSql] = useState(false);
   const [columns, setColumns] = useState(m.columns);
@@ -1595,6 +1616,13 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
                   </button>
                   <span className="action-sep" aria-hidden="true" />
                 </>
+              )}
+              {onDetails && (
+                <button className={"icon-btn" + (detailed ? " chip-on" : "")} onClick={onDetails}
+                        aria-pressed={detailed}
+                        title="Its steps, the sources and columns it used, and the tools it called">
+                  ◧ Details
+                </button>
               )}
               {m.text && (
                 <button className="icon-btn" onClick={copyText} title="Copy the answer">⧉ Copy</button>
