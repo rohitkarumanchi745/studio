@@ -82,4 +82,4 @@ def test_the_demo_data_has_places_for_every_map(tmp_path, monkeypatch):
     assert suggest_map(*lanes) == {"type": "route_map",
                                    "title": "origin_country → destination_country",
                                    "x": "origin_country", "y": ["destination_country", "units"]}
-    assert c.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table'").fetchone()[0] == 18
+    assert c.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table'").fetchone()[0] == 19
