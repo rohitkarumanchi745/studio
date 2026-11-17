@@ -29,6 +29,7 @@ Lifecycle, one table:
 """
 import logging
 import os
+import json
 import time
 import uuid
 
@@ -145,7 +146,10 @@ def draft(force=False):
         return None, "no LLM key is configured on the server"
     with db.connect() as c:
         since = _last_draft_through(c)
-    failures = db.list_traces(limit=_EVIDENCE_LIMIT, max_reward=0.4)
+    # A run grounded in web search output may not improve an AI model (the
+    # providers' terms): it is never evidence for a rule.
+    failures = [t for t in db.list_traces(limit=_EVIDENCE_LIMIT, max_reward=0.4)
+                if not _bing_grounded(t)]
     fresh = [t for t in failures if t["created_at"] > since]
     if not failures or (not force and len(fresh) < MIN_FAILURES):
         return None, (f"{len(fresh)} new low-reward runs since the last draft; "
@@ -172,6 +176,16 @@ def draft(force=False):
 def ticker_enabled():
     """STUDIO_LEARNED_RULES_TICKER kill-switch (default on)."""
     return os.getenv("STUDIO_LEARNED_RULES_TICKER", "1").lower() not in ("0", "false", "no")
+
+
+def _bing_grounded(trace):
+    meta = trace.get("meta")
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except ValueError:
+            return True             # unreadable: leave it out
+    return isinstance(meta, dict) and bool(meta.get("web_grounded") or meta.get("bing_grounded"))
 
 
 def tick_once():

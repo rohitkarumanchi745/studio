@@ -24,13 +24,17 @@ deterministic fallback (SELECT * ... LIMIT + auto chart).
 """
 import functools
 import json
+import logging
 import os
 import re
 from typing import List
 from urllib.parse import urlsplit
 
-from . import db, email_service, gateway, governance, grains, progress, rbac, visuals
+from . import (db, email_service, gateway, general_tools, governance, grains, local_files,
+               progress, rbac, settings, visuals)
 from .queryguard import QueryRejected
+
+log = logging.getLogger(__name__)
 
 # Full Power BI / Tableau-style catalog (rendered with ECharts client-side),
 # plus the types only the D3 engine draws: network, beeswarm, calendar,
@@ -463,6 +467,7 @@ def _build_graph(llm, tools, system):
             return create_agent(llm, tools, prompt=system)
     except ImportError:
         from langgraph.prebuilt import create_react_agent
+        tools = [t for t in tools if not isinstance(t, dict)]   # provider tools need create_agent
         try:
             return create_react_agent(llm, tools, prompt=system)
         except TypeError:
@@ -577,11 +582,25 @@ def _final_text(result):
             if isinstance(content, str) and content.strip():
                 return content.strip()
             if isinstance(content, list):
-                parts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
-                text = "\n".join(p for p in parts if p).strip()
+                text = _answer_text(content)
                 if text:
                     return text
     return ""
+
+
+def _answer_text(blocks):
+    """The text of one AI message's content blocks. A web search runs inside
+    the model call, so one message can hold "Let me look that up", the
+    search, its results and then the answer: the answer is the text after the
+    last non-text block. Text blocks next to each other are one passage split
+    by its citations, so they join without a separator."""
+    blocks = [b for b in blocks if isinstance(b, dict)]
+    last_other = max((i for i, b in enumerate(blocks) if b.get("type") != "text"), default=-1)
+    tail = [b.get("text", "") for b in blocks[last_other + 1:] if b.get("type") == "text"]
+    text = "".join(tail).strip()
+    if text:
+        return text
+    return "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
 
 
 _SUMMARY_SYSTEM = ("You are a data analyst. In 2-4 sentences, say what this query result shows "
@@ -710,7 +729,7 @@ def describe_for(user, connector, allowed_tables, table):
 def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, model=None,
               skill_md=None, kag_first=False, delegation=None, tool_profile="full",
               visual_mode=False, conversation_id=None, focus_schemas=None,
-              join_hints=None):
+              join_hints=None, web=None):
     """One analytics turn.
 
     schemas: {table_name: [{"name","type"}, ...]} — one entry for single-table
@@ -732,6 +751,8 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
     metaground.ground, else picks them by name, matching.focus_tables).
     join_hints: ["a.x = b.y  (state, confidence N)", ...] — how those tables
     join, from the metadata graph's relationships.
+    web: what this turn's person picked for web search — "off", "auto" or a
+    provider (general_tools.PROVIDERS); None is "auto".
     They go in the volatile half of the prompt, so the cached prefix — the
     skill file — stays the same from one question to the next. Any other
     table's columns are one describe_table call away.
@@ -1064,9 +1085,22 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         return delegation.propose(source, task, context, reason)
 
     memory_notes = memory.notes_for_prompt(user["id"], prompt)
+    # The web is a standalone chat's (graph workers keep a closed tool set):
+    # Bing through Studio's own tools, else Anthropic's server tools on Claude.
+    on_web = tool_profile == "full" and not self_hosted(spec) and general_tools.web_enabled(web)
+    web_mode = general_tools.web_provider(spec, web) if on_web else None
+    web_tools = general_tools.web_tools(spec, web) if web_mode == "anthropic" else []
+    web_seen = {"citations": [], "queries": []}
+    # Files from the machine's shared folder: a chat's, for admins and analysts.
+    files_seen = []
+    on_files = tool_profile == "full" and local_files.available(user)
+    rule = general_tools.web_rule(spec, web) if on_web else general_tools.NO_WEB_RULE
+    if on_files:
+        rule += "\n- " + local_files.FILES_RULE
     # Stable half (cached prefix) + volatile half (below the breakpoint).
     system, volatile = _system_blocks(connector, table, allowed_tables, schemas,
-                                      memory_notes, skill_md, focus_schemas, join_hints)
+                                      memory_notes, skill_md, focus_schemas, join_hints,
+                                      web_rule=rule)
     if delegation is not None:
         available = json.dumps(delegation.source_catalog, ensure_ascii=False)
         delegation_note = (
@@ -1102,7 +1136,18 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
 
     try:
         llm = make_llm(spec, user)
-        base_tools = [run_sql, describe_table, render_chart, data_freshness]
+        clock = general_tools.clock_tool(
+            lambda label: progress.emit_for(_tid, f"{_me}: {label}", agent=_me, kind="clock"))
+        base_tools = [run_sql, describe_table, render_chart, data_freshness, clock]
+        if on_web:
+            base_tools += general_tools.client_web_tools(
+                spec, web_seen,
+                lambda label: progress.emit_for(_tid, f"{_me}: {label}", agent=_me, kind="web"),
+                choice=web)
+        if on_files:
+            base_tools += local_files.tools(
+                user, files_seen,
+                lambda label: progress.emit_for(_tid, f"{_me}: {label}", agent=_me, kind="files"))
         if tool_profile == "full":
             # Memory is a full chat turn's: graph workers get none of it.
             base_tools += [remember, forget, recall_past_work, email_report]
@@ -1163,15 +1208,32 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
             import asyncio
 
             async def _arun():
-                tools = base_tools + list(await _load_mcp_tools(mcp_cfg))
+                tools = base_tools + list(await _load_mcp_tools(mcp_cfg)) + web_tools
                 graph = _graph(llm, tools, system, spec, volatile)
-                return await graph.ainvoke({"messages": messages}, config={"recursion_limit": 16})
+                return await graph.ainvoke({"messages": messages},
+                                           config={"recursion_limit": _agent_steps()})
 
             result = asyncio.run(_arun())
         else:
-            graph = _graph(llm, base_tools, system, spec, volatile)
-            result = graph.invoke({"messages": messages}, config={"recursion_limit": 16})
-        if not self_hosted(spec):
+            graph = _graph(llm, base_tools + web_tools, system, spec, volatile)
+            result = graph.invoke({"messages": messages}, config={"recursion_limit": _agent_steps()})
+        if web_tools:
+            searched, pages = general_tools.web_activity(result.get("messages"))
+            for label in searched:
+                progress.emit_for(_tid, f"{_me}: {label}", agent=_me, kind="web")
+            ctx["citations"].extend(pages)
+        pages, ctx["web_grounding"] = general_tools.grounding(web_seen, web_mode, user.get("id"))
+        ctx["citations"].extend(pages)
+        ctx["citations"].extend({"source": f, "path": f, "kind": "file"} for f in files_seen)
+        direct = web_seen.get("direct")
+        if direct:
+            # Bing or Google answered: their grounded answer is the answer, as
+            # it came back — nothing rewritten, no data interspersed with it.
+            text, usage = direct["text"], _extract_usage(result)
+            for key in ("sql", "chart"):
+                ctx[key] = None
+            ctx.update(columns=[], rows=[], panels=[])
+        elif not self_hosted(spec):
             text = _final_text(result)
             usage = _extract_usage(result)
             if not text and ctx["sql"] is not None and not ctx["errors"]:
@@ -1245,11 +1307,101 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         "agents": [me],
         "mode": "agent",
         "model": spec,
+        **({"web_grounding": ctx["web_grounding"]} if ctx.get("web_grounding") else {}),
     }
 
 
+GENERAL_AGENT = {"name": "Studio assistant", "role": "worker"}
+
+
+def _agent_steps():
+    """A data agent's step limit (model calls and tool calls): STUDIO_AGENT_MAX_STEPS."""
+    return settings.integer("STUDIO_AGENT_MAX_STEPS", 16, 4, 100)
+
+_GENERAL_SYSTEM = """You are Studio's assistant, in a chat where people ask about their data and
+anything else. This question matched none of the organization's connected data
+sources, so it came to you.
+
+- If it is about the organization's own data after all — its business numbers,
+  customers, orders, sales, products, operations, or anything stored in the
+  connected sources ({sources}) — call use_data_sources at once and write
+  nothing else: the data agents answer it.
+- Otherwise do the task yourself, fully: answer, explain, write, summarize,
+  translate, calculate, plan, or help with code. Never say it is outside your
+  scope.
+- Use current_time for the date or the time anywhere; never guess it.
+- {web}{files}
+- Be direct and concise. Use Markdown only where it helps (a short list, a table)."""
+
+
+def run_general(prompt, user, history, model=None, sources=(), web=None):
+    """Answer a question that matched no connected source — the time
+    somewhere, a public fact, a task. One assistant with the clock and, on a
+    Claude model, the web. It returns None when the question turns out to be
+    about the organization's data (it calls use_data_sources), when no model
+    is available, or on any failure: the caller then asks the data agents, as
+    before."""
+    spec = model or llm_spec()
+    if not llm_available(spec, user):
+        return None
+    spec = concrete_model_spec(spec)
+    if self_hosted(spec):
+        return None             # the self-hosted adapter is trained on SQL actions only
+    from langchain_core.tools import tool
+    tid, me = progress.current(), GENERAL_AGENT["name"]
+    handed = {"data": False}
+
+    @tool(return_direct=True)
+    def use_data_sources() -> str:
+        """Hand this question to the data agents, which query the organization's
+        connected databases. Call it when the question is about the
+        organization's own data."""
+        handed["data"] = True
+        return "Handed to the data agents."
+
+    choice = web
+    web = general_tools.web_tools(spec, choice)
+    web_mode, seen = general_tools.web_provider(spec, choice), {"citations": [], "queries": []}
+    clock = general_tools.clock_tool(
+        lambda label: progress.emit_for(tid, f"{me}: {label}", agent=me, kind="clock"))
+    own_web = general_tools.client_web_tools(
+        spec, seen, lambda label: progress.emit_for(tid, f"{me}: {label}", agent=me, kind="web"),
+        choice=choice)
+    files_read = []
+    files = local_files.tools(
+        user, files_read, lambda label: progress.emit_for(tid, f"{me}: {label}", agent=me, kind="files"))
+    names = ", ".join(sources) or "none"
+    system = _GENERAL_SYSTEM.format(sources=names, web=general_tools.web_rule(spec, choice),
+                                    files="\n- " + local_files.FILES_RULE if files else "")
+    try:
+        graph = _graph(make_llm(spec, user), [clock, use_data_sources] + own_web + files + web,
+                       system, spec)
+        result = graph.invoke({"messages": _cache_history(history, spec) + [("user", prompt)]},
+                              config={"recursion_limit": settings.integer(
+                                  "STUDIO_ASSISTANT_MAX_STEPS", 12, 4, 100)})
+    except Exception:
+        log.warning("general assistant failed; asking the data agents", exc_info=True)
+        return None
+    if handed["data"]:
+        return None
+    direct = seen.get("direct")
+    text = direct["text"] if direct else _final_text(result)   # Bing/Google: as it came back
+    if not text:
+        return None
+    searched, pages = general_tools.web_activity(result.get("messages")) if web else ([], [])
+    for label in searched:
+        progress.emit_for(tid, f"{me}: {label}", agent=me, kind="web")
+    own_pages, grounded = general_tools.grounding(seen, web_mode, user.get("id"))
+    return {"text": text, "sql": None, "columns": [], "rows": [], "chart": None, "panels": [],
+            "email": None, "errors": [],
+            "citations": pages + own_pages + [{"source": f, "path": f, "kind": "file"}
+                                              for f in files_read],
+            "usage": _extract_usage(result), "agents": [GENERAL_AGENT], "mode": "general",
+            "model": spec, **({"web_grounding": grounded} if grounded else {})}
+
+
 def _system_blocks(connector, table, allowed_tables, schemas, memory_notes, skill_md=None,
-                   focus_schemas=None, join_hints=None):
+                   focus_schemas=None, join_hints=None, web_rule=None):
     """(stable, volatile) halves of the system prompt.
 
     stable: role, scope, the skill file, learned rules, platform notes, rules —
@@ -1314,7 +1466,13 @@ The wider Studio platform (mention these when asked what you/Studio can do):
   always go through a supervised, human-approved job.
 
 Rules:
-- Always call run_sql to get real data before answering. Never invent numbers.
+- For questions about this data, always call run_sql to get real data before
+  answering. Never invent numbers.
+- Not every request is about this database. Do any other task directly —
+  explain, write, summarize, translate, calculate, plan, code. Use current_time
+  for the date or the time anywhere; never guess it. """ + (web_rule
+                                                             or general_tools.NO_WEB_RULE) + """
+  Never answer that you cannot do something a tool here can do.
 - The warehouse may hold terabytes: ALWAYS aggregate in SQL (GROUP BY, filters,
   date_trunc) and let the warehouse do the work. Never select raw rows when an
   aggregate answers the question; always LIMIT raw listings.

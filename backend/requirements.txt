@@ -9,6 +9,7 @@ langchain>=0.3
 langgraph>=0.2
 langchain-anthropic>=0.3
 langchain-openai>=0.2
+tzdata>=2024.1                   # time zones for the agents' clock, whatever the OS ships
 
 # Any SQL database (connectors/sql_conn.py): one connection URL, any dialect
 # whose driver is installed. SQLAlchemy reads the metadata the same way for

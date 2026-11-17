@@ -223,3 +223,74 @@ test("a run in progress: its live steps, the newest spinning, sources it has gro
   assert.match(sectionText(empty.host, "Steps").textContent, /Waiting for the first step/);
   await act(async () => empty.root.unmount());
 });
+
+test("web pages an answer used are a source of their own, with links, and web search is a tool", () => {
+  const m = { text: "12°C", mode: "general", model: "anthropic:claude-sonnet-5", citations: [
+    { source: "NYC weather", url: "https://weather.example/nyc", kind: "web" },
+    { source: "NYC weather again", url: "https://weather.example/nyc", kind: "web" },
+    { source: "evil", url: "javascript:alert(1)", kind: "web" },
+    { source: "pricing.pdf", page: 2 }] };
+  assert.deepEqual(panelSources(m), [
+    { key: "docs", docs: ["pricing.pdf"] },
+    { key: "web", pages: [{ url: "https://weather.example/nyc", title: "NYC weather" }], bing: [] }]);
+  assert.deepEqual(panelTools(m).map((t) => t.label),
+                   ["Knowledge search", "Web search", "anthropic:claude-sonnet-5"]);
+  assert.deepEqual(panelTools({ citations: [{ kind: "web", url: "https://a.example" }] }).map((t) => t.label),
+                   ["Web search"]);
+  const steps = [{ label: "Studio assistant: checking the time in America/New_York", kind: "clock" },
+                 { label: "Studio assistant: searched the web for “x”", kind: "web" }];
+  assert.deepEqual(panelTools(null, steps).map((t) => t.label), ["Clock", "Web search"]);
+});
+
+test("the panel links each web page, opening a new tab", async () => {
+  server({});
+  const { host, root } = await mount({ answer: { text: "12°C", citations: [
+    { source: "NYC weather", url: "https://weather.example/nyc", kind: "web" }] }, onClose() {} });
+  const link = sectionText(host, "Sources").querySelector("a.ap-link");
+  assert.equal(link.getAttribute("href"), "https://weather.example/nyc");
+  assert.equal(link.getAttribute("target"), "_blank");
+  assert.equal(link.getAttribute("rel"), "noopener noreferrer");
+  assert.match(sectionText(host, "Sources").textContent, /The web.*NYC weather.*weather\.example/);
+  await act(async () => root.unmount());
+});
+
+test("Bing-grounded answers carry the Bing results link; files from the shared folder are listed", async () => {
+  const m = { text: "12°C", mode: "general",
+    web_grounding: { provider: "bing", label: "Bing", note: "From a Bing web search", queries: [
+      { query: "NYC weather today", url: "https://www.bing.com/search?q=NYC+weather+today" },
+      { query: "forged", url: "https://evil.example/search?q=x" }] },
+    citations: [{ source: "NYC weather", url: "https://weather.example/nyc", kind: "web" },
+                { source: "notes/q3.md", path: "notes/q3.md", kind: "file" }] };
+  assert.deepEqual(panelSources(m), [
+    { key: "files", files: ["notes/q3.md"] },
+    { key: "web", pages: [{ url: "https://weather.example/nyc", title: "NYC weather" }],
+      bing: [{ query: "NYC weather today", url: "https://www.bing.com/search?q=NYC+weather+today" }],
+      provider: "Bing web search" }]);
+  assert.deepEqual(panelTools(m).map((t) => t.label), ["Web search", "Your files"]);
+  server({});
+  const { host, root } = await mount({ answer: m, onClose() {} });
+  const sources = sectionText(host, "Sources");
+  const bing = [...sources.querySelectorAll("a.ap-link")].map((a) => [a.textContent, a.getAttribute("href")]);
+  assert.deepEqual(bing, [["🔎 Searched Bing: NYC weather today", "https://www.bing.com/search?q=NYC+weather+today"],
+                          ["NYC weather", "https://weather.example/nyc"]]);
+  assert.match(sources.textContent, /Bing web search/);
+  assert.match(sources.textContent, /Your files.*notes\/q3\.md/);
+  await act(async () => root.unmount());
+});
+
+test("a Bing search with no page cited still shows its Bing results link", () => {
+  const m = { text: "No clear answer.", web_grounding: { provider: "bing", label: "Bing", queries: [
+    { query: "obscure thing", url: "https://www.bing.com/search?q=obscure+thing" }] } };
+  assert.deepEqual(panelSources(m), [{ key: "web", pages: [],
+    bing: [{ query: "obscure thing", url: "https://www.bing.com/search?q=obscure+thing" }],
+    provider: "Bing web search" }]);
+});
+
+test("a finished answer that ran no query lists no data source, whatever its steps read", () => {
+  const steps = [{ label: "Demo agent: reading the question and the schema", kind: "schema",
+                   source: "demo", source_type: "demo", engine: "sqlite" },
+                 { label: "Demo agent: checking the time in America/New_York", kind: "clock" }];
+  assert.deepEqual(panelSources({ text: "4 PM in New York." }, steps), []);
+  assert.deepEqual(panelSources({ text: "x", sql: "SELECT 1" }, steps).map((s) => s.name), ["demo"]);
+  assert.deepEqual(panelSources(null, steps).map((s) => s.name), ["demo"]);     // a live run
+});

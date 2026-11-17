@@ -165,7 +165,7 @@ test("Auto is on by default: no pickers, and the question goes out to be routed"
     assert.match(markup, /Studio picks the source and tables from each question/);
     const toolbar = markup.slice(markup.indexOf('class="toolbar"'), markup.indexOf('class="messages"'));
     assert.doesNotMatch(toolbar, /<select|tpicker-btn/);
-    assert.match(markup, /placeholder="Ask about your data — Studio finds the source and tables…"/);
+    assert.match(markup, /placeholder="Ask anything — your data, the web, your files…"/);
     // Hidden pickers fetch no table list (and so report no error about one).
     assert.equal(requests.filter((r) => r.url.endsWith("/tables")).length, 0);
     await ask(chat, "total amount of orders by region");
@@ -239,4 +239,24 @@ test("an auto-routed answer says where it went", () => {
   assert.match(markup, /✳ Auto<\/span> picked shop · orders — matched amount/);
   assert.doesNotMatch(html(AssistantMessage, { m: { ...m, auto_route: undefined }, onOpenCanvas() {} }),
                       /auto-route-row/);
+});
+
+test("a question carries the web search choice: the one picked, Off, or Auto for a provider gone", async () => {
+  const offer = { enabled: true, default: "google",
+                  providers: [{ id: "google", label: "Google" }, { id: "brave", label: "Brave" }] };
+  const withWeb = (url) => url === "/api/web/providers" ? offer : respond(url);
+  for (const [picked, sentAs] of [["brave", "brave"], ["off", "off"], ["bing", "auto"], [null, "auto"]]) {
+    for (const k of Object.keys(stored)) delete stored[k];
+    if (picked) stored.studio_web = picked;
+    await withChatNetwork(withWeb, async (requests) => {
+      const chat = chatHarness({ conversationId: null, onConversationCreated() {} });
+      chat.render();
+      chat.startEffects();
+      await flushPromises();
+      const { markup } = chat.render();
+      assert.match(markup, /aria-label="Web search"/);
+      await ask(chat, "what is the weather in Paris?");
+      assert.equal(requests.find((r) => r.url === "/api/chat/background").body.web, sentAs, String(picked));
+    });
+  }
 });

@@ -23,8 +23,19 @@ const TOOL_OF_KIND = {
   verified: ["✓", "Verified queries"], cache: ["⚡", "Plan cache"], plan: ["🗺", "Planner"],
   agents: ["👥", "Agents"], agent: ["👥", "Agents"], aggregate: ["∑", "Aggregator"],
   docs: ["📄", "Knowledge search"], tools: ["🔧", "MCP tools"], model: ["🧠", "Model routing"],
-  pipeline: ["⚙", "Pipelines"],
+  pipeline: ["⚙", "Pipelines"], web: ["🌐", "Web search"], clock: ["🕒", "Clock"],
+  files: ["📁", "Your files"],
 };
+
+/** A link only to a web page: http(s), nothing a browser would run. */
+function webLink(url) {
+  try {
+    const u = new URL(String(url || ""));
+    return u.protocol === "http:" || u.protocol === "https:" ? u.href : null;
+  } catch {
+    return null;
+  }
+}
 
 /** A step's state on the timeline: the newest of a running task is in progress. */
 export function stepRows(steps = [], running = false) {
@@ -76,15 +87,36 @@ export function panelSources(m, steps = []) {
     const s = add(m.source, m.source_meta?.source_type, m.source_meta?.engine);
     for (const t of m.inputs.tables) table(s, t);
   }
-  if (!m?.uses?.length) {
+  // A run in progress shows what its steps have grounded on so far; a finished
+  // answer that ran no query read no source, whatever its steps looked at.
+  const queried = Boolean(m?.sql || m?.panels?.some((p) => p?.sql));
+  if (!m?.uses?.length && (!m || queried)) {
     for (const step of steps || []) {
       if (!step?.source || !(step.source_type || step.engine || step.tables?.length)) continue;
       const s = add(step.source, step.source_type, step.engine);
       for (const t of step.tables || []) if (!t.bridge) table(s, t.name);
     }
   }
-  const docs = [...new Set((m?.citations || []).map((c) => c.source).filter(Boolean))];
+  const docs = [...new Set((m?.citations || []).filter((c) => !["web", "file"].includes(c.kind))
+    .map((c) => c.source).filter(Boolean))];
   if (docs.length) out.push({ key: "docs", docs });
+  const files = [...new Set((m?.citations || []).filter((c) => c.kind === "file")
+    .map((c) => c.path || c.source).filter(Boolean))];
+  if (files.length) out.push({ key: "files", files });
+  const pages = [];
+  for (const c of m?.citations || []) {
+    const url = c.kind === "web" && webLink(c.url);
+    if (url && !pages.some((p) => p.url === url)) pages.push({ url, title: c.source || new URL(url).hostname });
+  }
+  // Grounding with Bing: each query's results page is a required reference.
+  const bing = m?.web_grounding?.provider === "bing"
+    ? (m.web_grounding.queries || []).filter((q) => q?.query
+        && webLink(q.url)?.startsWith("https://www.bing.com/search?"))
+      .map((q) => ({ query: String(q.query), url: webLink(q.url) }))
+    : [];
+  // The provider as the server names it ("Bing", "Google", "Brave").
+  const provider = m?.web_grounding?.label ? `${m.web_grounding.label} web search` : null;
+  if (pages.length || bing.length) out.push({ key: "web", pages, bing, ...(provider ? { provider } : {}) });
   return out;
 }
 
@@ -134,7 +166,9 @@ export function panelTools(m, steps = []) {
     if (m.sql || m.panels?.some((p) => p?.sql)) put("SQL", ...TOOL_OF_KIND.query);
     if (m.chart || m.panels?.some((p) => p?.chart)) put("Charts", ...TOOL_OF_KIND.chart);
     if (m.visual || m.panels?.some((p) => p?.visual)) put("D3 visual", ...TOOL_OF_KIND.visual);
-    if (m.citations?.length) put("Knowledge search", ...TOOL_OF_KIND.docs);
+    if (m.citations?.some((c) => !["web", "file"].includes(c.kind))) put("Knowledge search", ...TOOL_OF_KIND.docs);
+    if (m.citations?.some((c) => c.kind === "web") || m.web_grounding) put("Web search", ...TOOL_OF_KIND.web);
+    if (m.citations?.some((c) => c.kind === "file")) put("Your files", ...TOOL_OF_KIND.files);
     if (m.served_by === "semantic") put("Semantic layer", ...TOOL_OF_KIND.semantic);
     if (m.verified_sql) put("Verified queries", ...TOOL_OF_KIND.verified);
     if (m.cached || m.mode === "cached") put("Plan cache", ...TOOL_OF_KIND.cache);
@@ -246,7 +280,36 @@ export default function AnswerPanel({ answer, question, steps, running = false, 
                empty={running ? "Sources appear as the agent finds them." : "This answer read no data source."}>
         {sources.length > 0 && (
           <ul className="ap-sources">
-            {sources.map((s) => s.docs ? (
+            {sources.map((s) => s.pages ? (
+              <li key={s.key} className="ap-source">
+                <div className="ap-source-head">
+                  <span aria-hidden="true">🌐</span><b>The web</b>
+                  {s.provider && <span className="ap-source-type">{s.provider}</span>}
+                </div>
+                <ul className="ap-tables">
+                  {s.bing.map((q) => (
+                    <li key={q.url} className="ap-table">
+                      <a className="ap-table-name ap-link" href={q.url} target="_blank"
+                         rel="noopener noreferrer" title={q.url}>🔎 Searched Bing: {q.query}</a>
+                    </li>
+                  ))}
+                  {s.pages.map((p) => (
+                    <li key={p.url} className="ap-table">
+                      <a className="ap-table-name ap-link" href={p.url} target="_blank"
+                         rel="noopener noreferrer" title={p.url}>{p.title}</a>
+                      <span className="ap-web-host">{new URL(p.url).hostname}</span>
+                    </li>
+                  ))}
+                </ul>
+              </li>
+            ) : s.files ? (
+              <li key={s.key} className="ap-source">
+                <div className="ap-source-head"><span aria-hidden="true">📁</span><b>Your files</b></div>
+                <ul className="ap-tables">
+                  {s.files.map((f) => <li key={f} className="ap-table"><span className="ap-table-name">{f}</span></li>)}
+                </ul>
+              </li>
+            ) : s.docs ? (
               <li key={s.key} className="ap-source">
                 <div className="ap-source-head"><span aria-hidden="true">📄</span><b>Your documents</b></div>
                 <ul className="ap-tables">
