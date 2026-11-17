@@ -1,12 +1,19 @@
 // The filter bar above a visual in the D3 & artifacts window (logic in
 // visualFilters.js): a date range with presets, category pickers, top N.
 // Changing anything re-draws the visual from the rows it already has — with
-// motion, not a jump — so trying a different window or slice is instant.
+// motion, not a jump — so trying a different window or slice is instant. A
+// category picker offers only the values the other filters leave (as a
+// slicer does): pick an origin and the destinations are that origin's.
 import { TOP_N_CHOICES, datePresets, isFiltered } from "./visualFilters";
 
-function CategoryPicker({ control, keep, onChange }) {
+function CategoryPicker({ control, keep, available, onChange }) {
   const all = !Array.isArray(keep);
   const chosen = new Set(all ? control.values : keep);
+  // Values with no rows under the other filters are left out — unless picked,
+  // so a pick the other filters ruled out can still be seen and taken back.
+  const has = (v) => !available || available.has(v);
+  const listed = control.values.filter((v) => has(v) || (!all && chosen.has(v)));
+  const hidden = control.values.length - listed.length;
   const toggle = (v) => {
     const next = new Set(chosen);
     if (next.has(v)) next.delete(v); else next.add(v);
@@ -24,17 +31,21 @@ function CategoryPicker({ control, keep, onChange }) {
           <button type="button" className="chip" onClick={() => onChange(null)}>all</button>
           <button type="button" className="chip" onClick={() => onChange([])}>none</button>
         </div>
-        {control.values.map((v) => (
-          <label key={v} className="vc-option">
+        {listed.map((v) => (
+          <label key={v} className={`vc-option${has(v) ? "" : " vc-option-off"}`}
+                 title={has(v) ? undefined : "No rows with the other filters"}>
             <input type="checkbox" checked={chosen.has(v)} onChange={() => toggle(v)} /> {v}
           </label>
         ))}
+        {hidden > 0 && (
+          <div className="meta vc-hidden">{hidden} more with no rows under the other filters</div>
+        )}
       </div>
     </details>
   );
 }
 
-export default function VisualControls({ controls, state, onChange, shown, total }) {
+export default function VisualControls({ controls, state, onChange, shown, total, available }) {
   const { date, categories, topN } = controls;
   if (!date && !categories.length && !topN) return null;
   const set = (patch) => onChange({ ...state, ...patch });
@@ -71,6 +82,7 @@ export default function VisualControls({ controls, state, onChange, shown, total
       )}
       {categories.map((c) => (
         <CategoryPicker key={c.column} control={c} keep={state.cats?.[c.column]}
+                        available={available?.[c.column]}
                         onChange={(keep) => set({ cats: { ...state.cats, [c.column]: keep } })} />
       ))}
       {topN && (

@@ -158,7 +158,7 @@ test("the D3 window shows the bar, and the chart draws what it keeps, with motio
   // Nothing left: a note, not an empty chart.
   find(view(), (n) => n.type === VisualControls).props.onChange(
     { ...F.EMPTY_STATE, cats: { region: [] } });
-  assert.match(renderToStaticMarkup(view()), /Nothing in this range/);
+  assert.match(renderToStaticMarkup(view()), /Nothing is picked for region — pick a value, or reset the filters/);
   // Reset brings everything back.
   find(view(), (n) => n.type === VisualControls).props.onChange(null);
   assert.equal(find(view(), (n) => n.type === D3View).props.rows.length, 5);
@@ -259,3 +259,94 @@ test("a custom visual builds controls that keep their value, and takes new rows 
   assert.equal(out(), "cost|3|1");
   frame.window.close();
 });
+
+// ── Linked filters: each picker offers what the others leave ────────────
+
+// Shipment routes, as the supply chain data has them: origin → destination.
+const ROUTES = {
+  columns: ["origin", "destination", "shipments_count"],
+  rows: [["Busan", "Savannah", 2], ["Chicago", "Columbus DC", 2], ["Dallas DC", "Atlanta DC", 2],
+         ["Frankfurt", "Chicago", 2], ["Hong Kong", "Memphis", 2], ["Houston", "Dallas DC", 2],
+         ["Los Angeles", "Dallas DC", 2], ["Los Angeles", "Chicago", 2], ["Memphis", "Chicago", 2],
+         ["Newark", "Allentown DC", 2], ["Savannah", "Atlanta DC", 2], ["Seattle", "Chicago", 2],
+         ["Shanghai", "Los Angeles", 2], ["Shanghai", "Rotterdam", 2], ["Shenzhen", "Tacoma", 2],
+         ["Tacoma", "Portland DC", 2]],
+};
+const NETWORK = { type: "network", x: "origin", y: ["destination", "shipments_count"], title: "Routes" };
+
+test("a picker offers only the values the other filters leave", () => {
+  const c = F.detectControls(ROUTES.columns, ROUTES.rows, NETWORK);
+  assert.deepEqual(c.categories.map((x) => x.column), ["origin", "destination"]);
+  const offer = (column, state) => [...F.availableValues(ROUTES.columns, ROUTES.rows, c,
+                                                         { ...F.EMPTY_STATE, ...state }, column)].sort();
+  // From Busan, the one destination there is.
+  assert.deepEqual(offer("destination", { cats: { origin: ["Busan"] } }), ["Savannah"]);
+  // Into Atlanta DC, the origins that go there.
+  assert.deepEqual(offer("origin", { cats: { destination: ["Atlanta DC"] } }), ["Dallas DC", "Savannah"]);
+  // A picker's own pick does not narrow it: every origin stays on offer.
+  assert.equal(offer("origin", { cats: { origin: ["Busan"] } }).length, 14);
+  // Nothing picked elsewhere: everything is on offer.
+  assert.equal(offer("destination", {}).length, 11);
+  // Dates narrow it too; top N does not.
+  const daily = F.detectControls(DAILY.columns, DAILY.rows, { type: "bar", x: "region", y: ["revenue"] });
+  const regions = (state) => [...F.availableValues(DAILY.columns, DAILY.rows, daily,
+                                                   { ...F.EMPTY_STATE, ...state }, "region")].sort();
+  assert.deepEqual(regions({ from: "2026-03-01", to: "2026-04-30" }), ["North", "West"]);
+  assert.deepEqual(regions({ top: 1 }), ["East", "North", "West"]);
+  const wide = { columns: ["product", "sales"], rows: Array.from({ length: 14 }, (_, i) => [`p${i}`, i * 10]) };
+  const wc = F.detectControls(wide.columns, wide.rows, { type: "hbar", x: "product", y: ["sales"] });
+  assert.ok(wc.topN, "top N is on offer");
+  assert.equal(F.availableValues(wide.columns, wide.rows, wc, { ...F.EMPTY_STATE, top: 3 }, "product").size, 14);
+});
+
+test("when nothing is left, the note says which picks clash", () => {
+  const c = F.detectControls(ROUTES.columns, ROUTES.rows, NETWORK);
+  const note = (state) => F.emptyNote(c, { ...F.EMPTY_STATE, ...state });
+  assert.equal(note({ cats: { origin: ["Busan"], destination: ["Atlanta DC"] } }),
+               "No rows with origin Busan and destination Atlanta DC — pick another value, or reset the filters.");
+  assert.equal(note({ cats: { origin: ["Busan", "Houston", "Newark", "Tacoma"], destination: ["Rotterdam"] } }),
+               "No rows with origin Busan, Houston or 2 more and destination Rotterdam — pick another value, or reset the filters.");
+  assert.equal(note({ cats: { origin: [] } }), "Nothing is picked for origin — pick a value, or reset the filters.");
+  assert.equal(note({ from: "2030-01-01" }), "Nothing in this range — widen the dates or reset the filters.");
+  const daily = F.detectControls(DAILY.columns, DAILY.rows, { type: "bar", x: "region", y: ["revenue"] });
+  assert.equal(F.emptyNote(daily, { ...F.EMPTY_STATE, from: "2026-05-01", cats: { region: ["North"] } }),
+               "No rows with region North from 2026-05-01 to 2026-06-30 — pick another value, or reset the filters.");
+});
+
+test("after picking an origin, the destination list is that origin's", () => {
+  const view = harness({ columns: ROUTES.columns, rows: ROUTES.rows, chart: NETWORK, d3Only: true });
+  find(view(), (n) => n.type === VisualControls).props.onChange(
+    { ...F.EMPTY_STATE, cats: { origin: ["Busan"] } });
+  const tree = view();
+  const bar = find(tree, (n) => n.type === VisualControls);
+  assert.deepEqual([...bar.props.available.destination], ["Savannah"]);
+  assert.equal(bar.props.available.origin.size, 14);
+  assert.deepEqual(find(tree, (n) => n.type === D3View).props.rows, [["Busan", "Savannah", 2]]);
+  const html = renderToStaticMarkup(bar);
+  const destination = html.slice(html.indexOf('title="Filter by destination"'));
+  const offered = [...destination.matchAll(/<label class="vc-option[^"]*"[^>]*><input type="checkbox"[^>]*\/> ([^<]+)<\/label>/g)]
+    .map((m) => m[1]);
+  assert.deepEqual(offered, ["Savannah"]);
+  assert.match(destination, /10 more with no rows under the other filters/);
+  // The origin list is not narrowed by its own pick.
+  const origin = html.slice(0, html.indexOf('title="Filter by destination"'));
+  assert.equal((origin.match(/class="vc-option"/g) || []).length, 14);
+});
+
+test("a pick the other filters rule out stays listed, greyed, so it can be taken back", () => {
+  const view = harness({ columns: ROUTES.columns, rows: ROUTES.rows, chart: NETWORK, d3Only: true });
+  find(view(), (n) => n.type === VisualControls).props.onChange(
+    { ...F.EMPTY_STATE, cats: { origin: ["Busan"], destination: ["Atlanta DC"] } });
+  const tree = view();
+  const html = renderToStaticMarkup(find(tree, (n) => n.type === VisualControls));
+  const destination = html.slice(html.indexOf('title="Filter by destination"'));
+  assert.match(destination, /<label class="vc-option vc-option-off" title="No rows with the other filters"><input type="checkbox" checked=""\/> Atlanta DC<\/label>/);
+  assert.match(destination, /<label class="vc-option"><input type="checkbox"\/> Savannah<\/label>/);
+  assert.match(renderToStaticMarkup(tree), /No rows with origin Busan and destination Atlanta DC — pick another value, or reset the filters/);
+  assert.equal(find(tree, (n) => n.type === D3View), null);
+  // Swapping Atlanta DC for Savannah draws the route.
+  find(view(), (n) => n.type === VisualControls).props.onChange(
+    { ...F.EMPTY_STATE, cats: { origin: ["Busan"], destination: ["Savannah"] } });
+  assert.deepEqual(find(view(), (n) => n.type === D3View).props.rows, [["Busan", "Savannah", 2]]);
+});
+

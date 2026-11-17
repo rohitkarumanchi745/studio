@@ -98,6 +98,36 @@ export function isFiltered(state) {
     || Object.values(state.cats || {}).some((v) => Array.isArray(v))));
 }
 
+/**
+ * The values of one category filter that some row still has under the other
+ * filters — what its picker offers, as a slicer does, so picking an origin
+ * leaves only the destinations that origin has. Its own pick and top N do
+ * not narrow it. A Set of the values (as strings).
+ */
+export function availableValues(columns, rows, controls, state, column) {
+  const others = { ...EMPTY_STATE, ...(state || {}), top: null,
+                   cats: { ...(state?.cats || {}), [column]: null } };
+  const ci = columns.indexOf(column);
+  return new Set(applyControls(columns, rows, controls, others).map((r) => String(r[ci])));
+}
+
+const listOf = (values) => (values.length <= 3 ? values.join(" or ")
+  : `${values.slice(0, 2).join(", ")} or ${values.length - 2} more`);
+
+/** What to say when the filters leave nothing: which picks clash ("No rows
+ *  with origin Busan and destination Atlanta DC"), or that a filter has
+ *  nothing picked, or that the dates are too narrow. */
+export function emptyNote(controls, state) {
+  const cats = Object.entries(state?.cats || {}).filter(([, keep]) => Array.isArray(keep));
+  const none = cats.filter(([, keep]) => !keep.length).map(([col]) => col);
+  if (none.length) return `Nothing is picked for ${none.join(" or ")} — pick a value, or reset the filters.`;
+  if (!cats.length) return "Nothing in this range — widen the dates or reset the filters.";
+  const picks = cats.map(([col, keep]) => `${col} ${listOf(keep)}`);
+  const dates = state?.from || state?.to
+    ? ` from ${state.from || controls?.date?.min || "…"} to ${state.to || controls?.date?.max || "…"}` : "";
+  return `No rows with ${picks.join(" and ")}${dates} — pick another value, or reset the filters.`;
+}
+
 /** The rows the visual draws under `state`. */
 export function applyControls(columns, rows, controls, state) {
   if (!rows?.length || !isFiltered(state)) return rows || [];
