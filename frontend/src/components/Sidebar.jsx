@@ -5,6 +5,9 @@ import DataConnections from "./DataConnections";
 import ShareDialog from "./ShareDialog";
 import AlertsBell, { useAutopilotAlerts } from "./AlertsBell";
 
+/** What Studio is, in a line, under its name at the top of the sidebar. */
+export const TAGLINE = "Your AI data chief";
+
 export default function Sidebar({
   conversations, activeId, onSelect, onNew, onDelete, onActivity, onCollapse,
   onDashboards, onRename, onRefresh, onKeysChanged, onQueries, onVisuals, onGovernance, onSemantic, onJobs, onPyBuild,
@@ -223,10 +226,14 @@ export default function Sidebar({
 
   return (
     <aside className="sidebar">
-      {/* The app's name, above the chats — the same ◆ badge its answers carry. */}
+      {/* The app's name and what it is, above the chats — the same ◆ badge
+          its answers carry. */}
       <div className="sidebar-brand">
         <span className="assistant-avatar sidebar-brand-mark" aria-hidden="true">◆</span>
-        <span className="sidebar-brand-name">Studio</span>
+        <span className="sidebar-brand-text">
+          <span className="sidebar-brand-name">Studio</span>
+          <span className="sidebar-brand-tagline">{TAGLINE}</span>
+        </span>
       </div>
       <div className="sidebar-top">
         <button className="new-chat" onClick={onNew}>
