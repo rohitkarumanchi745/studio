@@ -223,6 +223,11 @@ export default function Sidebar({
 
   return (
     <aside className="sidebar">
+      {/* The app's name, above the chats — the same ◆ badge its answers carry. */}
+      <div className="sidebar-brand">
+        <span className="assistant-avatar sidebar-brand-mark" aria-hidden="true">◆</span>
+        <span className="sidebar-brand-name">Studio</span>
+      </div>
       <div className="sidebar-top">
         <button className="new-chat" onClick={onNew}>
           + New chat
