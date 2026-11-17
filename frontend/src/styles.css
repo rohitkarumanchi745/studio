@@ -435,8 +435,8 @@ td { color: var(--ink-2); }
 .chat-pipeline-step pre { margin-top: 6px; }
 .chat-pipeline-results { margin: 8px 0; overflow-wrap: anywhere; }
 .chat-platform-payload {
-  display: block; width: 100%; box-sizing: border-box; min-height: 100px;
-  resize: vertical; margin: 10px 0; padding: 9px 12px;
+  display: block; width: 100%; box-sizing: border-box; min-height: 52px;
+  resize: vertical; margin: 8px 0 4px; padding: 7px 12px;
   color: var(--ink); background: var(--surface-2);
   border: 1px solid var(--line); border-radius: 8px;
   font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
@@ -445,7 +445,12 @@ td { color: var(--ink-2); }
 .chat-platform-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
 .chat-platform-choices { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 2px; }
 /* Not the round send button: the composer's own .primary rule must not shrink it. */
-.composer .chat-platform-submit, .chat-platform-submit { width: auto; border-radius: 8px; margin-top: 8px; }
+.composer .chat-platform-submit, .chat-platform-submit { width: auto; border-radius: 8px; }
+/* The platform panel under the composer: picker and Submit on one row. */
+.chat-platform-panel { padding: 10px 12px; }
+.chat-platform-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.chat-platform-row select { flex: 1 1 200px; max-width: 320px; }
+.chat-platform-none, .chat-platform-hint { margin: 6px 0 0; font-size: 12px; line-height: 1.45; }
 
 /* ── Canvas mode: chart on main screen, chat docked aside ── */
 .workspace { flex: 1; display: flex; min-width: 0; }

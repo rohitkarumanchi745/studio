@@ -90,11 +90,14 @@ test("no buttons once the run is submitted, or without a message to act on", () 
   assert.ok(findAll(busy, (n) => n.type === "button" && text(n) === "daily_sales")[0].props.disabled);
 });
 
-test("the composer points at plain English, and its Submit button is not the round send button", () => {
+test("the panel points at plain English, and its Submit button is not the round send button", () => {
   const tree = render(PlatformComposer, { busy: false, onSubmit() {}, onClose() {} });
   const html = renderToStaticMarkup(tree);
-  assert.match(html, /Or just ask in the chat — “kick off the daily sales pipeline on Airflow”/);
+  assert.match(html, /Or just ask in the chat: “kick off the daily sales pipeline on Airflow”/);
+  assert.match(html, /<div class="chat-platform-row"><select aria-label="Execution platform">/);
   assert.match(html, /class="primary chat-platform-submit"/);
+  assert.match(html, /<textarea class="chat-platform-payload" aria-label="Platform job parameters" rows="2"/);
   const css = readFileSync(path.join(frontend, "src/styles.css"), "utf8");
   assert.match(css, /\.composer \.chat-platform-submit, \.chat-platform-submit \{ width: auto;/);
+  assert.match(css, /\.chat-platform-payload \{\n  display: block; width: 100%; box-sizing: border-box; min-height: 52px;/);
 });
