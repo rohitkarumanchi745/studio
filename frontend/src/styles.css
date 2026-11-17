@@ -1929,3 +1929,22 @@ a.reference-web { text-decoration: none; color: inherit; }
   font-size: 11px; color: var(--ink-3); padding: 2px 8px; border-radius: 999px;
   background: var(--surface-2); border: 1px solid var(--line);
 }
+
+/* The composer's web search toggle (WebToggle.jsx). */
+.web-toggle { display: inline-flex; align-items: center; gap: 6px; }
+.web-switch { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--ink-2); cursor: pointer; }
+.web-switch input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.web-switch-track {
+  width: 26px; height: 15px; border-radius: 999px; background: var(--axis); position: relative;
+  transition: background .15s;
+}
+.web-switch-thumb {
+  position: absolute; top: 2px; left: 2px; width: 11px; height: 11px; border-radius: 50%;
+  background: #fff; transition: transform .15s;
+}
+.web-toggle.on .web-switch-track { background: var(--accent); }
+.web-toggle.on .web-switch-thumb { transform: translateX(11px); }
+.web-switch input:focus-visible + .web-switch-track { box-shadow: 0 0 0 2px var(--accent-soft); }
+.web-pick { font-size: 12px; padding: 3px 6px; border-radius: 6px; }
+/* Google's Search Suggestions, as Google renders them. */
+.search-suggestions { display: block; width: 100%; height: 72px; border: 0; margin: 6px 0 2px; }

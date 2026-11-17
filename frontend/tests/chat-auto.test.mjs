@@ -240,3 +240,23 @@ test("an auto-routed answer says where it went", () => {
   assert.doesNotMatch(html(AssistantMessage, { m: { ...m, auto_route: undefined }, onOpenCanvas() {} }),
                       /auto-route-row/);
 });
+
+test("a question carries the web search choice: the one picked, Off, or Auto for a provider gone", async () => {
+  const offer = { enabled: true, default: "google",
+                  providers: [{ id: "google", label: "Google" }, { id: "brave", label: "Brave" }] };
+  const withWeb = (url) => url === "/api/web/providers" ? offer : respond(url);
+  for (const [picked, sentAs] of [["brave", "brave"], ["off", "off"], ["bing", "auto"], [null, "auto"]]) {
+    for (const k of Object.keys(stored)) delete stored[k];
+    if (picked) stored.studio_web = picked;
+    await withChatNetwork(withWeb, async (requests) => {
+      const chat = chatHarness({ conversationId: null, onConversationCreated() {} });
+      chat.render();
+      chat.startEffects();
+      await flushPromises();
+      const { markup } = chat.render();
+      assert.match(markup, /aria-label="Web search"/);
+      await ask(chat, "what is the weather in Paris?");
+      assert.equal(requests.find((r) => r.url === "/api/chat/background").body.web, sentAs, String(picked));
+    });
+  }
+});

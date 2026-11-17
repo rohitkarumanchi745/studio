@@ -14,6 +14,7 @@ import ChatWorkflow from "./ChatWorkflow";
 import ChatPlatformRun, { PlatformComposer } from "./ChatPlatformRun";
 import ComposerPlus from "./ComposerPlus";
 import AnswerPanel from "./AnswerPanel";
+import WebToggle, { readWebChoice, webForRequest } from "./WebToggle";
 import { chatPipelineFields, PlanningContextPicker, PlanningSources,
   usePlanningCatalog } from "./planningContext";
 
@@ -365,6 +366,28 @@ export function describeRoute(route) {
   return "asked every source — no source's tables matched the question";
 }
 
+// Where a web answer came from, said beside its sources (Bing and Google
+// require it; Brave's is a courtesy).
+const WEB_NOTE = { bing: "From a Bing web search", google: "From Google Search",
+                   brave: "From a Brave web search" };
+
+/** An answer that IS a Bing or Google grounded answer: shown as it came back,
+ *  to its asker — never sent on to a channel. */
+export function verbatimWeb(m) {
+  return Boolean(m?.web_grounding?.verbatim && ["bing", "google"].includes(m.web_grounding.provider));
+}
+
+/** Google's Search Suggestions, as Google renders them: in a frame that runs
+ *  no script and opens its links in a new tab. */
+export function SearchSuggestions({ html }) {
+  if (!html) return null;
+  return (
+    <iframe className="search-suggestions" title="Google Search suggestions"
+            sandbox="allow-popups allow-popups-to-escape-sandbox"
+            srcDoc={`<base target="_blank">${html}`} />
+  );
+}
+
 /** The Bing queries an answer was grounded in, each with its results page. */
 export function bingQueries(m) {
   if (m?.web_grounding?.provider !== "bing") return [];
@@ -424,6 +447,12 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
   const [chatOpen, setChatOpen] = useState(true);
   const [models, setModels] = useState([]);
   const [model, setModel] = useState(localStorage.getItem("studio_model") || "");
+  // The web search toggle: "off", "auto" or a provider; what is offered.
+  const [web, setWeb] = useState(readWebChoice);
+  const [webOffer, setWebOffer] = useState(null);
+  useEffect(() => {
+    api("/web/providers").then(setWebOffer).catch(() => setWebOffer(null));
+  }, []);
 
   useEffect(() => {
     api("/models")
@@ -686,6 +715,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
           }),
           conversation_id: conversationId,
           model: model || undefined,
+          web: webForRequest(web, webOffer),
           ...(visualMode ? { visual: true } : chatPipelineFields(buildAirflow,
             repositoryId, confluencePageIds)),
         }),
@@ -790,6 +820,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
           table: "*",
           conversation_id: conversationId,
           model: model || undefined,
+          web: webForRequest(web, webOffer),
           allow_ambiguous: both,
           ...(visualMode ? { visual: true } : {}),
         }),
@@ -1213,6 +1244,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
                   </option>
                 ))}
               </select>
+              <WebToggle value={web} offer={webOffer} onChange={setWeb} disabled={busy} />
             </div>
             {busy ? (
               <button type="button" className="send-btn stop-btn" aria-label="Stop"
@@ -1512,6 +1544,9 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
           {m.mode === "stopped"
             ? <div className="answer-stopped" role="note">⏹ {m.text}</div>
             : m.text && <Markdown className="answer" text={m.text} />}
+          {m.web_grounding?.provider === "google" && (
+            <SearchSuggestions html={m.web_grounding.suggestions_html} />
+          )}
           {m.autopilot_draft && (
             <AutopilotDraft draft={m.autopilot_draft} conversationId={conversationId}
                             onCreated={onAutopilotCreated} />
@@ -1588,8 +1623,8 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
           {(sources.length > 0 || m.auto_route) && (
             <div className="references" aria-label="Sources">
               <span className="references-label">Sources</span>
-              {bingQueries(m).length > 0 && (
-                <span className="web-search-note">From a Bing web search</span>
+              {WEB_NOTE[m.web_grounding?.provider] && (
+                <span className="web-search-note">{WEB_NOTE[m.web_grounding.provider]}</span>
               )}
               {m.auto_route && (
                 <span className="auto-route-row" title={m.auto_route.why || ""}>
@@ -1712,7 +1747,7 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
                   )}
                 </>
               )}
-              {(m.text || m.sql) && (
+              {(m.text || m.sql) && !verbatimWeb(m) && (
                 <details className="export-menu share-menu">
                   <summary className="icon-btn" title="Send this answer to a Microsoft Teams or Slack channel">
                     ↗ Share

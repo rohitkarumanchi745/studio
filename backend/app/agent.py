@@ -729,7 +729,7 @@ def describe_for(user, connector, allowed_tables, table):
 def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, model=None,
               skill_md=None, kag_first=False, delegation=None, tool_profile="full",
               visual_mode=False, conversation_id=None, focus_schemas=None,
-              join_hints=None):
+              join_hints=None, web=None):
     """One analytics turn.
 
     schemas: {table_name: [{"name","type"}, ...]} — one entry for single-table
@@ -751,6 +751,8 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
     metaground.ground, else picks them by name, matching.focus_tables).
     join_hints: ["a.x = b.y  (state, confidence N)", ...] — how those tables
     join, from the metadata graph's relationships.
+    web: what this turn's person picked for web search — "off", "auto" or a
+    provider (general_tools.PROVIDERS); None is "auto".
     They go in the volatile half of the prompt, so the cached prefix — the
     skill file — stays the same from one question to the next. Any other
     table's columns are one describe_table call away.
@@ -1085,14 +1087,14 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
     memory_notes = memory.notes_for_prompt(user["id"], prompt)
     # The web is a standalone chat's (graph workers keep a closed tool set):
     # Bing through Studio's own tools, else Anthropic's server tools on Claude.
-    on_web = tool_profile == "full" and not self_hosted(spec)
-    web_mode = general_tools.web_provider(spec) if on_web else None
-    web_tools = general_tools.web_tools(spec) if web_mode == "anthropic" else []
+    on_web = tool_profile == "full" and not self_hosted(spec) and general_tools.web_enabled(web)
+    web_mode = general_tools.web_provider(spec, web) if on_web else None
+    web_tools = general_tools.web_tools(spec, web) if web_mode == "anthropic" else []
     web_seen = {"citations": [], "queries": []}
     # Files from the machine's shared folder: a chat's, for admins and analysts.
     files_seen = []
     on_files = tool_profile == "full" and local_files.available(user)
-    rule = general_tools.web_rule(spec) if on_web else general_tools.NO_WEB_RULE
+    rule = general_tools.web_rule(spec, web) if on_web else general_tools.NO_WEB_RULE
     if on_files:
         rule += "\n- " + local_files.FILES_RULE
     # Stable half (cached prefix) + volatile half (below the breakpoint).
@@ -1140,7 +1142,8 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
         if on_web:
             base_tools += general_tools.client_web_tools(
                 spec, web_seen,
-                lambda label: progress.emit_for(_tid, f"{_me}: {label}", agent=_me, kind="web"))
+                lambda label: progress.emit_for(_tid, f"{_me}: {label}", agent=_me, kind="web"),
+                choice=web)
         if on_files:
             base_tools += local_files.tools(
                 user, files_seen,
@@ -1218,10 +1221,18 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
             for label in searched:
                 progress.emit_for(_tid, f"{_me}: {label}", agent=_me, kind="web")
             ctx["citations"].extend(pages)
-        pages, ctx["web_grounding"] = general_tools.grounding(web_seen, web_mode)
+        pages, ctx["web_grounding"] = general_tools.grounding(web_seen, web_mode, user.get("id"))
         ctx["citations"].extend(pages)
         ctx["citations"].extend({"source": f, "path": f, "kind": "file"} for f in files_seen)
-        if not self_hosted(spec):
+        direct = web_seen.get("direct")
+        if direct:
+            # Bing or Google answered: their grounded answer is the answer, as
+            # it came back — nothing rewritten, no data interspersed with it.
+            text, usage = direct["text"], _extract_usage(result)
+            for key in ("sql", "chart"):
+                ctx[key] = None
+            ctx.update(columns=[], rows=[], panels=[])
+        elif not self_hosted(spec):
             text = _final_text(result)
             usage = _extract_usage(result)
             if not text and ctx["sql"] is not None and not ctx["errors"]:
@@ -1317,7 +1328,7 @@ sources, so it came to you.
 - Be direct and concise. Use Markdown only where it helps (a short list, a table)."""
 
 
-def run_general(prompt, user, history, model=None, sources=()):
+def run_general(prompt, user, history, model=None, sources=(), web=None):
     """Answer a question that matched no connected source — the time
     somewhere, a public fact, a task. One assistant with the clock and, on a
     Claude model, the web. It returns None when the question turns out to be
@@ -1342,17 +1353,19 @@ def run_general(prompt, user, history, model=None, sources=()):
         handed["data"] = True
         return "Handed to the data agents."
 
-    web = general_tools.web_tools(spec)
-    web_mode, seen = general_tools.web_provider(spec), {"citations": [], "queries": []}
+    choice = web
+    web = general_tools.web_tools(spec, choice)
+    web_mode, seen = general_tools.web_provider(spec, choice), {"citations": [], "queries": []}
     clock = general_tools.clock_tool(
         lambda label: progress.emit_for(tid, f"{me}: {label}", agent=me, kind="clock"))
     own_web = general_tools.client_web_tools(
-        spec, seen, lambda label: progress.emit_for(tid, f"{me}: {label}", agent=me, kind="web"))
+        spec, seen, lambda label: progress.emit_for(tid, f"{me}: {label}", agent=me, kind="web"),
+        choice=choice)
     files_read = []
     files = local_files.tools(
         user, files_read, lambda label: progress.emit_for(tid, f"{me}: {label}", agent=me, kind="files"))
     names = ", ".join(sources) or "none"
-    system = _GENERAL_SYSTEM.format(sources=names, web=general_tools.web_rule(spec),
+    system = _GENERAL_SYSTEM.format(sources=names, web=general_tools.web_rule(spec, choice),
                                     files="\n- " + local_files.FILES_RULE if files else "")
     try:
         graph = _graph(make_llm(spec, user), [clock, use_data_sources] + own_web + files + web,
@@ -1364,13 +1377,14 @@ def run_general(prompt, user, history, model=None, sources=()):
         return None
     if handed["data"]:
         return None
-    text = _final_text(result)
+    direct = seen.get("direct")
+    text = direct["text"] if direct else _final_text(result)   # Bing/Google: as it came back
     if not text:
         return None
     searched, pages = general_tools.web_activity(result.get("messages")) if web else ([], [])
     for label in searched:
         progress.emit_for(tid, f"{me}: {label}", agent=me, kind="web")
-    own_pages, grounded = general_tools.grounding(seen, web_mode)
+    own_pages, grounded = general_tools.grounding(seen, web_mode, user.get("id"))
     return {"text": text, "sql": None, "columns": [], "rows": [], "chart": None, "panels": [],
             "email": None, "errors": [],
             "citations": pages + own_pages + [{"source": f, "path": f, "kind": "file"}

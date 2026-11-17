@@ -1,19 +1,11 @@
-"""Tools any Studio agent can use, whatever the question: the clock and, on
-Claude models, the web.
+"""Tools any Studio agent can use, whatever the question: the clock and the web.
 
 Studio's agents answer questions about your data, and anything else asked in
 the same chat: the time somewhere, a public fact, what a page says. The clock
 is computed here from the IANA time-zone database, daylight saving included.
 
-The web, by STUDIO_WEB_SEARCH (default "auto"):
-    bing       Studio's own web_search (Grounding with Bing Search, through
-               Azure AI Foundry) and web_fetch (our page reader), for any model
-               — web_search.py;
-    anthropic  Anthropic's server tools, which Anthropic runs inside the model
-               call — Claude models only;
-    auto       bing when it is configured, else anthropic for a Claude model;
-               any other model still gets web_fetch, to read a page it is given;
-    off        no web at all.
+The web — Bing, Google, Brave or Claude's own search, picked per chat — is
+described below ("The web").
 
 A search query leaves for the web, so agents are told never to put the
 organization's data (names, figures, identifiers from its databases or
@@ -149,7 +141,30 @@ def clock_tool(emit=None):
     return current_time
 
 
-# ── The web (Anthropic server tools) ───────────────────────────────────
+# ── The web ─────────────────────────────────────────────────────────────
+#
+# Providers (web_search.py), each used the way its terms allow:
+#   verbatim — Bing, Google: their grounded answer IS the answer, shown as it
+#              comes back with its references; the search tool ends the turn
+#              (return_direct), so no model rewrites or adds to it;
+#   results  — Brave, Claude's own web search: results the agent writes its
+#              own answer from, citing them.
+# STUDIO_WEB_SEARCH is the server's: "off", "auto" (any configured provider,
+# the person picks in the chat — default the first of PROVIDER_ORDER), or one
+# provider only. Each chat turn says what its person picked: "off", "auto" or
+# a provider. Studio's page reader (web_fetch) comes with the web whenever it
+# is on, except beside Claude's own search, which has its own.
+
+PROVIDERS = {
+    "bing": {"label": "Bing", "verbatim": True},
+    "google": {"label": "Google", "verbatim": True},
+    "brave": {"label": "Brave", "verbatim": False},
+    "anthropic": {"label": "Claude web search", "verbatim": False},
+}
+PROVIDER_ORDER = ("bing", "google", "brave", "anthropic")
+CHOICES = ("off", "auto") + PROVIDER_ORDER
+# Grounded output none of these may train on (their terms), nor cache.
+NO_TRAIN = ("bing", "google", "brave")
 
 # Models that take the dynamic-filtering web tools (web_*_20260209); older
 # Claude models take the basic ones.
@@ -159,26 +174,55 @@ _CURRENT_WEB = ("claude-fable-5", "claude-mythos-5", "claude-opus-5", "claude-op
 
 def _web_setting():
     value = os.getenv("STUDIO_WEB_SEARCH", "auto").strip().lower()
-    return "off" if value in ("off", "0", "false", "no") else value
+    if value in ("off", "0", "false", "no"):
+        return "off"
+    return value if value in PROVIDERS else "auto"
 
 
-def web_enabled():
-    return _web_setting() != "off"
+def web_enabled(choice=None):
+    """The web is on for this turn: the server allows it and its person did
+    not switch it off."""
+    return _web_setting() != "off" and choice != "off"
 
 
-def web_provider(spec):
-    """Which web search a model gets: "bing", "anthropic", or None (then only
-    the page reader, unless the web is off)."""
-    from . import web_search
+def _claude(spec):
+    return str(spec or "").partition(":")[0] == "anthropic"
+
+
+def provider_ready(pid, spec=None):
+    """Configured on this server (and, for Claude's own search, a Claude model)."""
+    from . import web_search as web
+    if pid == "bing":
+        return bool(web.bing_config())
+    if pid == "google":
+        return bool(web.google_config())
+    if pid == "brave":
+        return bool(web.brave_config())
+    if pid == "anthropic":
+        return _claude(spec) if spec is not None else bool(os.getenv("ANTHROPIC_API_KEY", "").strip())
+    return False
+
+
+def offered():
+    """What the chat's web toggle offers: [{id, label, verbatim}] the server
+    allows and has configured (Claude's search: when a Claude key is set)."""
     setting = _web_setting()
     if setting == "off":
+        return []
+    ids = (setting,) if setting in PROVIDERS else PROVIDER_ORDER
+    return [{"id": pid, **PROVIDERS[pid]} for pid in ids if provider_ready(pid)]
+
+
+def web_provider(spec, choice=None):
+    """The search this turn uses: a provider id, or None (then the page reader
+    alone, unless the web is off)."""
+    if not web_enabled(choice):
         return None
-    claude = str(spec or "").partition(":")[0] == "anthropic"
-    if setting in ("auto", "on", "bing") and web_search.bing_config():
-        return "bing"
-    if setting in ("auto", "on", "anthropic") and claude:
-        return "anthropic"
-    return None
+    setting = _web_setting()
+    allowed = (setting,) if setting in PROVIDERS else PROVIDER_ORDER
+    if choice in PROVIDERS:
+        return choice if choice in allowed and provider_ready(choice, spec) else None
+    return next((pid for pid in allowed if provider_ready(pid, spec)), None)
 
 
 def _max_uses():
@@ -188,11 +232,11 @@ def _max_uses():
         return 3
 
 
-def web_tools(spec):
+def web_tools(spec, choice=None):
     """Anthropic's web search and web fetch for a Claude model, as server-tool
-    definitions, or [] (Bing is in use, another provider, or switched off)."""
+    definitions — only when Claude's own search is this turn's — else []."""
     provider, _, model = str(spec or "").partition(":")
-    if web_provider(spec) != "anthropic":
+    if web_provider(spec, choice) != "anthropic":
         return []
     current = model.startswith(_CURRENT_WEB)
     uses = _max_uses()
@@ -202,47 +246,84 @@ def web_tools(spec):
              "name": "web_fetch", "max_uses": uses}]
 
 
-def client_web_tools(spec, record, emit=None):
-    """Studio's own web tools for this model: web_search (Bing) and web_fetch
-    when Bing is configured; web_fetch alone when no search is available; none
-    when Anthropic's server tools are in use (same names) or the web is off.
-    `record` collects what they used: {"citations": [...], "queries": [...]}."""
+def _merge(record, got):
+    for c in got.get("citations") or []:
+        if all(x["url"] != c["url"] for x in record["citations"]):
+            record["citations"].append(c)
+    for q in got.get("queries") or []:
+        if q not in record["queries"]:
+            record["queries"].append(q)
+
+
+def client_web_tools(spec, record, emit=None, choice=None):
+    """Studio's own web tools for this turn: the chosen provider's web_search
+    and Studio's page reader (web_fetch); the reader alone when no search is
+    available; none when Claude's own search is in use (same names) or the
+    web is off. `record` collects what they used: citations, queries, and —
+    for Bing and Google — the grounded answer itself ("direct")."""
     from langchain_core.tools import tool
     from . import web_search as web
-    provider = web_provider(spec)
-    if provider == "anthropic" or not web_enabled():
+    provider = web_provider(spec, choice)
+    if provider == "anthropic" or not web_enabled(choice):
         return []
     say = emit or (lambda label: None)
+    tools = []
 
-    @tool
-    def web_search(query: str, freshness: str = "") -> str:
-        """Search the web (Bing) for current events, live facts and anything you
-        are unsure of. Returns a summary grounded in web pages, with numbered
-        sources: cite the ones you use. Never put names, figures or identifiers
-        from this organization's databases or documents into the query.
+    if provider in ("bing", "google"):
+        label = PROVIDERS[provider]["label"]
 
-        Args:
-            query: What to search for, in plain words.
-            freshness: Optional: Day, Week, Month, or a date range
-                YYYY-MM-DD..YYYY-MM-DD.
-        """
-        say(f"searched Bing for “{str(query)[:120]}”")
-        try:
-            got = web.bing_search(query, freshness or None)
-        except RuntimeError as e:
-            return f"SEARCH FAILED: {e}"
-        for c in got["citations"]:
-            if all(x["url"] != c["url"] for x in record["citations"]):
-                record["citations"].append(c)
-        for q in got["queries"]:
-            if q not in record["queries"]:
-                record["queries"].append(q)
-        return web.format_results(got)
+        @tool(return_direct=True)
+        def web_search(question: str) -> str:
+            """Answer the question from the web. The answer comes back grounded in
+            web pages and is shown to the person exactly as it is, with its
+            sources — it ends your turn. Call it only when the question needs
+            the web, pass the person's whole question, and write no answer of
+            your own. Never put names, figures or identifiers from this
+            organization's databases or documents into it.
+
+            Args:
+                question: The person's question, in full.
+            """
+            say(f"searched {label} for “{str(question)[:120]}”")
+            try:
+                got = (web.bing_search(question) if provider == "bing"
+                       else web.google_search(question))
+            except RuntimeError as e:
+                record["direct"] = {"provider": provider, "text": f"I couldn't search the web: {e}",
+                                    "failed": True}
+                return record["direct"]["text"]
+            _merge(record, got)
+            record["direct"] = {"provider": provider, "text": got["text"],
+                                "suggestions_html": got.get("suggestions_html", "")}
+            return got["text"]
+        tools.append(web_search)
+    elif provider == "brave":
+        @tool
+        def web_search(query: str) -> str:
+            """Search the web (Brave) for current events, live facts and anything
+            you are unsure of. Returns numbered results — title, link, snippet:
+            answer from them and cite the ones you use. Never put names, figures
+            or identifiers from this organization's databases or documents into
+            the query.
+
+            Args:
+                query: What to search for, in plain words.
+            """
+            say(f"searched Brave for “{str(query)[:120]}”")
+            try:
+                got = web.brave_search(query)
+            except RuntimeError as e:
+                return f"SEARCH FAILED: {e}"
+            _merge(record, {"citations": [{"url": r["url"], "title": r["title"]}
+                                          for r in got["results"]],
+                            "queries": got["queries"]})
+            return web.format_brave(got)
+        tools.append(web_search)
 
     @tool
     def web_fetch(url: str) -> str:
-        """Read a public web page as text: one the user gave, or one a search
-        found. Use it for details a search summary leaves out.
+        """Read a public web page as text: one the person gave, or one a search
+        found. Use it for details a search leaves out.
 
         Args:
             url: The page's full http(s) address.
@@ -252,23 +333,39 @@ def client_web_tools(spec, record, emit=None):
             page = web.fetch_page(url)
         except RuntimeError as e:
             return f"COULD NOT READ THE PAGE: {e}"
-        if all(x["url"] != page["url"] for x in record["citations"]):
-            record["citations"].append({"url": page["url"], "title": page["title"]})
+        record.setdefault("read", [])
+        if all(x["url"] != page["url"] for x in record["read"]):
+            record["read"].append({"url": page["url"], "title": page["title"]})
         return f"{page['title']}\n{page['url']}\n\n{page['text']}"
+    tools.append(web_fetch)
+    return tools
 
-    return [web_search, web_fetch] if provider == "bing" else [web_fetch]
 
+def grounding(record, provider, asked_by=None):
+    """(citations, web_grounding) for what an answer's own web tools used.
 
-def grounding(record, provider):
-    """What an answer's own web tools used: (citations, web_grounding) —
-    citations as {source, url, kind: "web"}; web_grounding names Bing and its
-    queries, which the terms require to be shown, and keeps the answer out of
-    training."""
+    citations: the pages, as {source, url, kind: "web"} — the ones a Bing or
+    Google answer gave, the Brave results the agent had, and pages it read.
+    web_grounding names the provider (for its references, and to keep the
+    answer out of training), its queries, whether the answer is that
+    provider's own (verbatim), who asked (Google answers are theirs alone),
+    and Google's Search Suggestions."""
+    used = list(record.get("citations") or [])
+    for page in record.get("read") or []:
+        if all(x["url"] != page["url"] for x in used):
+            used.append(page)
     pages = [{"source": c.get("title") or urlsplit(c["url"]).hostname, "url": c["url"], "kind": "web"}
-             for c in record["citations"] if _web_url(c.get("url"))]
-    if provider == "bing" and (record["queries"] or pages):
-        return pages, {"provider": "bing", "queries": record["queries"][:10]}
-    return pages, None
+             for c in used if _web_url(c.get("url"))]
+    direct = record.get("direct")
+    if provider not in NO_TRAIN or not (record.get("queries") or record.get("citations") or direct):
+        return pages, None
+    out = {"provider": provider, "queries": list(record.get("queries") or [])[:10],
+           "verbatim": bool(direct and not direct.get("failed"))}
+    if asked_by:
+        out["asked_by"] = asked_by
+    if direct and direct.get("suggestions_html"):
+        out["suggestions_html"] = direct["suggestions_html"]
+    return pages, out
 
 
 WEB_RULE = ("Use web_search for current events, live facts and anything you are unsure "
@@ -276,20 +373,25 @@ WEB_RULE = ("Use web_search for current events, live facts and anything you are 
             "sites you used. Never put names, figures or identifiers from this "
             "organization's databases or documents into a search — search only for "
             "public information.")
+VERBATIM_RULE = ("For a question that needs the web (current events, live facts), call "
+                 "web_search with the person's whole question: its grounded answer is shown "
+                 "as it is and ends your turn, so do not answer it yourself, and do not "
+                 "combine it with data. web_fetch reads a page whose URL is in the "
+                 "conversation. Never put names, figures or identifiers from this "
+                 "organization's databases or documents into a search.")
 FETCH_ONLY_RULE = ("You cannot search the web, but web_fetch reads a public page whose "
                    "address is in the conversation. For other live information (news, "
                    "weather, prices), say so plainly and give what you know, with its date.")
-
-
-def web_rule(spec):
-    """The rule matching the web tools this model gets."""
-    if web_provider(spec):
-        return WEB_RULE
-    return FETCH_ONLY_RULE if web_enabled() else NO_WEB_RULE
-
-
 NO_WEB_RULE = ("You have no web access: for live information (news, weather, prices), say so "
                "plainly and give what you know, with its date.")
+
+
+def web_rule(spec, choice=None):
+    """The rule matching the web tools this turn gets."""
+    provider = web_provider(spec, choice)
+    if provider:
+        return VERBATIM_RULE if PROVIDERS[provider]["verbatim"] else WEB_RULE
+    return FETCH_ONLY_RULE if web_enabled(choice) else NO_WEB_RULE
 
 
 def _web_url(url):

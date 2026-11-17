@@ -55,8 +55,11 @@ def init_tables():
 
 
 def ticker_enabled():
+    """On when result rows expire, or when Google search is configured (its
+    grounded answers go after two years whatever the row setting)."""
+    from . import web_search
     return (os.getenv("STUDIO_RETENTION_TICKER", "1").lower() not in ("0", "false", "no")
-            and chat._retention_days() > 0)
+            and (chat._retention_days() > 0 or bool(web_search.google_config())))
 
 
 # ── State ────────────────────────────────────────────────────────────────
@@ -102,6 +105,11 @@ def _eligible(cutoff):
 def tick_once(now=None):
     """One retention pass. Never raises — a failure is recorded and logged.
     Returns the recorded status (None when retention is off)."""
+    try:
+        # Not a setting: Google-grounded answers go after two years (Gemini terms).
+        chat.expire_google_answers(now)
+    except Exception:
+        log.exception("retention: expiring Google-grounded answers failed")
     days = chat._retention_days()
     if days <= 0:
         return None

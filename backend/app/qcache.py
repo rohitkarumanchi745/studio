@@ -248,8 +248,8 @@ def store(user, source, table_scope, prompt, result, reward=None):
     text = result.get("text") or ""
     if not sql or text.startswith("(Agent error") or len(result.get("panels") or []) > 1:
         return
-    if (result.get("web_grounding") or {}).get("provider") == "bing":
-        return              # Bing output: not stored for reuse, nor learned from
+    if (result.get("web_grounding") or {}).get("provider") in ("bing", "google", "brave"):
+        return              # web search output: not stored for reuse, nor learned from
     sig = _sig(prompt)
     if not sig:
         return

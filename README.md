@@ -31,11 +31,13 @@ reader's current permissions, but it no longer runs.
 Chat answers anything, not only questions about your data. A question no
 connected source has goes to a general assistant first, which hands it back to
 the data agents if it turns out to be about data. Every agent can tell the time
-anywhere, search the web (Grounding with Bing through Azure AI Foundry, or
-Anthropic's web search on Claude) and read a page with Studio's own reader. It
-can also read files from a folder on the machine Studio runs on
-(`STUDIO_LOCAL_FILES_DIR`). Answers list the pages, Bing searches and files
-they used; setup is in [deploy/web-search](deploy/web-search/README.md).
+anywhere and read a page with Studio's own reader. A **web toggle** in the
+composer (Off, Auto, or a provider) lets it search the web with Bing, Google
+(Gemini grounding), Brave or Claude's own search. Bing and Google answers are
+shown exactly as they come back, as their terms require. Agents can also read
+files from a folder on the machine Studio runs on (`STUDIO_LOCAL_FILES_DIR`).
+Answers list the pages, searches and files they used; setup is in
+[deploy/web-search](deploy/web-search/README.md).
 
 Chat also submits runs to **Airflow, Databricks Jobs, dbt Cloud, Spark on
 Kubernetes, and Ray Jobs**, asked for in plain English: **"kick off the daily sales

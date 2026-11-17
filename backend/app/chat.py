@@ -10,7 +10,7 @@ from typing import List, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from . import (agent, answer_uses, autopilot_intent, autoroute, chat_platforms, chat_workflows, db, email_service, gateway, governance, jobs, keys,
+from . import (agent, answer_uses, autopilot_intent, general_tools, autoroute, chat_platforms, chat_workflows, db, email_service, gateway, governance, jobs, keys,
                lightning, orchestrator, progress, qcache, queryguard, rbac,
                roster, router as model_router, semantic, sessions, skills,
                pipeline_sources)
@@ -101,6 +101,9 @@ class Ask(BaseModel):
     # The D3 & artifacts window: the agent always visualizes, and every chart
     # in the answer is drawn with D3 (agent.d3_only) — or is a custom visual.
     visual: bool = False
+    # The chat's web toggle: "off", "auto", or one provider (bing, google,
+    # brave, anthropic). The server's STUDIO_WEB_SEARCH still bounds it.
+    web: Optional[Literal["off", "auto", "bing", "google", "brave", "anthropic"]] = None
 
 
 @router.get("/agents")
@@ -108,6 +111,15 @@ def agents(user=Depends(current_user)):
     """The named agent crew for this user: a worker per accessible source, plus
     the Aggregator/Orchestrator, and whether a question fans out."""
     return roster.summary(user)
+
+
+@router.get("/web/providers")
+def web_providers(user=Depends(current_user)):
+    """What the chat's web toggle offers: whether the server allows the web,
+    and the search providers it has configured, in the order "Auto" tries."""
+    offered = general_tools.offered()
+    return {"enabled": general_tools.web_enabled(), "providers": offered,
+            "default": offered[0]["id"] if offered else None}
 
 
 @router.get("/models")
@@ -608,6 +620,7 @@ def _build_ctx(body, user, cid, scope=None, user_message_id=None):
                 "repository_id": body.repository_id,
                 "confluence_page_ids": body.confluence_page_ids or [],
                 "visual": bool(body.visual),
+                "web": body.web,
                 "auto_route": body.route,
                 "selected_tables": body.tables or ([body.table] if body.table != "*" else None)})
     return ctx
@@ -1059,7 +1072,8 @@ def _run_turn(ctx, user):
         if certified is None and verified is None and _ask_assistant_first(ctx):
             # Auto matched no source: the time somewhere, a public fact, a task.
             # The assistant answers it, or hands it back when it is about data.
-            general = agent.run_general(prompt, user, ctx["history"], model, sources=usable)
+            general = agent.run_general(prompt, user, ctx["history"], model, sources=usable,
+                                        web=ctx.get("web"))
             if general is None:
                 progress.emit("this is about your data — asking every source", kind="route")
         if certified is not None:
@@ -1137,7 +1151,7 @@ def _run_turn(ctx, user):
             allowed_tables=ctx["allowed"], schemas=ctx["schemas"], history=ctx["history"],
             user=user, model=spec, skill_md=skill_md, kag_first=kag_first,
             visual_mode=visual, conversation_id=cid, focus_schemas=focus["schemas"],
-            join_hints=focus["joins"])
+            join_hints=focus["joins"], web=ctx.get("web"))
         if focus.get("related") and isinstance(out, dict):
             from . import verified_sql
             out["verified_sql"] = verified_sql.provenance(focus["related"], user)
@@ -2369,11 +2383,19 @@ def _conversation(cid, user, prompt, recorded=False, before_message_id=None):
             if sql:
                 # The query, never its rows: numbers in history may be stale.
                 text += "\nSQL this answer ran:\n" + sql
+            grounded = (content.get("web_grounding") or {}).get("provider")
+            if (m["role"] == "assistant" and grounded in general_tools.PROVIDERS
+                    and general_tools.PROVIDERS[grounded]["verbatim"]
+                    and content["web_grounding"].get("verbatim")):
+                # A Bing or Google answer was shown as it came back; its terms
+                # let no model analyze or build on it, so the next model sees
+                # that it happened, not what it said.
+                label = general_tools.PROVIDERS[grounded]["label"]
+                text = f"[An answer from {label} web search was shown to the person as it came back.]"
             if text:
                 history.append({"role": m["role"], "text": text,
-                                # Grounded in Bing output: never training input.
-                                **({"bing": True} if (content.get("web_grounding") or {})
-                                   .get("provider") == "bing" else {})})
+                                # Grounded in search output: never training input.
+                                **({"web": grounded} if grounded in general_tools.NO_TRAIN else {})})
         history = history[-int(os.getenv("STUDIO_HISTORY_TURNS", "8")):]
         return cid, history
     return db.create_conversation(user["id"], prompt), []
@@ -2719,6 +2741,45 @@ def _governed(content):
 _REDACTED = "🔒 Hidden — this message used data your role cannot access."
 
 
+_GOOGLE_WITHHELD = ("This answer came from Google Search, which shows its answers only to the "
+                    "person who asked, for up to two years.")
+
+
+def _google_answer_visible(m, content, user, now=None):
+    """A Google-grounded answer, to its asker, within two years — or anything else."""
+    grounding = content.get("web_grounding") or {}
+    if m.get("role") != "assistant" or grounding.get("provider") != "google":
+        return True
+    from . import web_search
+    age = (now or time.time()) - float(m.get("created_at") or 0)
+    return (grounding.get("asked_by") == user["id"]
+            and age <= web_search.GOOGLE_RETENTION_DAYS * 86400)
+
+
+def expire_google_answers(now=None):
+    """Remove the text of Google-grounded answers older than two years (Gemini
+    API terms). Returns how many were removed. Run by the retention ticker."""
+    from . import web_search
+    cutoff = (now or time.time()) - web_search.GOOGLE_RETENTION_DAYS * 86400
+    removed = 0
+    with db.connect() as c:
+        rows = c.execute("SELECT id, content FROM messages WHERE role='assistant' AND created_at < ? "
+                         "AND content LIKE ?", (cutoff, '%"provider": "google"%')).fetchall()
+        for r in rows:
+            try:
+                content = json.loads(r["content"])
+            except (TypeError, ValueError):
+                continue
+            if (content.get("web_grounding") or {}).get("provider") != "google":
+                continue
+            content.update(text=_GOOGLE_WITHHELD, redacted=True, web_withheld=True, citations=[],
+                           web_grounding={"provider": "google", "expired": True})
+            c.execute("UPDATE messages SET content=? WHERE id=?", (json.dumps(content), r["id"]))
+            removed += 1
+        c.commit()
+    return removed
+
+
 def _visible_messages(cid, user, access):
     """Redact, at READ time, anything the viewer's role may not query.
 
@@ -2763,6 +2824,16 @@ def _visible_messages(cid, user, access):
             allowed = platform_allowed
         else:
             allowed = _msg_allowed(user["role"], content, m.get("role"))
+        if allowed and not _google_answer_visible(m, content, user):
+            # Grounding with Google Search: shown only to the person who asked,
+            # and kept two years at most (Gemini API terms).
+            m = {**m, "content": {
+                "text": _GOOGLE_WITHHELD, "redacted": True, "web_withheld": True,
+                "source": content.get("source"), "table": content.get("table"),
+                "columns": [], "rows": [], "panels": [], "chart": None, "sql": None,
+            }}
+            out.append(m)
+            continue
         if not allowed:
             m = {**m, "content": {
                 "text": _REDACTED, "redacted": True,

@@ -14,7 +14,8 @@ const frontend = fileURLToPath(new URL("../", import.meta.url));
 const require = createRequire(import.meta.url);
 const bundle = await build({
   stdin: {
-    contents: `export {AssistantMessage, readPanelPref, panelAnswer, webUrl, describeRoute, stepKind, bingQueries}
+    contents: `export {AssistantMessage, readPanelPref, panelAnswer, webUrl, describeRoute, stepKind, bingQueries,
+                         verbatimWeb, SearchSuggestions}
                  from "./src/components/Chat.jsx";`,
     resolveDir: frontend, loader: "jsx",
   },
@@ -48,7 +49,8 @@ compiled.filename = path.join(frontend, "chat-answer-panel-test.cjs");
 compiled.paths = Module._nodeModulePaths(frontend);
 compiled.require = (id) => id === "echarts" ? { init() { return {}; } } : require(id);
 compiled._compile(bundle.outputFiles[0].text, compiled.filename);
-const { AssistantMessage, readPanelPref, panelAnswer, webUrl, describeRoute, stepKind, bingQueries } = compiled.exports;
+const { AssistantMessage, readPanelPref, panelAnswer, webUrl, describeRoute, stepKind, bingQueries,
+        verbatimWeb, SearchSuggestions } = compiled.exports;
 
 function withBrowser({ saved, wide, throws = false }, work) {
   const before = { localStorage: globalThis.localStorage, window: globalThis.window };
@@ -152,4 +154,29 @@ test("tables that only matched the question's words are not sources of an answer
   const html = (x) => renderToStaticMarkup(React.createElement(AssistantMessage, { m: x, onOpenCanvas() {}, busy: false }));
   assert.doesNotMatch(html(m), /▦ production/);
   assert.match(html({ ...m, sql: "SELECT * FROM production" }), /▦ production/);
+});
+
+test("Google's answer shows its Search Suggestions in a script-less frame, names Google, and has no Share", () => {
+  const m = { text: "Spain won Euro 2024.", mode: "general", source: "*", table: "general", trace_id: "t",
+              model: "anthropic:claude-sonnet-5",
+              web_grounding: { provider: "google", verbatim: true, asked_by: "u1",
+                               suggestions_html: "<div class=chip><a href='https://www.google.com/search?q=euro'>euro</a></div>" },
+              citations: [{ source: "uefa.com", url: "https://vertexaisearch.cloud.google.com/grounding-api-redirect/x", kind: "web" }] };
+  const html = renderToStaticMarkup(React.createElement(AssistantMessage, { m, onOpenCanvas() {}, busy: false }));
+  assert.match(html, /<iframe class="search-suggestions" title="Google Search suggestions" sandbox="allow-popups allow-popups-to-escape-sandbox" srcDoc="&lt;base target=&quot;_blank&quot;&gt;&lt;div class=chip&gt;/);
+  assert.doesNotMatch(html, /allow-scripts|allow-same-origin/);
+  assert.match(html, /<span class="web-search-note">From Google Search<\/span>/);
+  assert.match(html, /🌐 uefa.com/);
+  assert.doesNotMatch(html, /↗ Share/);
+  assert.equal(verbatimWeb(m), true);
+  // Brave: the agent's own answer — named, and shareable.
+  const brave = { ...m, web_grounding: { provider: "brave", verbatim: false } };
+  const b = renderToStaticMarkup(React.createElement(AssistantMessage, { m: brave, onOpenCanvas() {}, busy: false }));
+  assert.match(b, /From a Brave web search/);
+  assert.match(b, /↗ Share/);
+  assert.doesNotMatch(b, /search-suggestions/);
+  assert.equal(renderToStaticMarkup(React.createElement(SearchSuggestions, { html: "" })), "");
+  // A Bing answer that failed (not verbatim) can be shared; one that answered cannot.
+  assert.equal(verbatimWeb({ web_grounding: { provider: "bing", verbatim: false } }), false);
+  assert.equal(verbatimWeb({ web_grounding: { provider: "bing", verbatim: true } }), true);
 });

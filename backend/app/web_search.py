@@ -1,4 +1,15 @@
-"""Studio's own web tools: search (Grounding with Bing Search) and a page reader.
+"""Studio's own web tools: search (Bing, Google, Brave) and a page reader.
+
+Three search providers, each used the way its terms allow:
+    bing    Grounding with Bing Search (Azure AI Foundry): a grounded answer,
+            shown to the user exactly as it comes back, with its references;
+    google  Grounding with Google Search (Gemini API): a grounded answer, shown
+            exactly as it comes back, with Google's Search Suggestions, to the
+            person who asked only, for at most two years;
+    brave   Brave Search API: plain results (title, link, snippet) that the
+            agent writes its own answer from — a "Data for AI" plan grants that.
+Google's Custom Search JSON API is closed to new customers and ends on
+1 January 2027, so Google is reached through Gemini's grounding.
 
 web_search goes through an Azure AI Foundry project's Responses API with the
 `bing_grounding` tool: the supported way to ground AI answers in Bing since
@@ -105,8 +116,9 @@ def _access_token(cfg):
         return _token["value"]
 
 
-_PROMPT = ("Search the web for: {query}\n\nReport what the sources say that answers it — the key "
-           "facts, numbers and dates — concisely. Do not add anything the sources do not say.")
+_PROMPT = ("Answer this question from current web search results, concisely and factually — the "
+           "key facts, numbers and dates the sources give. Do not add anything the sources do not "
+           "say.\n\nQuestion: {query}")
 _BING_QUERY_URL = re.compile(r"https?://(?:api\.bing\.microsoft\.com/v7\.0/search|(?:www\.)?bing\.com/search)"
                              r"\?[^\s\"'<>]+", re.I)
 
@@ -214,6 +226,134 @@ def format_results(result):
     lines += [f"[{i}] {c['title'] or c['url']} — {c['url']}"
               for i, c in enumerate(result["citations"], 1)] or ["(none cited)"]
     return "\n".join(lines)
+
+
+# ── Grounding with Google Search (Gemini API) ───────────────────────────
+
+GOOGLE_RETENTION_DAYS = 730          # Gemini API terms: grounded results, two years at most
+
+
+def google_config():
+    """{key, model} for Gemini grounding, or None."""
+    key = os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
+    if not key:
+        return None
+    return {"key": key, "model": os.getenv("GOOGLE_GROUNDING_MODEL", "gemini-2.5-flash").strip()}
+
+
+def parse_google_response(data):
+    """{text, citations, queries, suggestions_html} from a generateContent reply."""
+    cand = ((data or {}).get("candidates") or [{}])[0] or {}
+    parts = (cand.get("content") or {}).get("parts") or []
+    text = "".join(p.get("text", "") for p in parts if isinstance(p, dict)).strip()
+    meta = cand.get("groundingMetadata") or {}
+    citations = []
+    for ch in meta.get("groundingChunks") or []:
+        w = (ch or {}).get("web") or {}
+        url = _http_url(w.get("uri"))
+        if url and all(c["url"] != url for c in citations):
+            citations.append({"url": url, "title": (w.get("title") or "").strip()})
+    html = ((meta.get("searchEntryPoint") or {}).get("renderedContent") or "")
+    return {"text": text, "citations": citations,
+            "queries": [{"query": str(q)} for q in (meta.get("webSearchQueries") or []) if q][:10],
+            "suggestions_html": html if isinstance(html, str) and len(html) <= 100_000 else ""}
+
+
+def google_search(question):
+    """Answer a question with Grounding with Google Search. RuntimeError with
+    a fixed sentence when it cannot."""
+    cfg = google_config()
+    if cfg is None:
+        raise RuntimeError("Google search is not configured on this server.")
+    question = str(question or "").strip()[:2000]
+    if not question:
+        raise RuntimeError("Give a question.")
+    body = {"contents": [{"role": "user", "parts": [{"text": question}]}],
+            "tools": [{"google_search": {}}]}
+    url = ("https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{urllib.parse.quote(cfg['model'], safe='-._')}:generateContent")
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
+                                 headers={"x-goog-api-key": cfg["key"],
+                                          "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=90) as r:
+            data = json.loads(r.read(4_000_000) or b"{}")
+    except urllib.error.HTTPError as e:
+        said = {400: "Google search refused the request — check GOOGLE_GROUNDING_MODEL.",
+                401: "Google search refused the API key.",
+                403: "Google search refused the API key (no access to grounding).",
+                404: "Google search: the model in GOOGLE_GROUNDING_MODEL was not found.",
+                429: "Google search is busy (rate limited) — try again shortly."}
+        raise RuntimeError(said.get(e.code, f"Google search failed (HTTP {e.code}).")) from None
+    except (urllib.error.URLError, OSError, ValueError):
+        raise RuntimeError("Google search could not be reached.") from None
+    out = parse_google_response(data if isinstance(data, dict) else {})
+    if not out["text"]:
+        raise RuntimeError("Google search returned no answer.")
+    return out
+
+
+# ── Brave Search API ────────────────────────────────────────────────────
+
+def brave_config():
+    key = os.getenv("BRAVE_SEARCH_API_KEY", "").strip()
+    if not key:
+        return None
+    try:
+        count = int(os.getenv("BRAVE_COUNT", "8"))
+    except ValueError:
+        count = 8
+    return {"key": key, "count": min(20, max(1, count)),
+            "country": os.getenv("BRAVE_COUNTRY", "").strip()}
+
+
+def _plain(text):
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", str(text or ""))).strip()
+
+
+def parse_brave_response(data, asked):
+    results = []
+    for r in ((data or {}).get("web") or {}).get("results") or []:
+        url = _http_url((r or {}).get("url"))
+        if url and all(x["url"] != url for x in results):
+            results.append({"url": url, "title": _plain(r.get("title")),
+                            "snippet": _plain(r.get("description"))[:400],
+                            "age": str(r.get("age") or "")})
+    return {"results": results, "queries": [{"query": asked}]}
+
+
+def brave_search(query):
+    """Plain web results from Brave. RuntimeError with a fixed sentence."""
+    cfg = brave_config()
+    if cfg is None:
+        raise RuntimeError("Brave search is not configured on this server.")
+    query = re.sub(r"\s+", " ", str(query or "")).strip()[:400]
+    if not query:
+        raise RuntimeError("Give a search query.")
+    params = {"q": query, "count": cfg["count"]}
+    if cfg["country"]:
+        params["country"] = cfg["country"]
+    req = urllib.request.Request(
+        "https://api.search.brave.com/res/v1/web/search?" + urllib.parse.urlencode(params),
+        headers={"X-Subscription-Token": cfg["key"], "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read(4_000_000) or b"{}")
+    except urllib.error.HTTPError as e:
+        said = {401: "Brave search refused the API key.", 403: "Brave search refused the API key.",
+                422: "Brave search could not read the query.",
+                429: "Brave search is busy (rate limited) — try again shortly."}
+        raise RuntimeError(said.get(e.code, f"Brave search failed (HTTP {e.code}).")) from None
+    except (urllib.error.URLError, OSError, ValueError):
+        raise RuntimeError("Brave search could not be reached.") from None
+    return parse_brave_response(data if isinstance(data, dict) else {}, query)
+
+
+def format_brave(result):
+    lines = [f"[{i}] {r['title'] or r['url']} — {r['url']}" + (f" ({r['age']})" if r["age"] else "")
+             + (f"\n    {r['snippet']}" if r["snippet"] else "")
+             for i, r in enumerate(result["results"], 1)]
+    return "\n".join(lines) or "(no results)"
 
 
 # ── The page reader ─────────────────────────────────────────────────────

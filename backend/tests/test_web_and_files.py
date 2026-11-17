@@ -123,7 +123,7 @@ def test_a_search_signs_in_calls_foundry_and_reads_citations_and_the_bing_query(
     body = json.loads(search["body"])
     assert set(body) == {"model", "input", "tool_choice", "tools"}
     assert body["model"] == "gpt-4.1-mini" and body["tool_choice"] == "required"
-    assert "Search the web for: NYC weather today" in body["input"]
+    assert body["input"].endswith("Question: NYC weather today")
     assert body["tools"] == [{"type": "bing_grounding", "bing_grounding": {"search_configurations": [{
         "project_connection_id": BING_ENV["BING_PROJECT_CONNECTION_ID"], "count": 7,
         "market": "en-US", "set_lang": "en", "freshness": "day"}]}}]
@@ -178,7 +178,7 @@ def test_bing_is_every_models_search_when_configured(bing, monkeypatch):
         assert general_tools.web_provider(spec) == "bing"
         assert general_tools.web_tools(spec) == []              # no Anthropic search alongside
         assert [t.name for t in general_tools.client_web_tools(spec, seen)] == ["web_search", "web_fetch"]
-        assert general_tools.web_rule(spec) == general_tools.WEB_RULE
+        assert general_tools.web_rule(spec) == general_tools.VERBATIM_RULE
     monkeypatch.setenv("STUDIO_WEB_SEARCH", "anthropic")
     assert general_tools.web_provider("anthropic:claude-sonnet-5") == "anthropic"
     assert general_tools.client_web_tools("anthropic:claude-sonnet-5", seen) == []
@@ -189,19 +189,24 @@ def test_bing_is_every_models_search_when_configured(bing, monkeypatch):
     assert general_tools.web_rule("openai:gpt-5") == general_tools.NO_WEB_RULE
 
 
-def test_the_search_tool_records_what_it_used(bing):
+def test_the_bing_tool_returns_bings_answer_as_it_is_and_ends_the_turn(bing):
     seen = {"citations": [], "queries": []}
     steps = []
     search, _ = general_tools.client_web_tools("openai:gpt-5", seen, steps.append)
-    out = search.invoke({"query": "NYC weather today"})
-    assert out.startswith("It is 12°C") and "Sources:\n[1] NYC weather" in out
+    assert search.return_direct is True
+    out = search.invoke({"question": "NYC weather today"})
+    assert out == "It is 12°C and cloudy in New York."            # Bing's words, untouched
+    assert seen["direct"] == {"provider": "bing", "text": out, "suggestions_html": ""}
     assert steps == ["searched Bing for “NYC weather today”"]
-    pages, grounding = general_tools.grounding(seen, "bing")
+    pages, grounding = general_tools.grounding(seen, "bing", "u-1")
     assert pages == [{"source": "NYC weather", "url": "https://weather.example/nyc", "kind": "web"}]
-    assert grounding == {"provider": "bing", "queries": [
+    assert grounding == {"provider": "bing", "verbatim": True, "asked_by": "u-1", "queries": [
         {"query": "NYC weather today", "url": "https://www.bing.com/search?q=NYC+weather+today"}]}
     bing[1]["error"] = 500
-    assert search.invoke({"query": "x"}).startswith("SEARCH FAILED: Bing search failed")
+    failed = {"citations": [], "queries": []}
+    search2, _ = general_tools.client_web_tools("openai:gpt-5", failed)
+    assert search2.invoke({"question": "x"}) == "I couldn't search the web: Bing search failed (HTTP 500)."
+    assert general_tools.grounding(failed, "bing")[1]["verbatim"] is False
     assert general_tools.grounding({"citations": [], "queries": []}, "bing") == ([], None)
     # Pages read without a Bing search are not Bing output.
     read_only = {"citations": [{"url": "https://a.example/x", "title": "A"}], "queries": []}
@@ -427,17 +432,17 @@ def test_a_bing_answer_is_kept_out_of_training_and_later_history(monkeypatch):
     if meta is None:
         with db.connect() as c:
             meta = json.loads(c.execute("SELECT meta FROM agent_traces WHERE id=?", (tid,)).fetchone()["meta"])
-    assert meta["bing_grounded"] is True and meta["global_train_eligible"] is False
+    assert meta["web_grounded"] is True and meta["global_train_eligible"] is False
     assert lightning.global_training_eligible(meta) is False
     # A later data turn whose history holds that answer: excluded, text dropped.
     tid2 = lightning.record_chat_trace(ANA, None, "and revenue?", {"text": "x", "sql": "SELECT 1", "rows": []},
                                        10, history=[{"role": "user", "text": "weather?"},
                                                     {"role": "assistant", "text": "12°C per weather.example",
-                                                     "bing": True}])
+                                                     "web": "brave"}])
     with db.connect() as c:
         meta2 = json.loads(c.execute("SELECT meta FROM agent_traces WHERE id=?", (tid2,)).fetchone()["meta"])
     assert meta2["global_train_eligible"] is False
-    assert meta2["history"][1]["text"] == "[an answer grounded in Bing web results]"
+    assert meta2["history"][1]["text"] == "[an answer grounded in web search results]"
     assert "weather.example" not in json.dumps(meta2)
     # An ordinary trace is unaffected.
     tid3 = lightning.record_chat_trace(ANA, None, "revenue?", {"text": "x", "sql": "SELECT 1", "rows": []}, 10)
@@ -474,17 +479,24 @@ def test_the_plan_cache_never_keeps_a_bing_answer(monkeypatch):
     assert qcache.store(ANA, "demo", "*", "q", {**BING_ANSWER, "sql": "SELECT 1", "rows": [[1]]}) is None
 
 
-def test_history_marks_an_answer_grounded_in_bing():
+def test_history_never_feeds_a_bing_or_google_answer_to_a_model():
     db.init_db()
     chat.init_tables()
     cid = db.create_conversation(ANA["id"], "t")
-    db.add_message(cid, "user", {"text": "weather?", "source": "*", "table": "general", "author_role": "analyst"})
-    db.add_message(cid, "assistant", {**BING_ANSWER, "source": "*", "table": "general", "author_role": "analyst"})
-    db.add_message(cid, "user", {"text": "thanks", "source": "*", "table": "general", "author_role": "analyst"})
-    db.add_message(cid, "assistant", {"text": "Welcome.", "source": "*", "table": "general",
-                                      "author_role": "analyst", "mode": "general"})
+    turn = {"source": "*", "table": "general", "author_role": "analyst"}
+    db.add_message(cid, "user", {"text": "weather?", **turn})
+    db.add_message(cid, "assistant", {**BING_ANSWER, **turn,
+                                      "web_grounding": {**BING_ANSWER["web_grounding"], "verbatim": True}})
+    db.add_message(cid, "user", {"text": "and the news?", **turn})
+    db.add_message(cid, "assistant", {"text": "Per Brave results, X happened.", **turn,
+                                      "web_grounding": {"provider": "brave", "queries": [{"query": "news"}]}})
+    db.add_message(cid, "user", {"text": "thanks", **turn})
+    db.add_message(cid, "assistant", {"text": "Welcome.", **turn, "mode": "general"})
     history = chat._conversation(cid, ANA, "next")[1]
-    assert [h.get("bing", False) for h in history] == [False, True, False, False]
+    assert [h.get("web") for h in history] == [None, "bing", None, "brave", None, None]
+    assert history[1]["text"] == "[An answer from Bing web search was shown to the person as it came back.]"
+    assert "12°C" not in str(history)
+    assert history[3]["text"] == "Per Brave results, X happened."       # the agent's own words
 
 
 # ── The shared folder ───────────────────────────────────────────────────
@@ -583,21 +595,35 @@ class _Model(GenericFakeChatModel):
 _BOUND = []
 
 
-def test_the_assistant_searches_bing_and_reads_a_file(bing, folder, monkeypatch):
+def _scripted(monkeypatch, *replies):
     _BOUND.clear()
     monkeypatch.setattr(agent, "llm_available", lambda *a, **k: True)
-    replies = iter([
-        AIMessage(content="", tool_calls=[{"name": "web_search", "args": {"query": "NYC weather today"}, "id": "a"},
-                                          {"name": "read_local_file", "args": {"path": "notes/q3.md"}, "id": "b"}]),
-        AIMessage(content="12°C in NYC [1]; your notes say the West grew 12%."),
-    ])
-    monkeypatch.setattr(agent, "make_llm", lambda *a, **k: _Model(messages=replies))
-    out = agent.run_general("weather in NYC, and what do my Q3 notes say?", ANA, [],
-                            "anthropic:claude-sonnet-5", sources=["demo"])
+    state = {"replies": iter(replies)}
+    monkeypatch.setattr(agent, "make_llm", lambda *a, **k: _Model(messages=state["replies"]))
+    return state
+
+
+def test_the_assistant_answers_with_bings_words_and_nothing_after(bing, folder, monkeypatch):
+    state = _scripted(monkeypatch,
+                      AIMessage(content="Let me look that up.",
+                                tool_calls=[{"name": "web_search",
+                                             "args": {"question": "NYC weather today"}, "id": "a"}]),
+                      AIMessage(content="never read"))
+    out = agent.run_general("weather in NYC today?", ANA, [], "anthropic:claude-sonnet-5", sources=["demo"])
     assert _BOUND[0] == ["current_time", "use_data_sources", "web_search", "web_fetch",
                          "list_local_files", "search_local_files", "read_local_file"]
-    assert out["text"] == "12°C in NYC [1]; your notes say the West grew 12%."
-    assert out["citations"] == [{"source": "NYC weather", "url": "https://weather.example/nyc", "kind": "web"},
-                                {"source": "notes/q3.md", "path": "notes/q3.md", "kind": "file"}]
-    assert out["web_grounding"]["provider"] == "bing"
-    assert out["web_grounding"]["queries"][0]["url"] == "https://www.bing.com/search?q=NYC+weather+today"
+    assert out["text"] == "It is 12°C and cloudy in New York."         # as Bing gave it
+    assert next(state["replies"]).content == "never read"               # no model wrote after it
+    assert out["citations"] == [{"source": "NYC weather", "url": "https://weather.example/nyc", "kind": "web"}]
+    assert out["web_grounding"] == {"provider": "bing", "verbatim": True, "asked_by": ANA["id"], "queries": [
+        {"query": "NYC weather today", "url": "https://www.bing.com/search?q=NYC+weather+today"}]}
+
+
+def test_the_assistant_reads_a_file_and_answers_in_its_own_words(folder, monkeypatch):
+    _scripted(monkeypatch,
+              AIMessage(content="", tool_calls=[{"name": "read_local_file", "args": {"path": "notes/q3.md"}, "id": "b"}]),
+              AIMessage(content="Your notes say the West grew 12%."))
+    out = agent.run_general("what do my Q3 notes say?", ANA, [], "openai:gpt-5", sources=["demo"])
+    assert out["text"] == "Your notes say the West grew 12%."
+    assert out["citations"] == [{"source": "notes/q3.md", "path": "notes/q3.md", "kind": "file"}]
+    assert "web_grounding" not in out

@@ -264,7 +264,8 @@ test("Bing-grounded answers carry the Bing results link; files from the shared f
   assert.deepEqual(panelSources(m), [
     { key: "files", files: ["notes/q3.md"] },
     { key: "web", pages: [{ url: "https://weather.example/nyc", title: "NYC weather" }],
-      bing: [{ query: "NYC weather today", url: "https://www.bing.com/search?q=NYC+weather+today" }] }]);
+      bing: [{ query: "NYC weather today", url: "https://www.bing.com/search?q=NYC+weather+today" }],
+      provider: "bing" }]);
   assert.deepEqual(panelTools(m).map((t) => t.label), ["Web search", "Your files"]);
   server({});
   const { host, root } = await mount({ answer: m, onClose() {} });
@@ -281,7 +282,7 @@ test("a Bing search with no page cited still shows its Bing results link", () =>
   const m = { text: "No clear answer.", web_grounding: { provider: "bing", queries: [
     { query: "obscure thing", url: "https://www.bing.com/search?q=obscure+thing" }] } };
   assert.deepEqual(panelSources(m), [{ key: "web", pages: [],
-    bing: [{ query: "obscure thing", url: "https://www.bing.com/search?q=obscure+thing" }] }]);
+    bing: [{ query: "obscure thing", url: "https://www.bing.com/search?q=obscure+thing" }], provider: "bing" }]);
 });
 
 test("a finished answer that ran no query lists no data source, whatever its steps read", () => {

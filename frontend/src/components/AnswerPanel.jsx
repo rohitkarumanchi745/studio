@@ -27,6 +27,8 @@ const TOOL_OF_KIND = {
   files: ["📁", "Your files"],
 };
 
+const WEB_SOURCE = { bing: "Bing web search", google: "Google Search", brave: "Brave web search" };
+
 /** A link only to a web page: http(s), nothing a browser would run. */
 function webLink(url) {
   try {
@@ -114,7 +116,8 @@ export function panelSources(m, steps = []) {
         && webLink(q.url)?.startsWith("https://www.bing.com/search?"))
       .map((q) => ({ query: String(q.query), url: webLink(q.url) }))
     : [];
-  if (pages.length || bing.length) out.push({ key: "web", pages, bing });
+  const provider = WEB_SOURCE[m?.web_grounding?.provider] ? m.web_grounding.provider : null;
+  if (pages.length || bing.length) out.push({ key: "web", pages, bing, ...(provider ? { provider } : {}) });
   return out;
 }
 
@@ -282,7 +285,7 @@ export default function AnswerPanel({ answer, question, steps, running = false, 
               <li key={s.key} className="ap-source">
                 <div className="ap-source-head">
                   <span aria-hidden="true">🌐</span><b>The web</b>
-                  {s.bing.length > 0 && <span className="ap-source-type">Bing web search</span>}
+                  {s.provider && <span className="ap-source-type">{WEB_SOURCE[s.provider]}</span>}
                 </div>
                 <ul className="ap-tables">
                   {s.bing.map((q) => (

@@ -146,8 +146,8 @@ def draft(force=False):
         return None, "no LLM key is configured on the server"
     with db.connect() as c:
         since = _last_draft_through(c)
-    # A run grounded in Bing output may not improve an AI model (Grounding
-    # with Bing terms): it is never evidence for a rule.
+    # A run grounded in web search output may not improve an AI model (the
+    # providers' terms): it is never evidence for a rule.
     failures = [t for t in db.list_traces(limit=_EVIDENCE_LIMIT, max_reward=0.4)
                 if not _bing_grounded(t)]
     fresh = [t for t in failures if t["created_at"] > since]
@@ -185,7 +185,7 @@ def _bing_grounded(trace):
             meta = json.loads(meta)
         except ValueError:
             return True             # unreadable: leave it out
-    return isinstance(meta, dict) and bool(meta.get("bing_grounded"))
+    return isinstance(meta, dict) and bool(meta.get("web_grounded") or meta.get("bing_grounded"))
 
 
 def tick_once():

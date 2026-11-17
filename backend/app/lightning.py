@@ -387,10 +387,11 @@ def record_chat_trace(user, conversation_id, prompt, result, duration_ms, histor
     learnable WITH the turns that give it meaning."""
     errors = result.get("errors") or []
     chart = result.get("chart") or {}
-    # Bing output may not train or evaluate AI models (Grounding with Bing
-    # terms): a run that used it, or whose history holds an answer that did,
-    # is kept out of every training path, and that answer's text is not kept.
-    bing = (result.get("web_grounding") or {}).get("provider") == "bing"
+    # Web search output (Bing, Google, Brave) may not train AI models under
+    # their terms: a run that used it, or whose history holds an answer that
+    # did, is kept out of every training path, and that answer's text is not kept.
+    from .general_tools import NO_TRAIN
+    bing = (result.get("web_grounding") or {}).get("provider") in NO_TRAIN
     try:
         tid = db.add_trace(
             user,
@@ -418,11 +419,12 @@ def record_chat_trace(user, conversation_id, prompt, result, duration_ms, histor
                   "qcache_feedback_mode": result.get("_qcache_feedback_mode"),
                   # trimmed to keep the trace row lean; same order the model saw
                   "history": [{"role": h["role"],
-                               "text": "[an answer grounded in Bing web results]"
-                               if h.get("bing") else (h.get("text") or "")[:600]}
+                               "text": "[an answer grounded in web search results]"
+                               if h.get("web") or h.get("bing") else (h.get("text") or "")[:600]}
                               for h in (history or [])][-8:],
-                  **({"bing_grounded": True, "global_train_eligible": False}
-                     if bing or any(h.get("bing") for h in (history or [])) else {})},
+                  **({"bing_grounded": True, "web_grounded": True, "global_train_eligible": False}
+                     if bing or any(h.get("web") or h.get("bing") for h in (history or []))
+                     else {})},
         )
     except Exception:
         return None  # learning must never break answering
