@@ -2265,6 +2265,27 @@ def _canvas_source(body, user):
     return connector, allowed, schemas
 
 
+# How much of an earlier answer's SQL its history entry carries.
+HISTORY_SQL_CHARS = int(os.getenv("STUDIO_HISTORY_SQL_CHARS", "1500"))
+
+
+def _answer_sql(content):
+    """The SQL an earlier answer ran, for the history the next model reads —
+    so a follow-up (whichever model answers it) can build on the exact query
+    instead of re-deriving it. Each view's SQL, named by its source when the
+    answer spans several; trimmed. "" when it ran none."""
+    panels = [p for p in content.get("panels") or [] if isinstance(p, dict) and p.get("sql")]
+    many = len({p.get("source") for p in panels if p.get("source")}) > 1
+    parts = [f"[{p['source']}] {p['sql'].strip()}" if many and p.get("source") else p["sql"].strip()
+             for p in panels]
+    if not parts and content.get("sql"):
+        parts = [str(content["sql"]).strip()]
+    sql = "\n".join(dict.fromkeys(x for x in parts if x))     # each query once, in order
+    if len(sql) > HISTORY_SQL_CHARS:
+        sql = sql[:HISTORY_SQL_CHARS].rstrip() + " …"
+    return sql
+
+
 def _conversation(cid, user, prompt, recorded=False, before_message_id=None):
     """Resolve/create the conversation and return (cid, recent history).
     recorded=True means this turn's user message is already the newest row
@@ -2310,6 +2331,10 @@ def _conversation(cid, user, prompt, recorded=False, before_message_id=None):
             if platform_run:
                 text += "\nPlatform job (requires approval): " + json.dumps(
                     {k: platform_run.get(k) for k in ("target", "payload", "status", "job_id")})
+            sql = _answer_sql(content) if m["role"] == "assistant" else ""
+            if sql:
+                # The query, never its rows: numbers in history may be stale.
+                text += "\nSQL this answer ran:\n" + sql
             if text:
                 history.append({"role": m["role"], "text": text})
         history = history[-int(os.getenv("STUDIO_HISTORY_TURNS", "8")):]

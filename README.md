@@ -3426,6 +3426,7 @@ you in: the account is created unverified and the emailed 6-digit code
 | `STUDIO_AGENT_GRAPH_PLANNER_TIMEOUT_S` | Whole-council and per-provider planning deadline in seconds (default 30, clamped to 5–60) |
 | `STUDIO_AGENT_DYNAMIC_SPAWN` | Runtime worker delegation toggle (default on). Set `0`, `false`, or `no` to keep the seed DAG but omit `spawn_data_agent` and prevent dynamic child nodes |
 | `STUDIO_HISTORY_TURNS` | Prior turns replayed to the model each turn (default 8); sessions keep the full transcript |
+| `STUDIO_HISTORY_SQL_CHARS` | How much of each earlier answer's SQL rides along in that history (default 1500), so a follow-up — whichever model answers it — builds on the exact query; never its rows |
 | `STUDIO_LLM` | LangChain `init_chat_model` string — `anthropic:claude-sonnet-5`, `openai:gpt-4o`, … |
 | `STUDIO_LLM_BASE_URL` / `STUDIO_BITNET_LLM` | Self-hosted BitNet endpoint + model spec for the learned-scope router |
 | `STUDIO_MODELS` | The model menu offered in the composer |
