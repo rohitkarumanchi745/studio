@@ -1410,6 +1410,31 @@ input:focus, select:focus, .composer-pill:focus-within { box-shadow: 0 0 0 1px v
 .conn-req { color: var(--bad); }
 .conn-warn { color: var(--warn); }
 
+/* ── A Spark cluster (ClusterPanel): kubeconfig, sign-in, steps ───────── */
+.cluster-status {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 13px;
+  padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--surface);
+}
+.cluster-status > span:nth-child(2) { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.cluster-pem {
+  width: 100%; box-sizing: border-box; resize: vertical; min-height: 56px;
+  font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink);
+  background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px;
+}
+.cluster-pem:focus { outline: none; border-color: var(--accent); }
+.cluster-note { font-size: 12px; line-height: 1.4; }
+.cluster-steps, .cluster-cert { font-size: 13px; }
+.cluster-steps summary, .cluster-cert summary { cursor: pointer; color: var(--ink-2); }
+.cluster-steps ol { margin: 8px 0 0; padding-left: 20px; display: flex; flex-direction: column; gap: 6px; }
+.cluster-steps pre {
+  margin: 4px 0 0; padding: 6px 8px; border-radius: 6px; background: var(--surface-2);
+  white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px;
+}
+.cluster-cert[open] { display: flex; flex-direction: column; gap: 8px; }
+.cluster-check span { font-size: 13px; color: var(--ink-2); }
+.cluster-check input { margin: 0 4px 0 0; vertical-align: -2px; accent-color: var(--accent); }
+
 /* ── Data connections: connected-source rows ─────────────────────────── */
 .dbconn-row {
   display: flex; align-items: center; gap: 10px;

@@ -9,6 +9,10 @@ const EXAMPLES = {
   ray: '{"entrypoint":"python etl.py","runtime_env":{"working_dir":"https://…/job.zip"}}',
 };
 const TERMINAL = new Set(["succeeded", "failed", "canceled", "cancelled", "rejected", "escalated"]);
+// Where a queued Spark job runs (its payload's cluster; none named is the
+// server's own). A card still waiting for input says what is missing instead.
+export const CLUSTER_LABEL = { aks: "Azure Kubernetes Service", gke: "Google Kubernetes Engine",
+                               local: "Local Kubernetes", default: "the server's Kubernetes" };
 
 function externalUrl(value) {
   try {
@@ -105,6 +109,9 @@ export default function ChatPlatformRun({ artifact, busy, messageId, onAction })
         <strong>{artifact.label || artifact.target || "Platform job"}</strong>
         <span className="chat-pipeline-status" role="status">{state.replaceAll("_", " ")}</span>
       </div>
+      {artifact.target === "k8s_spark" && artifact.job_id && CLUSTER_LABEL[artifact.payload?.cluster] && (
+        <p className="meta chat-platform-cluster">Runs on {CLUSTER_LABEL[artifact.payload.cluster]}</p>
+      )}
       {state === "awaiting_approval" && <p className="meta">The job has not started. An administrator must approve it in <a href="/jobs">Jobs</a>.</p>}
       {["queued", "running"].includes(state) && <p className="meta">The platform has not reported completion yet.</p>}
       {artifact.missing?.length > 0 && <ul>{artifact.missing.map((item, i) => <li key={i}>{String(item)}</li>)}</ul>}

@@ -25,7 +25,9 @@ Payload shapes (the UI renders these):
                      shorthand: {"main_file": "local:///...", "type": "Python"|
                      "Scala", "main_class": ..., "image": ..., "spark_version":
                      ..., "arguments": [...], "name": ..., "service_account":
-                     ..., "driver": {...}, "executor": {...}}
+                     ..., "driver": {...}, "executor": {...}}; either may
+                     add "cluster": "aks"|"gke"|"local"|"default" (else the
+                     first connected — see K8sSparkPlatform)
     ray:             the Jobs API's own body: {"entrypoint": "python etl.py",
                      "runtime_env": {...}, "metadata": {...}, ...}, or
                      {"script": "<python source>", "args": [...], "runtime_env":
@@ -629,12 +631,19 @@ class DbtCloudPlatform(Platform):
 # ── Spark on Kubernetes (Kubeflow spark-operator) ───────────────────────
 
 class K8sSparkPlatform(Platform):
-    """SparkApplication CRs (sparkoperator.k8s.io/v1beta2) over the K8s API.
+    """SparkApplication CRs (sparkoperator.k8s.io/v1beta2) over the K8s API,
+    on one of several clusters (clusters.py): AKS, GKE and a local one set up
+    in Studio, and the deployment's own K8S_API_URL / K8S_TOKEN /
+    K8S_NAMESPACE / K8S_VERIFY_SSL / K8S_CA_CERT ("default").
 
-    Env: K8S_API_URL (e.g. https://1.2.3.4:6443), K8S_TOKEN (ServiceAccount
-    bearer token with create/get on sparkapplications and get on pods +
-    pods/log), K8S_NAMESPACE (default "default"), K8S_VERIFY_SSL (default
-    verify; "false"/"0" skips — cluster CAs aren't in public bundles).
+    A payload may name its cluster ({"cluster": "aks" | "gke" | "local" |
+    "default"}); one that names none runs on the first connected of aks, gke,
+    default, local — with no cloud cluster connected, on the local one. Run
+    refs say where a run went: "aks:ns/name" (a cluster set up in Studio) or
+    "ns/name" (the server's settings, as before).
+
+    Each cluster's token needs create/get on sparkapplications and get on pods
+    and pods/log (deploy/spark-k8s/studio-access.yaml grants exactly that).
 
     quality() returns [] — the operator exposes no test/data-quality results;
     checks belong to whatever the Spark app itself writes.
@@ -643,6 +652,7 @@ class K8sSparkPlatform(Platform):
     label = "Spark on Kubernetes"
 
     _GROUP = "/apis/sparkoperator.k8s.io/v1beta2"
+    _REF = re.compile(r"^(aks|gke|local):(.+)$")
     _STATES = {"": "queued", "SUBMITTED": "queued", "PENDING_RERUN": "queued",
                # SUCCEEDING/FAILING are terminal-transition states, not final
                "RUNNING": "running", "SUCCEEDING": "running", "FAILING": "running",
@@ -652,23 +662,48 @@ class K8sSparkPlatform(Platform):
                "FAILED": "failed", "SUBMISSION_FAILED": "failed",
                "SUSPENDED": "canceled"}
 
-    def _cfg(self):
-        return {
-            "base": os.getenv("K8S_API_URL", "").rstrip("/"),
-            "token": os.getenv("K8S_TOKEN", ""),
-            "namespace": os.getenv("K8S_NAMESPACE", "default"),
-            "verify": os.getenv("K8S_VERIFY_SSL", "true").lower() not in ("false", "0", "no"),
-        }
+    @staticmethod
+    def _clusters():
+        """{name: config} connected, in the order a job naming none tries them."""
+        from . import clusters
+        return dict(clusters.all_clusters())
 
     def configured(self):
-        cfg = self._cfg()
-        return bool(cfg["base"] and cfg["token"])
+        try:
+            return bool(self._clusters())
+        except Exception:
+            return False
+
+    def pick(self, wanted=None):
+        """(cluster name, config) a run goes to: the one named, or the first
+        connected. RuntimeError when that is not connected."""
+        from . import clusters
+        found = self._clusters()
+        if wanted:
+            if wanted not in clusters.ORDER:
+                raise RuntimeError(f"Unknown cluster '{wanted}' — use aks, gke, local or default")
+            if wanted not in found:
+                label = clusters.KINDS.get(wanted, "Kubernetes (server settings)")
+                raise RuntimeError(f"{label} is not connected in Studio")
+            return wanted, found[wanted]
+        if not found:
+            raise RuntimeError("Spark on Kubernetes is not configured: connect a cluster")
+        name = next(iter(found))
+        return name, found[name]
+
+    def _route(self, run_ref):
+        """(config, "ns/name") of the cluster a run went to."""
+        m = self._REF.match(run_ref or "")
+        cluster, ref = (m.group(1), m.group(2)) if m else ("default", run_ref)
+        return self.pick(cluster)[1], ref
 
     def _headers(self, cfg):
-        return {"Authorization": f"Bearer {cfg['token']}"}
+        from . import clusters
+        return clusters.headers(cfg)
 
     def _ctx(self, cfg):
-        return None if cfg["verify"] else ssl._create_unverified_context()
+        from . import clusters
+        return clusters.ssl_context(cfg)
 
     @staticmethod
     def _dns_name(s):
@@ -686,17 +721,21 @@ class K8sSparkPlatform(Platform):
             raise RuntimeError('k8s_spark shorthand needs "main_file" '
                                '(or pass a full SparkApplication manifest)')
         typ = shorthand.get("type", "Python")
+        # The image said, else the cluster's, else the operator's, else Spark's own.
+        image = (shorthand.get("image") or cfg.get("image")
+                 or os.getenv("K8S_SPARK_IMAGE", "").strip() or "docker.io/apache/spark:4.0.4")
         spec = {
             "type": typ,
             "mode": "cluster",
-            "image": shorthand.get("image", "docker.io/apache/spark:4.0.4"),
+            "image": image,
             "imagePullPolicy": "IfNotPresent",
             "mainApplicationFile": main,
             "sparkVersion": shorthand.get("spark_version", "4.0.4"),
             "driver": shorthand.get("driver") or {
                 "cores": 1, "memory": "512m",
                 # SA must be allowed to create executor pods (helm chart default)
-                "serviceAccount": shorthand.get("service_account", "spark-operator-spark"),
+                "serviceAccount": shorthand.get("service_account")
+                                  or cfg.get("service_account") or "spark-operator-spark",
             },
             "executor": shorthand.get("executor") or
                 {"instances": 1, "cores": 1, "memory": "512m"},
@@ -724,33 +763,35 @@ class K8sSparkPlatform(Platform):
         if not isinstance(payload, dict) or not payload:
             raise RuntimeError("k8s_spark payload must be a SparkApplication "
                                "manifest or a shorthand dict")
-        cfg = self._cfg()
+        payload = json.loads(json.dumps(payload))  # don't mutate caller's dict
+        cluster, cfg = self.pick(payload.pop("cluster", None))
         if payload.get("kind") == "SparkApplication" or "spec" in payload:
-            manifest = json.loads(json.dumps(payload))  # don't mutate caller's dict
+            manifest = payload
         else:
             manifest = self._expand(payload, cfg)
         meta = manifest.setdefault("metadata", {})
         meta["name"] = self._dns_name(meta.get("name"))
-        # Pin the run to the configured namespace — a manifest's own
+        # Pin the run to the cluster's namespace — a manifest's own
         # metadata.namespace must NOT silently retarget another namespace
-        # (the K8S_TOKEN's cross-namespace RBAC would decide the blast radius).
+        # (the token's cross-namespace RBAC would decide the blast radius).
         ns = meta["namespace"] = cfg["namespace"]
         _http("POST", f"{cfg['base']}{self._GROUP}/namespaces/{ns}/sparkapplications",
               self._headers(cfg), manifest, context=self._ctx(cfg))
         # No externally reachable UI by default (driver web UI is ClusterIP);
         # status() surfaces the ingress address when one exists.
-        return {"run_ref": f"{ns}/{meta['name']}", "url": None}
+        ref = f"{ns}/{meta['name']}"
+        return {"run_ref": ref if cluster == "default" else f"{cluster}:{ref}", "url": None}
 
-    def _get_app(self, cfg, run_ref):
-        ns, name = self._split(run_ref, cfg)
+    def _get_app(self, cfg, ref):
+        ns, name = self._split(ref, cfg)
         return ns, name, _json(
             "GET", f"{cfg['base']}{self._GROUP}/namespaces/{ns}/sparkapplications/{name}",
             self._headers(cfg), context=self._ctx(cfg))
 
     def status(self, run_ref):
-        cfg = self._cfg()
         try:
-            _, _, d = self._get_app(cfg, run_ref)
+            cfg, ref = self._route(run_ref)
+            _, _, d = self._get_app(cfg, ref)
         except Exception as e:
             return {"state": "unknown", "detail": str(e), "url": None, "metrics": {}}
         st = d.get("status") or {}
@@ -765,10 +806,13 @@ class K8sSparkPlatform(Platform):
                 "metrics": metrics}
 
     def logs(self, run_ref):
-        cfg = self._cfg()
-        ns, name = self._split(run_ref, cfg)
         try:
-            _, _, d = self._get_app(cfg, run_ref)
+            cfg, ref = self._route(run_ref)
+        except Exception:
+            return ""
+        ns, name = self._split(ref, cfg)
+        try:
+            _, _, d = self._get_app(cfg, ref)
             pod = ((d.get("status") or {}).get("driverInfo") or {}).get("podName")
         except Exception:
             pod = None
