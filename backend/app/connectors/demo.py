@@ -549,7 +549,9 @@ def _legs(waypoints, depart, kmh):
 def supply_chain_rows(now):
     """Position reports up to `now` (a naive UTC datetime): (shipment_id,
     ping_time, latitude, longitude, mode, carrier, origin, destination,
-    status, speed_kmh, units). Deterministic for a given `now`."""
+    status, speed_kmh, units). A shipment's first report is its departure
+    from the origin — "Shipped" — and its last, once it arrives, "Delivered".
+    Deterministic for a given `now`."""
     rng = random.Random(77)
     rows, n = [], 24000
     for mode, carrier, kmh, every, waypoints in SUPPLY_LANES:
@@ -584,6 +586,8 @@ def supply_chain_rows(now):
                             lon += rng.uniform(-jitter, jitter)
                         status = "Delayed" if pace < 0.92 else "In transit"
                         speed = round(kmh * pace * rng.uniform(0.9, 1.1), 1)
+                if t == depart:
+                    status, speed = "Shipped", 0.0            # left the origin
                 rows.append((f"SHP-{n}", t.strftime("%Y-%m-%d %H:%M:%S"), round(lat, 4), round(lon, 4),
                              mode, carrier, origin, destination, status, speed, units))
     rows.sort(key=lambda r: (r[1], r[0]))

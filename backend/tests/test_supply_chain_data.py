@@ -5,8 +5,9 @@ real ocean lanes, freight trains, trucks and cargo flights. Locked in:
 - it is shaped for a map over time: a latitude/longitude pair, a report
   time, and the shipment each report belongs to, in time order, with no
   jumps a ship, train, truck or plane could not make;
-- at "now" some shipments are still moving and some have been delivered —
-  at their destination, in a final report;
+- every shipment is "Shipped" in its first report, at its origin, and only
+  there; at "now" some are still moving and some have been delivered — at
+  their destination, in a final report;
 - it stays current: re-seeded once its newest report is a day old, never
   while it is fresh, and the same `now` always gives the same rows;
 - it is small enough that the no-key preview reads all of it, and the
@@ -27,7 +28,8 @@ from app.geo_columns import suggest_map
 NOW = dt.datetime(2026, 11, 16, 12, 0)
 COLUMNS = ["shipment_id", "ping_time", "latitude", "longitude", "mode", "carrier", "origin",
            "destination", "status", "speed_kmh", "units"]
-STATUSES = {"In transit", "Delayed", "Delivered", "At port", "At terminal", "At DC", "At hub"}
+STATUSES = {"Shipped", "In transit", "Delayed", "Delivered", "At port", "At terminal", "At DC",
+            "At hub"}
 # The fastest each mode moves, km/h, with room for the pace spread and jitter.
 TOP_SPEED = {"Ocean": 60, "Rail": 70, "Truck": 110, "Air": 1100}
 
@@ -82,6 +84,25 @@ def test_each_shipment_moves_in_time_order_without_jumps(warehouse):
             assert km <= TOP_SPEED[mode] * hours + 25, (sid, a[1], b[1], round(km))
         # It went somewhere.
         assert _km((reports[0][2], reports[0][3]), (reports[-1][2], reports[-1][3])) > 50, sid
+
+
+def test_every_shipment_is_shipped_once_from_its_origin(warehouse):
+    _, rows = _reports(warehouse)
+    starts = {}
+    for mode, carrier, kmh, every, waypoints in demo.SUPPLY_LANES:
+        starts[(waypoints[0][0], waypoints[-1][0], mode)] = waypoints[0][1:3]
+    first = {}
+    for r in rows:
+        first.setdefault(r[0], r)            # ordered by time within each shipment
+    for r in first.values():
+        lat, lon = starts[(r[6], r[7], r[4])]
+        assert r[8] == "Shipped" and (r[2], r[3]) == (round(lat, 4), round(lon, 4)) and r[9] == 0
+    shipped = [r for r in rows if r[8] == "Shipped"]
+    assert len(shipped) == len(first) == 32           # one departure each, and only that
+    # "Which shipments have shipped?" has an answer.
+    n = warehouse.execute("SELECT COUNT(DISTINCT shipment_id) FROM shipment_tracking "
+                          "WHERE status = 'Shipped'").fetchone()[0]
+    assert n == 32
 
 
 def test_at_now_some_are_moving_and_some_delivered_at_their_destination(warehouse):
