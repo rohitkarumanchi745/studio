@@ -101,6 +101,9 @@ input:focus, select:focus { border-color: var(--accent); }
 .vc-option { display: flex; align-items: center; gap: 6px; padding: 3px 4px; border-radius: 4px;
   cursor: pointer; white-space: nowrap; }
 .vc-option:hover { background: var(--surface-2); }
+/* Picked, but the other filters leave it no rows: shown so it can be taken back. */
+.vc-option-off { color: var(--ink-3); }
+.vc-hidden { padding: 4px 4px 2px; font-size: 11.5px; white-space: normal; max-width: 220px; }
 .vc-count { margin-left: 4px; }
 @keyframes vc-pop { from { opacity: 0; transform: scale(.96) translateY(-2px); } to { opacity: 1; transform: none; } }
 @media (prefers-reduced-motion: reduce) { .vc-menu { animation: none; } }

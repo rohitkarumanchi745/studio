@@ -18,7 +18,7 @@ import ArtifactView, { downloadArtifact } from "./renderers/ArtifactView";
 import { base64Text, downloadPng } from "../exporting";
 import VisualControls from "./VisualControls";
 import VizFrame from "./VizFrame";
-import { EMPTY_STATE, applyControls, detectControls } from "./visualFilters";
+import { EMPTY_STATE, applyControls, availableValues, detectControls, emptyNote } from "./visualFilters";
 import D3View, {
   D3_ONLY, D3_TYPES, LIMITS as D3_LIMITS, beeswarmData, calendarData, d3Type, networkData,
   packData,
@@ -274,15 +274,20 @@ export default function ChartView({
   const shownRows = useMemo(
     () => (controls ? applyControls(baseColumns, baseRows || [], controls, filters) : baseRows),
     [controls, baseColumns, baseRows, filters]);
+  // What each category picker offers: the values the other filters leave.
+  const available = useMemo(
+    () => (controls ? Object.fromEntries(controls.categories.map((c) => [
+      c.column, availableValues(baseColumns, baseRows || [], controls, filters, c.column)])) : null),
+    [controls, baseColumns, baseRows, filters]);
 
   if (!columns?.length || !rows?.length) return null;
 
   const filterBar = controls && (
-    <VisualControls controls={controls} state={filters} shown={shownRows.length}
+    <VisualControls controls={controls} state={filters} shown={shownRows.length} available={available}
                     total={(baseRows || []).length} onChange={(s) => setFilters(s || EMPTY_STATE)} />
   );
   const nothingLeft = d3Only && !shownRows.length && (
-    <div className="chart-note">Nothing in this range — widen the dates or reset the filters.</div>
+    <div className="chart-note">{emptyNote(controls, filters)}</div>
   );
 
   if (visual?.code && showVisual) {
