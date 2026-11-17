@@ -28,6 +28,15 @@ flow** screens, were removed. A pipeline drafted that way in an old
 conversation stays visible as a record of its SQL, still checked against the
 reader's current permissions, but it no longer runs.
 
+Chat answers anything, not only questions about your data. A question no
+connected source has goes to a general assistant first, which hands it back to
+the data agents if it turns out to be about data. Every agent can tell the time
+anywhere, search the web (Grounding with Bing through Azure AI Foundry, or
+Anthropic's web search on Claude) and read a page with Studio's own reader. It
+can also read files from a folder on the machine Studio runs on
+(`STUDIO_LOCAL_FILES_DIR`). Answers list the pages, Bing searches and files
+they used; setup is in [deploy/web-search](deploy/web-search/README.md).
+
 Chat also submits runs to **Airflow, Databricks Jobs, dbt Cloud, Spark on
 Kubernetes, and Ray Jobs**, asked for in plain English: **"kick off the daily sales
 pipeline on Airflow"**, **"run /opt/jobs/etl.py on Spark on Kubernetes with image

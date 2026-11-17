@@ -24,6 +24,8 @@ export function stepKind(step) {
   if (step?.kind) return step.kind;
   const label = String(step?.label || "");
   const rules = [
+    [/searched the web|searched Bing|: read https?:\/\//i, "web"], [/checking the time/i, "clock"],
+    [/the shared folder|read the file/i, "files"],
     [/running SQL|querying/i, "query"], [/reading the (question|columns|schema)/i, "schema"],
     [/custom visual|with D3/i, "visual"], [/rendering .* chart/i, "chart"],
     [/certified|semantic layer|semantic (metric|dimension)/i, "semantic"],

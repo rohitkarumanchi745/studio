@@ -1015,6 +1015,13 @@ def _platform_turn(ctx, user):
     return result
 
 
+def _ask_assistant_first(ctx):
+    """Auto found no source with what the question asks about (not a
+    follow-up kept on its earlier source): it may not be about data at all."""
+    route = ctx.get("auto_route") or {}
+    return route.get("mode") == "all" and not route.get("kept")
+
+
 def _run_turn(ctx, user):
     """Heavy half of a turn: run the agent, append the assistant message, trace,
     and checkpoint. Pure work off the prepared context — safe in a thread."""
@@ -1048,11 +1055,23 @@ def _run_turn(ctx, user):
                     verified["source"] = vsource
                     progress.emit(f"answered with the verified query “{vm['query']['title']}”", kind="verified")
         clash = None
+        general = None
+        if certified is None and verified is None and _ask_assistant_first(ctx):
+            # Auto matched no source: the time somewhere, a public fact, a task.
+            # The assistant answers it, or hands it back when it is about data.
+            general = agent.run_general(prompt, user, ctx["history"], model, sources=usable)
+            if general is None:
+                progress.emit("this is about your data — asking every source", kind="route")
         if certified is not None:
             progress.emit("answered from a certified metric", kind="semantic")
             result = certified
         elif verified is not None:
             result = verified
+        elif general is not None:
+            route = ctx.get("auto_route") or {}
+            result = {**general, "auto_route": {
+                **route, "mode": "general",
+                "why": "no connected source has what the question asks about — answered directly"}}
         else:
             # Same-named table in several sources? Don't guess — ask, unless the
             # user already chose "both, side by side" (allow_ambiguous).
@@ -1073,7 +1092,7 @@ def _run_turn(ctx, user):
         result.setdefault("source", "*")
         if ctx.get("visual"):
             agent.d3_only(result, prompt)
-        result["table"] = "all sources"
+        result["table"] = "general" if result.get("mode") == "general" else "all sources"
         result["matched_tables"] = []
         result["inputs"] = _query_inputs(result)
         tid = lightning.record_chat_trace(user, cid, prompt, result, int((time.time() - t0) * 1000),
@@ -2351,7 +2370,10 @@ def _conversation(cid, user, prompt, recorded=False, before_message_id=None):
                 # The query, never its rows: numbers in history may be stale.
                 text += "\nSQL this answer ran:\n" + sql
             if text:
-                history.append({"role": m["role"], "text": text})
+                history.append({"role": m["role"], "text": text,
+                                # Grounded in Bing output: never training input.
+                                **({"bing": True} if (content.get("web_grounding") or {})
+                                   .get("provider") == "bing" else {})})
         history = history[-int(os.getenv("STUDIO_HISTORY_TURNS", "8")):]
         return cid, history
     return db.create_conversation(user["id"], prompt), []

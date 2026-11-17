@@ -165,7 +165,7 @@ test("Auto is on by default: no pickers, and the question goes out to be routed"
     assert.match(markup, /Studio picks the source and tables from each question/);
     const toolbar = markup.slice(markup.indexOf('class="toolbar"'), markup.indexOf('class="messages"'));
     assert.doesNotMatch(toolbar, /<select|tpicker-btn/);
-    assert.match(markup, /placeholder="Ask about your data — Studio finds the source and tables…"/);
+    assert.match(markup, /placeholder="Ask anything — your data, the web, your files…"/);
     // Hidden pickers fetch no table list (and so report no error about one).
     assert.equal(requests.filter((r) => r.url.endsWith("/tables")).length, 0);
     await ask(chat, "total amount of orders by region");

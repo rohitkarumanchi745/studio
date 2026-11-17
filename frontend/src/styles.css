@@ -1921,3 +1921,11 @@ button.ap-output:hover { background: var(--surface-2); }
     box-shadow: var(--shadow-pop);
   }
 }
+.ap-link { color: var(--accent); text-decoration: none; }
+.ap-link:hover { text-decoration: underline; }
+.ap-web-host { font-size: 11px; color: var(--ink-3); }
+a.reference-web { text-decoration: none; color: inherit; }
+.web-search-note {
+  font-size: 11px; color: var(--ink-3); padding: 2px 8px; border-radius: 999px;
+  background: var(--surface-2); border: 1px solid var(--line);
+}

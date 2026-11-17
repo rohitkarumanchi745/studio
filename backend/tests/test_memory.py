@@ -224,7 +224,8 @@ def test_agent_turn_uses_ranked_notes_and_offers_memory_tools(monkeypatch):
     seen = {}
 
     def fake_graph(llm, tools, system, spec, volatile=None):
-        by_name = {t.name: t for t in tools}
+        # Anthropic's web tools are server-tool dicts, not client tools.
+        by_name = {t.name: t for t in tools if not isinstance(t, dict)}
         seen["tools"] = set(by_name)
         seen["volatile"] = volatile
         seen["remember"] = by_name["remember"].invoke({"note": "Prefers bar charts"})

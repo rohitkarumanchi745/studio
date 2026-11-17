@@ -70,6 +70,8 @@ const STEP_GLYPH = {
   docs: ["📄", "Your documents"], tools: ["🔧", "Tools"], model: ["🧠", "Model"],
   pipeline: ["⚙", "Pipeline"], error: ["⚠", "Problem"], done: ["🏁", "Finishing"],
   query: ["🛢", "Querying"], schema: ["▦", "Reading the schema"],
+  web: ["🌐", "Searching the web"], clock: ["🕒", "Checking the time"],
+  files: ["📁", "Your files"],
 };
 const SOURCE_KINDS = new Set(["query", "schema", "agent", "route", "error"]);
 export { sourceIconId, sourceTypeLabel, stepKind };
@@ -359,7 +361,26 @@ export function describeRoute(route) {
   if (route.mode === "multi") {
     return `${route.kept ? "stayed with" : "asked"} ${list(route.sources || [])}${matched}`;
   }
+  if (route.mode === "general") return "answered directly — no connected source has this";
   return "asked every source — no source's tables matched the question";
+}
+
+/** The Bing queries an answer was grounded in, each with its results page. */
+export function bingQueries(m) {
+  if (m?.web_grounding?.provider !== "bing") return [];
+  return (m.web_grounding.queries || [])
+    .filter((q) => q?.query && webUrl(q.url)?.startsWith("https://www.bing.com/search?"))
+    .map((q) => ({ query: String(q.query), url: webUrl(q.url) }));
+}
+
+/** A link only to a web page: http(s), nothing a browser would run. */
+export function webUrl(url) {
+  try {
+    const u = new URL(String(url || ""));
+    return u.protocol === "http:" || u.protocol === "https:" ? u.href : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -1159,7 +1180,7 @@ export default function Chat({ conversationId, onConversationCreated, onOpenDash
                 : visualMode
                 ? "Describe the visualization — e.g. “revenue by region as circle packing”…"
                 : auto
-                ? "Ask about your data — Studio finds the source and tables…"
+                ? "Ask anything — your data, the web, your files…"
                 : orchestrated
                 ? "Ask across all your databases — agents route the question…"
                 : tables.length ? `Ask about ${sel.length ? sel.join(", ") : "your data"}…` : "Choose a data source, or ask to run a platform job…"
@@ -1410,7 +1431,11 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
     : (m.agents_used || []).map((name) => ({ name, role: "worker" })));
   const views = m.panels?.length ? m.panels.length : (m.chart && rows?.length > 0 ? 1 : 0);
   const hasRows = !expired && columns?.length > 0 && rows?.length > 0;
-  const matched = Object.fromEntries((m.matched_tables || []).map((mt) => [mt.table, mt]));
+  // Tables that matched the question's words are sources only of an answer that
+  // queried: "what time is it" matching a table's column is not a source.
+  const queried = Boolean(m.sql || m.panels?.some((p) => p?.sql));
+  const matched = queried
+    ? Object.fromEntries((m.matched_tables || []).map((mt) => [mt.table, mt])) : {};
   const sampleable = m.source && m.source !== "*" && m.source !== "auto";
   const sources = [
     ...[...new Set([...(m.inputs?.tables || []), ...Object.keys(matched)])].map((t) => ({
@@ -1418,9 +1443,17 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
       title: [(m.inputs?.tables || []).includes(t) ? "read by this answer's SQL" : "matched your question",
                matched[t]?.why?.length ? `matched on: ${matched[t].why.join(", ")}` : "",
                sampleable ? "click for its latest rows" : ""].filter(Boolean).join(" — ") })),
-    ...(m.citations || []).map((c, i) => ({ key: `d:${i}`, kind: "doc",
+    // Grounding with Bing: the Bing results page for each query is one of the
+    // references its terms require shown with the answer.
+    ...bingQueries(m).map((q, i) => ({ key: `b:${i}`, kind: "bing", label: q.query, url: q.url,
+                                        title: "the Bing results this answer was grounded in" })),
+    ...(m.citations || []).map((c, i) => c.kind === "web" ? (webUrl(c.url) && {
+      key: `w:${i}`, kind: "web", label: c.source || new URL(c.url).hostname, url: webUrl(c.url),
+      title: `from the web · ${new URL(c.url).hostname}` }) : c.kind === "file" ? ({
+      key: `f:${i}`, kind: "file", label: c.path || c.source,
+      title: "a file in the shared folder on the Studio machine" }) : ({ key: `d:${i}`, kind: "doc",
       label: `${c.source}${c.page ? ` p.${c.page}` : c.sheet ? ` · ${c.sheet}` : ""}`,
-      title: `from your documents${c.collection ? ` · ${c.collection}` : ""}${c.score != null ? ` · relevance ${Math.round(c.score * 100)}%` : ""}` })),
+      title: `from your documents${c.collection ? ` · ${c.collection}` : ""}${c.score != null ? ` · relevance ${Math.round(c.score * 100)}%` : ""}` })).filter(Boolean),
   ];
   const suggestions = onFollowUp && !expired && !m.clarify && !m.autopilot_draft
     ? followUps(columns, rows) : [];
@@ -1434,10 +1467,11 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
           {m.mode !== "stopped" && (
           <span className="meta assistant-meta">
             {served}
+            {m.mode === "general" ? " · answered directly" : <>
             {" · "}{m.source_meta
               ? <SourceBadge name={m.source} type={m.source_meta.source_type} engine={m.source_meta.engine} />
               : m.source}
-            {" · "}{m.table === "*" ? "all tables" : m.table}
+            {" · "}{m.table === "*" ? "all tables" : m.table}</>}
             {m.agents?.length > 0
               ? ` · ${agentLabel(m.agents)}`
               : m.mode === "orchestrated" && m.agents_used?.length > 0
@@ -1554,6 +1588,9 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
           {(sources.length > 0 || m.auto_route) && (
             <div className="references" aria-label="Sources">
               <span className="references-label">Sources</span>
+              {bingQueries(m).length > 0 && (
+                <span className="web-search-note">From a Bing web search</span>
+              )}
               {m.auto_route && (
                 <span className="auto-route-row" title={m.auto_route.why || ""}>
                   <span className="auto-route-tag">✳ Auto</span>{" "}
@@ -1572,6 +1609,17 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
                   <span className="ref-num">{i + 1}</span>
                   ▦ {r.label}{sampleBusy === r.label ? " …" : ""}
                 </button>
+              ) : r.kind === "web" || r.kind === "bing" ? (
+                <a key={r.key} className="chip chip-input reference reference-web" title={r.title}
+                   href={r.url} target="_blank" rel="noopener noreferrer">
+                  <span className="ref-num">{i + 1}</span>
+                  {r.kind === "bing" ? `🔎 Bing: ${r.label}` : `🌐 ${r.label}`}
+                </a>
+              ) : r.kind === "file" ? (
+                <span key={r.key} className="chip chip-input reference" title={r.title}>
+                  <span className="ref-num">{i + 1}</span>
+                  📁 {r.label}
+                </span>
               ) : (
                 <span key={r.key} className="chip chip-input reference" title={r.title}>
                   <span className="ref-num">{i + 1}</span>

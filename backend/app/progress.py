@@ -39,7 +39,7 @@ def current():
 #: its engine, so the feed shows that database's own icon.
 KINDS = ("query", "schema", "chart", "visual", "semantic", "verified", "cache", "route",
          "plan", "agents", "agent", "aggregate", "docs", "tools", "model", "pipeline",
-         "error", "done")
+         "web", "clock", "files", "error", "done")
 
 
 def describe(source):
