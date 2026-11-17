@@ -17,8 +17,14 @@ function externalUrl(value) {
   } catch { return null; }
 }
 
+/** "A, B and C". */
+const listOf = (names) => (names.length > 1 ? `${names.slice(0, -1).join(", ")} and ${names.at(-1)}` : names[0] || "");
+
+/** Compact by design: it opens under the composer, so every line it takes
+ *  pushes the conversation up. With nothing connected it is one sentence. */
 export function PlatformComposer({ busy, onSubmit, onClose }) {
   const [platforms, setPlatforms] = useState([]);
+  const [loaded, setLoaded] = useState(false);
   const [target, setTarget] = useState("airflow");
   const [payload, setPayload] = useState("");
   const [error, setError] = useState("");
@@ -29,10 +35,12 @@ export function PlatformComposer({ busy, onSubmit, onClose }) {
       const options = Array.isArray(value) ? value : value.platforms || [];
       setPlatforms(options);
       setTarget((options.find((p) => p.configured) || options[0])?.name || "airflow");
+      setLoaded(true);
     }).catch((e) => { if (active) setError(e.message); });
     return () => { active = false; };
   }, []);
   const selected = platforms.find((p) => p.name === target);
+  const connected = platforms.filter((p) => p.configured);
   function submit() {
     try {
       const body = JSON.parse(payload);
@@ -43,18 +51,34 @@ export function PlatformComposer({ busy, onSubmit, onClose }) {
     } catch (e) { setError(e.message); }
   }
   return (
-    <section className="chat-pipeline" aria-label="Submit a platform job">
+    <section className="chat-pipeline chat-platform-panel" aria-label="Submit a platform job">
       <div className="chat-pipeline-heading"><strong>Run on a platform</strong><button type="button" className="chip" onClick={onClose}>Close</button></div>
-      <p className="meta">Choose an existing DAG or job, or provide a platform job definition. An administrator approves it before execution.
-        Or just ask in the chat — “kick off the daily sales pipeline on Airflow”, “run /opt/jobs/etl.py on Spark on Kubernetes”.</p>
-      <select aria-label="Execution platform" value={target} disabled={busy} onChange={(e) => { setTarget(e.target.value); setPayload(""); }}>
-        {platforms.map((p) => <option key={p.name} value={p.name}>{p.label || p.name}{p.configured ? "" : " (not configured)"}</option>)}
-      </select>
-      {selected && !selected.configured && <p className="error">Configure this platform's credentials on the server before submitting a job.</p>}
-      <textarea className="chat-platform-payload" aria-label="Platform job parameters" rows={4} value={payload}
-        placeholder={EXAMPLES[target]} disabled={busy} onChange={(e) => setPayload(e.target.value)} />
+      {loaded && !connected.length ? (
+        <p className="meta chat-platform-none">
+          No platform is connected yet — an administrator connects {listOf(platforms.map((p) => p.label || p.name))} on
+          the server. Then ask here, or just in the chat: “kick off the daily sales pipeline on Airflow”.
+        </p>
+      ) : (
+        <>
+          <div className="chat-platform-row">
+            <select aria-label="Execution platform" value={target} disabled={busy}
+                    onChange={(e) => { setTarget(e.target.value); setPayload(""); }}>
+              {platforms.map((p) => (
+                <option key={p.name} value={p.name} disabled={!p.configured}>
+                  {p.label || p.name}{p.configured ? "" : " — not connected"}
+                </option>
+              ))}
+            </select>
+            <button type="button" className="primary chat-platform-submit"
+                    disabled={busy || !selected?.configured || !payload.trim()} onClick={submit}>Submit for approval</button>
+          </div>
+          <textarea className="chat-platform-payload" aria-label="Platform job parameters" rows={2} value={payload}
+            placeholder={EXAMPLES[target]} disabled={busy} onChange={(e) => setPayload(e.target.value)} />
+          <p className="meta chat-platform-hint">The DAG or job and its parameters, as JSON — an administrator approves
+            every run. Or just ask in the chat: “kick off the daily sales pipeline on Airflow”.</p>
+        </>
+      )}
       {error && <p className="error">{error}</p>}
-      <button type="button" className="primary chat-platform-submit" disabled={busy || !selected?.configured || !payload.trim()} onClick={submit}>Submit for approval</button>
     </section>
   );
 }
