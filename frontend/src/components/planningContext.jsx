@@ -111,7 +111,7 @@ export function PlanningContextPicker({ repositories = [], repositoryStatus = "r
   confluencePages = [], confluenceStatus = "ready", repositoryId = "",
   confluencePageIds = [], onRepositoryChange, onConfluenceChange, disabled = false,
   preview = false, planningAllowed = true, confluenceHasMore = false,
-  confluenceLoadingMore = false, loadMoreConfluence }) {
+  confluenceLoadingMore = false, loadMoreConfluence, compact = false }) {
   if (!planningAllowed) {
     return (
       <div className="meta" style={{ margin: "8px 0" }}>
@@ -120,9 +120,8 @@ export function PlanningContextPicker({ repositories = [], repositoryStatus = "r
     );
   }
   const pageIds = new Set(confluencePageIds);
-  return (
-    <fieldset className="pl-draft" style={{ margin: "8px 0", padding: 10 }}>
-      <legend>Optional planning context</legend>
+  const fields = (
+    <>
       <div className="meta">
         {preview
           ? "Availability preview only — selections here are not saved. Builders choose context per draft."
@@ -177,7 +176,36 @@ export function PlanningContextPicker({ repositories = [], repositoryStatus = "r
           )}
         </label>
       </div>
-    </fieldset>
+    </>
+  );
+  if (!compact) {
+    return (
+      <fieldset className="pl-draft" style={{ margin: "8px 0", padding: 10 }}>
+        <legend>Optional planning context</legend>
+        {fields}
+      </fieldset>
+    );
+  }
+  // Under the chat composer: one line until opened, so an Airflow draft does
+  // not push the conversation away for pickers most drafts never use.
+  const repo = repositories.find((r) => String(r.id) === String(repositoryId));
+  const chosen = [repo?.name,
+                  confluencePageIds.length
+                    ? `${confluencePageIds.length} Confluence page${confluencePageIds.length === 1 ? "" : "s"}`
+                    : null].filter(Boolean).join(" · ");
+  const none = !repositories.length && !confluencePages.length;
+  return (
+    <details className="pl-context">
+      <summary>
+        Planning context{" "}
+        <span className="meta">
+          {chosen ? `— ${chosen}`
+            : none ? "— no repositories or Confluence pages are set up"
+            : "— optional: a repository or Confluence pages"}
+        </span>
+      </summary>
+      <div className="pl-draft">{fields}</div>
+    </details>
   );
 }
 

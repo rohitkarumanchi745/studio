@@ -234,3 +234,24 @@ test("Confluence pagination appends unique pages and stops after an empty page",
     "/api/confluence/pages?start=50&limit=25",
   ]);
 });
+
+test("under the chat composer the picker is one line until opened", () => {
+  const nothing = html(PlanningContextPicker, { compact: true, repositories: [], confluencePages: [],
+                                                confluenceStatus: "unconfigured" });
+  assert.match(nothing, /^<details class="pl-context"><summary>Planning context <span class="meta">— no repositories or Confluence pages are set up<\/span><\/summary>/);
+  assert.doesNotMatch(nothing, /<details[^>]* open/);
+  assert.doesNotMatch(nothing, /<fieldset|<legend/);
+  // The pickers are inside, for when it is opened.
+  assert.match(nothing, /aria-label="Repository planning context"/);
+  const offered = html(PlanningContextPicker, { compact: true,
+    repositories: [{ id: "repo-1", name: "Data jobs" }], confluencePages: [] });
+  assert.match(offered, /— optional: a repository or Confluence pages/);
+  const chosen = html(PlanningContextPicker, { compact: true,
+    repositories: [{ id: "repo-1", name: "Data jobs" }],
+    confluencePages: [{ id: "p1", title: "Runbook" }, { id: "p2", title: "Defs" }],
+    repositoryId: "repo-1", confluencePageIds: ["p1", "p2"] });
+  assert.match(chosen, /<span class="meta">— Data jobs · 2 Confluence pages<\/span>/);
+  // Elsewhere (Governance) it stays the full panel.
+  assert.match(html(PlanningContextPicker, { repositories: [], confluencePages: [] }),
+               /<fieldset class="pl-draft"[^>]*><legend>Optional planning context<\/legend>/);
+});
