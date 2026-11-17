@@ -256,7 +256,7 @@ test("the panel links each web page, opening a new tab", async () => {
 
 test("Bing-grounded answers carry the Bing results link; files from the shared folder are listed", async () => {
   const m = { text: "12°C", mode: "general",
-    web_grounding: { provider: "bing", queries: [
+    web_grounding: { provider: "bing", label: "Bing", note: "From a Bing web search", queries: [
       { query: "NYC weather today", url: "https://www.bing.com/search?q=NYC+weather+today" },
       { query: "forged", url: "https://evil.example/search?q=x" }] },
     citations: [{ source: "NYC weather", url: "https://weather.example/nyc", kind: "web" },
@@ -265,7 +265,7 @@ test("Bing-grounded answers carry the Bing results link; files from the shared f
     { key: "files", files: ["notes/q3.md"] },
     { key: "web", pages: [{ url: "https://weather.example/nyc", title: "NYC weather" }],
       bing: [{ query: "NYC weather today", url: "https://www.bing.com/search?q=NYC+weather+today" }],
-      provider: "bing" }]);
+      provider: "Bing web search" }]);
   assert.deepEqual(panelTools(m).map((t) => t.label), ["Web search", "Your files"]);
   server({});
   const { host, root } = await mount({ answer: m, onClose() {} });
@@ -279,10 +279,11 @@ test("Bing-grounded answers carry the Bing results link; files from the shared f
 });
 
 test("a Bing search with no page cited still shows its Bing results link", () => {
-  const m = { text: "No clear answer.", web_grounding: { provider: "bing", queries: [
+  const m = { text: "No clear answer.", web_grounding: { provider: "bing", label: "Bing", queries: [
     { query: "obscure thing", url: "https://www.bing.com/search?q=obscure+thing" }] } };
   assert.deepEqual(panelSources(m), [{ key: "web", pages: [],
-    bing: [{ query: "obscure thing", url: "https://www.bing.com/search?q=obscure+thing" }], provider: "bing" }]);
+    bing: [{ query: "obscure thing", url: "https://www.bing.com/search?q=obscure+thing" }],
+    provider: "Bing web search" }]);
 });
 
 test("a finished answer that ran no query lists no data source, whatever its steps read", () => {

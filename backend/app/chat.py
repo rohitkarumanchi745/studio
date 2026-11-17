@@ -2753,14 +2753,14 @@ def _google_answer_visible(m, content, user, now=None):
     from . import web_search
     age = (now or time.time()) - float(m.get("created_at") or 0)
     return (grounding.get("asked_by") == user["id"]
-            and age <= web_search.GOOGLE_RETENTION_DAYS * 86400)
+            and age <= web_search.google_retention_days() * 86400)
 
 
 def expire_google_answers(now=None):
     """Remove the text of Google-grounded answers older than two years (Gemini
     API terms). Returns how many were removed. Run by the retention ticker."""
     from . import web_search
-    cutoff = (now or time.time()) - web_search.GOOGLE_RETENTION_DAYS * 86400
+    cutoff = (now or time.time()) - web_search.google_retention_days() * 86400
     removed = 0
     with db.connect() as c:
         rows = c.execute("SELECT id, content FROM messages WHERE role='assistant' AND created_at < ? "

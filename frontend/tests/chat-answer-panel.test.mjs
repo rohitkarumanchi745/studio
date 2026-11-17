@@ -126,7 +126,7 @@ test("only http(s) links; route and step words for direct answers, the web and t
 
 test("a Bing-grounded answer shows the Bing results link and says it came from a web search", () => {
   const m = { text: "It is 12°C.", mode: "general", source: "*", table: "general", model: "openai:gpt-5",
-              web_grounding: { provider: "bing", queries: [
+              web_grounding: { provider: "bing", label: "Bing", note: "From a Bing web search", queries: [
                 { query: "NYC weather", url: "https://www.bing.com/search?q=NYC+weather" },
                 { query: "spoof", url: "javascript:alert(1)" }] },
               citations: [{ source: "NYC weather", url: "https://weather.example/nyc", kind: "web" },
@@ -159,7 +159,8 @@ test("tables that only matched the question's words are not sources of an answer
 test("Google's answer shows its Search Suggestions in a script-less frame, names Google, and has no Share", () => {
   const m = { text: "Spain won Euro 2024.", mode: "general", source: "*", table: "general", trace_id: "t",
               model: "anthropic:claude-sonnet-5",
-              web_grounding: { provider: "google", verbatim: true, asked_by: "u1",
+              web_grounding: { provider: "google", verbatim: true, asked_by: "u1", label: "Google",
+                               note: "From Google Search",
                                suggestions_html: "<div class=chip><a href='https://www.google.com/search?q=euro'>euro</a></div>" },
               citations: [{ source: "uefa.com", url: "https://vertexaisearch.cloud.google.com/grounding-api-redirect/x", kind: "web" }] };
   const html = renderToStaticMarkup(React.createElement(AssistantMessage, { m, onOpenCanvas() {}, busy: false }));
@@ -170,7 +171,8 @@ test("Google's answer shows its Search Suggestions in a script-less frame, names
   assert.doesNotMatch(html, /↗ Share/);
   assert.equal(verbatimWeb(m), true);
   // Brave: the agent's own answer — named, and shareable.
-  const brave = { ...m, web_grounding: { provider: "brave", verbatim: false } };
+  const brave = { ...m, web_grounding: { provider: "brave", verbatim: false, label: "Brave",
+                                         note: "From a Brave web search" } };
   const b = renderToStaticMarkup(React.createElement(AssistantMessage, { m: brave, onOpenCanvas() {}, busy: false }));
   assert.match(b, /From a Brave web search/);
   assert.match(b, /↗ Share/);

@@ -18,18 +18,45 @@ import re
 import stat
 import time
 
-MAX_READ_BYTES = 10 * 1024 * 1024
-MAX_TEXT_CHARS = 16000
-MAX_LIST = 200
-SEARCH_FILES = 3000
-SEARCH_SECONDS = 6.0
+from . import settings
+
 _SF_DATALESS = getattr(stat, "SF_DATALESS", 0x40000000)    # macOS: content not on disk
+# Read as plain text by default; STUDIO_LOCAL_FILES_TEXT_TYPES adds more.
 _TEXT = {".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".jsonl", ".log", ".yaml", ".yml",
          ".xml", ".html", ".htm", ".sql", ".py", ".js", ".ts", ".jsx", ".tsx", ".java", ".go",
          ".rs", ".rb", ".sh", ".ini", ".cfg", ".toml", ".r", ".ipynb", ".css", ".tex", ".rst"}
+# Documents with a reader of their own.
 _DOCS = {".pdf", ".xlsx", ".docx", ".eml"}
-READABLE = _TEXT | _DOCS
-ROLES = ("admin", "analyst")
+_ROLES = ("admin", "analyst", "viewer")
+
+
+# ── Settings (see backend/.env.example) ─────────────────────────────────
+
+def max_read_bytes():
+    return settings.integer("STUDIO_LOCAL_FILES_MAX_MB", 10, 1, 200) * 1024 * 1024
+
+
+def max_text_chars():
+    return settings.integer("STUDIO_LOCAL_FILES_MAX_CHARS", 16000, 1000, 500_000)
+
+
+def roles():
+    """Who may use the folder (STUDIO_LOCAL_FILES_ROLES): admin and analyst by default."""
+    return tuple(settings.names("STUDIO_LOCAL_FILES_ROLES", ("admin", "analyst"), allowed=_ROLES))
+
+
+def text_types():
+    extra = {("." + x.lstrip(".")) for x in settings.names("STUDIO_LOCAL_FILES_TEXT_TYPES", ())
+             if re.fullmatch(r"\.?[a-z0-9]{1,10}", x)}
+    return _TEXT | extra
+
+
+def readable():
+    """The kinds of file read: all supported, or STUDIO_LOCAL_FILES_TYPES (a
+    subset of them, e.g. "md,txt,pdf")."""
+    supported = text_types() | _DOCS
+    picked = {("." + x.lstrip(".")) for x in settings.names("STUDIO_LOCAL_FILES_TYPES", ())}
+    return (picked & supported) or supported
 
 
 def root():
@@ -42,7 +69,7 @@ def root():
 
 
 def available(user):
-    return bool(root()) and (user or {}).get("role") in ROLES
+    return bool(root()) and (user or {}).get("role") in roles()
 
 
 def _hidden(rel):
@@ -91,7 +118,7 @@ def _walk(base, start):
 
 
 def list_files(folder=""):
-    """Up to MAX_LIST files under a subfolder: path, size, modified."""
+    """Up to STUDIO_LOCAL_FILES_LIST_MAX files under a subfolder: path, size, modified."""
     path, rel = resolve(folder)
     if not os.path.isdir(path):
         raise ValueError(f"“{folder}” is not a folder in the shared folder.")
@@ -100,14 +127,14 @@ def list_files(folder=""):
         out.append({"path": rel_path, "bytes": st.st_size,
                     "modified": time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime)),
                     **({"offloaded": True} if _offloaded(st) else {})})
-        if len(out) >= MAX_LIST:
+        if len(out) >= settings.integer("STUDIO_LOCAL_FILES_LIST_MAX", 200, 10, 10_000):
             break
     return out
 
 
 def _text_of(path, name, data):
     ext = os.path.splitext(name)[1].lower()
-    if ext in _TEXT:
+    if ext in text_types():
         return data.decode("utf-8", "replace")
     if ext == ".docx":
         import docx
@@ -130,28 +157,34 @@ def read_file(rel):
     if not os.path.isfile(path):
         raise ValueError(f"There is no file “{rel}” in the shared folder.")
     ext = os.path.splitext(path)[1].lower()
-    if ext not in READABLE:
+    if ext not in readable():
         raise ValueError(f"{ext or 'That kind of'} file cannot be read as text.")
     st = os.stat(path)
     if _offloaded(st):
         raise ValueError(f"“{rel}” is in iCloud, not on this Mac — download it first.")
-    if st.st_size > MAX_READ_BYTES:
-        raise ValueError(f"“{rel}” is larger than {MAX_READ_BYTES // (1024 * 1024)} MB.")
+    limit = max_read_bytes()
+    if st.st_size > limit:
+        raise ValueError(f"“{rel}” is larger than {limit // (1024 * 1024)} MB.")
     with open(path, "rb") as fh:
-        data = fh.read(MAX_READ_BYTES + 1)
+        data = fh.read(limit + 1)
     try:
         text = _text_of(path, os.path.basename(path), data).strip()
     except Exception:
         raise ValueError(f"“{rel}” could not be read.") from None
-    if len(text) > MAX_TEXT_CHARS:
-        text = text[:MAX_TEXT_CHARS].rstrip() + f"\n… ({len(text) - MAX_TEXT_CHARS} more characters)"
+    cap = max_text_chars()
+    if len(text) > cap:
+        text = text[:cap].rstrip() + f"\n… ({len(text) - cap} more characters)"
     return {"path": rel, "text": text}
 
 
-def search(words, limit=20):
+def search(words, limit=None):
     """Files whose name or text holds every word: [{path, line}] with the
     first matching line. Text files only (the documents are searched by name),
     within a file and time budget."""
+    limit = limit or settings.integer("STUDIO_LOCAL_FILES_SEARCH_HITS", 20, 1, 500)
+    max_files = settings.integer("STUDIO_LOCAL_FILES_SEARCH_FILES", 3000, 100, 200_000)
+    max_seconds = settings.number("STUDIO_LOCAL_FILES_SEARCH_SECONDS", 6.0, 1.0, 120.0)
+    file_bytes = settings.integer("STUDIO_LOCAL_FILES_SEARCH_FILE_MB", 1, 1, 100) * 1024 * 1024
     terms = [t.lower() for t in re.findall(r"\w[\w.-]*", str(words or ""))][:8]
     if not terms:
         raise ValueError("Give words to search for.")
@@ -161,12 +194,12 @@ def search(words, limit=20):
     out, started, seen = [], time.monotonic(), 0
     for path, rel, st in _walk(base, base):
         seen += 1
-        if seen > SEARCH_FILES or time.monotonic() - started > SEARCH_SECONDS:
+        if seen > max_files or time.monotonic() - started > max_seconds:
             break
         name = rel.lower()
         if all(t in name for t in terms):
             out.append({"path": rel, "line": ""})
-        elif (os.path.splitext(rel)[1].lower() in _TEXT and st.st_size <= 1024 * 1024
+        elif (os.path.splitext(rel)[1].lower() in text_types() and st.st_size <= file_bytes
               and not _offloaded(st)):
             try:
                 with open(path, "rb") as fh:

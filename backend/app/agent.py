@@ -31,7 +31,7 @@ from typing import List
 from urllib.parse import urlsplit
 
 from . import (db, email_service, gateway, general_tools, governance, grains, local_files,
-               progress, rbac, visuals)
+               progress, rbac, settings, visuals)
 from .queryguard import QueryRejected
 
 log = logging.getLogger(__name__)
@@ -1210,12 +1210,13 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
             async def _arun():
                 tools = base_tools + list(await _load_mcp_tools(mcp_cfg)) + web_tools
                 graph = _graph(llm, tools, system, spec, volatile)
-                return await graph.ainvoke({"messages": messages}, config={"recursion_limit": 16})
+                return await graph.ainvoke({"messages": messages},
+                                           config={"recursion_limit": _agent_steps()})
 
             result = asyncio.run(_arun())
         else:
             graph = _graph(llm, base_tools + web_tools, system, spec, volatile)
-            result = graph.invoke({"messages": messages}, config={"recursion_limit": 16})
+            result = graph.invoke({"messages": messages}, config={"recursion_limit": _agent_steps()})
         if web_tools:
             searched, pages = general_tools.web_activity(result.get("messages"))
             for label in searched:
@@ -1312,6 +1313,11 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
 
 GENERAL_AGENT = {"name": "Studio assistant", "role": "worker"}
 
+
+def _agent_steps():
+    """A data agent's step limit (model calls and tool calls): STUDIO_AGENT_MAX_STEPS."""
+    return settings.integer("STUDIO_AGENT_MAX_STEPS", 16, 4, 100)
+
 _GENERAL_SYSTEM = """You are Studio's assistant, in a chat where people ask about their data and
 anything else. This question matched none of the organization's connected data
 sources, so it came to you.
@@ -1371,7 +1377,8 @@ def run_general(prompt, user, history, model=None, sources=(), web=None):
         graph = _graph(make_llm(spec, user), [clock, use_data_sources] + own_web + files + web,
                        system, spec)
         result = graph.invoke({"messages": _cache_history(history, spec) + [("user", prompt)]},
-                              config={"recursion_limit": 12})
+                              config={"recursion_limit": settings.integer(
+                                  "STUDIO_ASSISTANT_MAX_STEPS", 12, 4, 100)})
     except Exception:
         log.warning("general assistant failed; asking the data agents", exc_info=True)
         return None

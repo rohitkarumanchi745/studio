@@ -13,9 +13,21 @@ configured provider), or a single provider.
 | **Brave** (Brave Search API) | `BRAVE_SEARCH_API_KEY` on a *Data for AI* plan | Plain results that the agent answers from, citing them |
 | **Claude web search** (Anthropic) | an Anthropic key | Claude searches and answers with citations (Claude models only) |
 
-With **Auto**, Studio uses the first of these that is configured. The person
-can pick another in the toggle. Every model can also read a public page it is
-given, using Studio's own page reader.
+With **Auto**, Studio uses the first of these that is configured, in the
+order `STUDIO_WEB_ORDER` sets. The person can pick another in the toggle.
+Every model can also read a public page it is given, using Studio's own page
+reader.
+
+Every limit is a server setting with today's value as its default. That
+covers timeouts, result counts, page size, the Google model, service
+addresses, the clock's extra place names, the folder's roles, file kinds and
+sizes, and agent step limits. They are all listed in `backend/.env.example`.
+Only what the terms or safety require stays fixed:
+- verbatim Bing and Google answers;
+- no training on search output;
+- Google's two-year ceiling;
+- the page reader's address checks and five-redirect limit;
+- hidden files and paths outside the folder are never read.
 
 Why Bing and Google answers aren't reworded: Bing's terms say "Customer will
 not modify or create a derivative work based on any Bing Services Output".

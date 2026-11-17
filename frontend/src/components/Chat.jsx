@@ -366,11 +366,6 @@ export function describeRoute(route) {
   return "asked every source — no source's tables matched the question";
 }
 
-// Where a web answer came from, said beside its sources (Bing and Google
-// require it; Brave's is a courtesy).
-const WEB_NOTE = { bing: "From a Bing web search", google: "From Google Search",
-                   brave: "From a Brave web search" };
-
 /** An answer that IS a Bing or Google grounded answer: shown as it came back,
  *  to its asker — never sent on to a channel. */
 export function verbatimWeb(m) {
@@ -1623,8 +1618,10 @@ export function AssistantMessage({ m, requirement, onOpenCanvas, onClarify, onRu
           {(sources.length > 0 || m.auto_route) && (
             <div className="references" aria-label="Sources">
               <span className="references-label">Sources</span>
-              {WEB_NOTE[m.web_grounding?.provider] && (
-                <span className="web-search-note">{WEB_NOTE[m.web_grounding.provider]}</span>
+              {/* Where a web answer came from, as the server names its provider
+                  (Bing and Google require it said beside the sources). */}
+              {m.web_grounding?.note && (
+                <span className="web-search-note">{m.web_grounding.note}</span>
               )}
               {m.auto_route && (
                 <span className="auto-route-row" title={m.auto_route.why || ""}>

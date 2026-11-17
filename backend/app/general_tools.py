@@ -14,6 +14,8 @@ documents) into one.
 import datetime as dt
 import os
 import re
+
+from . import settings
 from functools import lru_cache
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
@@ -63,6 +65,18 @@ _REGIONS = ("America/", "Europe/", "Asia/", "Africa/", "Australia/", "Pacific/",
 _OFFSET = re.compile(r"^(?:utc|gmt)?\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?$")
 
 
+def _aliases():
+    """The built-in nicknames, plus STUDIO_CLOCK_ALIASES ("hq=America/Chicago;
+    pune office=Asia/Kolkata") — an entry naming an unknown zone is ignored."""
+    extra = {}
+    for item in os.getenv("STUDIO_CLOCK_ALIASES", "").split(";"):
+        name, _, zone = item.partition("=")
+        name, zone = re.sub(r"\s+", " ", name.strip().lower()), zone.strip()
+        if name and zone in available_timezones():
+            extra[name] = zone
+    return {**_ALIASES, **extra}
+
+
 @lru_cache(maxsize=1)
 def _zones():
     """{lowercase zone: zone} and {lowercase city: zone}, places first."""
@@ -92,7 +106,7 @@ def resolve(place):
         label = f"UTC{m.group(1)}{int(m.group(2)):02d}:{int(m.group(3) or 0):02d}"
         return dt.timezone(sign * delta, label), label
     by_name, by_city = _zones()
-    name = (_ALIASES.get(text) or by_name.get(text.replace(" ", "_"))
+    name = (_aliases().get(text) or by_name.get(text.replace(" ", "_"))
             or by_city.get(text) or by_city.get(text.split(",")[0].strip()))
     if name and not name.startswith("Etc/"):
         try:
@@ -150,26 +164,37 @@ def clock_tool(emit=None):
 #   results  — Brave, Claude's own web search: results the agent writes its
 #              own answer from, citing them.
 # STUDIO_WEB_SEARCH is the server's: "off", "auto" (any configured provider,
-# the person picks in the chat — default the first of PROVIDER_ORDER), or one
+# the person picks in the chat — default the first of provider_order()), or one
 # provider only. Each chat turn says what its person picked: "off", "auto" or
 # a provider. Studio's page reader (web_fetch) comes with the web whenever it
 # is on, except beside Claude's own search, which has its own.
 
 PROVIDERS = {
-    "bing": {"label": "Bing", "verbatim": True},
-    "google": {"label": "Google", "verbatim": True},
-    "brave": {"label": "Brave", "verbatim": False},
-    "anthropic": {"label": "Claude web search", "verbatim": False},
+    "bing": {"label": "Bing", "verbatim": True, "note": "From a Bing web search"},
+    "google": {"label": "Google", "verbatim": True, "note": "From Google Search"},
+    "brave": {"label": "Brave", "verbatim": False, "note": "From a Brave web search"},
+    "anthropic": {"label": "Claude web search", "verbatim": False, "note": ""},
 }
-PROVIDER_ORDER = ("bing", "google", "brave", "anthropic")
-CHOICES = ("off", "auto") + PROVIDER_ORDER
+DEFAULT_ORDER = ("bing", "google", "brave", "anthropic")
+CHOICES = ("off", "auto") + DEFAULT_ORDER
+
+
+def provider_order():
+    """The order "Auto" tries providers: STUDIO_WEB_ORDER first, then the rest."""
+    first = settings.names("STUDIO_WEB_ORDER", DEFAULT_ORDER, allowed=PROVIDERS)
+    return tuple(first + [p for p in DEFAULT_ORDER if p not in first])
 # Grounded output none of these may train on (their terms), nor cache.
 NO_TRAIN = ("bing", "google", "brave")
 
 # Models that take the dynamic-filtering web tools (web_*_20260209); older
-# Claude models take the basic ones.
+# Claude models take the basic ones. STUDIO_ANTHROPIC_WEB_CURRENT_MODELS
+# (model-name prefixes) replaces this list when a new model comes out.
 _CURRENT_WEB = ("claude-fable-5", "claude-mythos-5", "claude-opus-5", "claude-opus-4-8",
                 "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-5", "claude-sonnet-4-6")
+
+
+def _current_web_models():
+    return tuple(settings.names("STUDIO_ANTHROPIC_WEB_CURRENT_MODELS", _CURRENT_WEB))
 
 
 def _web_setting():
@@ -209,7 +234,7 @@ def offered():
     setting = _web_setting()
     if setting == "off":
         return []
-    ids = (setting,) if setting in PROVIDERS else PROVIDER_ORDER
+    ids = (setting,) if setting in PROVIDERS else provider_order()
     return [{"id": pid, **PROVIDERS[pid]} for pid in ids if provider_ready(pid)]
 
 
@@ -219,17 +244,14 @@ def web_provider(spec, choice=None):
     if not web_enabled(choice):
         return None
     setting = _web_setting()
-    allowed = (setting,) if setting in PROVIDERS else PROVIDER_ORDER
+    allowed = (setting,) if setting in PROVIDERS else provider_order()
     if choice in PROVIDERS:
         return choice if choice in allowed and provider_ready(choice, spec) else None
     return next((pid for pid in allowed if provider_ready(pid, spec)), None)
 
 
 def _max_uses():
-    try:
-        return min(10, max(1, int(os.getenv("STUDIO_WEB_MAX_USES", "3"))))
-    except ValueError:
-        return 3
+    return settings.integer("STUDIO_WEB_MAX_USES", 3, 1, 10)
 
 
 def web_tools(spec, choice=None):
@@ -238,7 +260,7 @@ def web_tools(spec, choice=None):
     provider, _, model = str(spec or "").partition(":")
     if web_provider(spec, choice) != "anthropic":
         return []
-    current = model.startswith(_CURRENT_WEB)
+    current = model.lower().startswith(_current_web_models())
     uses = _max_uses()
     return [{"type": "web_search_20260209" if current else "web_search_20250305",
              "name": "web_search", "max_uses": uses},
@@ -359,8 +381,10 @@ def grounding(record, provider, asked_by=None):
     direct = record.get("direct")
     if provider not in NO_TRAIN or not (record.get("queries") or record.get("citations") or direct):
         return pages, None
-    out = {"provider": provider, "queries": list(record.get("queries") or [])[:10],
-           "verbatim": bool(direct and not direct.get("failed"))}
+    from . import web_search as web
+    out = {"provider": provider, "queries": list(record.get("queries") or [])[:web.max_sources()],
+           "verbatim": bool(direct and not direct.get("failed")),
+           "label": PROVIDERS[provider]["label"], "note": PROVIDERS[provider]["note"]}
     if asked_by:
         out["asked_by"] = asked_by
     if direct and direct.get("suggestions_html"):
@@ -413,7 +437,7 @@ def _blocks(messages):
             yield from (b for b in m.content if isinstance(b, dict))
 
 
-def web_activity(messages, limit=8):
+def web_activity(messages, limit=None):
     """(steps, citations) for what the server tools did this turn: the
     searches and reads as activity steps, and the pages used as citations
     ({source, url, kind: "web"}) — the ones the answer cites, else the ones
@@ -443,6 +467,7 @@ def web_activity(messages, limit=8):
                 if url:
                     cited.setdefault(url, (c.get("title") or "").strip())
     pages = cited or found
+    from . import web_search as web
     citations = [{"source": title or urlsplit(url).hostname, "url": url, "kind": "web"}
-                 for url, title in list(pages.items())[:limit]]
+                 for url, title in list(pages.items())[:limit or web.max_sources()]]
     return steps, citations

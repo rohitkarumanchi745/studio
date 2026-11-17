@@ -55,11 +55,46 @@ import urllib.request
 import urllib.robotparser
 from html.parser import HTMLParser
 
-USER_AGENT = "StudioBot/1.0 (+web_fetch; reads pages an assistant cites)"
-ROBOTS_AGENT = "StudioBot"
-MAX_PAGE_BYTES = 2 * 1024 * 1024
+from . import settings
+
+# Fixed: how many redirects a page may take (each is checked again), and the
+# Azure scope Foundry tokens are issued for (the API's own).
 MAX_REDIRECTS = 5
 _TOKEN_SCOPE = "https://ai.azure.com/.default"
+
+
+# ── Settings (see backend/.env.example) ─────────────────────────────────
+
+def user_agent():
+    return settings.text("STUDIO_WEB_USER_AGENT", "StudioBot/1.0 (+web_fetch; reads pages an assistant cites)")
+
+
+def robots_agent():
+    """The name robots.txt rules are matched against: the user agent's first word."""
+    return user_agent().split("/")[0].split()[0] or "StudioBot"
+
+
+def page_bytes():
+    return settings.integer("STUDIO_WEB_FETCH_MAX_BYTES", 2 * 1024 * 1024, 64 * 1024, 20 * 1024 * 1024)
+
+
+def page_chars():
+    return settings.integer("STUDIO_WEB_FETCH_MAX_CHARS", 12000, 1000, 200_000)
+
+
+def max_sources():
+    """Pages (and queries) kept per search and per answer."""
+    return settings.integer("STUDIO_WEB_MAX_SOURCES", 8, 1, 50)
+
+
+def query_chars():
+    return settings.integer("STUDIO_WEB_QUERY_MAX_CHARS", 400, 50, 2000)
+
+
+def _https(name, default):
+    """An https base URL setting, without a trailing slash."""
+    value = settings.text(name, default).rstrip("/")
+    return value if urllib.parse.urlsplit(value).scheme == "https" else default.rstrip("/")
 
 
 # ── Grounding with Bing Search ──────────────────────────────────────────
@@ -74,13 +109,13 @@ def bing_config():
         return None
     if urllib.parse.urlsplit(cfg["endpoint"]).scheme != "https":
         return None
-    try:
-        count = int(os.getenv("BING_COUNT", "7"))
-    except ValueError:
-        count = 7
-    cfg.update(endpoint=cfg["endpoint"].rstrip("/"), market=os.getenv("BING_MARKET", "en-US").strip(),
-               count=min(50, max(1, count)),
-               authority=os.getenv("AZURE_AUTHORITY_HOST", "https://login.microsoftonline.com").rstrip("/"))
+    path = settings.text("FOUNDRY_RESPONSES_PATH", "/openai/v1/responses")
+    cfg.update(endpoint=cfg["endpoint"].rstrip("/"), market=settings.text("BING_MARKET", "en-US"),
+               count=settings.integer("BING_COUNT", 7, 1, 50),
+               authority=_https("AZURE_AUTHORITY_HOST", "https://login.microsoftonline.com"),
+               responses_path="/" + path.strip("/"),
+               timeout=settings.integer("BING_TIMEOUT_S", 90, 5, 600),
+               token_timeout=settings.integer("AZURE_TOKEN_TIMEOUT_S", 20, 2, 120))
     return cfg
 
 
@@ -102,7 +137,7 @@ def _access_token(cfg):
         req = urllib.request.Request(url, data=body, method="POST",
                                      headers={"Content-Type": "application/x-www-form-urlencoded"})
         try:
-            with urllib.request.urlopen(req, timeout=20) as r:
+            with urllib.request.urlopen(req, timeout=cfg["token_timeout"]) as r:
                 got = json.loads(r.read(1_000_000) or b"{}")
         except urllib.error.HTTPError as e:
             raise RuntimeError("Bing search could not sign in to Azure — check AZURE_TENANT_ID, "
@@ -119,6 +154,12 @@ def _access_token(cfg):
 _PROMPT = ("Answer this question from current web search results, concisely and factually — the "
            "key facts, numbers and dates the sources give. Do not add anything the sources do not "
            "say.\n\nQuestion: {query}")
+
+
+def bing_prompt(query):
+    """What Foundry's model is asked (BING_GROUNDING_PROMPT, with {query})."""
+    template = settings.text("BING_GROUNDING_PROMPT", _PROMPT)
+    return (template if "{query}" in template else _PROMPT).replace("{query}", query)
 _BING_QUERY_URL = re.compile(r"https?://(?:api\.bing\.microsoft\.com/v7\.0/search|(?:www\.)?bing\.com/search)"
                              r"\?[^\s\"'<>]+", re.I)
 
@@ -177,8 +218,8 @@ def parse_bing_response(data, asked):
     _queries_in(data.get("output") or [], queries)
     if not queries:
         queries = [asked]
-    return {"text": "\n".join(t for t in texts if t).strip(), "citations": citations,
-            "queries": [{"query": q, "url": bing_results_url(q)} for q in queries[:5]]}
+    return {"text": "\n".join(t for t in texts if t).strip(), "citations": citations[:max_sources()],
+            "queries": [{"query": q, "url": bing_results_url(q)} for q in queries[:max_sources()]]}
 
 
 def bing_search(query, freshness=None):
@@ -187,7 +228,7 @@ def bing_search(query, freshness=None):
     cfg = bing_config()
     if cfg is None:
         raise RuntimeError("Bing search is not configured on this server.")
-    query = re.sub(r"\s+", " ", str(query or "")).strip()[:400]
+    query = re.sub(r"\s+", " ", str(query or "")).strip()[:query_chars()]
     if not query:
         raise RuntimeError("Give a search query.")
     search = {"project_connection_id": cfg["connection"], "count": cfg["count"],
@@ -195,13 +236,13 @@ def bing_search(query, freshness=None):
     if freshness and re.fullmatch(r"(?i)day|week|month|\d{4}-\d{2}-\d{2}(\.\.\d{4}-\d{2}-\d{2})?",
                                   str(freshness)):
         search["freshness"] = str(freshness).lower() if str(freshness).isalpha() else str(freshness)
-    body = {"model": cfg["deployment"], "input": _PROMPT.format(query=query), "tool_choice": "required",
+    body = {"model": cfg["deployment"], "input": bing_prompt(query), "tool_choice": "required",
             "tools": [{"type": "bing_grounding", "bing_grounding": {"search_configurations": [search]}}]}
     req = urllib.request.Request(
-        f"{cfg['endpoint']}/openai/v1/responses", data=json.dumps(body).encode(), method="POST",
+        f"{cfg['endpoint']}{cfg['responses_path']}", data=json.dumps(body).encode(), method="POST",
         headers={"Authorization": f"Bearer {_access_token(cfg)}", "Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=90) as r:
+        with urllib.request.urlopen(req, timeout=cfg["timeout"]) as r:
             data = json.loads(r.read(4_000_000) or b"{}")
     except urllib.error.HTTPError as e:
         said = {401: "Bing search was refused: the service principal's sign-in was not accepted.",
@@ -233,12 +274,21 @@ def format_results(result):
 GOOGLE_RETENTION_DAYS = 730          # Gemini API terms: grounded results, two years at most
 
 
+def google_retention_days():
+    """How long Google-grounded answers are kept: GOOGLE_RETENTION_DAYS, never
+    more than the terms' two years."""
+    return settings.integer("GOOGLE_RETENTION_DAYS", GOOGLE_RETENTION_DAYS, 1, GOOGLE_RETENTION_DAYS)
+
+
 def google_config():
-    """{key, model} for Gemini grounding, or None."""
+    """{key, model, base, timeout} for Gemini grounding, or None."""
     key = os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
     if not key:
         return None
-    return {"key": key, "model": os.getenv("GOOGLE_GROUNDING_MODEL", "gemini-2.5-flash").strip()}
+    return {"key": key, "model": settings.text("GOOGLE_GROUNDING_MODEL", "gemini-2.5-flash"),
+            "base": _https("GOOGLE_API_BASE", "https://generativelanguage.googleapis.com/v1beta"),
+            "timeout": settings.integer("GOOGLE_TIMEOUT_S", 90, 5, 600),
+            "question_chars": settings.integer("GOOGLE_QUESTION_MAX_CHARS", 2000, 100, 20000)}
 
 
 def parse_google_response(data):
@@ -254,8 +304,8 @@ def parse_google_response(data):
         if url and all(c["url"] != url for c in citations):
             citations.append({"url": url, "title": (w.get("title") or "").strip()})
     html = ((meta.get("searchEntryPoint") or {}).get("renderedContent") or "")
-    return {"text": text, "citations": citations,
-            "queries": [{"query": str(q)} for q in (meta.get("webSearchQueries") or []) if q][:10],
+    return {"text": text, "citations": citations[:max_sources()],
+            "queries": [{"query": str(q)} for q in (meta.get("webSearchQueries") or []) if q][:max_sources()],
             "suggestions_html": html if isinstance(html, str) and len(html) <= 100_000 else ""}
 
 
@@ -265,18 +315,17 @@ def google_search(question):
     cfg = google_config()
     if cfg is None:
         raise RuntimeError("Google search is not configured on this server.")
-    question = str(question or "").strip()[:2000]
+    question = str(question or "").strip()[:cfg["question_chars"]]
     if not question:
         raise RuntimeError("Give a question.")
     body = {"contents": [{"role": "user", "parts": [{"text": question}]}],
             "tools": [{"google_search": {}}]}
-    url = ("https://generativelanguage.googleapis.com/v1beta/models/"
-           f"{urllib.parse.quote(cfg['model'], safe='-._')}:generateContent")
+    url = f"{cfg['base']}/models/{urllib.parse.quote(cfg['model'], safe='-._')}:generateContent"
     req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
                                  headers={"x-goog-api-key": cfg["key"],
                                           "Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=90) as r:
+        with urllib.request.urlopen(req, timeout=cfg["timeout"]) as r:
             data = json.loads(r.read(4_000_000) or b"{}")
     except urllib.error.HTTPError as e:
         said = {400: "Google search refused the request — check GOOGLE_GROUNDING_MODEL.",
@@ -299,27 +348,26 @@ def brave_config():
     key = os.getenv("BRAVE_SEARCH_API_KEY", "").strip()
     if not key:
         return None
-    try:
-        count = int(os.getenv("BRAVE_COUNT", "8"))
-    except ValueError:
-        count = 8
-    return {"key": key, "count": min(20, max(1, count)),
-            "country": os.getenv("BRAVE_COUNTRY", "").strip()}
+    return {"key": key, "count": settings.integer("BRAVE_COUNT", 8, 1, 20),
+            "country": settings.text("BRAVE_COUNTRY", ""),
+            "url": _https("BRAVE_API_URL", "https://api.search.brave.com/res/v1/web/search"),
+            "timeout": settings.integer("BRAVE_TIMEOUT_S", 30, 3, 300),
+            "snippet_chars": settings.integer("BRAVE_SNIPPET_MAX_CHARS", 400, 50, 4000)}
 
 
 def _plain(text):
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", str(text or ""))).strip()
 
 
-def parse_brave_response(data, asked):
+def parse_brave_response(data, asked, snippet_chars=400):
     results = []
     for r in ((data or {}).get("web") or {}).get("results") or []:
         url = _http_url((r or {}).get("url"))
         if url and all(x["url"] != url for x in results):
             results.append({"url": url, "title": _plain(r.get("title")),
-                            "snippet": _plain(r.get("description"))[:400],
+                            "snippet": _plain(r.get("description"))[:snippet_chars],
                             "age": str(r.get("age") or "")})
-    return {"results": results, "queries": [{"query": asked}]}
+    return {"results": results[:max_sources()], "queries": [{"query": asked}]}
 
 
 def brave_search(query):
@@ -327,17 +375,17 @@ def brave_search(query):
     cfg = brave_config()
     if cfg is None:
         raise RuntimeError("Brave search is not configured on this server.")
-    query = re.sub(r"\s+", " ", str(query or "")).strip()[:400]
+    query = re.sub(r"\s+", " ", str(query or "")).strip()[:query_chars()]
     if not query:
         raise RuntimeError("Give a search query.")
     params = {"q": query, "count": cfg["count"]}
     if cfg["country"]:
         params["country"] = cfg["country"]
     req = urllib.request.Request(
-        "https://api.search.brave.com/res/v1/web/search?" + urllib.parse.urlencode(params),
+        cfg["url"] + "?" + urllib.parse.urlencode(params),
         headers={"X-Subscription-Token": cfg["key"], "Accept": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with urllib.request.urlopen(req, timeout=cfg["timeout"]) as r:
             data = json.loads(r.read(4_000_000) or b"{}")
     except urllib.error.HTTPError as e:
         said = {401: "Brave search refused the API key.", 403: "Brave search refused the API key.",
@@ -346,7 +394,7 @@ def brave_search(query):
         raise RuntimeError(said.get(e.code, f"Brave search failed (HTTP {e.code}).")) from None
     except (urllib.error.URLError, OSError, ValueError):
         raise RuntimeError("Brave search could not be reached.") from None
-    return parse_brave_response(data if isinstance(data, dict) else {}, query)
+    return parse_brave_response(data if isinstance(data, dict) else {}, query, cfg["snippet_chars"])
 
 
 def format_brave(result):
@@ -402,10 +450,11 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
 
 
-def _get(url, timeout=15, limit=None):
+def _get(url, timeout=None, limit=None):
     """(status, headers, body bytes, final url) for one GET, following up to
     five redirects, each checked again. The body stops at `limit` bytes."""
-    limit = limit or MAX_PAGE_BYTES
+    limit = limit or page_bytes()
+    timeout = timeout or settings.integer("STUDIO_WEB_FETCH_TIMEOUT_S", 15, 2, 120)
     for _ in range(MAX_REDIRECTS + 1):
         parts = urllib.parse.urlsplit(url)
         if parts.scheme not in ("http", "https") or not parts.hostname:
@@ -416,7 +465,7 @@ def _get(url, timeout=15, limit=None):
         conn = cls(parts.hostname, ip, port=port, timeout=timeout)
         path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
         try:
-            conn.request("GET", path, headers={"User-Agent": USER_AGENT, "Accept-Encoding": "identity",
+            conn.request("GET", path, headers={"User-Agent": user_agent(), "Accept-Encoding": "identity",
                                                "Accept": "text/html, text/plain, application/json;q=0.9, */*;q=0.5"})
             resp = conn.getresponse()
             if resp.status in (301, 302, 303, 307, 308) and resp.getheader("Location"):
@@ -442,10 +491,12 @@ def _allowed_by_robots(url):
     origin = f"{parts.scheme}://{parts.netloc}"
     with _robots_lock:
         cached = _robots.get(origin)
-    if not cached or time.time() - cached[1] > 3600:
+    if not cached or time.time() - cached[1] > settings.integer("STUDIO_WEB_ROBOTS_CACHE_S", 3600, 60, 86400):
         parser = urllib.robotparser.RobotFileParser()
         try:
-            status, _, body, _ = _get(origin + "/robots.txt", timeout=8, limit=512 * 1024)
+            status, _, body, _ = _get(origin + "/robots.txt",
+                                      timeout=settings.integer("STUDIO_WEB_ROBOTS_TIMEOUT_S", 8, 1, 60),
+                                      limit=512 * 1024)
         except RuntimeError:
             status, body = 404, b""
         if status in (401, 403):
@@ -459,7 +510,7 @@ def _allowed_by_robots(url):
             if len(_robots) > 500:
                 _robots.clear()
             _robots[origin] = cached
-    return cached[0].can_fetch(ROBOTS_AGENT, url)
+    return cached[0].can_fetch(robots_agent(), url)
 
 
 class _Text(HTMLParser):
@@ -504,10 +555,11 @@ _READABLE = ("text/html", "application/xhtml+xml", "text/plain", "text/markdown"
              "application/json")
 
 
-def fetch_page(url, max_chars=12000):
+def fetch_page(url, max_chars=None):
     """{url, title, text} of one public web page, as text. RuntimeError with a
     fixed sentence when it cannot be read."""
     url = _http_url(url)
+    max_chars = max_chars or page_chars()
     if not url:
         raise RuntimeError("Give a full http(s) address.")
     if not _allowed_by_robots(url):

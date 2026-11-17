@@ -200,7 +200,7 @@ def test_the_bing_tool_returns_bings_answer_as_it_is_and_ends_the_turn(bing):
     assert steps == ["searched Bing for “NYC weather today”"]
     pages, grounding = general_tools.grounding(seen, "bing", "u-1")
     assert pages == [{"source": "NYC weather", "url": "https://weather.example/nyc", "kind": "web"}]
-    assert grounding == {"provider": "bing", "verbatim": True, "asked_by": "u-1", "queries": [
+    assert grounding == {"provider": "bing", "verbatim": True, "label": "Bing", "note": "From a Bing web search", "asked_by": "u-1", "queries": [
         {"query": "NYC weather today", "url": "https://www.bing.com/search?q=NYC+weather+today"}]}
     bing[1]["error"] = 500
     failed = {"citations": [], "queries": []}
@@ -331,7 +331,7 @@ def test_the_name_is_resolved_once_and_the_connection_pinned(site, monkeypatch):
 
 
 def test_a_page_stops_at_the_size_cap(site, monkeypatch):
-    monkeypatch.setattr(web, "MAX_PAGE_BYTES", 20)
+    monkeypatch.setattr(web, "page_bytes", lambda: 20)
     assert web.fetch_page(site.base + "/long")["text"] == "a" * 20
 
 
@@ -563,7 +563,7 @@ def test_text_csv_word_and_excel_are_read(folder):
 
 
 def test_size_and_icloud_are_checked(folder, monkeypatch):
-    monkeypatch.setattr(local_files, "MAX_READ_BYTES", 50)
+    monkeypatch.setattr(local_files, "max_read_bytes", lambda: 50)
     with pytest.raises(ValueError, match="larger than"):
         local_files.read_file("big.txt")
     monkeypatch.setattr(local_files, "_offloaded", lambda st: True)
@@ -615,7 +615,7 @@ def test_the_assistant_answers_with_bings_words_and_nothing_after(bing, folder, 
     assert out["text"] == "It is 12°C and cloudy in New York."         # as Bing gave it
     assert next(state["replies"]).content == "never read"               # no model wrote after it
     assert out["citations"] == [{"source": "NYC weather", "url": "https://weather.example/nyc", "kind": "web"}]
-    assert out["web_grounding"] == {"provider": "bing", "verbatim": True, "asked_by": ANA["id"], "queries": [
+    assert out["web_grounding"] == {"provider": "bing", "verbatim": True, "label": "Bing", "note": "From a Bing web search", "asked_by": ANA["id"], "queries": [
         {"query": "NYC weather today", "url": "https://www.bing.com/search?q=NYC+weather+today"}]}
 
 
