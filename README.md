@@ -29,7 +29,9 @@ conversation stays visible as a record of its SQL, still checked against the
 reader's current permissions, but it no longer runs.
 
 Chat also submits runs to **Airflow, Databricks Jobs, dbt Cloud, Spark on
-Kubernetes, and Ray Jobs**. For example, say **"trigger Airflow DAG daily_sales"**, **"run
+Kubernetes, and Ray Jobs**, asked for in plain English: **"kick off the daily sales
+pipeline on Airflow"**, **"run /opt/jobs/etl.py on Spark on Kubernetes with image
+my/spark:3.5 with args --day 2026-11-01"**, **"run `python etl.py` on Ray"**, **"run
 Databricks job 123"**, or **"run dbt job 456"**. Supply parameters as JSON, or
 open **Run on Airflow / another platform** in the composer to choose a platform
 and enter its payload. Every external run requires an administrator's approval
@@ -1033,7 +1035,25 @@ retry loop.
 
 **Conversation-driven platform runs.** `chat_platforms.py` resolves explicit
 commands and the composer's platform/JSON form into the same supervised
-request. This existing-job path requires an Airflow `dag_id`; new typed SQL DAGs
+request. Commands are plain English — "kick off", "launch", "I'd like to run…",
+"let's run…" all work — and words become fields only when they say so outright:
+- **Airflow:** a DAG named in words ("the daily sales pipeline") is looked up
+  among the DAGs Airflow has (`GET /dags`, cached a minute): the one whose id
+  says the same words; several are offered on the card as buttons; none is
+  answered with the DAGs it does have. Without a listing, an exact id is taken
+  as typed and anything else is asked about. `key=value` pairs become `conf`
+  (Databricks: `job_parameters`). A request that names an existing DAG is a
+  run of it, even when it starts with "run" and says "pipeline" — describing
+  new work ("run an Airflow pipeline that loads orders into …") still goes to
+  the DAG builder.
+- **Spark on Kubernetes:** the file (a path, a URI, or a bare name under
+  `K8S_SPARK_JOBS_DIR`), "image X", "class X", "named X" and "with args …";
+  a `.jar` is a Scala (or, said so, Java) job and needs its class. The only
+  default is the operator's `K8S_SPARK_IMAGE`.
+- **Ray:** a `quoted` command, or one that starts with python / bash / sh.
+
+Anything left over ("tomorrow") is asked about, never guessed; questions and
+negations ("how do I…", "don't run…") never submit. This existing-job path requires an Airflow `dag_id`; new typed SQL DAGs
 use the separate approval-gated chat workflow path above. Databricks accepts an existing
 `job_id` (`jobs/run-now`) or explicit `tasks` (`runs/submit`), dbt Cloud uses an
 existing `job_id`, Kubernetes accepts a SparkApplication definition that

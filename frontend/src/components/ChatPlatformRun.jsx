@@ -45,7 +45,8 @@ export function PlatformComposer({ busy, onSubmit, onClose }) {
   return (
     <section className="chat-pipeline" aria-label="Submit a platform job">
       <div className="chat-pipeline-heading"><strong>Run on a platform</strong><button type="button" className="chip" onClick={onClose}>Close</button></div>
-      <p className="meta">Choose an existing DAG or job, or provide a platform job definition. An administrator approves it before execution.</p>
+      <p className="meta">Choose an existing DAG or job, or provide a platform job definition. An administrator approves it before execution.
+        Or just ask in the chat — “kick off the daily sales pipeline on Airflow”, “run /opt/jobs/etl.py on Spark on Kubernetes”.</p>
       <select aria-label="Execution platform" value={target} disabled={busy} onChange={(e) => { setTarget(e.target.value); setPayload(""); }}>
         {platforms.map((p) => <option key={p.name} value={p.name}>{p.label || p.name}{p.configured ? "" : " (not configured)"}</option>)}
       </select>
@@ -53,7 +54,7 @@ export function PlatformComposer({ busy, onSubmit, onClose }) {
       <textarea className="chat-platform-payload" aria-label="Platform job parameters" rows={4} value={payload}
         placeholder={EXAMPLES[target]} disabled={busy} onChange={(e) => setPayload(e.target.value)} />
       {error && <p className="error">{error}</p>}
-      <button type="button" className="primary" disabled={busy || !selected?.configured || !payload.trim()} onClick={submit}>Submit for approval</button>
+      <button type="button" className="primary chat-platform-submit" disabled={busy || !selected?.configured || !payload.trim()} onClick={submit}>Submit for approval</button>
     </section>
   );
 }
@@ -107,6 +108,17 @@ export default function ChatPlatformRun({ artifact, busy, messageId, onAction })
       {state === "awaiting_approval" && <p className="meta">The job has not started. An administrator must approve it in <a href="/jobs">Jobs</a>.</p>}
       {["queued", "running"].includes(state) && <p className="meta">The platform has not reported completion yet.</p>}
       {artifact.missing?.length > 0 && <ul>{artifact.missing.map((item, i) => <li key={i}>{String(item)}</li>)}</ul>}
+      {state === "needs_input" && artifact.choices?.length > 0 && messageId && (
+        <div className="chat-platform-choices" role="group" aria-label="Pick the DAG">
+          {artifact.choices.map((dag) => (
+            <button key={dag} type="button" className="chip" disabled={busy}
+                    onClick={() => onAction("submit", { payload: { ...(artifact.payload || {}), dag_id: dag },
+                                                        text: `Run Airflow DAG ${dag}` })}>
+              {dag}
+            </button>
+          ))}
+        </div>
+      )}
       {artifact.job?.supervisor_reasons?.length > 0 && <ul>{artifact.job.supervisor_reasons.map((item, i) => <li key={i}>{item}</li>)}</ul>}
       <details><summary>Job parameters</summary><pre className="query-sql">{JSON.stringify(artifact.payload || {}, null, 2)}</pre></details>
       {(live?.detail || artifact.job?.last_error) && <p className="error">{live?.detail || artifact.job.last_error}</p>}

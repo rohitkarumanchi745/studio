@@ -2,10 +2,22 @@
 
 This module only extracts identifiers and JSON supplied by the user. It does
 not generate DAGs, notebook paths, container images, or execution approvals.
+
+Commands are plain English: "kick off the daily sales pipeline on Airflow",
+"run /opt/jobs/etl.py on Spark on Kubernetes with image my/spark:3.5 with
+args --day 2026-11-01", "run `python etl.py` on Ray". Words are mapped to a
+field only when they say it outright — a DAG named in words is looked up in
+the DAGs Airflow actually has (one match, or a choice of several), a path is
+a path, "image X" is the image — and anything left over is asked about,
+never guessed. The one default is the operator's: K8S_SPARK_IMAGE (and
+K8S_SPARK_JOBS_DIR for a bare file name).
 """
 import copy
 import json
+import os
 import re
+import shlex
+import time
 import uuid
 
 from fastapi import HTTPException
@@ -29,7 +41,15 @@ _PLATFORM = re.compile(r"\b(" + "|".join(
     re.escape(k) for k in sorted(_TARGETS, key=len, reverse=True)) + r")\b", re.I)
 _IDENTIFIER = r'''(?:"([^"\n]+)"|'([^'\n]+)'|`([^`\n]+)`|([\w.-]+))'''
 _NEGATION = re.compile(r"\b(?:don't|don’t|do not|never|without|not yet|instead of|except|unless)\b", re.I)
-_COMMAND = re.compile(r"^(?:trigger|run|rerun|execute|start|submit|deploy)\b\s*", re.I)
+_COMMAND = re.compile(r"^(?:trigger|re-?run|run|execute|start|submit|deploy|kick[\s-]+off|launch|"
+                      r"fire(?:\s+off)?)\b\s*", re.I)
+# How a request may open before its verb: "can you", "please", "I'd like to"…
+_LEAD = re.compile(r"^(?:(?:(?:can|could|would|will) you|please|kindly|i(?:['’]d| would) like to|"
+                   r"i (?:want|need) to|let['’]?s|go ahead and)\s+)+", re.I)
+# Words that carry no run parameter: what is left after them is asked about.
+_FILLER = re.compile(r"\b(?:this|that|the|a|an|my|our|it|pipeline|workflow|job|run|dag|on|in|now|"
+                     r"again|please|spark|application|app|using|via|with|to|into|onto|for me|"
+                     r"right away)\b", re.I)
 _STATUS = re.compile(
     r"^(?:(?:check|show|refresh|poll)(?: me)?(?: the)?(?: (?:pipeline|job|run))? status\b|"
     r"status\b|(?:what(?:'s| is)|how is)(?: the)?(?: pipeline|job|run|it|that|this)\b|"
@@ -134,8 +154,9 @@ def _missing(target, payload):
             errors.append("mainApplicationFile" if full else "main_file: provide the deployed Spark application path")
         if not isinstance(spec.get("image"), str) or not spec["image"].strip():
             errors.append("image: provide the Spark container image")
-        if spec.get("type") == "Scala" and not spec.get("mainClass" if full else "main_class"):
-            errors.append("mainClass" if full else "main_class: provide the Scala entry point")
+        if spec.get("type") in ("Scala", "Java") and not spec.get("mainClass" if full else "main_class"):
+            errors.append("mainClass" if full else
+                          f"main_class: provide the {spec['type']} entry point (class com.example.Main)")
         if "arguments" in spec and (not isinstance(spec["arguments"], list)
                                     or not all(isinstance(a, str) for a in spec["arguments"])):
             errors.append("arguments must be a list of strings")
@@ -208,7 +229,7 @@ new named DAG/job starts with an empty payload, even on the same platform.
         return _context(request, prompt, previous, references_previous=target is None)
 
     text = str(prompt or "").strip()
-    text = re.sub(r"^(?:(?:can|could|would) you\s+)?(?:please\s+)?", "", text, flags=re.I)
+    text = _LEAD.sub("", text)
     text, supplied, errors = _extract_json(text)
     if _NEGATION.search(text):
         return None
@@ -222,15 +243,20 @@ new named DAG/job starts with an empty payload, even on the same platform.
     command = _COMMAND.match(text)
     # Answering a missing-input card continues that explicit request. A plain
     # new question, quoted instruction, or descriptive prose never does.
+    picked = _picked(text, previous)
+    if picked:
+        text = f"dag {picked}"
     filling = bool(previous and previous.get("status") == "needs_input" and (
-        re.match(r"^(?:dag|job)(?:_id)?\b", text, re.I) or (supplied is not None and not text)))
+        re.match(r"^(?:dag|job)(?:_id)?\b", text, re.I) or (supplied is not None and not text)
+        or (previous.get("target") == "k8s_spark" and _spark_said(text))
+        or (previous.get("target") == "ray" and _command_said(text))))
     if not command and not filling:
         return None
     tail = text[command.end():].strip() if command else text
     if not selected:
         # Recognize external-platform commands even when no platform was
         # supplied; anything else is an ordinary chat question.
-        if not re.search(r"\b(?:dag|databricks|airflow|dbt|kubernetes|k8s)\b", tail, re.I):
+        if not re.search(r"\b(?:dag|databricks|airflow|dbt|kubernetes|k8s|ray)\b", tail, re.I):
             return None
     reference = bool(re.match(r"^(?:(?:this|that|the) (?:pipeline|job|run|dag)|it|this|that)\b", tail, re.I))
     same = previous and selected == previous.get("target")
@@ -250,33 +276,247 @@ new named DAG/job starts with an empty payload, even on the same platform.
         else:
             body.update(supplied)
     noun = "dag" if selected == "airflow" else "job"
-    identifier = re.search(r"\b" + noun + r"(?:_id|\s+id)?(?:\s*(?:=|:)\s*|\s+)" + _IDENTIFIER, tail, re.I)
+    # Only DAGs and Databricks / dbt jobs have ids; a Spark or Ray "job" names none.
+    identifier = selected in ("airflow", "databricks_jobs", "dbt_cloud") and re.search(
+        r"\b" + noun + r"(?:_id|\s+id)?(?:\s*(?:=|:)\s*|\s+)" + _IDENTIFIER, tail, re.I)
     if identifier:
         value = next(v for v in identifier.groups() if v is not None)
-        if value.lower() not in ("with", "on", "for", "now", "again", "please"):
+        if value.lower() not in ("with", "on", "for", "now", "again", "please", "in", "at", "to",
+                                 "from", "of", "and", "using", "via", "the", "this", "that"):
             key = "dag_id" if selected == "airflow" else "job_id"
             if key in body and str(body[key]) != value and supplied and key in supplied:
                 errors.append(f"conflicting {key} in the command and JSON payload")
             body[key] = int(value) if key == "job_id" and _positive_id(value) else value
             tail = tail[:identifier.start()] + tail[identifier.end():]
+    # key=value pairs said outright: Airflow conf, Databricks job parameters.
+    tail, pairs = _pairs(tail)
+    if pairs:
+        field = {"airflow": "conf", "databricks_jobs": "job_parameters"}.get(selected)
+        if field:
+            body[field] = {**(body.get(field) if isinstance(body.get(field), dict) else {}), **pairs}
+        else:
+            errors.append("key=value parameters are Airflow conf or Databricks job parameters; "
+                          "give this platform a JSON payload")
+    if selected == "k8s_spark":
+        tail = _spark_words(tail, body, errors)
+    elif selected == "ray":
+        tail = _ray_words(tail, body)
     # No inferred deployment/schedule/filter semantics. Any unresolved prose
-    # is surfaced for clarification instead of being silently dropped.
-    remainder = re.sub(
-        r"\b(?:this|that|the|a|an|my|it|pipeline|job|run|dag|on|now|again|please|spark|application)\b",
-        "", tail, flags=re.I).strip(" \t\r\n.!?:")
+    # is surfaced for clarification instead of being silently dropped — but a
+    # DAG named in words is looked up among the DAGs Airflow has.
+    remainder = _leftover(tail)
+    choices = []
+    if remainder and selected == "airflow" and "dag_id" not in body:
+        dag, choices, problem = _dag_named(remainder)
+        if dag:
+            body["dag_id"] = dag
+        if dag or problem:
+            remainder = ""
+        if problem:
+            errors.append(problem)
     if remainder:
-        errors.append("express additional run parameters as an explicit JSON payload")
+        errors.append(f"I could not use “{remainder[:120]}” — give extra run parameters as "
+                      "key=value pairs or a JSON payload")
     return _context({"action": "submit", "target": selected, "payload": body,
-                     "missing": list(dict.fromkeys(errors + _missing(selected, body)))}, prompt, previous,
+                     "missing": _one_per_field(errors + _missing(selected, body)),
+                     **({"choices": choices} if choices else {})}, prompt, previous,
                     references_previous=reference)
 
 
-def _artifact(target, payload, user, *, status="needs_input", missing=None):
+def _one_per_field(messages):
+    """Each message once, and one per field ("dag_id: …"): the first, most
+    specific one — "no DAG matches 'payroll'" says more than "provide the
+    DAG identifier"."""
+    seen, out = set(), []
+    for m in dict.fromkeys(messages):
+        field = re.match(r"^([a-z_]+(?:_id|_file|_class)?|image|arguments):", m)
+        key = field.group(1) if field else m
+        if key not in seen:
+            seen.add(key)
+            out.append(m)
+    return out
+
+
+# ── Plain-words parameters ──────────────────────────────────────────────
+
+def _leftover(tail):
+    return re.sub(r"\s+", " ", _FILLER.sub(" ", tail)).strip(" \t\r\n.,;!?:")
+
+
+_PAIR = re.compile(r"(?<![\w-])([A-Za-z_][\w.-]*)\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s,;]+)")
+
+
+def _pairs(tail):
+    """("tail without them", {key: value}) for key=value pairs said outright;
+    numbers and true/false become JSON numbers and booleans."""
+    found = {}
+    for key, raw in _PAIR.findall(tail):
+        value = raw[1:-1] if raw[:1] in "\"'" else raw
+        if raw[:1] not in "\"'":
+            if re.fullmatch(r"-?\d{1,15}", value):
+                value = int(value)
+            elif re.fullmatch(r"-?\d+\.\d+", value):
+                value = float(value)
+            elif value.lower() in ("true", "false"):
+                value = value.lower() == "true"
+        found[key] = value
+    return (_PAIR.sub(" ", tail) if found else tail), found
+
+
+def _words(name):
+    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(name or ""))
+    return [w for w in re.split(r"[^a-z0-9]+", spaced.lower()) if w]
+
+
+_DAG_CACHE = {}
+
+
+def _known_dags():
+    """The DAG ids the configured Airflow has (cached a minute), or None when
+    Airflow is not configured or cannot be listed."""
+    airflow = platforms.PLATFORMS.get("airflow")
+    if airflow is None or not hasattr(airflow, "list_dags"):
+        return None
+    try:
+        if not airflow.configured():
+            return None
+        key = airflow._cfg().get("url")
+        hit = _DAG_CACHE.get(key)
+        if hit and time.time() - hit[0] < 60:
+            return hit[1]
+        dags = list(airflow.list_dags())
+    except Exception:
+        return None
+    _DAG_CACHE[key] = (time.time(), dags)
+    return dags
+
+
+def _dag_named(phrase):
+    """(dag_id, choices, problem) for a DAG named in words ("daily sales"):
+    the one Airflow DAG whose id says the same words, or a choice of the
+    several that do, or what went wrong — never a made-up id."""
+    words = _words(phrase)
+    if not words:
+        return None, [], None
+    known = _known_dags()
+    if known is None:
+        # Nothing to look it up in: an exact id is taken as typed.
+        if re.fullmatch(r"[\w.-]{1,250}", phrase, flags=re.ASCII):
+            return phrase, [], None
+        return None, [], (f"dag_id: which Airflow DAG is “{phrase[:80]}”? Give its exact id, "
+                          "e.g. “dag daily_sales”")
+    key = "_".join(words)
+    exact = [d for d in known if d.lower() == phrase.lower() or "_".join(_words(d)) == key]
+    hits = exact or [d for d in known if set(words) <= set(_words(d))]
+    if len(hits) == 1:
+        return hits[0], [], None
+    if hits:
+        return None, hits[:8], (f"dag_id: more than one Airflow DAG matches “{phrase[:80]}” — "
+                                f"pick one: {', '.join(hits[:8])}")
+    some = ", ".join(known[:6]) + (" …" if len(known) > 6 else "")
+    return None, [], (f"dag_id: no Airflow DAG matches “{phrase[:80]}”"
+                      + (f" — its DAGs include {some}" if known else " — Airflow lists no DAGs"))
+
+
+def _picked(text, previous):
+    """A DAG picked from the choices a card offered, said on its own."""
+    if not previous or previous.get("status") != "needs_input" or previous.get("target") != "airflow":
+        return None
+    said = text.strip().strip("`'\"“”.!").lower()
+    return next((c for c in previous.get("choices") or [] if c.lower() == said), None)
+
+
+_SPARK_PATH = re.compile(r"((?:local|s3a?|gs|abfss|wasbs|hdfs|file|https?)://[^\s,;'\"`]+"
+                         r"|(?<![\w:])/(?:[\w.-]+/)*[\w.-]+\.(?:py|jar|r)\b)", re.I)
+_SPARK_FILE = re.compile(r"(?<![\w/.-])([\w-]+\.(?:py|jar|r))\b", re.I)
+_SPARK_IMAGE = re.compile(r"\b(?:(?:using|with|on)\s+)?(?:the\s+)?(?:docker\s+|container\s+)?image"
+                          r"\s*[:=]?\s*([A-Za-z0-9][\w./:@-]*)", re.I)
+_SPARK_CLASS = re.compile(r"\b(?:main[\s_-]?class|class)\s*[:=]?\s*([A-Za-z_$][\w.$]*)", re.I)
+_SPARK_NAME = re.compile(r"\b(?:named|called)\s+([A-Za-z0-9][\w-]*)", re.I)
+_SPARK_ARGS = re.compile(r"\b(?:with\s+)?(?:args|arguments)\s*[:=]?\s+(.+)$", re.I)
+_TRAILING = re.compile(r"(?:\s+(?:on|in|now|please|right away))+\s*$", re.I)
+
+
+def _spark_said(text):
+    return any(p.search(text) for p in (_SPARK_PATH, _SPARK_FILE, _SPARK_IMAGE, _SPARK_CLASS,
+                                        _SPARK_ARGS))
+
+
+def _spark_words(tail, body, errors):
+    """Fill a Spark on Kubernetes shorthand from plain words: the file (a
+    path, a URI, or a bare name under K8S_SPARK_JOBS_DIR), "image X",
+    "class X", "named X" and "with args …". Returns what is left."""
+    original = tail
+    m = _SPARK_ARGS.search(tail)
+    if m and "arguments" not in body:
+        try:
+            body["arguments"] = shlex.split(_TRAILING.sub("", m.group(1)))
+        except ValueError:
+            errors.append("arguments: close the quotes in the arguments")
+        tail = tail[:m.start()]
+    for pattern, key in ((_SPARK_IMAGE, "image"), (_SPARK_CLASS, "main_class"), (_SPARK_NAME, "name")):
+        m = pattern.search(tail)
+        if m:
+            body.setdefault(key, m.group(1))
+            tail = tail[:m.start()] + " " + tail[m.end():]
+    m = _SPARK_PATH.search(tail)
+    if m:
+        path = m.group(1)
+        body.setdefault("main_file", f"local://{path}" if path.startswith("/") else path)
+        tail = tail[:m.start()] + " " + tail[m.end():]
+    else:
+        m = _SPARK_FILE.search(tail)
+        if m:
+            folder = os.getenv("K8S_SPARK_JOBS_DIR", "").rstrip("/")
+            if folder:
+                body.setdefault("main_file", f"{folder}/{m.group(1)}")
+            elif "main_file" not in body and "mainApplicationFile" not in body:
+                errors.append(f"main_file: where is {m.group(1)}? Give its full path, "
+                              f"e.g. local:///opt/jobs/{m.group(1)}")
+            tail = tail[:m.start()] + " " + tail[m.end():]
+    main = str(body.get("main_file") or "")
+    if main.lower().endswith(".jar") and "type" not in body:
+        body["type"] = "Java" if re.search(r"\bjava\b", original, re.I) else "Scala"
+    elif main.lower().endswith(".r") and "type" not in body:
+        body["type"] = "R"
+    if "image" not in body and "spec" not in body and os.getenv("K8S_SPARK_IMAGE", "").strip():
+        body["image"] = os.getenv("K8S_SPARK_IMAGE").strip()   # the operator's default
+    return re.sub(r"\b(?:java|scala|python|with|and)\b", " ", tail, flags=re.I)
+
+
+_COMMAND_TEXT = re.compile(r"`([^`]+)`|\"([^\"]+)\"|“([^”]+)”")
+_COMMAND_START = re.compile(r"\b((?:python3?|bash|sh|uv\s+run|node|java)\s+\S.*)$", re.I)
+
+
+def _command_said(text):
+    return bool(_COMMAND_TEXT.search(text) or _COMMAND_START.search(text))
+
+
+def _ray_words(tail, body):
+    """A Ray entrypoint said outright: `quoted`, or a command that starts
+    with python / bash / sh. Returns what is left."""
+    if "entrypoint" in body or "script" in body:
+        return tail
+    m = _COMMAND_TEXT.search(tail)
+    if m:
+        body["entrypoint"] = next(g for g in m.groups() if g).strip()
+        return tail[:m.start()] + " " + tail[m.end():]
+    m = _COMMAND_START.search(tail)
+    if m:
+        body["entrypoint"] = _TRAILING.sub("", m.group(1)).strip()
+        return tail[:m.start()]
+    return tail
+
+
+def _artifact(target, payload, user, *, status="needs_input", missing=None, choices=None):
     platform = platforms.PLATFORMS.get(target)
-    return {"execution_mode": "platform_run", "target": target,
-            "label": platform.label if platform else "Pipeline platform",
-            "payload": copy.deepcopy(payload), "requested_by": user["id"],
-            "status": status, "missing": list(missing or [])}
+    out = {"execution_mode": "platform_run", "target": target,
+           "label": platform.label if platform else "Pipeline platform",
+           "payload": copy.deepcopy(payload), "requested_by": user["id"],
+           "status": status, "missing": list(missing or [])}
+    if choices:
+        out["choices"] = list(choices)[:8]      # DAGs a name matched: the card offers them
+    return out
 
 
 def _summary(job):
@@ -311,8 +551,8 @@ def submit(request, user, *, request_id):
         raise HTTPException(403, "Only admins and analysts can submit platform pipelines")
     target = _target(request.get("target"))
     payload, errors = _object(request.get("payload", {}))
-    missing = list(dict.fromkeys(list(request.get("missing") or []) + errors + _missing(target, payload)))
-    artifact = _artifact(target, payload, user, missing=missing)
+    missing = _one_per_field(list(request.get("missing") or []) + errors + _missing(target, payload))
+    artifact = _artifact(target, payload, user, missing=missing, choices=request.get("choices"))
     if missing:
         return artifact
     if not platforms.PLATFORMS[target].configured():

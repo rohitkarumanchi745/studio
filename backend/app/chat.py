@@ -400,6 +400,16 @@ def _scope(body, user, before_message_id=None):
         if not chat_workflows.is_plan(workflow_previous):
             raise HTTPException(400, "Select an Airflow pipeline to inspect its status")
         workflow_action = "status"
+    if (workflow_action == "build_submit" and body.pipeline_action is None
+            and not chat_workflows.is_plan(workflow_previous)
+            and not (body.repository_id or body.confluence_page_ids)):
+        # "Run the daily sales pipeline on Airflow" names a DAG Airflow already
+        # has (or an exact id): that is a run of it, not a new DAG to build.
+        named = chat_platforms.intent(prompt, _platform_context(
+            body.conversation_id, user, body.platform_message_id, before_message_id))
+        if named and named.get("target") == "airflow" and named.get("action") == "submit" and (
+                (named.get("payload") or {}).get("dag_id") or named.get("choices")):
+            workflow_action = None
     if body.repository_id or body.confluence_page_ids:
         if body.pipeline_action not in (None, "build") or (
                 body.pipeline_action is None and workflow_action not in ("build", "build_submit")):
