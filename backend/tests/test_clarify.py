@@ -176,6 +176,6 @@ def test_clarify_exchange_is_hidden_from_model_history_and_both_is_sticky(monkey
     # And the answered turns are what the model sees — no clarify text anywhere.
     hist = chat._conversation(cid, ANA, "next")[1]
     assert all("Which source" not in h["text"] for h in hist)
-    answers = [h["text"].split("\nCurrent pipeline", 1)[0]
+    answers = [h["text"].split("\nCurrent pipeline", 1)[0].split("\nSQL this answer ran", 1)[0]
                for h in hist if h["role"] == "assistant"]
     assert answers == ["answered", "answered"]

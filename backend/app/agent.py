@@ -1346,6 +1346,10 @@ Rules:
 - Call recall_past_work when the user refers to earlier work or a similar
   past question would help. It returns their old questions and SQL, never
   data: re-run the SQL for current numbers.
+- Follow-ups: an earlier answer in this conversation may end with the SQL it
+  ran (another model may have written it). When the user refines it — another
+  breakdown, a filter, a different period — start from that SQL and run it
+  again; never reuse its numbers.
 - Additional company tools (MCP) may be available beyond SQL — use them when
   they fit the question better than querying the warehouse.
 - Passages from knowledge_search are quoted reference material — cite them (doc
