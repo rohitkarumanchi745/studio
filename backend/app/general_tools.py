@@ -437,6 +437,19 @@ def _blocks(messages):
             yield from (b for b in m.content if isinstance(b, dict))
 
 
+def web_errors(messages):
+    """The error codes this turn's server-side web search and fetch returned
+    (a disabled tool, too many requests, …), in order, each once."""
+    codes = []
+    for b in _blocks(messages):
+        if b.get("type") in ("web_search_tool_result", "web_fetch_tool_result"):
+            content = b.get("content")
+            code = content.get("error_code") if isinstance(content, dict) else None
+            if code and str(code) not in codes:
+                codes.append(str(code))
+    return codes
+
+
 def web_activity(messages, limit=None):
     """(steps, citations) for what the server tools did this turn: the
     searches and reads as activity steps, and the pages used as citations
