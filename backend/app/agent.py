@@ -393,6 +393,10 @@ def make_llm(spec, user=None, **kwargs):
         key = user_key(user, spec)
         if key:
             kwargs["api_key"] = key
+    if str(spec).startswith("anthropic:"):
+        # LangChain's default cap (4,096) is too small once adaptive thinking
+        # and a web search share it: the answer came back cut off or empty.
+        kwargs.setdefault("max_tokens", settings.integer("STUDIO_MAX_OUTPUT_TOKENS", 16000, 1024, 64000))
     return init_chat_model(spec, **kwargs)
 
 
@@ -1210,13 +1214,14 @@ def run_agent(prompt, connector, table, allowed_tables, schemas, history, user, 
             async def _arun():
                 tools = base_tools + list(await _load_mcp_tools(mcp_cfg)) + web_tools
                 graph = _graph(llm, tools, system, spec, volatile)
-                return await graph.ainvoke({"messages": messages},
-                                           config={"recursion_limit": _agent_steps()})
+                return await _arun_graph(graph, messages, _agent_steps())
 
             result = asyncio.run(_arun())
         else:
             graph = _graph(llm, base_tools + web_tools, system, spec, volatile)
-            result = graph.invoke({"messages": messages}, config={"recursion_limit": _agent_steps()})
+            result = _run_graph(graph, messages, _agent_steps())
+        if not self_hosted(spec):        # the BitNet path runs one action, not a graph
+            _report_web_trouble(result, _tid, _me)
         if web_tools:
             searched, pages = general_tools.web_activity(result.get("messages"))
             for label in searched:
@@ -1318,6 +1323,60 @@ def _agent_steps():
     """A data agent's step limit (model calls and tool calls): STUDIO_AGENT_MAX_STEPS."""
     return settings.integer("STUDIO_AGENT_MAX_STEPS", 16, 4, 100)
 
+
+def _paused(result):
+    """The turn ended on Anthropic's pause_turn: its server-side loop (a web
+    search) hit its own limit and must be sent back to carry on."""
+    msgs = (result or {}).get("messages") or []
+    last = msgs[-1] if msgs else None
+    meta = getattr(last, "response_metadata", None) or {}
+    return getattr(last, "type", "") == "ai" and meta.get("stop_reason") == "pause_turn"
+
+
+def _resumes():
+    return settings.integer("STUDIO_WEB_PAUSE_RESUMES", 3, 0, 10)
+
+
+def _run_graph(graph, messages, steps):
+    """Invoke the agent, resuming a paused server-side search: the paused
+    reply goes back as it is (no new user message) and Anthropic carries on
+    where it stopped. LangChain's loop would otherwise end the turn there,
+    with no answer written."""
+    config = {"recursion_limit": steps}
+    result = graph.invoke({"messages": messages}, config=config)
+    for _ in range(_resumes()):
+        if not _paused(result):
+            break
+        result = graph.invoke({"messages": result["messages"]}, config=config)
+    return result
+
+
+async def _arun_graph(graph, messages, steps):
+    config = {"recursion_limit": steps}
+    result = await graph.ainvoke({"messages": messages}, config=config)
+    for _ in range(_resumes()):
+        if not _paused(result):
+            break
+        result = await graph.ainvoke({"messages": result["messages"]}, config=config)
+    return result
+
+
+def _report_web_trouble(result, tid, name):
+    """A search that failed, or an answer cut short, said where the person can
+    see it (the activity feed) and in the server log — not left looking like
+    the agent never searched."""
+    for code in general_tools.web_errors(result.get("messages")):
+        hint = (" — check that web search is turned on for your Anthropic organization "
+                "(Console → Settings → Capabilities)") if code in ("unavailable", "permission_denied") else ""
+        progress.emit_for(tid, f"{name}: web search failed ({code}){hint}", agent=name, kind="error")
+        log.warning("web search failed for %s: %s", name, code)
+    msgs = result.get("messages") or []
+    last = msgs[-1] if msgs else None
+    stop = (getattr(last, "response_metadata", None) or {}).get("stop_reason")
+    if stop in ("pause_turn", "max_tokens"):
+        progress.emit_for(tid, f"{name}: the answer was cut short ({stop})", agent=name, kind="error")
+        log.warning("agent %s turn ended on %s", name, stop)
+
 _GENERAL_SYSTEM = """You are Studio's assistant, in a chat where people ask about their data and
 anything else. This question matched none of the organization's connected data
 sources, so it came to you.
@@ -1376,9 +1435,9 @@ def run_general(prompt, user, history, model=None, sources=(), web=None):
     try:
         graph = _graph(make_llm(spec, user), [clock, use_data_sources] + own_web + files + web,
                        system, spec)
-        result = graph.invoke({"messages": _cache_history(history, spec) + [("user", prompt)]},
-                              config={"recursion_limit": settings.integer(
-                                  "STUDIO_ASSISTANT_MAX_STEPS", 12, 4, 100)})
+        result = _run_graph(graph, _cache_history(history, spec) + [("user", prompt)],
+                            settings.integer("STUDIO_ASSISTANT_MAX_STEPS", 12, 4, 100))
+        _report_web_trouble(result, tid, me)
     except Exception:
         log.warning("general assistant failed; asking the data agents", exc_info=True)
         return None
